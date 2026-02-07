@@ -106,13 +106,22 @@ func _server_process(delta: float) -> void:
 
 	# Combat: shooting (damage scaled by heat)
 	if player_input.action_shoot and current_weapon != null:
-		var aim_origin := camera_pivot.global_position
-		var aim_direction := (camera_pivot.global_transform.basis * Vector3(0, 0, -1)).normalized()
+		# Third-person aiming: cast a ray from the camera through the crosshair
+		# (screen center) to find the world-space target, then fire from the
+		# character's muzzle position toward that target. This ensures bullets
+		# land exactly where the crosshair points.
+		var cam_origin := camera.global_position
+		var cam_forward := -camera.global_transform.basis.z
+		var aim_target := _get_camera_aim_target(cam_origin, cam_forward)
 
-		var hit_info := current_weapon.try_fire(self, aim_origin, aim_direction)
+		# Fire from character shoulder height toward the aim target
+		var muzzle_pos := camera_pivot.global_position
+		var aim_direction := (aim_target - muzzle_pos).normalized()
+
+		var hit_info := current_weapon.try_fire(self, muzzle_pos, aim_direction)
 		if hit_info.has("shot_end"):
 			# Show tracer FX on all clients
-			_show_shot_fx.rpc(aim_origin, hit_info["shot_end"])
+			_show_shot_fx.rpc(muzzle_pos, hit_info["shot_end"])
 
 			var collider = hit_info.get("hit_collider")
 			if collider != null and collider.has_method("take_damage"):
@@ -121,6 +130,21 @@ func _server_process(delta: float) -> void:
 				collider.take_damage(final_damage, peer_id)
 				# Add heat for dealing damage
 				heat_system.on_damage_dealt(base_damage)
+
+
+func _get_camera_aim_target(cam_origin: Vector3, cam_forward: Vector3) -> Vector3:
+	## Raycast from the camera through screen-center to find what the
+	## crosshair is actually pointing at. Returns the hit point, or a
+	## far point along the camera forward if nothing is hit.
+	var space_state := get_world_3d().direct_space_state
+	var far_point := cam_origin + cam_forward * 1000.0
+	var query := PhysicsRayQueryParameters3D.create(cam_origin, far_point)
+	query.exclude = [get_rid()]
+	query.collision_mask = 0xFFFFFFFF
+	var result := space_state.intersect_ray(query)
+	if not result.is_empty():
+		return result.position
+	return far_point
 
 
 func _client_process(_delta: float) -> void:
