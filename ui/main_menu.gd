@@ -7,7 +7,7 @@ extends Control
 
 var _connect_timer: float = 0.0
 var _is_connecting := false
-const CONNECT_TIMEOUT := 10.0  # seconds
+const CONNECT_TIMEOUT := 30.0  # Match ENet's internal timeout (~30s)
 
 
 func _ready() -> void:
@@ -19,18 +19,21 @@ func _process(delta: float) -> void:
 	if _is_connecting:
 		_connect_timer += delta
 		var dots := ".".repeat(int(_connect_timer * 2) % 4)
-		status_label.text = "Connecting%s (%.0fs)" % [dots, _connect_timer]
+		var peer_status := NetworkManager.get_peer_status_string()
+		status_label.text = "Connecting%s (%.0fs)\nENet status: %s" % [dots, _connect_timer, peer_status]
 		if _connect_timer >= CONNECT_TIMEOUT:
 			_is_connecting = false
-			status_label.text = "Connection timed out! Check:\n- Server is running\n- Using correct local IP (e.g. 192.168.x.x)\n- UDP port 7777 is open in firewall"
+			status_label.text = "Connection timed out!\n- Is the server running?\n- Correct IP? (check host's Output panel)\n- Windows Firewall: allow Godot.exe for UDP\n- Both machines on same network?"
 			NetworkManager.disconnect_game()
 
 
 func _on_host_pressed() -> void:
-	status_label.text = "Starting server on UDP port %d..." % NetConstants.DEFAULT_PORT
+	var local_ip := NetworkManager.get_local_ip()
 	var err := NetworkManager.host_game()
 	if err != OK:
 		status_label.text = "Failed to start server!"
+	else:
+		status_label.text = "Server running on UDP port %d\nTell others to connect to: %s" % [NetConstants.DEFAULT_PORT, local_ip]
 
 
 func _on_join_pressed() -> void:
@@ -57,4 +60,4 @@ func _on_connection_succeeded() -> void:
 
 func _on_connection_failed() -> void:
 	_is_connecting = false
-	status_label.text = "Connection failed!\nCheck: server running? correct IP? UDP port 7777 open?"
+	status_label.text = "Connection failed!\n- Is the server running?\n- Correct IP? (check host's Output panel)\n- Windows Firewall: allow Godot.exe for UDP"

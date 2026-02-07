@@ -29,24 +29,101 @@ var player_spawner: MultiplayerSpawner = null
 
 const PLAYER_SCENE := preload("res://player/player.tscn")
 
+## Debug: track connection state for polling
+var _is_connecting := false
+var _last_peer_status: int = -1
+var _connect_poll_timer: float = 0.0
+const _POLL_INTERVAL := 2.0  # Print status every 2 seconds
+
 
 func _ready() -> void:
 	multiplayer.peer_connected.connect(_on_peer_connected)
 	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 	multiplayer.connected_to_server.connect(_on_connected_to_server)
 	multiplayer.connection_failed.connect(_on_connection_failed)
+	multiplayer.server_disconnected.connect(_on_server_disconnected)
+
+
+func _process(delta: float) -> void:
+	if not _is_connecting:
+		return
+
+	# Poll ENet peer connection status for debug visibility
+	var peer := multiplayer.multiplayer_peer
+	if peer == null:
+		print("[Client] DEBUG: multiplayer_peer became NULL during connection!")
+		_is_connecting = false
+		return
+
+	var status: int = peer.get_connection_status()
+
+	# Log state transitions immediately
+	if status != _last_peer_status:
+		print("[Client] DEBUG: Peer status changed → %s" % _status_str(status))
+		_last_peer_status = status
+		if status == MultiplayerPeer.CONNECTION_CONNECTED:
+			print("[Client] DEBUG: ENet peer is CONNECTED!")
+			_is_connecting = false
+		elif status == MultiplayerPeer.CONNECTION_DISCONNECTED:
+			print("[Client] DEBUG: ENet peer went DISCONNECTED — server unreachable")
+			_is_connecting = false
+
+	# Periodic heartbeat print so we know the polling loop is alive
+	_connect_poll_timer += delta
+	if _connect_poll_timer >= _POLL_INTERVAL:
+		_connect_poll_timer = 0.0
+		if _is_connecting:
+			print("[Client] DEBUG: Still %s..." % _status_str(status))
+
+
+func _status_str(status: int) -> String:
+	match status:
+		MultiplayerPeer.CONNECTION_DISCONNECTED:
+			return "DISCONNECTED"
+		MultiplayerPeer.CONNECTION_CONNECTING:
+			return "CONNECTING"
+		MultiplayerPeer.CONNECTION_CONNECTED:
+			return "CONNECTED"
+		_:
+			return "UNKNOWN(%d)" % status
+
+
+## Returns the current peer connection status as a readable string.
+## Used by main_menu to display on screen.
+func get_peer_status_string() -> String:
+	var peer := multiplayer.multiplayer_peer
+	if peer == null:
+		return "NO PEER"
+	return _status_str(peer.get_connection_status())
+
+
+## Returns the best local LAN IP (192.168.x.x or 10.x.x.x).
+static func get_local_ip() -> String:
+	for ip in IP.get_local_addresses():
+		if ip.begins_with("192.168.") or ip.begins_with("10."):
+			return ip
+	for ip in IP.get_local_addresses():
+		if "." in ip and ip != "127.0.0.1":
+			return ip
+	return "unknown"
 
 
 func host_game(port: int = NetConstants.DEFAULT_PORT) -> Error:
 	var peer := ENetMultiplayerPeer.new()
 	var err := peer.create_server(port, NetConstants.MAX_PLAYERS)
 	if err != OK:
-		push_error("Failed to create server: %s" % error_string(err))
+		push_error("[Server] create_server() FAILED: %s" % error_string(err))
 		return err
 
 	multiplayer.multiplayer_peer = peer
 	is_server = true
-	print("[Server] Server started on port %d (UDP)" % port)
+
+	var local_ip := get_local_ip()
+	print("[Server] ========================================")
+	print("[Server] Server started on UDP port %d" % port)
+	print("[Server] Other players should connect to: %s" % local_ip)
+	print("[Server] All local IPs: %s" % str(IP.get_local_addresses()))
+	print("[Server] ========================================")
 
 	# Kick off map load (async, not awaited here so host_game stays non-coroutine)
 	_start_host.call_deferred()
@@ -61,18 +138,29 @@ func _start_host() -> void:
 
 func join_game(address: String, port: int = NetConstants.DEFAULT_PORT) -> Error:
 	var peer := ENetMultiplayerPeer.new()
+	print("[Client] Creating ENet client peer for %s:%d..." % [address, port])
 	var err := peer.create_client(address, port)
 	if err != OK:
-		push_error("[Client] Failed to create client: %s" % error_string(err))
+		push_error("[Client] create_client() FAILED: %s" % error_string(err))
 		return err
+	print("[Client] create_client() returned OK")
 
 	multiplayer.multiplayer_peer = peer
 	is_server = false
+	_is_connecting = true
+	_last_peer_status = -1
+	_connect_poll_timer = 0.0
+
+	var initial_status: int = peer.get_connection_status()
 	print("[Client] Connecting to %s:%d (UDP)..." % [address, port])
+	print("[Client] Initial peer status: %s" % _status_str(initial_status))
+	print("[Client] Waiting for connected_to_server signal...")
+	print("[Client] (If this stays CONNECTING, the server is unreachable — check UDP firewall rules)")
 	return OK
 
 
 func disconnect_game() -> void:
+	_is_connecting = false
 	multiplayer.multiplayer_peer = null
 	is_server = false
 	players.clear()
@@ -140,7 +228,10 @@ func _on_peer_disconnected(peer_id: int) -> void:
 
 
 func _on_connected_to_server() -> void:
+	_is_connecting = false
+	print("[Client] ========================================")
 	print("[Client] Connected to server! My peer ID: %d" % multiplayer.get_unique_id())
+	print("[Client] ========================================")
 	await _load_game_map()
 	# Tell the server we have loaded the map and are ready for our player to spawn
 	_client_ready.rpc_id(1)
@@ -149,7 +240,22 @@ func _on_connected_to_server() -> void:
 
 
 func _on_connection_failed() -> void:
-	print("[Client] Connection failed!")
+	_is_connecting = false
+	print("[Client] ========================================")
+	print("[Client] CONNECTION FAILED!")
+	print("[Client] The server did not respond. Check:")
+	print("[Client]   1. Server is running (Host Game pressed)")
+	print("[Client]   2. Correct IP address (check server's Output panel)")
+	print("[Client]   3. Windows Firewall allows Godot.exe for UDP")
+	print("[Client]   4. Both machines on same network")
+	print("[Client] ========================================")
+	multiplayer.multiplayer_peer = null
+	connection_failed.emit()
+
+
+func _on_server_disconnected() -> void:
+	print("[Client] Server disconnected!")
+	_is_connecting = false
 	multiplayer.multiplayer_peer = null
 	connection_failed.emit()
 
