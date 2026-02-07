@@ -1,11 +1,10 @@
 extends Node3D
 
 ## Map logic: spawns initial loot on server, manages world items.
+## The SeedWorld child generates terrain, structures, and spawn points.
 
 ## Item definitions to spawn across the map.
 var item_definitions: Array[ItemData] = []
-
-@onready var loot_spawn_points: Node3D = $LootSpawnPoints
 
 
 func _ready() -> void:
@@ -19,8 +18,9 @@ func _ready() -> void:
 	if has_node("/root/BurnClock"):
 		get_node("/root/BurnClock").start()
 
-	# Spawn initial loot after a brief delay to let everything initialize
-	await get_tree().create_timer(0.5).timeout
+	# Wait for terrain to generate (SeedWorld._ready creates spawn points)
+	# then wait a bit more for everything to settle
+	await get_tree().create_timer(1.0).timeout
 	_spawn_initial_loot()
 
 
@@ -44,16 +44,16 @@ func _load_item_definitions() -> void:
 
 
 func _spawn_initial_loot() -> void:
+	var loot_spawn_points := get_node_or_null("LootSpawnPoints")
 	if loot_spawn_points == null:
+		push_warning("No LootSpawnPoints node found — terrain may not have generated yet")
 		return
 
 	for spawn_point in loot_spawn_points.get_children():
-		if spawn_point is LootSpawnPoint:
-			# If spawn point has its own loot table, use it
-			spawn_point.spawn_random_item()
-		elif spawn_point is Marker3D:
-			# Generic spawn point: pick a random item from all definitions
+		if spawn_point is Marker3D:
 			_spawn_random_at(spawn_point.global_position)
+
+	print("Spawned loot at %d locations" % loot_spawn_points.get_child_count())
 
 
 func _spawn_random_at(pos: Vector3) -> void:
