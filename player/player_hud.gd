@@ -9,12 +9,22 @@ extends Control
 @onready var inventory_list: VBoxContainer = $MarginContainer/VBoxRight/InventoryList
 @onready var fever_label: Label = $FeverLabel
 @onready var inventory_hint: Label = $MarginContainer/VBoxRight/InventoryHint
+@onready var ip_label: Label = $IPLabel
 
 var _player: CharacterBody3D = null
 
 
 func setup(player: CharacterBody3D) -> void:
 	_player = player
+	# Show local IP addresses so others can connect
+	if ip_label:
+		var ips := IP.get_local_addresses()
+		var display_ip := "IP: "
+		for addr in ips:
+			# Filter to IPv4 non-loopback addresses
+			if "." in addr and addr != "127.0.0.1":
+				display_ip += addr + " "
+		ip_label.text = display_ip.strip_edges()
 
 
 func _process(_delta: float) -> void:

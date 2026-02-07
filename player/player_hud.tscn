@@ -88,6 +88,20 @@ layout_mode = 2
 custom_minimum_size = Vector2(4, 4)
 color = Color(1, 1, 1, 0.8)
 
+[node name="IPLabel" type="Label" parent="."]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -300.0
+offset_top = 10.0
+offset_right = -10.0
+offset_bottom = 30.0
+text = "IP: ..."
+horizontal_alignment = 2
+theme_override_font_sizes/font_size = 14
+theme_override_colors/font_color = Color(0.6, 0.9, 0.6, 1)
+
 [node name="FeverLabel" type="Label" parent="."]
 layout_mode = 1
 anchors_preset = 5
