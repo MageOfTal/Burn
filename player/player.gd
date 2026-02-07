@@ -114,6 +114,11 @@ func _server_process(delta: float) -> void:
 			_do_respawn()
 		return
 
+	# Fall-through-ground safety: respawn if player falls below the map
+	if global_position.y < -50.0:
+		_do_respawn()
+		return
+
 	# Slide cooldown
 	if _slide_cooldown_timer > 0.0:
 		_slide_cooldown_timer -= delta

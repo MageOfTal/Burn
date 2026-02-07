@@ -92,7 +92,7 @@ func _update_shoe_display() -> void:
 	elif shoe.burn_time_remaining < 45.0:
 		shoe_slot_label.modulate = Color.YELLOW
 	else:
-		shoe_slot_label.modulate = Color.GREEN
+		shoe_slot_label.modulate = Color.WHITE
 
 
 func _update_inventory_display() -> void:
