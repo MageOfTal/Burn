@@ -1,6 +1,16 @@
 extends Node
 
 ## Manages ENet server/client connections and player spawning.
+##
+## Connection flow:
+##   1. Host starts server, loads map, spawns own player (peer_id 1).
+##   2. Client connects → server sees _on_peer_connected but does NOT
+##      spawn the client's player yet (the client hasn't loaded the map).
+##   3. Client receives _on_connected_to_server, loads the map, then sends
+##      an RPC (client_ready) to the server.
+##   4. Server receives client_ready and NOW spawns the client's player.
+##      The MultiplayerSpawner replicates it to the client (who now has
+##      the Players container ready).
 
 signal player_connected(peer_id: int)
 signal player_disconnected(peer_id: int)
@@ -36,7 +46,7 @@ func host_game(port: int = NetConstants.DEFAULT_PORT) -> Error:
 
 	multiplayer.multiplayer_peer = peer
 	is_server = true
-	print("Server started on port %d" % port)
+	print("[Server] Server started on port %d (UDP)" % port)
 
 	# Kick off map load (async, not awaited here so host_game stays non-coroutine)
 	_start_host.call_deferred()
@@ -53,12 +63,12 @@ func join_game(address: String, port: int = NetConstants.DEFAULT_PORT) -> Error:
 	var peer := ENetMultiplayerPeer.new()
 	var err := peer.create_client(address, port)
 	if err != OK:
-		push_error("Failed to create client: %s" % error_string(err))
+		push_error("[Client] Failed to create client: %s" % error_string(err))
 		return err
 
 	multiplayer.multiplayer_peer = peer
 	is_server = false
-	print("Connecting to %s:%d..." % [address, port])
+	print("[Client] Connecting to %s:%d (UDP)..." % [address, port])
 	return OK
 
 
@@ -70,6 +80,7 @@ func disconnect_game() -> void:
 
 
 func _load_game_map() -> void:
+	print("[Net] Loading game map...")
 	get_tree().change_scene_to_file("res://world/blockout_map.tscn")
 	# change_scene_to_file is deferred — poll until the new scene is actually ready
 	while get_tree().current_scene == null or get_tree().current_scene.scene_file_path != "res://world/blockout_map.tscn":
@@ -80,12 +91,16 @@ func _load_game_map() -> void:
 	var map := get_tree().current_scene
 	player_spawner = map.get_node("PlayerSpawner")
 	player_container = map.get_node("Players")
-	print("Map loaded. Spawner and container ready.")
+	print("[Net] Map loaded. Spawner and container ready.")
 
 
 func _spawn_player(peer_id: int) -> void:
 	if player_container == null:
-		push_error("Player container not set — map not loaded?")
+		push_error("[Server] Player container not set — map not loaded?")
+		return
+
+	if players.has(peer_id):
+		print("[Server] Player %d already spawned, skipping." % peer_id)
 		return
 
 	var player_node := PLAYER_SCENE.instantiate()
@@ -99,7 +114,7 @@ func _spawn_player(peer_id: int) -> void:
 	player_container.add_child(player_node, true)
 	players[peer_id] = player_node
 	player_connected.emit(peer_id)
-	print("Spawned player for peer %d" % peer_id)
+	print("[Server] Spawned player for peer %d at %s" % [peer_id, str(player_node.position)])
 
 
 func _despawn_player(peer_id: int) -> void:
@@ -108,28 +123,42 @@ func _despawn_player(peer_id: int) -> void:
 		player_node.queue_free()
 		players.erase(peer_id)
 		player_disconnected.emit(peer_id)
-		print("Despawned player for peer %d" % peer_id)
+		print("[Server] Despawned player for peer %d" % peer_id)
 
 
 func _on_peer_connected(peer_id: int) -> void:
-	print("Peer connected: %d" % peer_id)
-	if is_server:
-		_spawn_player(peer_id)
+	print("[Net] Peer connected: %d" % peer_id)
+	# Do NOT spawn immediately — wait for client_ready RPC so the client
+	# has loaded the map and the MultiplayerSpawner can replicate correctly.
+	# (The host player is spawned directly in _start_host, not here.)
 
 
 func _on_peer_disconnected(peer_id: int) -> void:
-	print("Peer disconnected: %d" % peer_id)
+	print("[Net] Peer disconnected: %d" % peer_id)
 	if is_server:
 		_despawn_player(peer_id)
 
 
 func _on_connected_to_server() -> void:
-	print("Connected to server! My peer ID: %d" % multiplayer.get_unique_id())
+	print("[Client] Connected to server! My peer ID: %d" % multiplayer.get_unique_id())
 	await _load_game_map()
+	# Tell the server we have loaded the map and are ready for our player to spawn
+	_client_ready.rpc_id(1)
+	print("[Client] Sent client_ready to server.")
 	connection_succeeded.emit()
 
 
 func _on_connection_failed() -> void:
-	print("Connection failed!")
+	print("[Client] Connection failed!")
 	multiplayer.multiplayer_peer = null
 	connection_failed.emit()
+
+
+@rpc("any_peer", "reliable")
+func _client_ready() -> void:
+	## Server-only: called when a client has loaded the map and is ready.
+	if not multiplayer.is_server():
+		return
+	var sender_id: int = multiplayer.get_remote_sender_id()
+	print("[Server] Received client_ready from peer %d" % sender_id)
+	_spawn_player(sender_id)
