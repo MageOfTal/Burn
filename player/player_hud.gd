@@ -80,8 +80,9 @@ func _update_shoe_display() -> void:
 	var rarity_tag: String = rarity_names[shoe.item_data.rarity] if shoe.item_data else "?"
 	var time_remaining := ceili(shoe.burn_time_remaining)
 	var bonus_pct := 0.0
-	if shoe.item_data is ShoeData:
-		bonus_pct = (shoe.item_data as ShoeData).speed_bonus * 100.0
+	var spd = shoe.item_data.get("speed_bonus") if shoe.item_data else null
+	if spd != null:
+		bonus_pct = spd * 100.0
 
 	shoe_slot_label.text = "SHOES: [%s] %s - %ds (+%.0f%%)" % [rarity_tag, shoe.item_data.item_name, time_remaining, bonus_pct]
 

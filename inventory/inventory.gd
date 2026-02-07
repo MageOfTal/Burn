@@ -166,8 +166,8 @@ func get_shoe_speed_bonus() -> float:
 	## Returns the speed bonus from the equipped shoe (0.0 if none).
 	if equipped_shoe == null:
 		return 0.0
-	if equipped_shoe.item_data is ShoeData:
-		return (equipped_shoe.item_data as ShoeData).speed_bonus
+	if equipped_shoe.item_data and equipped_shoe.item_data.item_type == ItemData.ItemType.SHOE:
+		return equipped_shoe.item_data.get("speed_bonus") if equipped_shoe.item_data.get("speed_bonus") != null else 0.0
 	return 0.0
 
 

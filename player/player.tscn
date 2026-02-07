@@ -41,6 +41,9 @@ properties/6/replication_mode = 1
 properties/7/path = NodePath(".:is_sliding")
 properties/7/spawn = true
 properties/7/replication_mode = 1
+properties/8/path = NodePath(".:is_crouching")
+properties/8/spawn = true
+properties/8/replication_mode = 1
 
 [sub_resource type="SceneReplicationConfig" id="InputSyncConfig"]
 properties/0/path = NodePath("PlayerInput:input_direction")

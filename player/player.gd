@@ -26,6 +26,12 @@ const SLIDE_UPHILL_PENALTY := 20.0
 const SLIDE_CAPSULE_HEIGHT := 1.0
 const SLIDE_CAMERA_OFFSET := -0.5
 
+## Crouch constants
+const CROUCH_CAPSULE_HEIGHT := 1.0
+const CROUCH_CAMERA_OFFSET := -0.5
+const CROUCH_SPEED_MULT := 0.5
+const CROUCH_MESH_SCALE_Y := 0.55  # Visual squish
+
 var gravity: float = ProjectSettings.get_setting("physics/3d/default_gravity")
 
 ## The peer ID that owns this player. Set by NetworkManager on spawn.
@@ -39,12 +45,15 @@ var is_alive: bool = true
 var current_weapon: WeaponBase = null
 var _respawn_timer: float = 0.0
 
-## Slide state (server-managed, is_sliding synced to clients)
+## Slide/crouch state (server-managed, synced to clients)
 var is_sliding: bool = false
+var is_crouching: bool = false
 var _slide_velocity: Vector3 = Vector3.ZERO
 var _slide_cooldown_timer: float = 0.0
 var _original_capsule_height: float = 1.8
 var _original_camera_y: float = 1.5
+var _original_mesh_y: float = 0.9
+var _original_mesh_scale_y: float = 1.0
 
 @onready var camera_pivot: Node3D = $CameraPivot
 @onready var spring_arm: SpringArm3D = $CameraPivot/SpringArm3D
@@ -70,6 +79,8 @@ func _ready() -> void:
 		col_shape.shape = col_shape.shape.duplicate()
 		_original_capsule_height = col_shape.shape.height
 	_original_camera_y = $CameraPivot.position.y
+	_original_mesh_y = body_mesh.position.y
+	_original_mesh_scale_y = body_mesh.scale.y
 
 	if peer_id == multiplayer.get_unique_id():
 		camera.current = true
@@ -112,18 +123,24 @@ func _server_process(delta: float) -> void:
 	rotation.y = player_input.look_yaw
 	camera_pivot.rotation.x = player_input.look_pitch
 
-	# Slide vs normal movement
+	# Slide / crouch / normal movement
 	if is_sliding:
 		_process_slide(delta)
+	elif is_crouching:
+		_process_crouch(delta)
 	else:
-		# Jump (no jumping while sliding)
+		# Jump (no jumping while sliding/crouching)
 		if player_input.action_jump and is_on_floor():
 			velocity.y = JUMP_VELOCITY
 
-		# Check if we should start a slide
+		# Check if we should start a slide (must be moving fast enough)
 		if player_input.action_slide and _can_start_slide():
 			_start_slide()
 			_process_slide(delta)
+		elif player_input.action_slide and is_on_floor():
+			# Not fast enough to slide — enter crouch
+			_start_crouch()
+			_process_crouch(delta)
 		else:
 			_process_normal_movement(delta)
 
@@ -201,6 +218,7 @@ func _can_start_slide() -> bool:
 
 func _start_slide() -> void:
 	is_sliding = true
+	is_crouching = false
 	# Lock slide direction to current movement direction
 	var horiz := Vector2(velocity.x, velocity.z)
 	var horiz_speed := horiz.length()
@@ -213,15 +231,7 @@ func _start_slide() -> void:
 		var forward := -transform.basis.z
 		_slide_velocity = forward * SLIDE_INITIAL_SPEED
 
-	# Shrink capsule for slide
-	var col_shape := $CollisionShape3D
-	if col_shape.shape is CapsuleShape3D:
-		col_shape.shape.height = SLIDE_CAPSULE_HEIGHT
-		# Adjust collision shape position so bottom stays on floor
-		col_shape.position.y = SLIDE_CAPSULE_HEIGHT * 0.5
-
-	# Lower camera
-	camera_pivot.position.y = _original_camera_y + SLIDE_CAMERA_OFFSET
+	_apply_lowered_pose(SLIDE_CAPSULE_HEIGHT, SLIDE_CAMERA_OFFSET)
 
 
 func _process_slide(delta: float) -> void:
@@ -279,19 +289,100 @@ func _end_slide() -> void:
 	is_sliding = false
 	_slide_cooldown_timer = SLIDE_COOLDOWN
 
-	# Restore capsule
+	# Keep horizontal momentum from slide
+	velocity.x = _slide_velocity.x
+	velocity.z = _slide_velocity.z
+	_slide_velocity = Vector3.ZERO
+
+	# Transition to crouch if still holding slide key, or if there's no headroom
+	if player_input.action_slide or not _has_headroom():
+		_start_crouch()
+	else:
+		_apply_standing_pose()
+
+
+## ---- Crouch mechanics (server-only) ----
+
+func _start_crouch() -> void:
+	is_crouching = true
+	is_sliding = false
+	_apply_lowered_pose(CROUCH_CAPSULE_HEIGHT, CROUCH_CAMERA_OFFSET)
+
+
+func _process_crouch(delta: float) -> void:
+	## Server-only: crouched movement with reduced speed.
+	# Try to stand up if no longer holding crouch AND there's headroom
+	if not player_input.action_slide and _has_headroom():
+		_end_crouch()
+		return
+
+	# Allow jumping out of crouch (uncrouch + jump)
+	if player_input.action_jump and is_on_floor() and _has_headroom():
+		_end_crouch()
+		velocity.y = JUMP_VELOCITY
+		return
+
+	# Crouched movement — slower, same acceleration feel
+	var shoe_bonus: float = inventory.get_shoe_speed_bonus() if inventory else 0.0
+	var current_speed := SPEED * (heat_system.get_speed_multiplier() + shoe_bonus) * CROUCH_SPEED_MULT
+	var input_dir: Vector2 = player_input.input_direction
+	var direction := (transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized()
+
+	var horizontal := Vector2(velocity.x, velocity.z)
+	if direction:
+		var target := Vector2(direction.x, direction.z) * current_speed
+		horizontal = horizontal.move_toward(target, ACCELERATION * delta)
+	else:
+		horizontal = horizontal.move_toward(Vector2.ZERO, DECELERATION * delta)
+
+	velocity.x = horizontal.x
+	velocity.z = horizontal.y
+
+
+func _end_crouch() -> void:
+	is_crouching = false
+	_apply_standing_pose()
+
+
+## ---- Shared pose helpers ----
+
+func _apply_lowered_pose(capsule_height: float, camera_offset: float) -> void:
+	## Shrink capsule, mesh, and lower camera for slide/crouch.
+	var col_shape := $CollisionShape3D
+	if col_shape.shape is CapsuleShape3D:
+		col_shape.shape.height = capsule_height
+		col_shape.position.y = capsule_height * 0.5
+
+	# Shrink and lower the body mesh to match the smaller capsule
+	var height_ratio := capsule_height / _original_capsule_height
+	body_mesh.scale.y = _original_mesh_scale_y * height_ratio
+	body_mesh.position.y = _original_mesh_y * height_ratio
+
+	# Camera offset (server sets it; client will lerp)
+	camera_pivot.position.y = _original_camera_y + camera_offset
+
+
+func _apply_standing_pose() -> void:
+	## Restore capsule, mesh, and camera to full standing height.
 	var col_shape := $CollisionShape3D
 	if col_shape.shape is CapsuleShape3D:
 		col_shape.shape.height = _original_capsule_height
 		col_shape.position.y = _original_capsule_height * 0.5
 
-	# Restore camera (will be lerped on client side)
+	body_mesh.scale.y = _original_mesh_scale_y
+	body_mesh.position.y = _original_mesh_y
 	camera_pivot.position.y = _original_camera_y
 
-	# Keep horizontal momentum from slide
-	velocity.x = _slide_velocity.x
-	velocity.z = _slide_velocity.z
-	_slide_velocity = Vector3.ZERO
+
+func _has_headroom() -> bool:
+	## Check if there's enough space above to stand up from crouch/slide.
+	var space_state := get_world_3d().direct_space_state
+	var head_pos := global_position + Vector3(0, CROUCH_CAPSULE_HEIGHT, 0)
+	var stand_pos := global_position + Vector3(0, _original_capsule_height + 0.1, 0)
+	var query := PhysicsRayQueryParameters3D.create(head_pos, stand_pos)
+	query.exclude = [get_rid()]
+	var result := space_state.intersect_ray(query)
+	return result.is_empty()
 
 
 func _get_camera_aim_target(cam_origin: Vector3, cam_forward: Vector3) -> Vector3:
@@ -312,9 +403,17 @@ func _get_camera_aim_target(cam_origin: Vector3, cam_forward: Vector3) -> Vector
 func _client_process(delta: float) -> void:
 	if peer_id == multiplayer.get_unique_id():
 		camera_pivot.rotation.x = player_input.look_pitch
-		# Smooth camera height for slide
-		var target_y := _original_camera_y + SLIDE_CAMERA_OFFSET if is_sliding else _original_camera_y
-		camera_pivot.position.y = lerpf(camera_pivot.position.y, target_y, 10.0 * delta)
+		# Smooth camera height for slide/crouch
+		var lowered := is_sliding or is_crouching
+		var target_cam_y := _original_camera_y + SLIDE_CAMERA_OFFSET if lowered else _original_camera_y
+		camera_pivot.position.y = lerpf(camera_pivot.position.y, target_cam_y, 10.0 * delta)
+
+	# Smooth mesh scale for all players (slide/crouch visual)
+	var lowered := is_sliding or is_crouching
+	var target_scale_y := CROUCH_MESH_SCALE_Y if lowered else _original_mesh_scale_y
+	body_mesh.scale.y = lerpf(body_mesh.scale.y, target_scale_y, 12.0 * delta)
+	var height_ratio := body_mesh.scale.y / _original_mesh_scale_y
+	body_mesh.position.y = _original_mesh_y * height_ratio
 
 	# Update mesh visibility based on alive state
 	body_mesh.visible = is_alive
@@ -338,9 +437,11 @@ func die(killer_id: int) -> void:
 	is_alive = false
 	_respawn_timer = RESPAWN_DELAY
 	body_mesh.visible = false
-	# End slide if active
+	# End slide/crouch if active
 	if is_sliding:
 		_end_slide()
+	if is_crouching:
+		_end_crouch()
 	# Disable collision while dead
 	$CollisionShape3D.set_deferred("disabled", true)
 	# Clear inventory on death (keep time currency)
@@ -406,7 +507,7 @@ func _on_item_pickup(world_item: Node) -> void:
 		return
 
 	# Shoes go into the dedicated shoe slot
-	if item_data is ShoeData:
+	if item_data.item_type == ItemData.ItemType.SHOE:
 		var old_shoe: ItemStack = inventory.equip_shoe(item_data)
 		# Drop old shoe back into the world with its remaining burn time
 		if old_shoe != null and old_shoe.item_data != null:
@@ -436,6 +537,8 @@ func _drop_item_as_world_item(stack: ItemStack) -> void:
 	world_item.setup(stack.item_data)
 	# Override burn time with the remaining time from the stack
 	world_item.burn_time_remaining = stack.burn_time_remaining
+	# Prevent the dropping player from immediately re-picking this up
+	world_item.set_pickup_immunity(peer_id)
 	# Drop slightly behind the player
 	var drop_pos := global_position - transform.basis.z * 1.5
 	drop_pos.y = global_position.y

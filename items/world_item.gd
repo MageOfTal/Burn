@@ -8,6 +8,12 @@ class_name WorldItem
 
 var burn_time_remaining: float = 0.0
 
+## Pickup immunity: the peer_id that just dropped this item can't pick it up
+## until the timer expires. Prevents drop-pickup loops.
+var _immune_peer_id: int = -1
+var _immune_timer: float = 0.0
+const PICKUP_IMMUNITY_TIME := 2.0
+
 @onready var mesh: MeshInstance3D = $MeshInstance3D
 @onready var label: Label3D = $Label3D
 
@@ -27,6 +33,12 @@ func setup(data: ItemData) -> void:
 		_update_visual()
 
 
+func set_pickup_immunity(peer_id: int) -> void:
+	## Prevent a specific player from picking this item up for a short time.
+	_immune_peer_id = peer_id
+	_immune_timer = PICKUP_IMMUNITY_TIME
+
+
 func _process(delta: float) -> void:
 	# Update label with remaining time
 	if label and item_data:
@@ -39,6 +51,12 @@ func _process(delta: float) -> void:
 		if burn_time_remaining <= 0.0:
 			queue_free()
 
+		# Decrement pickup immunity timer
+		if _immune_timer > 0.0:
+			_immune_timer -= delta
+			if _immune_timer <= 0.0:
+				_immune_peer_id = -1
+
 
 func _update_visual() -> void:
 	if mesh and item_data:
@@ -47,10 +65,19 @@ func _update_visual() -> void:
 		mesh.material_override = mat
 
 
+func is_immune_to(peer_id: int) -> bool:
+	## Returns true if this specific player can't pick up the item yet.
+	return _immune_peer_id == peer_id and _immune_timer > 0.0
+
+
 func _on_body_entered(body: Node3D) -> void:
 	## When a player walks into the pickup area, they can pick it up.
 	## For simplicity, auto-pickup on contact. Can change to button press later.
 	if not multiplayer.is_server():
 		return
 	if body is CharacterBody3D and body.has_method("_on_item_pickup"):
+		# Check pickup immunity
+		if body.has_method("get") and body.get("peer_id") is int:
+			if is_immune_to(body.peer_id):
+				return
 		body._on_item_pickup(self)
