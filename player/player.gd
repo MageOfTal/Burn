@@ -221,7 +221,21 @@ func _can_start_slide() -> bool:
 	if _slide_cooldown_timer > 0.0:
 		return false
 	var horiz_speed := Vector2(velocity.x, velocity.z).length()
-	return horiz_speed >= SLIDE_MIN_ENTRY_SPEED
+	if horiz_speed < SLIDE_MIN_ENTRY_SPEED:
+		return false
+	# Don't allow slide initiation while moving uphill — go straight to crouch
+	var floor_normal := get_floor_normal()
+	var slope_steepness := sqrt(1.0 - floor_normal.y * floor_normal.y)
+	if slope_steepness > 0.1:
+		var downhill_3d := (Vector3.DOWN - floor_normal * Vector3.DOWN.dot(floor_normal))
+		var downhill_horiz := Vector3(downhill_3d.x, 0.0, downhill_3d.z)
+		if downhill_horiz.length() > 0.001:
+			var move_dir := Vector3(velocity.x, 0.0, velocity.z).normalized()
+			var alignment := move_dir.dot(downhill_horiz.normalized())
+			# alignment < 0 means moving uphill
+			if alignment < -0.3:
+				return false
+	return true
 
 
 func _start_slide() -> void:
@@ -353,15 +367,35 @@ func _end_slide() -> void:
 	is_sliding = false
 	_slide_cooldown_timer = SLIDE_COOLDOWN
 
-	# Keep horizontal momentum from slide
-	velocity.x = _slide_velocity.x
-	velocity.z = _slide_velocity.z
+	var slide_speed := _slide_velocity.length()
 	_slide_velocity = Vector3.ZERO
 
 	# Transition to crouch if still holding slide key, or if there's no headroom
 	if player_input.action_slide or not _has_headroom():
+		# If the slide had decent momentum, keep it. Otherwise, let crouch
+		# movement take over immediately from WASD input so the player
+		# doesn't feel frozen.
+		if slide_speed > SLIDE_MIN_SPEED:
+			velocity.x = velocity.x
+			velocity.z = velocity.z
+		else:
+			# Slide died from deceleration — use player's current WASD input
+			# direction at crouch speed so they aren't stuck at zero velocity
+			var input_dir: Vector2 = player_input.input_direction
+			if input_dir.length() > 0.1:
+				var shoe_bonus: float = inventory.get_shoe_speed_bonus() if inventory else 0.0
+				var crouch_speed := SPEED * (heat_system.get_speed_multiplier() + shoe_bonus) * CROUCH_SPEED_MULT
+				var direction := (transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized()
+				velocity.x = direction.x * crouch_speed
+				velocity.z = direction.z * crouch_speed
 		_start_crouch()
 	else:
+		if slide_speed > SLIDE_MIN_SPEED:
+			# Keep slide momentum when standing back up
+			pass
+		else:
+			velocity.x = 0.0
+			velocity.z = 0.0
 		_apply_standing_pose()
 
 
