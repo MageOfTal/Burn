@@ -118,8 +118,8 @@ func _server_process(delta: float) -> void:
 	if _slide_cooldown_timer > 0.0:
 		_slide_cooldown_timer -= delta
 
-	# Gravity
-	if not is_on_floor():
+	# Gravity (skip during slide — slide manages its own Y velocity)
+	if not is_on_floor() and not is_sliding:
 		velocity.y -= gravity * delta
 
 	# Rotation from look input
@@ -240,6 +240,9 @@ func _start_slide() -> void:
 
 func _process_slide(delta: float) -> void:
 	## Server-only: process slide movement with slope awareness.
+	## The slide follows the terrain surface — on downhill slopes the player
+	## accelerates and the velocity is redirected along the slope, preventing
+	## the "launch off the hill" problem.
 	var on_floor := is_on_floor()
 
 	# --- Airborne grace: allow brief air time over bumps without cancelling ---
@@ -253,8 +256,14 @@ func _process_slide(delta: float) -> void:
 	# slope_steepness: 0.0 on flat, ~0.26 at 15°, ~0.5 at 30°, ~0.71 at 45°
 	var slope_steepness := sqrt(1.0 - floor_normal.y * floor_normal.y)
 
-	# Downhill direction projected onto the slope plane (horizontal component only)
+	# Downhill direction on the slope surface (full 3D, not just horizontal)
 	var downhill_3d := (Vector3.DOWN - floor_normal * Vector3.DOWN.dot(floor_normal))
+	if downhill_3d.length() > 0.001:
+		downhill_3d = downhill_3d.normalized()
+	else:
+		downhill_3d = Vector3.ZERO
+
+	# Horizontal-only downhill for alignment checks
 	var downhill_horiz := Vector3(downhill_3d.x, 0.0, downhill_3d.z)
 	if downhill_horiz.length() > 0.001:
 		downhill_horiz = downhill_horiz.normalized()
@@ -262,7 +271,20 @@ func _process_slide(delta: float) -> void:
 	# How much our slide direction aligns with the downhill direction (XZ only)
 	var slide_dir := _slide_velocity.normalized()
 	var alignment := slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
-	# alignment: +1 = sliding downhill, -1 = sliding uphill, 0 = across slope
+
+	# --- On steep slopes, redirect slide velocity toward downhill ---
+	# This is the key fix: instead of launching off the hill, the slide
+	# curves to follow the terrain. Steeper slope = stronger redirection.
+	if on_floor and slope_steepness > 0.1 and alignment > 0.0:
+		var redirect_strength := slope_steepness * 3.0 * delta
+		redirect_strength = minf(redirect_strength, 1.0)
+		var current_speed := _slide_velocity.length()
+		var redirected_dir := slide_dir.lerp(downhill_horiz, redirect_strength).normalized()
+		_slide_velocity = redirected_dir * current_speed
+
+	# Recalculate after potential redirect
+	slide_dir = _slide_velocity.normalized() if _slide_velocity.length() > 0.01 else Vector3.ZERO
+	alignment = slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
 
 	# --- Apply slope forces based on actual steepness ---
 	if on_floor and slope_steepness > 0.02:
@@ -290,26 +312,33 @@ func _process_slide(delta: float) -> void:
 	else:
 		_slide_velocity = Vector3.ZERO
 
-	# --- Apply velocity ---
+	# --- Apply velocity: follow the slope surface ---
 	velocity.x = _slide_velocity.x
 	velocity.z = _slide_velocity.z
 
-	# Snap player down onto slopes to prevent bouncing/stuttering
-	if on_floor and slope_steepness > 0.02:
-		velocity.y = -SLIDE_SNAP_DOWN * slope_steepness
-	elif not on_floor:
-		# Apply gravity while briefly airborne (going over bumps)
+	if on_floor:
+		# Project velocity downward along the slope to stay glued to terrain.
+		# Stronger snap on steeper slopes and at higher speeds.
+		var speed_factor := _slide_velocity.length() / SLIDE_INITIAL_SPEED
+		var snap_force := SLIDE_SNAP_DOWN + SLIDE_GRAVITY_ACCEL * slope_steepness * speed_factor
+		velocity.y = -snap_force * maxf(slope_steepness, 0.05)
+	else:
+		# Airborne — apply full gravity so we fall back to the surface
 		velocity.y -= gravity * delta
 
 	# --- End slide conditions ---
 	var should_end := false
-	if _slide_velocity.length() < SLIDE_MIN_SPEED:
+	if _slide_velocity.length() < SLIDE_MIN_SPEED and slope_steepness < 0.15:
+		# Only stop from low speed on flat-ish ground — on steep slopes, gravity
+		# will keep accelerating us, so don't cancel the slide
 		should_end = true
 	if not player_input.action_slide:
 		should_end = true
-	# Only cancel from airborne after grace period expires
+	# Only cancel from airborne after grace period — and NOT if we're clearly
+	# sliding down a hill (high speed means we just crested a bump)
 	if not on_floor and _slide_airborne_timer > SLIDE_AIRBORNE_GRACE:
-		should_end = true
+		if _slide_velocity.length() < SLIDE_INITIAL_SPEED * 0.8:
+			should_end = true
 
 	if should_end:
 		_end_slide()
