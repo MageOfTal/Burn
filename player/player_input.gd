@@ -21,10 +21,21 @@ const MOUSE_SENSITIVITY := 0.002
 
 ## Accumulated mouse delta this frame (reset each physics tick).
 var _mouse_delta := Vector2.ZERO
-var _has_captured := false
 
 
-func _unhandled_input(event: InputEvent) -> void:
+func _ready() -> void:
+	# Capture mouse immediately once we know we're the authority.
+	# Use call_deferred so multiplayer authority is set first (player.gd _ready runs first).
+	_try_capture_mouse.call_deferred()
+
+
+func _try_capture_mouse() -> void:
+	if is_multiplayer_authority():
+		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
+
+func _input(event: InputEvent) -> void:
+	# Use _input (not _unhandled_input) so mouse motion is never blocked
 	if not is_multiplayer_authority():
 		return
 
@@ -35,20 +46,16 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event.is_action_pressed("ui_cancel"):
 		Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 
+	# Any mouse click re-captures if needed (but does NOT consume the event,
+	# so the click still registers as shoot/pickup/etc.)
+	if event is InputEventMouseButton and event.pressed:
+		if Input.get_mouse_mode() != Input.MOUSE_MODE_CAPTURED:
+			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
 
 func _physics_process(_delta: float) -> void:
 	if not is_multiplayer_authority():
 		return
-
-	# Auto-capture mouse on first frame for local player (free-look by default)
-	if not _has_captured:
-		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
-		_has_captured = true
-
-	# Re-capture mouse if it was released (e.g. by Escape) when any key is pressed
-	if Input.get_mouse_mode() != Input.MOUSE_MODE_CAPTURED:
-		if Input.is_anything_pressed():
-			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
 	# Movement
 	input_direction = Input.get_vector("move_left", "move_right", "move_forward", "move_back")
