@@ -98,28 +98,28 @@ func _ready() -> void:
 
 func get_height_at(world_x: float, world_z: float) -> float:
 	## Returns the interpolated terrain height at the given world XZ position.
-	var gx := world_x / cell_size
-	var gz := world_z / cell_size
-	var x0 := int(floor(gx))
-	var z0 := int(floor(gz))
-	var x1 := x0 + 1
-	var z1 := z0 + 1
+	var gx: float = world_x / cell_size
+	var gz: float = world_z / cell_size
+	var x0: int = int(floor(gx))
+	var z0: int = int(floor(gz))
+	var x1: int = x0 + 1
+	var z1: int = z0 + 1
 
 	x0 = clampi(x0, 0, width - 1)
 	x1 = clampi(x1, 0, width - 1)
 	z0 = clampi(z0, 0, depth - 1)
 	z1 = clampi(z1, 0, depth - 1)
 
-	var fx := gx - floor(gx)
-	var fz := gz - floor(gz)
+	var fx: float = gx - float(x0)
+	var fz: float = gz - float(z0)
 
-	var h00 := _heights[z0 * width + x0]
-	var h10 := _heights[z0 * width + x1]
-	var h01 := _heights[z1 * width + x0]
-	var h11 := _heights[z1 * width + x1]
+	var h00: float = _heights[z0 * width + x0]
+	var h10: float = _heights[z0 * width + x1]
+	var h01: float = _heights[z1 * width + x0]
+	var h11: float = _heights[z1 * width + x1]
 
-	var h0 := h00 + fx * (h10 - h00)
-	var h1 := h01 + fx * (h11 - h01)
+	var h0: float = h00 + fx * (h10 - h00)
+	var h1: float = h01 + fx * (h11 - h01)
 	return h0 + fz * (h1 - h0)
 
 
@@ -312,85 +312,94 @@ func _spawn_dummies(rng: RandomNumberGenerator) -> void:
 # ======================================================================
 
 func _hash_3d(x: int, y: int, z: int, s: int) -> float:
-	var n = (x << 17) ^ (y << 9) ^ (z << 3) ^ s
+	var n: int = (x << 17) ^ (y << 9) ^ (z << 3) ^ s
 	n = (n ^ (n >> 15)) * 0x85ebca6b
 	n = (n ^ (n >> 13)) * 0xc2b2ae35
 	n = n ^ (n >> 16)
-	return (n & 0x7fffffff) * INV_0X7FFFFFFF
+	return float(n & 0x7fffffff) * INV_0X7FFFFFFF
 
 
 func _value_noise_3d(x: float, y: float, z: float, s: int, blend_mode: String) -> float:
-	var x0 = int(floor(x))
-	var y0 = int(floor(y))
-	var z0 = int(floor(z))
-	var xf = x - x0
-	var yf = y - y0
-	var zf = z - z0
+	var x0: int = int(floor(x))
+	var y0: int = int(floor(y))
+	var z0: int = int(floor(z))
+	var xf: float = x - x0
+	var yf: float = y - y0
+	var zf: float = z - z0
 	var u: float
 	var v: float
 	var w: float
 
 	if blend_mode == "smoothstep":
-		var xf2 = xf * xf; var xf3 = xf2 * xf
-		var yf2 = yf * yf; var yf3 = yf2 * yf
-		var zf2 = zf * zf; var zf3 = zf2 * zf
+		var xf2: float = xf * xf
+		var xf3: float = xf2 * xf
+		var yf2: float = yf * yf
+		var yf3: float = yf2 * yf
+		var zf2: float = zf * zf
+		var zf3: float = zf2 * zf
 		u = xf3 * (xf * (xf * 6.0 - 15.0) + 10.0)
 		v = yf3 * (yf * (yf * 6.0 - 15.0) + 10.0)
 		w = zf3 * (zf * (zf * 6.0 - 15.0) + 10.0)
 	else:
-		var xf2c = xf * xf; var yf2c = yf * yf; var zf2c = zf * zf
+		var xf2c: float = xf * xf
+		var yf2c: float = yf * yf
+		var zf2c: float = zf * zf
 		u = xf2c * (3.0 - 2.0 * xf)
 		v = yf2c * (3.0 - 2.0 * yf)
 		w = zf2c * (3.0 - 2.0 * zf)
 
-	var x1 = x0 + 1; var y1 = y0 + 1; var z1 = z0 + 1
-	var n000 = _hash_3d(x0, y0, z0, s)
-	var n100 = _hash_3d(x1, y0, z0, s)
-	var n010 = _hash_3d(x0, y1, z0, s)
-	var n110 = _hash_3d(x1, y1, z0, s)
-	var n001 = _hash_3d(x0, y0, z1, s)
-	var n101 = _hash_3d(x1, y0, z1, s)
-	var n011 = _hash_3d(x0, y1, z1, s)
-	var n111 = _hash_3d(x1, y1, z1, s)
-	var nx00 = n000 + u * (n100 - n000)
-	var nx10 = n010 + u * (n110 - n010)
-	var nx01 = n001 + u * (n101 - n001)
-	var nx11 = n011 + u * (n111 - n011)
-	var nxy0 = nx00 + v * (nx10 - nx00)
-	var nxy1 = nx01 + v * (nx11 - nx01)
+	var x1: int = x0 + 1
+	var y1: int = y0 + 1
+	var z1: int = z0 + 1
+	var n000: float = _hash_3d(x0, y0, z0, s)
+	var n100: float = _hash_3d(x1, y0, z0, s)
+	var n010: float = _hash_3d(x0, y1, z0, s)
+	var n110: float = _hash_3d(x1, y1, z0, s)
+	var n001: float = _hash_3d(x0, y0, z1, s)
+	var n101: float = _hash_3d(x1, y0, z1, s)
+	var n011: float = _hash_3d(x0, y1, z1, s)
+	var n111: float = _hash_3d(x1, y1, z1, s)
+	var nx00: float = n000 + u * (n100 - n000)
+	var nx10: float = n010 + u * (n110 - n010)
+	var nx01: float = n001 + u * (n101 - n001)
+	var nx11: float = n011 + u * (n111 - n011)
+	var nxy0: float = nx00 + v * (nx10 - nx00)
+	var nxy1: float = nx01 + v * (nx11 - nx01)
 	return nxy0 + w * (nxy1 - nxy0)
 
 
 func _apply_gain_bias(val: float, g: float, b: float) -> float:
-	var vv = (val + 1.0) * 0.5
+	var vv: float = (val + 1.0) * 0.5
 	if b != INF and b != 0.0:
-		var denom = (1.0 / b - 2.0) * (1.0 - vv) + 1.0
+		var denom: float = (1.0 / b - 2.0) * (1.0 - vv) + 1.0
 		vv = vv / denom if denom != 0.0 else vv
 	if g != INF:
 		if vv < 0.5:
-			var vv2 = 2.0 * vv
-			var denom2 = (1.0 / g - 2.0) * (1.0 - vv2) + 1.0
+			var vv2: float = 2.0 * vv
+			var denom2: float = (1.0 / g - 2.0) * (1.0 - vv2) + 1.0
 			vv = (vv2 / denom2 if denom2 != 0.0 else vv2) * 0.5
 		else:
-			var vv2 = 2.0 - 2.0 * vv
-			var denom3 = (1.0 / g - 2.0) * (1.0 - vv2) + 1.0
+			var vv2: float = 2.0 - 2.0 * vv
+			var denom3: float = (1.0 / g - 2.0) * (1.0 - vv2) + 1.0
 			vv = 1.0 - (vv2 / denom3 if denom3 != 0.0 else vv2) * 0.5
 	return vv * 2.0 - 1.0
 
 
 func _fractal_value_noise(x: float, y: float, z: float, s: int, blend_mode: String) -> float:
-	var fx = x; var fy = y; var fz = z
+	var fx: float = x
+	var fy: float = y
+	var fz: float = z
 	if domain_warp_amp > 0.0:
-		var f = domain_warp_freq
+		var f: float = domain_warp_freq
 		fx += _value_noise_3d(x * f, y * f, z * f, s + 0x123456, blend_mode) * domain_warp_amp
 		fy += _value_noise_3d((x + 100.0) * f, (y + 100.0) * f, (z + 100.0) * f, s + 0x654321, blend_mode) * domain_warp_amp
 		fz += _value_noise_3d((x + 200.0) * f, (y + 200.0) * f, (z + 200.0) * f, s + 0xABCDEF, blend_mode) * domain_warp_amp
-	var amplitude = 1.0
-	var frequency = 1.0
-	var total = 0.0
-	var max_amp = 0.0
+	var amplitude: float = 1.0
+	var frequency: float = 1.0
+	var total: float = 0.0
+	var max_amp: float = 0.0
 	for i in octaves:
-		var n = _value_noise_3d(fx * frequency, fy * frequency, fz * frequency, s + i * 0x9E3779B9, blend_mode)
+		var n: float = _value_noise_3d(fx * frequency, fy * frequency, fz * frequency, s + i * 0x9E3779B9, blend_mode)
 		total += n * amplitude
 		max_amp += amplitude
 		amplitude *= persistence
@@ -411,7 +420,7 @@ func _generate_height_field() -> PackedFloat32Array:
 	out.resize(width * depth)
 	for z in depth:
 		for x in width:
-			var n = _fractal_value_noise(
+			var n: float = _fractal_value_noise(
 				float(x) * base_frequency,
 				slice_y,
 				float(z) * base_frequency,
@@ -422,43 +431,83 @@ func _generate_height_field() -> PackedFloat32Array:
 	return out
 
 
+func _compute_vertex_normals(heights: PackedFloat32Array) -> Array[Vector3]:
+	## Pre-compute smooth per-vertex normals from the heightfield.
+	## Each normal is derived from the slope to neighboring vertices.
+	var normals: Array[Vector3] = []
+	normals.resize(width * depth)
+
+	for z in depth:
+		for x in width:
+			# Sample neighboring heights (clamped at edges)
+			var xL: int = maxi(x - 1, 0)
+			var xR: int = mini(x + 1, width - 1)
+			var zD: int = maxi(z - 1, 0)
+			var zU: int = mini(z + 1, depth - 1)
+
+			var hL: float = heights[z * width + xL]
+			var hR: float = heights[z * width + xR]
+			var hD: float = heights[zD * width + x]
+			var hU: float = heights[zU * width + x]
+
+			# Central difference: tangent in X and Z, cross product gives normal
+			var dx: float = (xR - xL) * cell_size
+			var dz: float = (zU - zD) * cell_size
+			var n: Vector3 = Vector3(
+				(hL - hR) / dx * 2.0 * cell_size,
+				2.0,
+				(hD - hU) / dz * 2.0 * cell_size
+			).normalized()
+			normals[z * width + x] = n
+
+	return normals
+
+
 func _build_heightmap_mesh(heights: PackedFloat32Array) -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
-	var max_x = width - 1
-	var max_z = depth - 1
+
+	# Pre-compute smooth normals so terrain isn't flat-shaded
+	var normals: Array[Vector3] = _compute_vertex_normals(heights)
+
+	var max_x: int = width - 1
+	var max_z: int = depth - 1
 	for z in max_z:
 		for x in max_x:
-			var i00 = z * width + x
-			var i10 = i00 + 1
-			var i01 = i00 + width
-			var i11 = i01 + 1
-			var p00 = Vector3(x * cell_size, heights[i00], z * cell_size)
-			var p10 = Vector3((x + 1) * cell_size, heights[i10], z * cell_size)
-			var p01 = Vector3(x * cell_size, heights[i01], (z + 1) * cell_size)
-			var p11 = Vector3((x + 1) * cell_size, heights[i11], (z + 1) * cell_size)
+			var i00: int = z * width + x
+			var i10: int = i00 + 1
+			var i01: int = i00 + width
+			var i11: int = i01 + 1
+			var p00: Vector3 = Vector3(x * cell_size, heights[i00], z * cell_size)
+			var p10: Vector3 = Vector3((x + 1) * cell_size, heights[i10], z * cell_size)
+			var p01: Vector3 = Vector3(x * cell_size, heights[i01], (z + 1) * cell_size)
+			var p11: Vector3 = Vector3((x + 1) * cell_size, heights[i11], (z + 1) * cell_size)
 
-			# Triangle 1
-			var n1 = (p10 - p00).cross(p01 - p00).normalized()
-			st.set_normal(n1)
+			# Smooth per-vertex normals
+			var nm00: Vector3 = normals[i00]
+			var nm10: Vector3 = normals[i10]
+			var nm01: Vector3 = normals[i01]
+			var nm11: Vector3 = normals[i11]
+
+			# Triangle 1: p00, p10, p01
+			st.set_normal(nm00)
 			st.set_uv(Vector2(x / float(max_x), z / float(max_z)))
 			st.add_vertex(p00)
-			st.set_normal(n1)
+			st.set_normal(nm10)
 			st.set_uv(Vector2((x + 1) / float(max_x), z / float(max_z)))
 			st.add_vertex(p10)
-			st.set_normal(n1)
+			st.set_normal(nm01)
 			st.set_uv(Vector2(x / float(max_x), (z + 1) / float(max_z)))
 			st.add_vertex(p01)
 
-			# Triangle 2
-			var n2 = (p11 - p10).cross(p01 - p10).normalized()
-			st.set_normal(n2)
+			# Triangle 2: p10, p11, p01
+			st.set_normal(nm10)
 			st.set_uv(Vector2((x + 1) / float(max_x), z / float(max_z)))
 			st.add_vertex(p10)
-			st.set_normal(n2)
+			st.set_normal(nm11)
 			st.set_uv(Vector2((x + 1) / float(max_x), (z + 1) / float(max_z)))
 			st.add_vertex(p11)
-			st.set_normal(n2)
+			st.set_normal(nm01)
 			st.set_uv(Vector2(x / float(max_x), (z + 1) / float(max_z)))
 			st.add_vertex(p01)
 

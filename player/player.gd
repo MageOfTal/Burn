@@ -21,10 +21,12 @@ const SLIDE_FRICTION := 8.0
 const SLIDE_MIN_SPEED := 2.0
 const SLIDE_MIN_ENTRY_SPEED := 4.0
 const SLIDE_COOLDOWN := 0.5
-const SLIDE_GRAVITY_ACCEL := 15.0
-const SLIDE_UPHILL_PENALTY := 20.0
+const SLIDE_GRAVITY_ACCEL := 35.0
+const SLIDE_UPHILL_PENALTY := 25.0
 const SLIDE_CAPSULE_HEIGHT := 1.0
 const SLIDE_CAMERA_OFFSET := -0.5
+const SLIDE_AIRBORNE_GRACE := 0.15  ## Seconds allowed airborne before slide cancels
+const SLIDE_SNAP_DOWN := 4.0  ## Downward velocity to keep player stuck to slopes
 
 ## Crouch constants
 const CROUCH_CAPSULE_HEIGHT := 1.0
@@ -50,6 +52,7 @@ var is_sliding: bool = false
 var is_crouching: bool = false
 var _slide_velocity: Vector3 = Vector3.ZERO
 var _slide_cooldown_timer: float = 0.0
+var _slide_airborne_timer: float = 0.0
 var _original_capsule_height: float = 1.8
 var _original_camera_y: float = 1.5
 var _original_mesh_y: float = 0.9
@@ -219,6 +222,7 @@ func _can_start_slide() -> bool:
 func _start_slide() -> void:
 	is_sliding = true
 	is_crouching = false
+	_slide_airborne_timer = 0.0
 	# Lock slide direction to current movement direction
 	var horiz := Vector2(velocity.x, velocity.z)
 	var horiz_speed := horiz.length()
@@ -236,49 +240,75 @@ func _start_slide() -> void:
 
 func _process_slide(delta: float) -> void:
 	## Server-only: process slide movement with slope awareness.
-	# Get floor slope info
-	var floor_normal := get_floor_normal() if is_on_floor() else Vector3.UP
-	# Downhill direction is the direction gravity would pull along the slope
-	var downhill := (Vector3.DOWN - floor_normal * Vector3.DOWN.dot(floor_normal)).normalized()
+	var on_floor := is_on_floor()
 
-	# How much our slide direction aligns with downhill
+	# --- Airborne grace: allow brief air time over bumps without cancelling ---
+	if on_floor:
+		_slide_airborne_timer = 0.0
+	else:
+		_slide_airborne_timer += delta
+
+	# --- Slope calculation ---
+	var floor_normal := get_floor_normal() if on_floor else Vector3.UP
+	# slope_steepness: 0.0 on flat, ~0.26 at 15°, ~0.5 at 30°, ~0.71 at 45°
+	var slope_steepness := sqrt(1.0 - floor_normal.y * floor_normal.y)
+
+	# Downhill direction projected onto the slope plane (horizontal component only)
+	var downhill_3d := (Vector3.DOWN - floor_normal * Vector3.DOWN.dot(floor_normal))
+	var downhill_horiz := Vector3(downhill_3d.x, 0.0, downhill_3d.z)
+	if downhill_horiz.length() > 0.001:
+		downhill_horiz = downhill_horiz.normalized()
+
+	# How much our slide direction aligns with the downhill direction (XZ only)
 	var slide_dir := _slide_velocity.normalized()
-	var downhill_factor := slide_dir.dot(downhill)  # +1 = downhill, -1 = uphill, 0 = flat
+	var alignment := slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
+	# alignment: +1 = sliding downhill, -1 = sliding uphill, 0 = across slope
 
-	# Apply slope effects
-	if downhill_factor > 0.05:
-		# Sliding downhill — gain speed
-		_slide_velocity += downhill * SLIDE_GRAVITY_ACCEL * downhill_factor * delta
-	elif downhill_factor < -0.05:
-		# Sliding uphill — lose speed quickly
-		var penalty := SLIDE_UPHILL_PENALTY * absf(downhill_factor) * delta
-		var speed := _slide_velocity.length()
-		speed = maxf(speed - penalty, 0.0)
-		if speed > 0.01:
-			_slide_velocity = slide_dir * speed
-		else:
-			_slide_velocity = Vector3.ZERO
+	# --- Apply slope forces based on actual steepness ---
+	if on_floor and slope_steepness > 0.02:
+		if alignment > 0.05:
+			# Sliding downhill — steeper slope = more acceleration
+			var accel := SLIDE_GRAVITY_ACCEL * slope_steepness * alignment
+			_slide_velocity += slide_dir * accel * delta
+		elif alignment < -0.05:
+			# Sliding uphill — steeper slope = harder penalty
+			var penalty := SLIDE_UPHILL_PENALTY * slope_steepness * absf(alignment) * delta
+			var speed := _slide_velocity.length()
+			speed = maxf(speed - penalty, 0.0)
+			if speed > 0.01:
+				_slide_velocity = slide_dir * speed
+			else:
+				_slide_velocity = Vector3.ZERO
 
-	# Apply friction on flat ground
-	var flat_friction := SLIDE_FRICTION * (1.0 - absf(downhill_factor)) * delta
+	# --- Friction (reduced when on steep downhill slopes) ---
+	var friction_scale := 1.0 - slope_steepness * maxf(alignment, 0.0)
+	var friction := SLIDE_FRICTION * friction_scale * delta
 	var current_speed := _slide_velocity.length()
-	current_speed = maxf(current_speed - flat_friction, 0.0)
+	current_speed = maxf(current_speed - friction, 0.0)
 	if current_speed > 0.01:
 		_slide_velocity = _slide_velocity.normalized() * current_speed
 	else:
 		_slide_velocity = Vector3.ZERO
 
-	# Set velocity
+	# --- Apply velocity ---
 	velocity.x = _slide_velocity.x
 	velocity.z = _slide_velocity.z
 
-	# End slide conditions
+	# Snap player down onto slopes to prevent bouncing/stuttering
+	if on_floor and slope_steepness > 0.02:
+		velocity.y = -SLIDE_SNAP_DOWN * slope_steepness
+	elif not on_floor:
+		# Apply gravity while briefly airborne (going over bumps)
+		velocity.y -= gravity * delta
+
+	# --- End slide conditions ---
 	var should_end := false
 	if _slide_velocity.length() < SLIDE_MIN_SPEED:
 		should_end = true
 	if not player_input.action_slide:
 		should_end = true
-	if not is_on_floor():
+	# Only cancel from airborne after grace period expires
+	if not on_floor and _slide_airborne_timer > SLIDE_AIRBORNE_GRACE:
 		should_end = true
 
 	if should_end:
