@@ -6,6 +6,7 @@ extends Control
 @onready var health_bar: ProgressBar = $MarginContainer/VBoxLeft/HealthBar
 @onready var heat_bar: ProgressBar = $MarginContainer/VBoxLeft/HeatBar
 @onready var time_currency_label: Label = $MarginContainer/VBoxLeft/TimeCurrencyLabel
+@onready var shoe_slot_label: Label = $MarginContainer/VBoxLeft/ShoeSlotLabel
 @onready var inventory_list: VBoxContainer = $MarginContainer/VBoxRight/InventoryList
 @onready var fever_label: Label = $FeverLabel
 @onready var inventory_hint: Label = $MarginContainer/VBoxRight/InventoryHint
@@ -60,7 +61,37 @@ func _process(_delta: float) -> void:
 	if inventory_hint:
 		inventory_hint.text = "1-6: switch weapon"
 
+	_update_shoe_display()
 	_update_inventory_display()
+
+
+func _update_shoe_display() -> void:
+	if shoe_slot_label == null or _player == null:
+		return
+
+	var inventory := _player.get_node_or_null("Inventory") as Inventory
+	if inventory == null or inventory.equipped_shoe == null:
+		shoe_slot_label.text = "SHOES: ---"
+		shoe_slot_label.modulate = Color(0.5, 0.5, 0.5, 1)
+		return
+
+	var shoe := inventory.equipped_shoe
+	var rarity_names := ["C", "U", "R", "E", "L"]
+	var rarity_tag: String = rarity_names[shoe.item_data.rarity] if shoe.item_data else "?"
+	var time_remaining := ceili(shoe.burn_time_remaining)
+	var bonus_pct := 0.0
+	if shoe.item_data is ShoeData:
+		bonus_pct = (shoe.item_data as ShoeData).speed_bonus * 100.0
+
+	shoe_slot_label.text = "SHOES: [%s] %s - %ds (+%.0f%%)" % [rarity_tag, shoe.item_data.item_name, time_remaining, bonus_pct]
+
+	# Color by time remaining
+	if shoe.burn_time_remaining < 15.0:
+		shoe_slot_label.modulate = Color.RED
+	elif shoe.burn_time_remaining < 45.0:
+		shoe_slot_label.modulate = Color.YELLOW
+	else:
+		shoe_slot_label.modulate = Color.GREEN
 
 
 func _update_inventory_display() -> void:

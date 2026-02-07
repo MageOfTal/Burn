@@ -38,6 +38,9 @@ properties/5/replication_mode = 1
 properties/6/path = NodePath("HeatSystem:is_fever")
 properties/6/spawn = true
 properties/6/replication_mode = 1
+properties/7/path = NodePath(".:is_sliding")
+properties/7/spawn = true
+properties/7/replication_mode = 1
 
 [sub_resource type="SceneReplicationConfig" id="InputSyncConfig"]
 properties/0/path = NodePath("PlayerInput:input_direction")
@@ -61,6 +64,9 @@ properties/5/replication_mode = 1
 properties/6/path = NodePath("PlayerInput:action_slot")
 properties/6/spawn = true
 properties/6/replication_mode = 1
+properties/7/path = NodePath("PlayerInput:action_slide")
+properties/7/spawn = true
+properties/7/replication_mode = 1
 
 [node name="Player" type="CharacterBody3D"]
 script = ExtResource("1_player")

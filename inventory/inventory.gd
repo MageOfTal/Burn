@@ -10,11 +10,15 @@ var items: Array[ItemStack] = []
 var time_currency: float = 0.0
 var equipped_index: int = -1
 
+## Shoe equipment slot (separate from the 6 item slots)
+var equipped_shoe: ItemStack = null
+
 signal item_added(index: int, stack: ItemStack)
 signal item_removed(index: int)
 signal item_expired(index: int, item_name: String)
 signal inventory_changed
 signal weapon_equipped(index: int)
+signal shoe_changed
 
 
 func add_item(item_data: ItemData) -> int:
@@ -140,6 +144,33 @@ func remove_expired_items() -> Array[String]:
 	return expired_names
 
 
+func equip_shoe(shoe_data: ItemData) -> ItemStack:
+	## Equip a shoe. Returns the previously equipped shoe (or null).
+	var old_shoe := equipped_shoe
+	equipped_shoe = ItemStack.create(shoe_data)
+	shoe_changed.emit()
+	inventory_changed.emit()
+	return old_shoe
+
+
+func remove_shoe() -> ItemStack:
+	## Remove and return the equipped shoe.
+	var old := equipped_shoe
+	equipped_shoe = null
+	shoe_changed.emit()
+	inventory_changed.emit()
+	return old
+
+
+func get_shoe_speed_bonus() -> float:
+	## Returns the speed bonus from the equipped shoe (0.0 if none).
+	if equipped_shoe == null:
+		return 0.0
+	if equipped_shoe.item_data is ShoeData:
+		return (equipped_shoe.item_data as ShoeData).speed_bonus
+	return 0.0
+
+
 func get_serialized() -> Array:
 	## Serialize the full inventory for network transmission.
 	var result: Array = []
@@ -152,4 +183,6 @@ func clear_all() -> void:
 	## Remove all items (used on death/respawn).
 	items.clear()
 	equipped_index = -1
+	equipped_shoe = null
+	shoe_changed.emit()
 	inventory_changed.emit()

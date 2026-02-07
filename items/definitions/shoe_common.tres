@@ -1,0 +1,16 @@
+[gd_resource type="Resource" script_class="ShoeData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/shoe_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Scrap Boots"
+item_type = 4
+rarity = 0
+description = "Worn boots held together with tape. Better than barefoot."
+base_burn_rate = 0.5
+initial_burn_time = 60.0
+burn_cost_to_extend = 1.0
+time_currency_value = 3.0
+mesh_color = Color(0.6, 0.5, 0.4, 1)
+speed_bonus = 0.05

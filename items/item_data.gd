@@ -3,7 +3,7 @@ class_name ItemData
 
 ## Base class for all item definitions. Saved as .tres files.
 
-enum ItemType { WEAPON, CONSUMABLE, GADGET, MATERIAL }
+enum ItemType { WEAPON, CONSUMABLE, GADGET, MATERIAL, SHOE }
 enum Rarity { COMMON, UNCOMMON, RARE, EPIC, LEGENDARY }
 
 @export var item_name: String = ""

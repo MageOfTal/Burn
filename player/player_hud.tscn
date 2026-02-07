@@ -54,6 +54,12 @@ layout_mode = 2
 text = "TC: 0"
 theme_override_font_sizes/font_size = 16
 
+[node name="ShoeSlotLabel" type="Label" parent="MarginContainer/VBoxLeft"]
+layout_mode = 2
+text = "SHOES: ---"
+theme_override_font_sizes/font_size = 14
+theme_override_colors/font_color = Color(0.8, 0.8, 0.8, 1)
+
 [node name="VBoxRight" type="VBoxContainer" parent="MarginContainer"]
 layout_mode = 2
 size_flags_horizontal = 10

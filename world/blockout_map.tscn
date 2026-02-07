@@ -1,4 +1,4 @@
-[gd_scene load_steps=9 format=3 uid="uid://blockout001"]
+[gd_scene load_steps=12 format=3 uid="uid://blockout001"]
 
 [ext_resource type="Script" path="res://world/blockout_map.gd" id="1_mapscript"]
 [ext_resource type="PackedScene" path="res://world/target_dummy.tscn" id="2_dummy"]
@@ -20,6 +20,15 @@ size = Vector3(10, 4, 1)
 
 [sub_resource type="StandardMaterial3D" id="WallMat"]
 albedo_color = Color(0.6, 0.55, 0.5, 1)
+
+[sub_resource type="BoxShape3D" id="RampShape"]
+size = Vector3(4, 0.3, 8)
+
+[sub_resource type="BoxMesh" id="RampMesh"]
+size = Vector3(4, 0.3, 8)
+
+[sub_resource type="StandardMaterial3D" id="RampMat"]
+albedo_color = Color(0.5, 0.6, 0.5, 1)
 
 [node name="BlockoutMap" type="Node3D"]
 script = ExtResource("1_mapscript")
@@ -161,3 +170,65 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 10, 0, 10)
 
 [node name="Dummy4" parent="Dummies" instance=ExtResource("2_dummy")]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5, 0, -10)
+
+[node name="Ramps" type="Node3D" parent="."]
+
+[node name="Ramp1" type="StaticBody3D" parent="Ramps"]
+transform = Transform3D(1, 0, 0, 0, 0.9397, -0.342, 0, 0.342, 0.9397, 12, 0.6, -5)
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Ramps/Ramp1"]
+shape = SubResource("RampShape")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Ramps/Ramp1"]
+mesh = SubResource("RampMesh")
+surface_material_override/0 = SubResource("RampMat")
+
+[node name="Ramp2" type="StaticBody3D" parent="Ramps"]
+transform = Transform3D(0, 0.4226, 0.9063, 0, 0.9063, -0.4226, -1, 0, 0, -6, 0.6, 12)
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Ramps/Ramp2"]
+shape = SubResource("RampShape")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Ramps/Ramp2"]
+mesh = SubResource("RampMesh")
+surface_material_override/0 = SubResource("RampMat")
+
+[node name="Ramp3" type="StaticBody3D" parent="Ramps"]
+transform = Transform3D(1, 0, 0, 0, 0.866, -0.5, 0, 0.5, 0.866, -14, 0.6, -18)
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Ramps/Ramp3"]
+shape = SubResource("RampShape")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Ramps/Ramp3"]
+mesh = SubResource("RampMesh")
+surface_material_override/0 = SubResource("RampMat")
+
+[node name="Ramp4" type="StaticBody3D" parent="Ramps"]
+transform = Transform3D(0.7071, 0.2419, 0.6644, 0, 0.9397, -0.342, -0.7071, 0.2419, 0.6644, 22, 0.6, -16)
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Ramps/Ramp4"]
+shape = SubResource("RampShape")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Ramps/Ramp4"]
+mesh = SubResource("RampMesh")
+surface_material_override/0 = SubResource("RampMat")
+
+[node name="Ramp5" type="StaticBody3D" parent="Ramps"]
+transform = Transform3D(-1, 0, 0, 0, 0.9063, -0.4226, 0, -0.4226, -0.9063, 0, 0.6, 24)
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Ramps/Ramp5"]
+shape = SubResource("RampShape")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Ramps/Ramp5"]
+mesh = SubResource("RampMesh")
+surface_material_override/0 = SubResource("RampMat")
+
+[node name="Ramp6" type="StaticBody3D" parent="Ramps"]
+transform = Transform3D(1, 0, 0, 0, 0.9659, -0.2588, 0, 0.2588, 0.9659, -18, 0.4, -8)
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Ramps/Ramp6"]
+shape = SubResource("RampShape")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Ramps/Ramp6"]
+mesh = SubResource("RampMesh")
+surface_material_override/0 = SubResource("RampMat")

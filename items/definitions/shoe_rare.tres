@@ -1,0 +1,16 @@
+[gd_resource type="Resource" script_class="ShoeData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/shoe_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Sprint Treads"
+item_type = 4
+rarity = 2
+description = "Military-grade boots with spring-loaded soles."
+base_burn_rate = 0.25
+initial_burn_time = 120.0
+burn_cost_to_extend = 2.0
+time_currency_value = 10.0
+mesh_color = Color(0.2, 0.8, 0.3, 1)
+speed_bonus = 0.18

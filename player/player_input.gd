@@ -14,6 +14,7 @@ var look_pitch := 0.0
 var action_jump := false
 var action_shoot := false
 var action_pickup := false
+var action_slide := false
 ## Weapon slot selection (1-6, 0 = no change this frame).
 var action_slot := 0
 
@@ -63,13 +64,14 @@ func _physics_process(_delta: float) -> void:
 	# Look — accumulate mouse motion into yaw/pitch
 	look_yaw -= _mouse_delta.x * MOUSE_SENSITIVITY
 	look_pitch -= _mouse_delta.y * MOUSE_SENSITIVITY
-	look_pitch = clampf(look_pitch, -1.2, 0.5)
+	look_pitch = clampf(look_pitch, -1.48, 1.2)
 	_mouse_delta = Vector2.ZERO
 
 	# Actions (pressed this frame)
 	action_jump = Input.is_action_just_pressed("jump")
 	action_shoot = Input.is_action_pressed("shoot")
 	action_pickup = Input.is_action_just_pressed("pickup")
+	action_slide = Input.is_action_pressed("slide")
 
 	# Weapon slot keys (1-6)
 	action_slot = 0

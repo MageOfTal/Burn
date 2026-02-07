@@ -1,0 +1,16 @@
+[gd_resource type="Resource" script_class="ShoeData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/shoe_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Phoenix Soles"
+item_type = 4
+rarity = 4
+description = "Forged in eternal flame. The ground trembles beneath you."
+base_burn_rate = 0.15
+initial_burn_time = 200.0
+burn_cost_to_extend = 5.0
+time_currency_value = 25.0
+mesh_color = Color(1.0, 0.85, 0.0, 1)
+speed_bonus = 0.35

@@ -41,3 +41,14 @@ func _physics_process(delta: float) -> void:
 	var expired := inventory.remove_expired_items()
 	for item_name in expired:
 		print("Item burned away: %s" % item_name)
+
+	# Decrement shoe burn timer
+	if inventory.equipped_shoe != null:
+		var shoe_rate: float = inventory.equipped_shoe.item_data.base_burn_rate * global_mult * heat_mult
+		inventory.equipped_shoe.burn_time_remaining -= shoe_rate * delta
+		if inventory.equipped_shoe.is_expired():
+			var shoe_name: String = inventory.equipped_shoe.item_data.item_name
+			inventory.equipped_shoe = null
+			inventory.shoe_changed.emit()
+			inventory.inventory_changed.emit()
+			print("Shoes burned away: %s" % shoe_name)

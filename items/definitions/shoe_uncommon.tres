@@ -1,0 +1,16 @@
+[gd_resource type="Resource" script_class="ShoeData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/shoe_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Runner's Kicks"
+item_type = 4
+rarity = 1
+description = "Lightweight sneakers with decent grip."
+base_burn_rate = 0.35
+initial_burn_time = 90.0
+burn_cost_to_extend = 1.5
+time_currency_value = 6.0
+mesh_color = Color(0.3, 0.6, 0.9, 1)
+speed_bonus = 0.1
