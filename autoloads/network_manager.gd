@@ -98,7 +98,7 @@ func get_peer_status_string() -> String:
 
 
 ## Returns the best local LAN IP (192.168.x.x or 10.x.x.x).
-static func get_local_ip() -> String:
+func get_local_ip() -> String:
 	for ip in IP.get_local_addresses():
 		if ip.begins_with("192.168.") or ip.begins_with("10."):
 			return ip
