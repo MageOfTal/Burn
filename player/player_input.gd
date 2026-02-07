@@ -21,6 +21,7 @@ const MOUSE_SENSITIVITY := 0.002
 
 ## Accumulated mouse delta this frame (reset each physics tick).
 var _mouse_delta := Vector2.ZERO
+var _has_captured := false
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -30,17 +31,24 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
 		_mouse_delta += event.relative
 
-	# Escape releases mouse, any click re-captures it
+	# Escape releases mouse
 	if event.is_action_pressed("ui_cancel"):
 		Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
-	elif event is InputEventMouseButton and event.pressed:
-		if Input.get_mouse_mode() != Input.MOUSE_MODE_CAPTURED:
-			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
 
 func _physics_process(_delta: float) -> void:
 	if not is_multiplayer_authority():
 		return
+
+	# Auto-capture mouse on first frame for local player (free-look by default)
+	if not _has_captured:
+		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+		_has_captured = true
+
+	# Re-capture mouse if it was released (e.g. by Escape) when any key is pressed
+	if Input.get_mouse_mode() != Input.MOUSE_MODE_CAPTURED:
+		if Input.is_anything_pressed():
+			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
 	# Movement
 	input_direction = Input.get_vector("move_left", "move_right", "move_forward", "move_back")

@@ -283,8 +283,8 @@ func _show_shot_fx(from_pos: Vector3, to_pos: Vector3) -> void:
 	flash.light_energy = 5.0
 	flash.omni_range = 3.0
 	flash.top_level = true
-	flash.global_position = from_pos
 	add_child(flash)
+	flash.global_position = from_pos
 
 	# Fade out and cleanup after 0.1 seconds
 	var tween := get_tree().create_tween()

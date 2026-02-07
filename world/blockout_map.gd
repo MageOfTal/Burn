@@ -64,7 +64,8 @@ func _spawn_random_at(pos: Vector3) -> void:
 	var world_item_scene := preload("res://items/world_item.tscn")
 	var world_item: WorldItem = world_item_scene.instantiate()
 	world_item.setup(item_data)
-	world_item.global_position = pos
+	# Use local position before adding to tree (global_position requires being in tree)
+	world_item.position = pos
 
 	var container := get_node_or_null("WorldItems")
 	if container:
