@@ -16,16 +16,17 @@ const AIR_ACCELERATION := 15.0
 const AIR_DECELERATION := 5.0
 
 ## Slide constants
-const SLIDE_INITIAL_SPEED := 11.0
-const SLIDE_FRICTION := 8.0
-const SLIDE_MIN_SPEED := 2.0
-const SLIDE_MIN_ENTRY_SPEED := 4.0
-const SLIDE_COOLDOWN := 0.5
-const SLIDE_GRAVITY_ACCEL := 35.0
-const SLIDE_UPHILL_PENALTY := 25.0
+const SLIDE_INITIAL_SPEED := 12.0
+const SLIDE_FRICTION := 4.5        ## Lower = slides last longer on flat ground
+const SLIDE_MIN_SPEED := 1.5
+const SLIDE_MIN_ENTRY_SPEED := 3.5
+const SLIDE_COOLDOWN := 0.4
+const SLIDE_GRAVITY_ACCEL := 38.0
+const SLIDE_UPHILL_PENALTY_BASE := 6.0   ## Gentle inclines barely slow you
+const SLIDE_UPHILL_PENALTY_STEEP := 35.0 ## Steep hills drain speed fast
 const SLIDE_CAPSULE_HEIGHT := 1.0
 const SLIDE_CAMERA_OFFSET := -0.5
-const SLIDE_AIRBORNE_GRACE := 0.15  ## Seconds allowed airborne before slide cancels
+const SLIDE_AIRBORNE_GRACE := 0.2  ## Seconds allowed airborne before slide cancels
 const SLIDE_SNAP_DOWN := 4.0  ## Downward velocity to keep player stuck to slopes
 
 ## Crouch constants
@@ -223,17 +224,17 @@ func _can_start_slide() -> bool:
 	var horiz_speed := Vector2(velocity.x, velocity.z).length()
 	if horiz_speed < SLIDE_MIN_ENTRY_SPEED:
 		return false
-	# Don't allow slide initiation while moving uphill — go straight to crouch
+	# Block slide initiation only on steep uphill — gentle inclines are fine
 	var floor_normal := get_floor_normal()
 	var slope_steepness := sqrt(1.0 - floor_normal.y * floor_normal.y)
-	if slope_steepness > 0.1:
+	if slope_steepness > 0.25:  # ~14° — only check steeper slopes
 		var downhill_3d := (Vector3.DOWN - floor_normal * Vector3.DOWN.dot(floor_normal))
 		var downhill_horiz := Vector3(downhill_3d.x, 0.0, downhill_3d.z)
 		if downhill_horiz.length() > 0.001:
 			var move_dir := Vector3(velocity.x, 0.0, velocity.z).normalized()
 			var alignment := move_dir.dot(downhill_horiz.normalized())
-			# alignment < 0 means moving uphill
-			if alignment < -0.3:
+			# alignment < 0 means moving uphill; block only steep uphill
+			if alignment < -0.4:
 				return false
 	return true
 
@@ -312,8 +313,11 @@ func _process_slide(delta: float) -> void:
 			var accel := SLIDE_GRAVITY_ACCEL * slope_steepness * alignment
 			_slide_velocity += slide_dir * accel * delta
 		elif alignment < -0.05:
-			# Sliding uphill — steeper slope = harder penalty
-			var penalty := SLIDE_UPHILL_PENALTY * slope_steepness * absf(alignment) * delta
+			# Sliding uphill — penalty scales quadratically with steepness
+			# so gentle inclines barely slow you but steep hills drain speed fast
+			var steep_t := clampf(slope_steepness / 0.7, 0.0, 1.0)  # 0-1 range (0° to ~45°)
+			var penalty_rate := lerpf(SLIDE_UPHILL_PENALTY_BASE, SLIDE_UPHILL_PENALTY_STEEP, steep_t * steep_t)
+			var penalty := penalty_rate * absf(alignment) * delta
 			var speed := _slide_velocity.length()
 			speed = maxf(speed - penalty, 0.0)
 			if speed > 0.01:
@@ -321,8 +325,11 @@ func _process_slide(delta: float) -> void:
 			else:
 				_slide_velocity = Vector3.ZERO
 
-	# --- Friction (reduced when on steep downhill slopes) ---
+	# --- Friction (reduced on downhill slopes, slightly reduced at high speed) ---
 	var friction_scale := 1.0 - slope_steepness * maxf(alignment, 0.0)
+	# High-speed slides have less friction (momentum carries further)
+	var speed_preservation := clampf(_slide_velocity.length() / (SLIDE_INITIAL_SPEED * 1.5), 0.0, 1.0)
+	friction_scale *= lerpf(1.0, 0.6, speed_preservation)
 	var friction := SLIDE_FRICTION * friction_scale * delta
 	var current_speed := _slide_velocity.length()
 	current_speed = maxf(current_speed - friction, 0.0)
