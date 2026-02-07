@@ -15,19 +15,17 @@ const DECELERATION := 30.0         # ~0.23s to stop — slight momentum
 const AIR_ACCELERATION := 15.0
 const AIR_DECELERATION := 5.0
 
-## Slide constants
+## Slide constants — physics-based
 const SLIDE_INITIAL_SPEED := 12.0
-const SLIDE_FRICTION := 4.5        ## Lower = slides last longer on flat ground
-const SLIDE_MIN_SPEED := 1.5
+const SLIDE_FRICTION_COEFF := 0.18  ## Kinetic friction coefficient (real physics range 0.15-0.25)
+const SLIDE_MIN_SPEED := 0.5       ## Low threshold — let slides die naturally via physics
 const SLIDE_MIN_ENTRY_SPEED := 3.5
 const SLIDE_COOLDOWN := 0.4
-const SLIDE_GRAVITY_ACCEL := 38.0
-const SLIDE_UPHILL_PENALTY_BASE := 6.0   ## Gentle inclines barely slow you
-const SLIDE_UPHILL_PENALTY_STEEP := 35.0 ## Steep hills drain speed fast
 const SLIDE_CAPSULE_HEIGHT := 1.0
 const SLIDE_CAMERA_OFFSET := -0.5
-const SLIDE_AIRBORNE_GRACE := 0.2  ## Seconds allowed airborne before slide cancels
-const SLIDE_SNAP_DOWN := 4.0  ## Downward velocity to keep player stuck to slopes
+const SLIDE_AIRBORNE_GRACE := 0.2
+const SLIDE_SNAP_DOWN := 4.0
+const SLIDE_TO_CROUCH_DELAY := 0.3  ## Seconds coasting at low speed before crouch transition
 
 ## Crouch constants
 const CROUCH_CAPSULE_HEIGHT := 1.0
@@ -54,6 +52,7 @@ var is_crouching: bool = false
 var _slide_velocity: Vector3 = Vector3.ZERO
 var _slide_cooldown_timer: float = 0.0
 var _slide_airborne_timer: float = 0.0
+var _slide_low_speed_timer: float = 0.0
 var _slide_smoothed_normal: Vector3 = Vector3.UP  ## Smoothed floor normal to avoid jitter
 var _original_capsule_height: float = 1.8
 var _original_camera_y: float = 1.5
@@ -243,6 +242,7 @@ func _start_slide() -> void:
 	is_sliding = true
 	is_crouching = false
 	_slide_airborne_timer = 0.0
+	_slide_low_speed_timer = 0.0
 	_slide_smoothed_normal = get_floor_normal() if is_on_floor() else Vector3.UP
 	# Lock slide direction to current movement direction
 	var horiz := Vector2(velocity.x, velocity.z)
@@ -260,8 +260,9 @@ func _start_slide() -> void:
 
 
 func _process_slide(delta: float) -> void:
-	## Server-only: process slide movement with slope awareness.
-	## Uses a smoothed floor normal to avoid speed jitter on bumpy terrain.
+	## Server-only: physics-based slide.
+	## Uses real inclined-plane physics: a = g * (sin(angle)*alignment - friction*cos(angle))
+	## A single formula handles flat, downhill, and uphill — no arbitrary penalty constants.
 	var on_floor := is_on_floor()
 
 	# --- Airborne grace ---
@@ -271,10 +272,8 @@ func _process_slide(delta: float) -> void:
 		_slide_airborne_timer += delta
 
 	# --- Smooth the floor normal to prevent jitter on procedural terrain ---
-	# Raw normals change every frame based on which triangle we're on.
-	# Lerping gives stable slope readings that don't cause rubberbanding.
 	var raw_normal := get_floor_normal() if on_floor else _slide_smoothed_normal
-	var smooth_rate := 8.0 * delta  # ~8 Hz smoothing — responsive but stable
+	var smooth_rate := 6.0 * delta
 	_slide_smoothed_normal = _slide_smoothed_normal.lerp(raw_normal, clampf(smooth_rate, 0.0, 1.0)).normalized()
 
 	var slope_steepness := sqrt(1.0 - _slide_smoothed_normal.y * _slide_smoothed_normal.y)
@@ -290,65 +289,65 @@ func _process_slide(delta: float) -> void:
 	var slide_dir := _slide_velocity.normalized() if _slide_velocity.length() > 0.01 else Vector3.ZERO
 	var alignment := slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
 
-	# --- On slopes, gently redirect slide velocity toward downhill ---
+	# --- On downhill slopes, gently redirect slide toward downhill ---
 	if on_floor and slope_steepness > 0.1 and alignment > 0.0:
 		var redirect_strength := slope_steepness * 2.5 * delta
 		redirect_strength = minf(redirect_strength, 0.5)
 		var spd := _slide_velocity.length()
 		var redirected_dir := slide_dir.lerp(downhill_horiz, redirect_strength).normalized()
 		_slide_velocity = redirected_dir * spd
+		# Recalculate after redirect
+		slide_dir = _slide_velocity.normalized() if _slide_velocity.length() > 0.01 else Vector3.ZERO
+		alignment = slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
 
-	# Recalculate after redirect
-	slide_dir = _slide_velocity.normalized() if _slide_velocity.length() > 0.01 else Vector3.ZERO
-	alignment = slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
+	# --- Unified physics-based slope force ---
+	# a = g * (sin(angle) * alignment - friction * cos(angle))
+	# alignment > 0 = downhill (gravity helps), < 0 = uphill (gravity resists)
+	# Friction always opposes motion.
+	var slope_force: float = 0.0
+	if on_floor and slope_steepness > 0.01:
+		var sin_angle := slope_steepness
+		var cos_angle := _slide_smoothed_normal.y
+		slope_force = gravity * (sin_angle * alignment - SLIDE_FRICTION_COEFF * cos_angle)
+	else:
+		# Flat or airborne: friction only
+		slope_force = -gravity * SLIDE_FRICTION_COEFF
 
-	# --- Slope forces ---
-	if on_floor and slope_steepness > 0.02:
-		if alignment > 0.05:
-			# Downhill: accelerate proportional to steepness
-			var accel := SLIDE_GRAVITY_ACCEL * slope_steepness * alignment
-			_slide_velocity += slide_dir * accel * delta
-		elif alignment < -0.05:
-			# Uphill: gentle deceleration that ramps up with steepness.
-			# Uses cubic scaling so gentle inclines barely slow you.
-			var steep_t := clampf(slope_steepness / 0.7, 0.0, 1.0)
-			var penalty_rate := lerpf(SLIDE_UPHILL_PENALTY_BASE, SLIDE_UPHILL_PENALTY_STEEP, steep_t * steep_t * steep_t)
-			var penalty := penalty_rate * absf(alignment) * delta
-			var spd := _slide_velocity.length()
-			spd = maxf(spd - penalty, 0.0)
-			_slide_velocity = slide_dir * spd if spd > 0.01 else Vector3.ZERO
-
-	# --- Friction ---
-	# Reduced on downhill, reduced at high speed (momentum preservation)
-	var friction_scale := 1.0 - slope_steepness * maxf(alignment, 0.0)
-	var speed_ratio := clampf(_slide_velocity.length() / (SLIDE_INITIAL_SPEED * 1.5), 0.0, 1.0)
-	friction_scale *= lerpf(1.0, 0.5, speed_ratio)
-	var friction := SLIDE_FRICTION * friction_scale * delta
-	var current_speed := _slide_velocity.length()
-	current_speed = maxf(current_speed - friction, 0.0)
-	_slide_velocity = _slide_velocity.normalized() * current_speed if current_speed > 0.01 else Vector3.ZERO
+	# Apply force as speed change
+	var spd := _slide_velocity.length()
+	spd = maxf(spd + slope_force * delta, 0.0)
+	if spd > 0.01 and slide_dir.length() > 0.001:
+		_slide_velocity = slide_dir * spd
+	else:
+		_slide_velocity = Vector3.ZERO
 
 	# --- Apply velocity ---
 	velocity.x = _slide_velocity.x
 	velocity.z = _slide_velocity.z
 
 	if on_floor:
-		# Snap down onto the slope. Constant minimum snap + extra for steep/fast.
+		# Snap down onto slope to prevent bouncing
 		var speed_factor := _slide_velocity.length() / SLIDE_INITIAL_SPEED
-		var snap_force := SLIDE_SNAP_DOWN + SLIDE_GRAVITY_ACCEL * slope_steepness * speed_factor
+		var snap_force := SLIDE_SNAP_DOWN + gravity * slope_steepness * speed_factor
 		velocity.y = -snap_force * maxf(slope_steepness, 0.08)
 	else:
 		velocity.y -= gravity * delta
 
-	# --- End conditions ---
+	# --- End conditions: gradual transition, not abrupt ---
+	# Track time coasting at low speed
+	if _slide_velocity.length() < SLIDE_MIN_SPEED:
+		_slide_low_speed_timer += delta
+	else:
+		_slide_low_speed_timer = 0.0
+
 	var should_end := false
-	if _slide_velocity.length() < SLIDE_MIN_SPEED and slope_steepness < 0.2:
-		should_end = true
 	if not player_input.action_slide:
 		should_end = true
 	if not on_floor and _slide_airborne_timer > SLIDE_AIRBORNE_GRACE:
-		if _slide_velocity.length() < SLIDE_INITIAL_SPEED * 0.7:
-			should_end = true
+		should_end = true
+	# Only end after coasting at low speed for a bit — smooth transition
+	if _slide_low_speed_timer > SLIDE_TO_CROUCH_DELAY:
+		should_end = true
 
 	if should_end:
 		_end_slide()
@@ -357,36 +356,27 @@ func _process_slide(delta: float) -> void:
 func _end_slide() -> void:
 	is_sliding = false
 	_slide_cooldown_timer = SLIDE_COOLDOWN
-
-	var slide_speed := _slide_velocity.length()
+	_slide_low_speed_timer = 0.0
 	_slide_velocity = Vector3.ZERO
 
-	# Transition to crouch if still holding slide key, or if there's no headroom
+	# Transition to crouch if still holding Ctrl, or if there's no headroom
 	if player_input.action_slide or not _has_headroom():
-		# If the slide had decent momentum, keep it. Otherwise, let crouch
-		# movement take over immediately from WASD input so the player
-		# doesn't feel frozen.
-		if slide_speed > SLIDE_MIN_SPEED:
-			velocity.x = velocity.x
-			velocity.z = velocity.z
-		else:
-			# Slide died from deceleration — use player's current WASD input
-			# direction at crouch speed so they aren't stuck at zero velocity
-			var input_dir: Vector2 = player_input.input_direction
-			if input_dir.length() > 0.1:
-				var shoe_bonus: float = inventory.get_shoe_speed_bonus() if inventory else 0.0
-				var crouch_speed := SPEED * (heat_system.get_speed_multiplier() + shoe_bonus) * CROUCH_SPEED_MULT
-				var direction := (transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized()
-				velocity.x = direction.x * crouch_speed
-				velocity.z = direction.z * crouch_speed
-		_start_crouch()
-	else:
-		if slide_speed > SLIDE_MIN_SPEED:
-			# Keep slide momentum when standing back up
-			pass
+		# Always use WASD input for crouch velocity so the player
+		# immediately starts crouch walking and never feels frozen
+		var input_dir: Vector2 = player_input.input_direction
+		if input_dir.length() > 0.1:
+			var shoe_bonus: float = inventory.get_shoe_speed_bonus() if inventory else 0.0
+			var crouch_speed := SPEED * (heat_system.get_speed_multiplier() + shoe_bonus) * CROUCH_SPEED_MULT
+			var direction := (transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized()
+			velocity.x = direction.x * crouch_speed
+			velocity.z = direction.z * crouch_speed
 		else:
 			velocity.x = 0.0
 			velocity.z = 0.0
+		_start_crouch()
+	else:
+		velocity.x = 0.0
+		velocity.z = 0.0
 		_apply_standing_pose()
 
 
