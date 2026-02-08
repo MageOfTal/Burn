@@ -1,0 +1,26 @@
+[gd_scene format=3 uid="uid://cens1jmacsiyy"]
+
+[ext_resource type="Script" path="res://weapons/rubber_ball_projectile.gd" id="1_ball"]
+
+[sub_resource type="SphereShape3D" id="BallCollision"]
+radius = 0.05
+
+[sub_resource type="SphereMesh" id="BallMesh"]
+radius = 0.05
+height = 0.1
+
+[sub_resource type="PhysicsMaterial" id="BallPhysMat"]
+bounce = 0.92
+friction = 0.3
+
+[node name="RubberBall" type="RigidBody3D"]
+collision_layer = 8
+collision_mask = 7
+physics_material_override = SubResource("BallPhysMat")
+script = ExtResource("1_ball")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="."]
+shape = SubResource("BallCollision")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="."]
+mesh = SubResource("BallMesh")

@@ -4,8 +4,10 @@ extends CharacterBody3D
 ## The server reads input from PlayerInput (synced via InputSync),
 ## computes movement and combat, and the result is synced back via ServerSync.
 
+const WeaponProjectileScript = preload("res://weapons/weapon_projectile.gd")
+
 const SPEED := 7.0
-const JUMP_VELOCITY := 5.5
+const JUMP_VELOCITY := 7.5
 const MAX_HEALTH := 100.0
 const RESPAWN_DELAY := 3.0
 
@@ -16,16 +18,21 @@ const AIR_ACCELERATION := 15.0
 const AIR_DECELERATION := 5.0
 
 ## Slide constants — physics-based
-const SLIDE_INITIAL_SPEED := 12.0
-const SLIDE_FRICTION_COEFF := 0.18  ## Kinetic friction coefficient (real physics range 0.15-0.25)
-const SLIDE_MIN_SPEED := 0.5       ## Low threshold — let slides die naturally via physics
+const SLIDE_INITIAL_SPEED := 12.0    ## Only used as fallback if somehow speed is 0
+const SLIDE_FRICTION_COEFF := 0.35   ## Ground friction (higher = grippier, Fortnite-like)
+const SLIDE_MIN_SPEED := 0.5        ## Low threshold — let slides die naturally via physics
 const SLIDE_MIN_ENTRY_SPEED := 3.5
 const SLIDE_COOLDOWN := 0.4
 const SLIDE_CAPSULE_HEIGHT := 1.0
 const SLIDE_CAMERA_OFFSET := -0.5
 const SLIDE_AIRBORNE_GRACE := 0.2
 const SLIDE_SNAP_DOWN := 4.0
-const SLIDE_TO_CROUCH_DELAY := 0.3  ## Seconds coasting at low speed before crouch transition
+const SLIDE_TO_CROUCH_DELAY := 0.3   ## Seconds coasting at low speed before crouch transition
+const SLIDE_MAX_SPEED := 14.0        ## Hard cap — prevents runaway downhill speed
+const SLIDE_LATERAL_FRICTION := 12.0  ## How quickly lateral (sideways) drift is killed
+
+## Rarity damage bonus: +15% per rarity tier (Common=1.0, Uncommon=1.15, Rare=1.30, Epic=1.45, Legendary=1.60)
+const RARITY_DAMAGE_BONUS := 0.15
 
 ## Crouch constants
 const CROUCH_CAPSULE_HEIGHT := 1.0
@@ -33,7 +40,7 @@ const CROUCH_CAMERA_OFFSET := -0.5
 const CROUCH_SPEED_MULT := 0.5
 const CROUCH_MESH_SCALE_Y := 0.55  # Visual squish
 
-var gravity: float = ProjectSettings.get_setting("physics/3d/default_gravity")
+var gravity: float = 17.5  ## Heavier gravity for snappy movement (default Godot is 9.8)
 
 ## The peer ID that owns this player. Set by NetworkManager on spawn.
 var peer_id: int = 1
@@ -53,6 +60,14 @@ var _current_gun_model: Node3D = null
 var _last_synced_gun_model_path: String = ""
 var _last_synced_fire_sound_path: String = ""
 
+## ADS (Aim Down Sights) state — synced via ServerSync
+var is_aiming: bool = false
+const DEFAULT_FOV := 70.0
+const ADS_LERP_SPEED := 12.0         ## How fast FOV/spring transitions
+const ADS_SPRING_LENGTH := 1.0       ## Camera pulls closer when aiming
+const DEFAULT_SPRING_LENGTH := 2.2
+var _scope_overlay: ColorRect = null  ## Scope vignette for scoped weapons
+
 ## Slide/crouch state (server-managed, synced to clients)
 var is_sliding: bool = false
 var is_crouching: bool = false
@@ -61,6 +76,11 @@ var _slide_cooldown_timer: float = 0.0
 var _slide_airborne_timer: float = 0.0
 var _slide_low_speed_timer: float = 0.0
 var _slide_smoothed_normal: Vector3 = Vector3.UP  ## Smoothed floor normal to avoid jitter
+var _slide_forward_dir: Vector3 = Vector3.ZERO    ## Original slide direction for lateral friction
+var _wants_slide_on_land: bool = false             ## Queue slide when landing from a jump
+var _slide_on_land_grace: float = 0.0              ## Grace window after landing to trigger slide
+var _was_on_floor: bool = true                     ## Track floor state for landing detection
+var _pre_land_velocity_y: float = 0.0              ## Vertical speed right before landing
 var _original_capsule_height: float = 1.8
 var _original_camera_y: float = 1.5
 var _original_mesh_y: float = 0.9
@@ -77,6 +97,7 @@ var _original_mesh_scale_y: float = 1.0
 @onready var player_hud: Control = $HUDLayer/PlayerHUD
 @onready var weapon_mount: Node3D = $WeaponMount
 @onready var fire_sound_player: AudioStreamPlayer3D = $FireSoundPlayer
+@onready var inventory_ui: Control = $HUDLayer/InventoryUI
 
 signal player_killed(victim_id: int, killer_id: int)
 
@@ -95,21 +116,38 @@ func _ready() -> void:
 	_original_mesh_y = body_mesh.position.y
 	_original_mesh_scale_y = body_mesh.scale.y
 
+	# Add VoxelViewer so the voxel terrain generates around each player.
+	# Without this, VoxelTerrain won't load any chunks.
+	if ClassDB.class_exists(&"VoxelViewer"):
+		var viewer: Node3D = ClassDB.instantiate(&"VoxelViewer")
+		viewer.name = "VoxelViewer"
+		add_child(viewer)
+
 	if peer_id == multiplayer.get_unique_id():
 		camera.current = true
 		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 		# Setup HUD for local player
 		if player_hud and player_hud.has_method("setup"):
 			player_hud.setup(self)
+		# Setup inventory UI for local player
+		if inventory_ui and inventory_ui.has_method("setup"):
+			inventory_ui.setup(self)
+			inventory_ui.visible = false
 	else:
 		camera.current = false
 		camera_pivot.visible = false
 		# Hide HUD for non-local players
 		if player_hud:
 			player_hud.visible = false
+		if inventory_ui:
+			inventory_ui.visible = false
 
 
 func _physics_process(delta: float) -> void:
+	# Toggle inventory UI for the local player (must happen regardless of server/client)
+	if peer_id == multiplayer.get_unique_id() and inventory_ui:
+		inventory_ui.visible = player_input.inventory_open
+
 	if multiplayer.is_server():
 		_server_process(delta)
 	else:
@@ -150,6 +188,11 @@ func _server_process(delta: float) -> void:
 		# Jump (no jumping while sliding/crouching)
 		if player_input.action_jump and is_on_floor():
 			velocity.y = JUMP_VELOCITY
+			_wants_slide_on_land = false  # Clear on new jump
+
+		# While airborne, queue slide for when we land
+		if not is_on_floor() and player_input.action_slide:
+			_wants_slide_on_land = true
 
 		# Check if we should start a slide (must be moving fast enough)
 		if player_input.action_slide and _can_start_slide():
@@ -162,7 +205,49 @@ func _server_process(delta: float) -> void:
 		else:
 			_process_normal_movement(delta)
 
+	# Track floor state before move_and_slide for landing detection
+	var was_airborne := not _was_on_floor
+	if was_airborne:
+		_pre_land_velocity_y = velocity.y  # Capture vertical speed before landing
 	move_and_slide()
+	_was_on_floor = is_on_floor()
+
+	# --- Push nearby bubbles ---
+	# Bubbles are on layer 3 (not layer 1), so move_and_slide() doesn't see them.
+	# We manually detect nearby bubbles and apply impulses. Since bubbles have
+	# mass 0.1 and we push with player velocity * 80kg equivalent, they fly easily.
+	_push_nearby_bubbles()
+
+	# --- Slide-on-land system ---
+	# When the player presses crouch while airborne, give a generous grace window
+	# after landing to trigger the slide. This accounts for the fact that landing
+	# on slopes can eat horizontal speed on the first frame.
+	if was_airborne and is_on_floor() and _wants_slide_on_land:
+		# Convert some downward velocity into horizontal speed on landing.
+		# Falling faster = more slide momentum. Going upward = no bonus.
+		var land_speed_bonus := maxf(-_pre_land_velocity_y, 0.0) * 0.5
+		if land_speed_bonus > 0.1:
+			var horiz_dir := Vector3(velocity.x, 0.0, velocity.z)
+			if horiz_dir.length() < 0.1:
+				horiz_dir = -transform.basis.z  # Fallback: forward
+			horiz_dir = horiz_dir.normalized()
+			velocity.x += horiz_dir.x * land_speed_bonus
+			velocity.z += horiz_dir.z * land_speed_bonus
+		# Start grace window
+		_slide_on_land_grace = 0.15  # 150ms to trigger slide after landing
+
+	# Process grace window: try to start slide each frame for a few frames after landing
+	if _slide_on_land_grace > 0.0 and not is_sliding and not is_crouching:
+		_slide_on_land_grace -= delta
+		if is_on_floor() and _can_start_slide():
+			_wants_slide_on_land = false
+			_slide_on_land_grace = 0.0
+			_start_slide()
+		elif _slide_on_land_grace <= 0.0:
+			# Grace expired — fall back to crouch if still holding
+			_wants_slide_on_land = false
+			if player_input.action_slide:
+				_start_crouch()
 
 	# Weapon slot switching (1-6)
 	if player_input.action_slot > 0:
@@ -173,32 +258,107 @@ func _server_process(delta: float) -> void:
 			if stack.item_data is WeaponData:
 				equip_weapon(stack.item_data as WeaponData)
 
+	# --- Extend equipped item lifespan (F key) ---
+	if player_input.action_extend and inventory:
+		_try_extend_equipped_item()
+
+	# --- Scrap nearby ground item or equipped item (X key) ---
+	if player_input.action_scrap and inventory:
+		_try_scrap_item()
+
+	# ADS state: server tracks whether the player is aiming
+	var w_data: WeaponData = current_weapon.weapon_data if current_weapon else null
+	is_aiming = player_input.action_aim and w_data != null and w_data.ads_fov > 0.0
+
 	# Combat: shooting (damage scaled by heat)
-	if player_input.action_shoot and current_weapon != null:
-		# Third-person aiming: cast a ray from the camera through the crosshair
-		# (screen center) to find the world-space target, then fire from the
-		# character's muzzle position toward that target. This ensures bullets
-		# land exactly where the crosshair points.
-		var cam_origin := camera.global_position
-		var cam_forward := -camera.global_transform.basis.z
-		var aim_target := _get_camera_aim_target(cam_origin, cam_forward)
+	if player_input.action_shoot and current_weapon != null and current_weapon.can_fire():
+		# Calculate fuel cost: weapon base cost + ammo cost (if ammo slotted)
+		var fuel_cost: float = current_weapon.weapon_data.burn_fuel_cost
+		var equipped_stack: ItemStack = null
+		if inventory and inventory.equipped_index >= 0 and inventory.equipped_index < inventory.items.size():
+			equipped_stack = inventory.items[inventory.equipped_index]
+			if equipped_stack and equipped_stack.slotted_ammo:
+				if equipped_stack.slotted_ammo is AmmoData:
+					fuel_cost += equipped_stack.slotted_ammo.burn_cost_per_shot
+				elif equipped_stack.slotted_ammo is WeaponData:
+					fuel_cost += equipped_stack.slotted_ammo.ammo_burn_cost_per_shot
 
-		# Fire from character shoulder height toward the aim target
-		var muzzle_pos := camera_pivot.global_position
-		var aim_direction := (aim_target - muzzle_pos).normalized()
+		# Check fuel before firing
+		if inventory.has_fuel(fuel_cost):
+			# Spend fuel only when the weapon is actually ready to fire
+			inventory.spend_fuel(fuel_cost)
 
-		var hit_info := current_weapon.try_fire(self, muzzle_pos, aim_direction)
-		if hit_info.has("shot_end"):
-			# Show tracer FX on all clients
-			_show_shot_fx.rpc(muzzle_pos, hit_info["shot_end"])
+			# Set ammo context on weapon before firing
+			if equipped_stack and equipped_stack.slotted_ammo:
+				current_weapon.ammo_data = equipped_stack.slotted_ammo
+			else:
+				current_weapon.ammo_data = null
 
-			var collider = hit_info.get("hit_collider")
-			if collider != null and collider.has_method("take_damage"):
-				var base_damage: float = current_weapon.weapon_data.damage
-				var final_damage: float = base_damage * heat_system.get_damage_multiplier()
-				collider.take_damage(final_damage, peer_id)
-				# Add heat for dealing damage
-				heat_system.on_damage_dealt(base_damage)
+			# Third-person aiming: cast a ray from the camera through the crosshair
+			# (screen center) to find the world-space target, then fire from the
+			# character's muzzle position toward that target.
+			var cam_origin := camera.global_position
+			var cam_forward := -camera.global_transform.basis.z
+			var aim_target := _get_camera_aim_target(cam_origin, cam_forward)
+
+			# Fire from the gun barrel, not camera pivot
+			var muzzle_pos := _get_barrel_position()
+			var aim_direction := (aim_target - muzzle_pos).normalized()
+
+			# Reduce spread while ADS
+			var saved_spread: float = current_weapon.weapon_data.spread
+			if is_aiming:
+				current_weapon.weapon_data.spread *= current_weapon.weapon_data.ads_spread_mult
+
+			var hit_info := current_weapon.try_fire(self, muzzle_pos, aim_direction)
+
+			# Restore original spread
+			current_weapon.weapon_data.spread = saved_spread
+			if hit_info.has("pellets"):
+				# Multi-pellet weapon (shotgun) — process each pellet independently.
+				# Damage is split evenly across all pellets.
+				var pellets: Array = hit_info["pellets"]
+				var pellet_count := pellets.size()
+				var base_damage_per_pellet: float = current_weapon.weapon_data.damage / pellet_count
+				var total_damage_dealt: float = 0.0
+
+				# Collect all shot endpoints for a single batched RPC
+				var shot_ends: Array[Vector3] = []
+				for pellet in pellets:
+					if pellet.has("shot_end"):
+						shot_ends.append(pellet["shot_end"])
+
+				# Show all tracers on all clients in one RPC
+				if shot_ends.size() > 0:
+					_show_shotgun_fx.rpc(muzzle_pos, shot_ends)
+
+				# Rarity multiplier: higher rarity weapons deal more damage
+				var rarity_mult: float = 1.0 + current_weapon.weapon_data.rarity * RARITY_DAMAGE_BONUS
+
+				# Process damage per pellet — each pellet can hit a different target
+				for pellet in pellets:
+					var collider = pellet.get("hit_collider")
+					if collider != null and collider.has_method("take_damage"):
+						var final_damage: float = base_damage_per_pellet * heat_system.get_damage_multiplier() * rarity_mult
+						collider.take_damage(final_damage, peer_id)
+						total_damage_dealt += base_damage_per_pellet
+
+				# Add heat based on total damage actually dealt
+				if total_damage_dealt > 0.0:
+					heat_system.on_damage_dealt(total_damage_dealt)
+
+			elif hit_info.has("shot_end"):
+				# Single-pellet weapon — original path
+				_show_shot_fx.rpc(muzzle_pos, hit_info["shot_end"])
+
+				var collider = hit_info.get("hit_collider")
+				if collider != null and collider.has_method("take_damage"):
+					var base_damage: float = current_weapon.weapon_data.damage
+					var rarity_mult: float = 1.0 + current_weapon.weapon_data.rarity * RARITY_DAMAGE_BONUS
+					var final_damage: float = base_damage * heat_system.get_damage_multiplier() * rarity_mult
+					collider.take_damage(final_damage, peer_id)
+					# Add heat for dealing damage
+					heat_system.on_damage_dealt(base_damage)
 
 
 func _process_normal_movement(delta: float) -> void:
@@ -253,17 +413,19 @@ func _start_slide() -> void:
 	_slide_airborne_timer = 0.0
 	_slide_low_speed_timer = 0.0
 	_slide_smoothed_normal = get_floor_normal() if is_on_floor() else Vector3.UP
-	# Lock slide direction to current movement direction
+	# Lock slide direction to current movement direction — NO speed boost.
+	# Enter at your current speed so it doesn't feel like you get launched.
 	var horiz := Vector2(velocity.x, velocity.z)
 	var horiz_speed := horiz.length()
 	if horiz_speed > 0.01:
 		var dir_2d := horiz.normalized()
-		var boost_speed := maxf(horiz_speed, SLIDE_INITIAL_SPEED)
-		_slide_velocity = Vector3(dir_2d.x * boost_speed, 0.0, dir_2d.y * boost_speed)
+		_slide_velocity = Vector3(dir_2d.x * horiz_speed, 0.0, dir_2d.y * horiz_speed)
+		_slide_forward_dir = _slide_velocity.normalized()
 	else:
-		# Fallback: slide forward
+		# Fallback: slide forward at entry threshold speed
 		var forward := -transform.basis.z
-		_slide_velocity = forward * SLIDE_INITIAL_SPEED
+		_slide_velocity = forward * SLIDE_MIN_ENTRY_SPEED
+		_slide_forward_dir = Vector3(forward.x, 0.0, forward.z).normalized()
 
 	_apply_lowered_pose(SLIDE_CAPSULE_HEIGHT, SLIDE_CAMERA_OFFSET)
 
@@ -302,9 +464,9 @@ func _process_slide(delta: float) -> void:
 	if on_floor and slope_steepness > 0.1 and alignment > 0.0:
 		var redirect_strength := slope_steepness * 2.5 * delta
 		redirect_strength = minf(redirect_strength, 0.5)
-		var spd := _slide_velocity.length()
+		var redirect_spd := _slide_velocity.length()
 		var redirected_dir := slide_dir.lerp(downhill_horiz, redirect_strength).normalized()
-		_slide_velocity = redirected_dir * spd
+		_slide_velocity = redirected_dir * redirect_spd
 		# Recalculate after redirect
 		slide_dir = _slide_velocity.normalized() if _slide_velocity.length() > 0.01 else Vector3.ZERO
 		alignment = slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
@@ -325,10 +487,25 @@ func _process_slide(delta: float) -> void:
 	# Apply force as speed change
 	var spd := _slide_velocity.length()
 	spd = maxf(spd + slope_force * delta, 0.0)
+	# Hard speed cap — prevents runaway downhill acceleration
+	spd = minf(spd, SLIDE_MAX_SPEED)
 	if spd > 0.01 and slide_dir.length() > 0.001:
 		_slide_velocity = slide_dir * spd
 	else:
 		_slide_velocity = Vector3.ZERO
+
+	# --- Kill lateral drift ---
+	# Decompose velocity into forward (original entry direction) and sideways.
+	# Apply heavy friction to the sideways component so it's hard to veer off course.
+	if _slide_velocity.length() > 0.01 and _slide_forward_dir.length() > 0.001:
+		var forward_speed := _slide_velocity.dot(_slide_forward_dir)
+		var forward_component := _slide_forward_dir * forward_speed
+		var lateral_component := _slide_velocity - forward_component
+		lateral_component = lateral_component.move_toward(Vector3.ZERO, SLIDE_LATERAL_FRICTION * delta)
+		_slide_velocity = forward_component + lateral_component
+		# Slowly update the forward direction toward current movement so
+		# downhill gravity redirect still works, but much more gradually
+		_slide_forward_dir = _slide_forward_dir.lerp(_slide_velocity.normalized(), 1.5 * delta).normalized()
 
 	# --- Apply velocity ---
 	velocity.x = _slide_velocity.x
@@ -367,6 +544,7 @@ func _end_slide() -> void:
 	_slide_cooldown_timer = SLIDE_COOLDOWN
 	_slide_low_speed_timer = 0.0
 	_slide_velocity = Vector3.ZERO
+	_slide_forward_dir = Vector3.ZERO
 
 	# Transition to crouch if still holding Ctrl, or if there's no headroom
 	if player_input.action_slide or not _has_headroom():
@@ -473,6 +651,16 @@ func _has_headroom() -> bool:
 	return result.is_empty()
 
 
+func _get_barrel_position() -> Vector3:
+	## Returns the world-space position of the gun barrel tip.
+	## Uses the barrel_offset from WeaponData, transformed by the WeaponMount.
+	if current_weapon and current_weapon.weapon_data:
+		var offset: Vector3 = current_weapon.weapon_data.barrel_offset
+		return weapon_mount.global_transform * offset
+	# Fallback: use camera pivot position (old behavior)
+	return camera_pivot.global_position
+
+
 func _get_camera_aim_target(cam_origin: Vector3, cam_forward: Vector3) -> Vector3:
 	## Raycast from the camera through screen-center to find what the
 	## crosshair is actually pointing at. Returns the hit point, or a
@@ -488,13 +676,76 @@ func _get_camera_aim_target(cam_origin: Vector3, cam_forward: Vector3) -> Vector
 	return far_point
 
 
+func _push_nearby_bubbles() -> void:
+	## Server-only: push nearby bubbles away from the player using impulses.
+	## Jolt already applies collision response forces (player is kinematic,
+	## bubble is dynamic with mass 0.1), so this is a supplemental push
+	## that adds slight upward bias and works at the outer detection edge
+	## before physics contact actually occurs.
+	var projectiles := get_tree().current_scene.get_node_or_null("Projectiles")
+	if projectiles == null:
+		return
+
+	var player_pos := global_position + Vector3(0, 0.9, 0)  # Capsule center
+	var player_speed := velocity.length()
+
+	for child in projectiles.get_children():
+		if not child is RigidBody3D:
+			continue
+		if not child.has_method("apply_push_impulse"):
+			continue
+		if not is_instance_valid(child):
+			continue
+
+		var body: RigidBody3D = child as RigidBody3D
+		var to_bubble := body.global_position - player_pos
+		var dist := to_bubble.length()
+		# Slightly larger than physics contact distance so we push before overlap
+		var push_threshold := 1.4  # 0.4 (player) + 0.6 (bubble) + 0.4 outer margin
+
+		if dist < push_threshold and dist > 0.01:
+			var overlap := 1.0 - (dist / push_threshold)
+			var push_dir := to_bubble.normalized()
+			# Scale with player speed — running shoves harder than standing still
+			var speed_factor := maxf(player_speed * 0.3, 0.5)
+			# Light impulse — Jolt collision response handles the heavy push.
+			# This mainly adds the upward arc and pre-contact nudge.
+			var impulse := push_dir * overlap * speed_factor * 0.4
+			# Upward bias so bubbles arc over the player's head
+			impulse.y += 0.2 * overlap
+			body.apply_push_impulse(impulse)
+
+
 func _client_process(delta: float) -> void:
-	if peer_id == multiplayer.get_unique_id():
+	var is_local := (peer_id == multiplayer.get_unique_id())
+	if is_local:
 		camera_pivot.rotation.x = player_input.look_pitch
 		# Smooth camera height for slide/crouch
-		var lowered := is_sliding or is_crouching
-		var target_cam_y := _original_camera_y + SLIDE_CAMERA_OFFSET if lowered else _original_camera_y
+		var cam_lowered := is_sliding or is_crouching
+		var target_cam_y := _original_camera_y + SLIDE_CAMERA_OFFSET if cam_lowered else _original_camera_y
 		camera_pivot.position.y = lerpf(camera_pivot.position.y, target_cam_y, 10.0 * delta)
+
+		# --- ADS: FOV zoom, spring arm pull-in, scope overlay ---
+		var w_data: WeaponData = null
+		if current_weapon and current_weapon.weapon_data:
+			w_data = current_weapon.weapon_data
+		var target_fov := DEFAULT_FOV
+		var target_spring := DEFAULT_SPRING_LENGTH
+		var show_scope := false
+
+		if is_aiming and w_data and w_data.ads_fov > 0.0:
+			target_fov = w_data.ads_fov
+			target_spring = ADS_SPRING_LENGTH
+			show_scope = w_data.has_scope
+
+		# Smooth FOV transition
+		camera.fov = lerpf(camera.fov, target_fov, ADS_LERP_SPEED * delta)
+		# Smooth spring arm transition (camera distance)
+		spring_arm.spring_length = lerpf(spring_arm.spring_length, target_spring, ADS_LERP_SPEED * delta)
+
+		# Scope overlay
+		_update_scope_overlay(show_scope, delta)
+
 
 	# Smooth mesh scale for all players (slide/crouch visual)
 	var lowered := is_sliding or is_crouching
@@ -584,7 +835,7 @@ func _do_respawn() -> void:
 
 
 func equip_weapon(weapon_data: WeaponData) -> void:
-	## Server-only: equip a weapon by creating a WeaponHitscan node
+	## Server-only: equip a weapon by creating the appropriate weapon node
 	## and syncing visual paths so clients load the 3D model + sound.
 	if current_weapon != null:
 		current_weapon.queue_free()
@@ -592,7 +843,8 @@ func equip_weapon(weapon_data: WeaponData) -> void:
 	if weapon_data.is_hitscan:
 		current_weapon = WeaponHitscan.new()
 	else:
-		current_weapon = WeaponBase.new()
+		# Projectile weapon (e.g. rocket launcher)
+		current_weapon = WeaponProjectileScript.new()
 
 	current_weapon.setup(weapon_data)
 	add_child(current_weapon)
@@ -645,6 +897,13 @@ func _on_item_pickup(world_item: Node) -> void:
 
 	var item_data: ItemData = world_item.item_data
 	if item_data == null:
+		return
+
+	# Fuel pickups: consumed instantly, don't occupy a slot
+	if item_data.item_type == ItemData.ItemType.FUEL and item_data is FuelData:
+		inventory.add_fuel(item_data.fuel_amount)
+		world_item.queue_free()
+		print("Player %d picked up %s (+%.0f fuel)" % [peer_id, item_data.item_name, item_data.fuel_amount])
 		return
 
 	# Shoes go into the dedicated shoe slot
@@ -754,6 +1013,65 @@ func _show_shot_fx(from_pos: Vector3, to_pos: Vector3) -> void:
 	tween.tween_callback(flash.queue_free)
 
 
+@rpc("authority", "call_local", "unreliable")
+func _show_shotgun_fx(from_pos: Vector3, shot_ends: Array[Vector3]) -> void:
+	## Visual effect for multi-pellet weapons: multiple tracer lines + muzzle flash + fire sound.
+
+	# Play fire sound (once per shot, not per pellet)
+	if fire_sound_player and fire_sound_player.stream:
+		if fire_sound_player.playing:
+			var one_shot := AudioStreamPlayer3D.new()
+			one_shot.stream = fire_sound_player.stream
+			one_shot.max_distance = 60.0
+			one_shot.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+			one_shot.top_level = true
+			add_child(one_shot)
+			one_shot.global_position = global_position
+			one_shot.play()
+			one_shot.finished.connect(one_shot.queue_free)
+		else:
+			fire_sound_player.play()
+
+	# Draw all pellet tracers in a single ImmediateMesh for efficiency
+	var tracer := MeshInstance3D.new()
+	var im := ImmediateMesh.new()
+	tracer.mesh = im
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(1.0, 0.9, 0.3, 0.6)
+	mat.emission_enabled = true
+	mat.emission = Color(1.0, 0.8, 0.2)
+	mat.emission_energy_multiplier = 2.0
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	tracer.material_override = mat
+
+	im.surface_begin(Mesh.PRIMITIVE_LINES)
+	for end_pos in shot_ends:
+		im.surface_add_vertex(from_pos)
+		im.surface_add_vertex(end_pos)
+	im.surface_end()
+
+	tracer.top_level = true
+	add_child(tracer)
+
+	# Muzzle flash light (brighter for shotguns)
+	var flash := OmniLight3D.new()
+	flash.light_color = Color(1.0, 0.8, 0.3)
+	flash.light_energy = 8.0
+	flash.omni_range = 4.0
+	flash.top_level = true
+	add_child(flash)
+	flash.global_position = from_pos
+
+	# Fade out and cleanup
+	var tween := get_tree().create_tween()
+	tween.tween_property(mat, "albedo_color:a", 0.0, 0.12)
+	tween.parallel().tween_property(flash, "light_energy", 0.0, 0.1)
+	tween.tween_callback(tracer.queue_free)
+	tween.tween_callback(flash.queue_free)
+
+
 @rpc("any_peer", "call_remote", "reliable")
 func rpc_sacrifice_item(sacrifice_idx: int, target_idx: int) -> void:
 	## Client requests sacrificing one item to extend another.
@@ -789,3 +1107,231 @@ func rpc_equip_from_inventory(index: int) -> void:
 		if stack.item_data is WeaponData:
 			inventory.equip_slot(index)
 			equip_weapon(stack.item_data as WeaponData)
+
+
+@rpc("any_peer", "call_local", "reliable")
+func rpc_slot_ammo(ammo_index: int, weapon_index: int) -> void:
+	## Client requests slotting an ammo module into a weapon.
+	if not multiplayer.is_server():
+		return
+	# Validate sender: remote clients send their ID, host sends 0 (local call)
+	var sender := multiplayer.get_remote_sender_id()
+	if sender != 0 and sender != peer_id:
+		return
+	if inventory == null:
+		return
+
+	# Validate indices
+	if ammo_index < 0 or ammo_index >= inventory.items.size():
+		return
+	if weapon_index < 0 or weapon_index >= inventory.items.size():
+		return
+
+	var ammo_stack: ItemStack = inventory.items[ammo_index]
+	var weapon_stack: ItemStack = inventory.items[weapon_index]
+
+	# Verify types: ammo must be AmmoData OR WeaponData with can_slot_as_ammo
+	var valid_ammo: bool = false
+	if ammo_stack.item_data is AmmoData:
+		valid_ammo = true
+	elif ammo_stack.item_data is WeaponData and ammo_stack.item_data.can_slot_as_ammo:
+		valid_ammo = true
+	if not valid_ammo:
+		return
+	if not weapon_stack.item_data is WeaponData:
+		return
+	# Can't slot a weapon into itself
+	if ammo_index == weapon_index:
+		return
+	# Weapon must accept ammo (some weapons like Bubble and Rubber Ball don't)
+	if not weapon_stack.item_data.can_receive_ammo:
+		return
+
+	# Weapon already has ammo merged — can't merge again
+	if weapon_stack.slotted_ammo != null:
+		return
+
+	# --- Permanent merge: combine timers, consume ammo item ---
+	# Merge burn timers: (weapon_time + ammo_time) * 0.8
+	var merged_time: float = (weapon_stack.burn_time_remaining + ammo_stack.burn_time_remaining) * 0.8
+	weapon_stack.burn_time_remaining = merged_time
+
+	# Set ammo reference on the weapon
+	weapon_stack.slotted_ammo = ammo_stack.item_data
+	weapon_stack.slotted_ammo_source_index = -1  # No source — ammo is consumed
+
+	print("Player %d merged %s into %s (timer: %.0fs)" % [peer_id, ammo_stack.item_data.item_name, weapon_stack.item_data.item_name, merged_time])
+
+	# Remove the ammo item from inventory (consumed permanently)
+	# Must adjust weapon_index if it comes after ammo_index — the weapon_stack
+	# ref is still valid but its position in items[] shifts after removal.
+	if ammo_index < weapon_index:
+		weapon_index -= 1
+	inventory.remove_item(ammo_index)
+
+
+@rpc("any_peer", "call_local", "reliable")
+func rpc_unslot_ammo(_weapon_index: int) -> void:
+	## Ammo merging is permanent — this RPC is now a no-op.
+	## Keeping the method so old clients don't crash.
+	pass
+
+
+## ---- Extend Item Lifespan (F key) ----
+## Spend burn fuel to add time to the equipped weapon. Each press adds a fixed
+## chunk of time, but the cost scales up based on how much fuel has already been
+## spent on this item — up to 2.5x the base cost.
+
+const EXTEND_BASE_COST := 50.0       ## Fuel cost for the first extension press
+const EXTEND_TIME_ADDED := 30.0      ## Seconds added per extension press
+const EXTEND_MAX_COST_MULT := 2.5    ## Maximum cost multiplier after many extensions
+const EXTEND_SCALE_RATE := 0.003     ## How fast cost ramps up per fuel spent (higher = faster)
+
+func _try_extend_equipped_item() -> void:
+	## Server-only: extend the equipped weapon's burn timer by spending fuel.
+	if not multiplayer.is_server():
+		return
+	if inventory.equipped_index < 0 or inventory.equipped_index >= inventory.items.size():
+		return
+
+	var stack: ItemStack = inventory.items[inventory.equipped_index]
+	if stack.item_data == null:
+		return
+
+	# Calculate scaling cost: starts at base, ramps toward base * max_mult
+	# Formula: cost = base * (1 + (max_mult - 1) * (1 - e^(-scale_rate * fuel_spent)))
+	# This gives a smooth curve: cheap at first, expensive after heavy investment.
+	var progress: float = 1.0 - exp(-EXTEND_SCALE_RATE * stack.fuel_spent_extending)
+	var cost_mult: float = 1.0 + (EXTEND_MAX_COST_MULT - 1.0) * progress
+	var fuel_cost: float = EXTEND_BASE_COST * cost_mult
+
+	if not inventory.has_fuel(fuel_cost):
+		return
+
+	inventory.spend_fuel(fuel_cost)
+	stack.burn_time_remaining += EXTEND_TIME_ADDED
+	stack.fuel_spent_extending += fuel_cost
+	print("Player %d extended %s by %.0fs (cost: %.0f fuel, total spent: %.0f)" % [
+		peer_id, stack.item_data.item_name, EXTEND_TIME_ADDED, fuel_cost, stack.fuel_spent_extending])
+
+
+## ---- Scrap Item (X key) ----
+## Scrap a nearby ground item (priority) or the equipped weapon into burn fuel.
+## Rarer items give significantly more fuel.
+
+const SCRAP_FUEL_BY_RARITY := [30.0, 75.0, 175.0, 400.0, 800.0]  # Common → Legendary
+const SCRAP_PICKUP_RANGE := 4.0  ## Max distance to scrap a ground item
+
+func _try_scrap_item() -> void:
+	## Server-only: look for a nearby ground item to scrap first, then fall back
+	## to scrapping the equipped weapon.
+	if not multiplayer.is_server():
+		return
+
+	# Priority 1: scrap a nearby WorldItem on the ground
+	var scrapped_ground := _try_scrap_ground_item()
+	if scrapped_ground:
+		return
+
+	# Priority 2: scrap the equipped weapon
+	if inventory.equipped_index < 0 or inventory.equipped_index >= inventory.items.size():
+		return
+
+	var stack: ItemStack = inventory.items[inventory.equipped_index]
+	if stack.item_data == null:
+		return
+
+	var rarity: int = stack.item_data.rarity
+	var fuel_gained: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
+	# Bonus fuel based on remaining burn time (more time left = more value)
+	fuel_gained += stack.burn_time_remaining * 0.1
+
+	var item_name: String = stack.item_data.item_name
+	var idx := inventory.equipped_index
+
+	# If this was the equipped weapon, drop the weapon node
+	if current_weapon:
+		current_weapon.queue_free()
+		current_weapon = null
+	if _current_gun_model:
+		_current_gun_model.queue_free()
+		_current_gun_model = null
+	equipped_gun_model_path = ""
+	equipped_fire_sound_path = ""
+
+	inventory.remove_item(idx)
+	inventory.add_fuel(fuel_gained)
+	print("Player %d scrapped %s for %.0f fuel" % [peer_id, item_name, fuel_gained])
+
+
+func _try_scrap_ground_item() -> bool:
+	## Look for the nearest WorldItem within range and scrap it for fuel.
+	## Returns true if an item was scrapped.
+	var world_items := get_tree().current_scene.get_node_or_null("WorldItems")
+	if world_items == null:
+		return false
+
+	var player_pos := global_position
+	var best_item: Node = null
+	var best_dist := SCRAP_PICKUP_RANGE
+
+	for child in world_items.get_children():
+		if not child is Area3D or not child.has_method("setup"):
+			continue
+		if not "item_data" in child or child.item_data == null:
+			continue
+		var dist: float = player_pos.distance_to(child.global_position)
+		if dist < best_dist:
+			best_dist = dist
+			best_item = child
+
+	if best_item == null:
+		return false
+
+	var item_data: ItemData = best_item.item_data
+	var rarity: int = item_data.rarity
+	var fuel_gained: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
+	# Bonus fuel based on remaining burn time
+	if "burn_time_remaining" in best_item:
+		fuel_gained += best_item.burn_time_remaining * 0.1
+
+	inventory.add_fuel(fuel_gained)
+	print("Player %d scrapped ground item %s for %.0f fuel" % [peer_id, item_data.item_name, fuel_gained])
+	best_item.queue_free()
+	return true
+
+
+func _update_scope_overlay(scope_visible: bool, delta: float) -> void:
+	## Show/hide the scope overlay vignette when ADS with a scoped weapon.
+	if scope_visible and _scope_overlay == null:
+		# Create scope overlay: dark vignette with a circular cutout feel
+		_scope_overlay = ColorRect.new()
+		_scope_overlay.color = Color(0, 0, 0, 0.0)
+		_scope_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
+		_scope_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		# Add a cross-hair in the scope
+		var scope_hud := get_node_or_null("HUDLayer")
+		if scope_hud:
+			scope_hud.add_child(_scope_overlay)
+			# Add fine crosshair lines
+			var h_line := ColorRect.new()
+			h_line.color = Color(0, 0, 0, 0.8)
+			h_line.set_anchors_preset(Control.PRESET_CENTER)
+			h_line.custom_minimum_size = Vector2(300, 1)
+			h_line.position = Vector2(-150, 0)
+			h_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			_scope_overlay.add_child(h_line)
+			var v_line := ColorRect.new()
+			v_line.color = Color(0, 0, 0, 0.8)
+			v_line.set_anchors_preset(Control.PRESET_CENTER)
+			v_line.custom_minimum_size = Vector2(1, 300)
+			v_line.position = Vector2(0, -150)
+			v_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			_scope_overlay.add_child(v_line)
+
+	if _scope_overlay:
+		var target_alpha := 0.6 if scope_visible else 0.0
+		_scope_overlay.color.a = lerpf(_scope_overlay.color.a, target_alpha, ADS_LERP_SPEED * delta)
+		if not scope_visible and _scope_overlay.color.a < 0.01:
+			_scope_overlay.queue_free()
+			_scope_overlay = null

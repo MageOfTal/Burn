@@ -195,9 +195,15 @@ func _spawn_player(peer_id: int) -> void:
 	player_node.name = str(peer_id)
 	# Set spawn position based on available spawn points
 	var map := get_tree().current_scene
-	var spawn_points := map.get_node("PlayerSpawnPoints").get_children()
-	var spawn_idx := players.size() % spawn_points.size()
-	player_node.position = spawn_points[spawn_idx].position
+	var spawn_container := map.get_node_or_null("PlayerSpawnPoints")
+	var spawn_points: Array[Node] = spawn_container.get_children() if spawn_container else []
+	if spawn_points.size() > 0:
+		var spawn_idx := players.size() % spawn_points.size()
+		player_node.position = spawn_points[spawn_idx].position
+	else:
+		# Terrain hasn't generated spawn points yet — use a safe fallback
+		player_node.position = Vector3(0, 20, 0)
+		push_warning("[Server] No spawn points available yet — spawning at fallback position")
 
 	player_container.add_child(player_node, true)
 	players[peer_id] = player_node

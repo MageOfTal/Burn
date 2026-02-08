@@ -20,3 +20,6 @@ is_hitscan = true
 heat_per_shot = 3.6
 gun_model_path = "res://assets/guns/models/jeg_compound_bow.glb"
 fire_sound_path = "res://assets/guns/sounds/jeg_compound_bow_fire.ogg"
+ads_fov = 35.0
+ads_spread_mult = 0.15
+barrel_offset = Vector3(0.15, 0.3, -0.5)

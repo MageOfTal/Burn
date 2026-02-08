@@ -6,7 +6,7 @@
 script = ExtResource("1")
 item_name = "M16a1"
 item_type = 0
-rarity = 1
+rarity = 2
 description = "M16a1 (mteg)"
 base_burn_rate = 0.4
 initial_burn_time = 150.0
@@ -20,3 +20,5 @@ is_hitscan = true
 heat_per_shot = 2.7
 gun_model_path = "res://assets/guns/models/mteg_m16a1.glb"
 fire_sound_path = "res://assets/guns/sounds/mteg_m16a1_fire.ogg"
+ads_fov = 40.0
+barrel_offset = Vector3(0.1, 0.05, -1.0)

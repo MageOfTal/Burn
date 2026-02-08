@@ -1,0 +1,30 @@
+[gd_resource type="Resource" script_class="WeaponData" load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+[ext_resource type="PackedScene" path="res://weapons/bubble_projectile.tscn" id="2"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Bubble"
+item_type = 0
+rarity = 2
+description = "Blows floating bubbles that block shots. Pop!"
+base_burn_rate = 0.35
+initial_burn_time = 150.0
+burn_cost_to_extend = 1.0
+time_currency_value = 5.0
+damage = 5.0
+fire_rate = 0.4
+weapon_range = 50.0
+spread = 8.0
+is_hitscan = false
+projectile_scene = ExtResource("2")
+heat_per_shot = 0.5
+ads_fov = 50.0
+ads_spread_mult = 0.5
+can_receive_ammo = false
+can_slot_as_ammo = true
+ammo_burn_cost_per_shot = 8.0
+ammo_damage_mult = 0.3
+ammo_explosion_spawn_count = 10
+barrel_offset = Vector3(0.0, 0.0, -0.5)

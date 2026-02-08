@@ -1,0 +1,20 @@
+[gd_resource type="Resource" script_class="AmmoData" load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://items/ammo_data.gd" id="1_script"]
+[ext_resource type="PackedScene" path="res://weapons/bubble_projectile.tscn" id="2_proj"]
+
+[resource]
+script = ExtResource("1_script")
+item_name = "Bubble Ammo"
+item_type = 6
+rarity = 2
+description = "Loads weapons with bubble projectiles. Explosion weapons scatter bubbles."
+base_burn_rate = 0.3
+initial_burn_time = 120.0
+burn_cost_to_extend = 1.0
+time_currency_value = 3.0
+projectile_scene = ExtResource("2_proj")
+burn_cost_per_shot = 8.0
+damage_mult = 0.3
+size_mult = 1.0
+explosion_spawn_count = 10

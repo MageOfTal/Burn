@@ -20,3 +20,7 @@ is_hitscan = true
 heat_per_shot = 7.1
 gun_model_path = "res://assets/guns/models/mteg_awp.glb"
 fire_sound_path = "res://assets/guns/sounds/mteg_awp_fire.ogg"
+ads_fov = 20.0
+ads_spread_mult = 0.05
+has_scope = true
+barrel_offset = Vector3(0.1, 0.1, -1.2)

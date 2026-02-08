@@ -6,7 +6,7 @@
 script = ExtResource("1")
 item_name = "Revolver"
 item_type = 0
-rarity = 0
+rarity = 1
 description = "Revolver (jeg)"
 base_burn_rate = 0.3
 initial_burn_time = 180.0
@@ -20,3 +20,5 @@ is_hitscan = true
 heat_per_shot = 1.8
 gun_model_path = "res://assets/guns/models/jeg_revolver.glb"
 fire_sound_path = "res://assets/guns/sounds/jeg_revolver_fire.ogg"
+ads_fov = 50.0
+barrel_offset = Vector3(0.1, 0.1, -0.6)

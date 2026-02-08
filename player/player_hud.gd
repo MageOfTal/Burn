@@ -7,6 +7,7 @@ extends Control
 @onready var heat_bar: ProgressBar = $MarginContainer/VBoxLeft/HeatBar
 @onready var time_currency_label: Label = $MarginContainer/VBoxLeft/TimeCurrencyLabel
 @onready var shoe_slot_label: Label = $MarginContainer/VBoxLeft/ShoeSlotLabel
+@onready var fuel_label: Label = $MarginContainer/VBoxLeft/FuelLabel
 @onready var inventory_list: VBoxContainer = $MarginContainer/VBoxRight/InventoryList
 @onready var fever_label: Label = $FeverLabel
 @onready var inventory_hint: Label = $MarginContainer/VBoxRight/InventoryHint
@@ -52,6 +53,16 @@ func _process(_delta: float) -> void:
 	if inventory and time_currency_label:
 		time_currency_label.text = "TC: %.0f" % inventory.time_currency
 
+	# Burn fuel gauge
+	if fuel_label and inventory:
+		fuel_label.text = "FUEL: %.0f" % inventory.burn_fuel
+		if inventory.burn_fuel < 100.0:
+			fuel_label.modulate = Color.RED
+		elif inventory.burn_fuel < 300.0:
+			fuel_label.modulate = Color.YELLOW
+		else:
+			fuel_label.modulate = Color(1.0, 0.6, 0.2)  # Orange fire color
+
 	# Fever indicator
 	if fever_label:
 		var heat_sys := _player.get_node_or_null("HeatSystem")
@@ -59,7 +70,7 @@ func _process(_delta: float) -> void:
 
 	# Weapon slot hint
 	if inventory_hint:
-		inventory_hint.text = "1-6: switch weapon"
+		inventory_hint.text = "1-6: switch  |  F: extend  |  X: scrap  |  TAB: inventory"
 
 	_update_shoe_display()
 	_update_inventory_display()

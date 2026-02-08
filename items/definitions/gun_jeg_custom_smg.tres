@@ -20,3 +20,5 @@ is_hitscan = true
 heat_per_shot = 1.0
 gun_model_path = "res://assets/guns/models/jeg_custom_smg.glb"
 fire_sound_path = "res://assets/guns/sounds/jeg_custom_smg_fire.ogg"
+ads_fov = 55.0
+barrel_offset = Vector3(0.1, 0.05, -0.7)

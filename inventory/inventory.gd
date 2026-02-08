@@ -5,10 +5,12 @@ class_name Inventory
 ## All mutations happen on the server. Clients receive updates via RPC.
 
 const MAX_SLOTS := 6
+const STARTING_FUEL := 1000.0
 
 var items: Array[ItemStack] = []
 var time_currency: float = 0.0
 var equipped_index: int = -1
+var burn_fuel: float = STARTING_FUEL  ## Player's burn fuel pool (used to fire weapons)
 
 ## Shoe equipment slot (separate from the 6 item slots)
 var equipped_shoe: ItemStack = null
@@ -19,6 +21,7 @@ signal item_expired(index: int, item_name: String)
 signal inventory_changed
 signal weapon_equipped(index: int)
 signal shoe_changed
+signal fuel_changed(new_amount: float)
 
 
 func add_item(item_data: ItemData) -> int:
@@ -131,6 +134,15 @@ func remove_expired_items() -> Array[String]:
 		if items[i].is_expired():
 			expired_names.append(items[i].item_data.item_name)
 			item_expired.emit(i, items[i].item_data.item_name)
+
+			# Clear ammo references from any weapons that had this item slotted
+			for j in items.size():
+				if items[j].slotted_ammo_source_index == i:
+					items[j].slotted_ammo = null
+					items[j].slotted_ammo_source_index = -1
+				elif items[j].slotted_ammo_source_index > i:
+					items[j].slotted_ammo_source_index -= 1
+
 			items.remove_at(i)
 			# Adjust equipped index
 			if equipped_index == i:
@@ -179,10 +191,32 @@ func get_serialized() -> Array:
 	return result
 
 
+func add_fuel(amount: float) -> void:
+	## Add burn fuel to the player's pool.
+	burn_fuel += amount
+	fuel_changed.emit(burn_fuel)
+
+
+func spend_fuel(amount: float) -> bool:
+	## Spend burn fuel. Returns true if successful, false if insufficient.
+	if burn_fuel < amount:
+		return false
+	burn_fuel -= amount
+	fuel_changed.emit(burn_fuel)
+	return true
+
+
+func has_fuel(amount: float) -> bool:
+	## Check if the player has enough burn fuel.
+	return burn_fuel >= amount
+
+
 func clear_all() -> void:
 	## Remove all items (used on death/respawn).
 	items.clear()
 	equipped_index = -1
 	equipped_shoe = null
+	burn_fuel = STARTING_FUEL
 	shoe_changed.emit()
 	inventory_changed.emit()
+	fuel_changed.emit(burn_fuel)

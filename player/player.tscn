@@ -1,12 +1,13 @@
-[gd_scene load_steps=6 format=3 uid="uid://player001"]
+[gd_scene load_steps=13 format=3 uid="uid://player001"]
 
 [ext_resource type="Script" path="res://player/player.gd" id="1_player"]
 [ext_resource type="Script" path="res://player/player_camera.gd" id="2_camera"]
 [ext_resource type="Script" path="res://player/player_input.gd" id="3_input"]
 [ext_resource type="Script" path="res://inventory/inventory.gd" id="4_inventory"]
 [ext_resource type="Script" path="res://inventory/burn_timer_manager.gd" id="5_burn_timer"]
-[ext_resource type="PackedScene" uid="uid://playerhud001" path="res://player/player_hud.tscn" id="6_hud"]
+[ext_resource type="PackedScene" path="res://player/player_hud.tscn" id="6_hud"]
 [ext_resource type="Script" path="res://player/heat_system.gd" id="7_heat"]
+[ext_resource type="PackedScene" path="res://player/inventory_ui.tscn" id="8_inventory_ui"]
 
 [sub_resource type="CapsuleShape3D" id="CapsuleShape3D_001"]
 radius = 0.4
@@ -50,6 +51,12 @@ properties/9/replication_mode = 1
 properties/10/path = NodePath(".:equipped_fire_sound_path")
 properties/10/spawn = true
 properties/10/replication_mode = 1
+properties/11/path = NodePath(".:is_aiming")
+properties/11/spawn = true
+properties/11/replication_mode = 1
+properties/12/path = NodePath("Inventory:burn_fuel")
+properties/12/spawn = true
+properties/12/replication_mode = 1
 
 [sub_resource type="SceneReplicationConfig" id="InputSyncConfig"]
 properties/0/path = NodePath("PlayerInput:input_direction")
@@ -76,6 +83,18 @@ properties/6/replication_mode = 1
 properties/7/path = NodePath("PlayerInput:action_slide")
 properties/7/spawn = true
 properties/7/replication_mode = 1
+properties/8/path = NodePath("PlayerInput:action_aim")
+properties/8/spawn = true
+properties/8/replication_mode = 1
+properties/9/path = NodePath("PlayerInput:inventory_open")
+properties/9/spawn = true
+properties/9/replication_mode = 1
+properties/10/path = NodePath("PlayerInput:action_extend")
+properties/10/spawn = true
+properties/10/replication_mode = 1
+properties/11/path = NodePath("PlayerInput:action_scrap")
+properties/11/spawn = true
+properties/11/replication_mode = 1
 
 [node name="Player" type="CharacterBody3D"]
 floor_max_angle = 1.0472
@@ -129,3 +148,6 @@ script = ExtResource("5_burn_timer")
 [node name="HUDLayer" type="CanvasLayer" parent="."]
 
 [node name="PlayerHUD" parent="HUDLayer" instance=ExtResource("6_hud")]
+
+[node name="InventoryUI" parent="HUDLayer" instance=ExtResource("8_inventory_ui")]
+visible = false

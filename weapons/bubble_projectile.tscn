@@ -1,0 +1,36 @@
+[gd_scene format=3 uid="uid://bubble001"]
+
+[ext_resource type="Script" path="res://weapons/bubble_projectile.gd" id="1_bubble"]
+
+[sub_resource type="SphereShape3D" id="BubbleCollision"]
+radius = 0.6
+
+[sub_resource type="SphereMesh" id="BubbleMesh"]
+radius = 0.6
+height = 1.2
+radial_segments = 32
+rings = 16
+
+[sub_resource type="PhysicsMaterial" id="BubblePhysMat"]
+bounce = 0.5
+friction = 0.0
+
+[node name="Bubble" type="RigidBody3D"]
+collision_layer = 4
+collision_mask = 1
+mass = 0.1
+gravity_scale = 0.0
+continuous_cd = true
+lock_rotation = true
+linear_damp = 2.5
+angular_damp = 10.0
+contact_monitor = true
+max_contacts_reported = 4
+physics_material_override = SubResource("BubblePhysMat")
+script = ExtResource("1_bubble")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="."]
+shape = SubResource("BubbleCollision")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="."]
+mesh = SubResource("BubbleMesh")

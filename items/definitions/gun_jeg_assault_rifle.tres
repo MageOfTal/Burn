@@ -20,3 +20,5 @@ is_hitscan = true
 heat_per_shot = 2.1
 gun_model_path = "res://assets/guns/models/jeg_assault_rifle.glb"
 fire_sound_path = "res://assets/guns/sounds/jeg_assault_rifle_fire.ogg"
+ads_fov = 45.0
+barrel_offset = Vector3(0.1, 0.05, -0.9)

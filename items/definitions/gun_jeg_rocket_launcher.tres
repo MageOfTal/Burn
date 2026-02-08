@@ -1,22 +1,26 @@
-[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+[gd_resource type="Resource" script_class="WeaponData" load_steps=3 format=3]
 
 [ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+[ext_resource type="PackedScene" path="res://weapons/rocket_projectile.tscn" id="2"]
 
 [resource]
 script = ExtResource("1")
 item_name = "Rocket Launcher"
 item_type = 0
 rarity = 4
-description = "Rocket Launcher (jeg)"
+description = "Fires an explosive rocket. Devastating area damage."
 base_burn_rate = 1.0
 initial_burn_time = 60.0
 burn_cost_to_extend = 1.0
 time_currency_value = 5.0
 damage = 70.0
-fire_rate = 5.00
+fire_rate = 3.00
 weapon_range = 200.0
-spread = 0.8
-is_hitscan = true
+spread = 0.0
+is_hitscan = false
+projectile_scene = ExtResource("2")
 heat_per_shot = 10.0
 gun_model_path = "res://assets/guns/models/jeg_rocket_launcher.glb"
 fire_sound_path = "res://assets/guns/sounds/jeg_rocket_launcher_fire.ogg"
+ads_fov = 50.0
+barrel_offset = Vector3(0.0, 0.1, -1.0)

@@ -1,85 +1,154 @@
 extends Node3D
 
-## Procedural terrain generator using value noise.
-## Generates a heightmap mesh with collision, then scatters walls and ramps
-## as structures on the surface. Also places player spawn points, loot spawns,
-## and target dummies on the terrain.
+## Procedural terrain using Zylann's Voxel Tools GDExtension.
+## Uses VoxelTerrain + VoxelMesherTransvoxel + VoxelGeneratorNoise2D
+## for a smooth, destructible terrain with hills and bumps.
+##
+## The terrain is SDF-based (Signed Distance Field) which means digging
+## creates smooth holes — not blocky Minecraft-style cuts.
+##
+## Key APIs preserved from old system:
+##   - create_crater(pos, radius, depth)  — deforms terrain via VoxelTool
+##   - get_height_at(x, z)                — raycast-based surface query
+##   - get_normal_at(x, z)                — central-difference from height samples
+##
+## Structures (walls, ramps) are spawned on top of the terrain surface.
 
-@export var width: int = 225
-@export var depth: int = 225
-@export var slice_y: float = 64.0
-@export var base_frequency: float = 1.0 / 16.0
-@export var octaves: int = 5
-@export var persistence: float = 0.5
-@export var lacunarity: float = 2.0
-@export var domain_warp_amp: float = 2.0
-@export var domain_warp_freq: float = 1.0 / 128.0
-@export var seed: int = 1029384756
-@export var blend_func: String = "smoothstep"
-@export var gain: float = INF
-@export var bias: float = INF
-@export var height_scale: float = 16.0
-@export var cell_size: float = 1.0
+## Terrain size and shape
+@export_group("Terrain")
+@export var map_size: float = 224.0         ## World units per side (~56 cells × 4m)
+@export var height_scale: float = 16.0      ## Max height variation (meters)
+@export var noise_period: float = 128.0     ## Noise repeat period (larger = broader hills)
+@export var height_range: float = 32.0      ## VoxelGeneratorNoise2D height range
 
 ## Structure generation
 @export_group("Structures")
-@export var num_walls: int = 25
-@export var num_ramps: int = 15
+@export var num_walls: int = 200
+@export var num_ramps: int = 100
 @export var num_player_spawns: int = 8
 @export var num_loot_spawns: int = 30
 @export var num_dummies: int = 8
-@export var structure_margin: float = 15.0  ## Keep structures this far from map edges
+@export var structure_margin: float = 15.0  ## Keep structures this far from edges
 
-const INV_0X7FFFFFFF := 1.0 / 0x7fffffff
-
-## Cached height field for surface queries
-var _heights: PackedFloat32Array
+## Internal refs
+var _voxel_terrain: VoxelTerrain = null
+var _voxel_tool: VoxelTool = null
 var _terrain_ready := false
 
 
 func _ready() -> void:
-	_heights = _generate_height_field()
-	var mesh := _build_heightmap_mesh(_heights)
+	# --- Create VoxelTerrain node ---
+	_voxel_terrain = VoxelTerrain.new()
+	_voxel_terrain.name = "VoxelTerrainNode"
 
-	# --- Terrain visual ---
-	var mi := MeshInstance3D.new()
-	mi.name = "TerrainMesh"
-	mi.mesh = mesh
+	# --- Mesher: Transvoxel for smooth terrain ---
+	var mesher := VoxelMesherTransvoxel.new()
+	_voxel_terrain.mesher = mesher
 
+	# --- Generator: Noise2D for hilly terrain ---
+	var generator := VoxelGeneratorNoise2D.new()
+	var noise := FastNoiseLite.new()
+	noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	noise.frequency = 1.0 / noise_period
+	noise.fractal_octaves = 4
+	noise.fractal_lacunarity = 2.0
+	noise.fractal_gain = 0.45
+	noise.seed = 10293847
+	generator.noise = noise
+	# height_start: Y position of the lowest terrain surface.
+	# height_range: vertical span the noise covers above height_start.
+	# So terrain surface lives between Y=0 and Y=height_range.
+	generator.height_start = 0.0
+	generator.height_range = height_range
+	# Channel must be SDF for smooth Transvoxel meshing (should be default, but be explicit)
+	generator.channel = VoxelBuffer.CHANNEL_SDF
+	_voxel_terrain.generator = generator
+
+	# --- Terrain settings ---
+	_voxel_terrain.mesh_block_size = 16
+	_voxel_terrain.max_view_distance = 256
+	_voxel_terrain.generate_collisions = true
+	_voxel_terrain.collision_layer = 1   # Layer 1 — world geometry
+	_voxel_terrain.collision_mask = 0    # Static terrain doesn't collide with anything itself
+
+	# Constrain terrain to our map area (prevent infinite generation).
+	# Bounds AABB is in data-block coordinates (each block = mesh_block_size voxels).
+	# With mesh_block_size=16, one block covers 16 voxels = 16 world units.
+	var half_extent := map_size * 0.5
+	_voxel_terrain.bounds = AABB(
+		Vector3(-half_extent, -64.0, -half_extent),
+		Vector3(map_size, 128.0, map_size)
+	)
+
+	# --- Terrain material ---
+	# Use a simple green material. For triplanar mapping in the future,
+	# this can be replaced with a ShaderMaterial.
 	var mat := StandardMaterial3D.new()
-	mat.shading_mode = StandardMaterial3D.SHADING_MODE_PER_PIXEL
 	mat.albedo_color = Color(0.25, 0.65, 0.35)
-	mi.material_override = mat
-	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
-	add_child(mi)
+	_voxel_terrain.material_override = mat
 
-	# --- Terrain collision ---
-	var static_body := StaticBody3D.new()
-	static_body.name = "TerrainBody"
-	add_child(static_body)
+	add_child(_voxel_terrain)
 
-	var col_shape := CollisionShape3D.new()
-	var trimesh := ConcavePolygonShape3D.new()
-	trimesh.set_faces(mesh.get_faces())
-	col_shape.shape = trimesh
-	static_body.add_child(col_shape)
+	# Get the VoxelTool for editing (digging, craters)
+	_voxel_tool = _voxel_terrain.get_voxel_tool()
 
 	# --- Directional light ---
 	if not get_parent().has_node("Sun"):
 		var sun := DirectionalLight3D.new()
 		sun.name = "Sun"
 		sun.light_color = Color(1, 1, 0.95)
-		sun.light_energy = 1.5
+		sun.light_energy = 0.8
 		sun.shadow_enabled = true
-		sun.directional_shadow_max_distance = maxf(width, depth) * cell_size * 2.0
+		sun.directional_shadow_max_distance = map_size * 2.0
 		sun.rotation_degrees = Vector3(-50, -45, 0)
 		add_child(sun)
 
+	# --- Sky + Environment ---
+	if not get_parent().has_node("WorldEnvironment"):
+		var sky_mat := ProceduralSkyMaterial.new()
+		sky_mat.sky_top_color = Color(0.3, 0.5, 0.88)          # Bright blue top
+		sky_mat.sky_horizon_color = Color(0.6, 0.72, 0.9)     # Lighter blue horizon
+		sky_mat.ground_bottom_color = Color(0.22, 0.32, 0.14) # Dark ground
+		sky_mat.ground_horizon_color = Color(0.45, 0.55, 0.4) # Greenish horizon
+		sky_mat.sky_curve = 0.15
+		sky_mat.ground_curve = 0.02
+		sky_mat.sky_energy_multiplier = 0.5
+		sky_mat.use_debanding = true
+
+		var sky := Sky.new()
+		sky.sky_material = sky_mat
+		sky.radiance_size = Sky.RADIANCE_SIZE_256
+
+		var env := Environment.new()
+		env.background_mode = Environment.BG_SKY
+		env.sky = sky
+		env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+		env.ambient_light_sky_contribution = 0.2
+		env.ambient_light_energy = 0.3
+		env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+		env.tonemap_white = 1.0
+		env.tonemap_exposure = 0.9
+		# Subtle distant fog only — very low density to avoid white haze
+		env.fog_enabled = true
+		env.fog_light_color = Color(0.5, 0.6, 0.75)
+		env.fog_density = 0.0003
+		env.fog_sky_affect = 0.05
+		env.fog_height = 80.0
+		env.fog_height_density = 0.003
+
+		var world_env := WorldEnvironment.new()
+		world_env.name = "WorldEnvironment"
+		world_env.environment = env
+		get_parent().add_child.call_deferred(world_env)
+
 	_terrain_ready = true
 
-	# --- Spawn structures and points ---
+	# --- Spawn structures after terrain is ready ---
+	# Wait for chunks to load and mesh before placing structures
+	await get_tree().create_timer(1.5).timeout
+
 	var rng := RandomNumberGenerator.new()
-	rng.seed = seed
+	rng.seed = 10293847
 
 	var structures_node := Node3D.new()
 	structures_node.name = "Structures"
@@ -93,39 +162,26 @@ func _ready() -> void:
 
 
 # ======================================================================
-#  Height query
+#  Height query — raycast from above to find terrain surface
 # ======================================================================
 
 func get_height_at(world_x: float, world_z: float) -> float:
-	## Returns the interpolated terrain height at the given world XZ position.
-	var gx: float = world_x / cell_size
-	var gz: float = world_z / cell_size
-	var x0: int = int(floor(gx))
-	var z0: int = int(floor(gz))
-	var x1: int = x0 + 1
-	var z1: int = z0 + 1
-
-	x0 = clampi(x0, 0, width - 1)
-	x1 = clampi(x1, 0, width - 1)
-	z0 = clampi(z0, 0, depth - 1)
-	z1 = clampi(z1, 0, depth - 1)
-
-	var fx: float = gx - float(x0)
-	var fz: float = gz - float(z0)
-
-	var h00: float = _heights[z0 * width + x0]
-	var h10: float = _heights[z0 * width + x1]
-	var h01: float = _heights[z1 * width + x0]
-	var h11: float = _heights[z1 * width + x1]
-
-	var h0: float = h00 + fx * (h10 - h00)
-	var h1: float = h01 + fx * (h11 - h01)
-	return h0 + fz * (h1 - h0)
+	## Returns the terrain height at the given world XZ position.
+	## Uses a physics raycast from high above to find the surface.
+	var space_state := get_world_3d().direct_space_state
+	var from := Vector3(world_x, 100.0, world_z)
+	var to := Vector3(world_x, -100.0, world_z)
+	var query := PhysicsRayQueryParameters3D.create(from, to)
+	query.collision_mask = 1  # World geometry only
+	var result := space_state.intersect_ray(query)
+	if not result.is_empty():
+		return result.position.y
+	return 0.0
 
 
 func get_normal_at(world_x: float, world_z: float) -> Vector3:
 	## Returns the approximate surface normal at the given world XZ position.
-	var eps := cell_size
+	var eps := 2.0
 	var hL := get_height_at(world_x - eps, world_z)
 	var hR := get_height_at(world_x + eps, world_z)
 	var hD := get_height_at(world_x, world_z - eps)
@@ -135,8 +191,9 @@ func get_normal_at(world_x: float, world_z: float) -> Vector3:
 
 func _get_random_surface_pos(rng: RandomNumberGenerator) -> Vector3:
 	## Pick a random XZ position within margins, return the surface point.
-	var x := rng.randf_range(structure_margin, (width - 1) * cell_size - structure_margin)
-	var z := rng.randf_range(structure_margin, (depth - 1) * cell_size - structure_margin)
+	var half := map_size * 0.5
+	var x := rng.randf_range(-half + structure_margin, half - structure_margin)
+	var z := rng.randf_range(-half + structure_margin, half - structure_margin)
 	var y := get_height_at(x, z)
 	return Vector3(x, y, z)
 
@@ -144,54 +201,81 @@ func _get_random_surface_pos(rng: RandomNumberGenerator) -> Vector3:
 func _get_slope_at(world_x: float, world_z: float) -> float:
 	## Returns the slope angle in degrees at the given position.
 	var n := get_normal_at(world_x, world_z)
-	return rad_to_deg(acos(n.dot(Vector3.UP)))
+	return rad_to_deg(acos(clampf(n.dot(Vector3.UP), -1.0, 1.0)))
 
 
 # ======================================================================
-#  Structure spawning
+#  Terrain deformation (craters) via VoxelTool
+# ======================================================================
+
+func create_crater(world_pos: Vector3, radius: float, _crater_depth: float) -> void:
+	## Deform the terrain to create a crater at the given world position.
+	## Uses VoxelTool.do_sphere() with MODE_REMOVE for smooth SDF subtraction.
+	## Server calls this, then syncs to clients.
+	if _voxel_tool == null:
+		return
+
+	_apply_crater(world_pos, radius)
+
+	if multiplayer.is_server():
+		_sync_crater.rpc(world_pos, radius)
+
+
+@rpc("authority", "call_remote", "reliable")
+func _sync_crater(world_pos: Vector3, radius: float) -> void:
+	## Client-side: apply the same crater deformation locally.
+	_apply_crater(world_pos, radius)
+
+
+func _apply_crater(world_pos: Vector3, radius: float) -> void:
+	## Internal: remove a sphere of terrain at the given position.
+	if _voxel_tool == null:
+		return
+	_voxel_tool.mode = VoxelTool.MODE_REMOVE
+	_voxel_tool.do_sphere(world_pos, radius)
+
+
+# ======================================================================
+#  Structure spawning (walls, ramps, spawns, loot, dummies)
 # ======================================================================
 
 func _spawn_walls(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn wall structures on the terrain surface.
+	## Spawn destructible walls with random tiers on the terrain surface.
+	var wall_scene := preload("res://world/destructible_wall.tscn")
 	var wall_sizes := [
 		Vector3(10, 4, 1),
 		Vector3(8, 3, 1),
 		Vector3(12, 5, 1),
-		Vector3(6, 3, 1.5),
+		Vector3(6, 3, 2),
 		Vector3(14, 4, 1),
 	]
-	var wall_mat := StandardMaterial3D.new()
-	wall_mat.albedo_color = Color(0.6, 0.55, 0.5, 1)
+	var tier_weights := [0.30, 0.35, 0.25, 0.10]
 
 	for i in num_walls:
 		var pos := _get_random_surface_pos(rng)
 		var slope := _get_slope_at(pos.x, pos.z)
-		# Skip very steep spots for walls
 		if slope > 30.0:
 			continue
 
 		var wall_size: Vector3 = wall_sizes[rng.randi() % wall_sizes.size()]
 		var y_rot := rng.randf_range(0, TAU)
 
-		var wall := StaticBody3D.new()
+		var roll := rng.randf()
+		var tier: int = 0
+		var cumulative := 0.0
+		for t in tier_weights.size():
+			cumulative += tier_weights[t]
+			if roll <= cumulative:
+				tier = t
+				break
+
+		var wall: Node3D = wall_scene.instantiate()
 		wall.name = "Wall_%d" % i
-		# Place wall so its bottom sits on the terrain
+		wall.wall_size = wall_size
+		wall.wall_tier = tier
 		wall.position = Vector3(pos.x, pos.y + wall_size.y * 0.5, pos.z)
 		wall.rotation.y = y_rot
 		parent.add_child(wall)
-
-		var col := CollisionShape3D.new()
-		var box_shape := BoxShape3D.new()
-		box_shape.size = wall_size
-		col.shape = box_shape
-		wall.add_child(col)
-
-		var mesh_inst := MeshInstance3D.new()
-		var box_mesh := BoxMesh.new()
-		box_mesh.size = wall_size
-		mesh_inst.mesh = box_mesh
-		mesh_inst.material_override = wall_mat
-		wall.add_child(mesh_inst)
 
 
 func _spawn_ramps(rng: RandomNumberGenerator, parent: Node3D) -> void:
@@ -205,7 +289,6 @@ func _spawn_ramps(rng: RandomNumberGenerator, parent: Node3D) -> void:
 	for i in num_ramps:
 		var pos := _get_random_surface_pos(rng)
 		var slope := _get_slope_at(pos.x, pos.z)
-		# Ramps work best on gentler terrain
 		if slope > 25.0:
 			continue
 
@@ -241,16 +324,13 @@ func _spawn_player_spawns(rng: RandomNumberGenerator) -> void:
 		container.name = "PlayerSpawnPoints"
 		get_parent().add_child(container)
 
-	# Remove any existing static spawn points
 	for child in container.get_children():
 		child.queue_free()
 
 	for i in num_player_spawns:
 		var pos := _get_random_surface_pos(rng)
 		var slope := _get_slope_at(pos.x, pos.z)
-		# Players should spawn on flat-ish ground
 		if slope > 20.0:
-			# Try again with a new position (simple retry)
 			pos = _get_random_surface_pos(rng)
 
 		var marker := Marker3D.new()
@@ -267,7 +347,6 @@ func _spawn_loot_points(rng: RandomNumberGenerator) -> void:
 		container.name = "LootSpawnPoints"
 		get_parent().add_child(container)
 
-	# Remove any existing static loot points
 	for child in container.get_children():
 		child.queue_free()
 
@@ -291,7 +370,6 @@ func _spawn_dummies(rng: RandomNumberGenerator) -> void:
 		container.name = "Dummies"
 		get_parent().add_child(container)
 
-	# Remove any existing static dummies
 	for child in container.get_children():
 		child.queue_free()
 
@@ -305,210 +383,3 @@ func _spawn_dummies(rng: RandomNumberGenerator) -> void:
 		dummy.name = "Dummy%d" % (i + 1)
 		dummy.position = pos
 		container.add_child(dummy)
-
-
-# ======================================================================
-#  Noise core (ported from Python)
-# ======================================================================
-
-func _hash_3d(x: int, y: int, z: int, s: int) -> float:
-	var n: int = (x << 17) ^ (y << 9) ^ (z << 3) ^ s
-	n = (n ^ (n >> 15)) * 0x85ebca6b
-	n = (n ^ (n >> 13)) * 0xc2b2ae35
-	n = n ^ (n >> 16)
-	return float(n & 0x7fffffff) * INV_0X7FFFFFFF
-
-
-func _value_noise_3d(x: float, y: float, z: float, s: int, blend_mode: String) -> float:
-	var x0: int = int(floor(x))
-	var y0: int = int(floor(y))
-	var z0: int = int(floor(z))
-	var xf: float = x - x0
-	var yf: float = y - y0
-	var zf: float = z - z0
-	var u: float
-	var v: float
-	var w: float
-
-	if blend_mode == "smoothstep":
-		var xf2: float = xf * xf
-		var xf3: float = xf2 * xf
-		var yf2: float = yf * yf
-		var yf3: float = yf2 * yf
-		var zf2: float = zf * zf
-		var zf3: float = zf2 * zf
-		u = xf3 * (xf * (xf * 6.0 - 15.0) + 10.0)
-		v = yf3 * (yf * (yf * 6.0 - 15.0) + 10.0)
-		w = zf3 * (zf * (zf * 6.0 - 15.0) + 10.0)
-	else:
-		var xf2c: float = xf * xf
-		var yf2c: float = yf * yf
-		var zf2c: float = zf * zf
-		u = xf2c * (3.0 - 2.0 * xf)
-		v = yf2c * (3.0 - 2.0 * yf)
-		w = zf2c * (3.0 - 2.0 * zf)
-
-	var x1: int = x0 + 1
-	var y1: int = y0 + 1
-	var z1: int = z0 + 1
-	var n000: float = _hash_3d(x0, y0, z0, s)
-	var n100: float = _hash_3d(x1, y0, z0, s)
-	var n010: float = _hash_3d(x0, y1, z0, s)
-	var n110: float = _hash_3d(x1, y1, z0, s)
-	var n001: float = _hash_3d(x0, y0, z1, s)
-	var n101: float = _hash_3d(x1, y0, z1, s)
-	var n011: float = _hash_3d(x0, y1, z1, s)
-	var n111: float = _hash_3d(x1, y1, z1, s)
-	var nx00: float = n000 + u * (n100 - n000)
-	var nx10: float = n010 + u * (n110 - n010)
-	var nx01: float = n001 + u * (n101 - n001)
-	var nx11: float = n011 + u * (n111 - n011)
-	var nxy0: float = nx00 + v * (nx10 - nx00)
-	var nxy1: float = nx01 + v * (nx11 - nx01)
-	return nxy0 + w * (nxy1 - nxy0)
-
-
-func _apply_gain_bias(val: float, g: float, b: float) -> float:
-	var vv: float = (val + 1.0) * 0.5
-	if b != INF and b != 0.0:
-		var denom: float = (1.0 / b - 2.0) * (1.0 - vv) + 1.0
-		vv = vv / denom if denom != 0.0 else vv
-	if g != INF:
-		if vv < 0.5:
-			var vv2: float = 2.0 * vv
-			var denom2: float = (1.0 / g - 2.0) * (1.0 - vv2) + 1.0
-			vv = (vv2 / denom2 if denom2 != 0.0 else vv2) * 0.5
-		else:
-			var vv2: float = 2.0 - 2.0 * vv
-			var denom3: float = (1.0 / g - 2.0) * (1.0 - vv2) + 1.0
-			vv = 1.0 - (vv2 / denom3 if denom3 != 0.0 else vv2) * 0.5
-	return vv * 2.0 - 1.0
-
-
-func _fractal_value_noise(x: float, y: float, z: float, s: int, blend_mode: String) -> float:
-	var fx: float = x
-	var fy: float = y
-	var fz: float = z
-	if domain_warp_amp > 0.0:
-		var f: float = domain_warp_freq
-		fx += _value_noise_3d(x * f, y * f, z * f, s + 0x123456, blend_mode) * domain_warp_amp
-		fy += _value_noise_3d((x + 100.0) * f, (y + 100.0) * f, (z + 100.0) * f, s + 0x654321, blend_mode) * domain_warp_amp
-		fz += _value_noise_3d((x + 200.0) * f, (y + 200.0) * f, (z + 200.0) * f, s + 0xABCDEF, blend_mode) * domain_warp_amp
-	var amplitude: float = 1.0
-	var frequency: float = 1.0
-	var total: float = 0.0
-	var max_amp: float = 0.0
-	for i in octaves:
-		var n: float = _value_noise_3d(fx * frequency, fy * frequency, fz * frequency, s + i * 0x9E3779B9, blend_mode)
-		total += n * amplitude
-		max_amp += amplitude
-		amplitude *= persistence
-		frequency *= lacunarity
-	if max_amp != 0.0:
-		total /= max_amp
-	if gain != INF or bias != INF:
-		total = _apply_gain_bias(total, gain, bias)
-	return clampf(total, -1.0, 1.0)
-
-
-# ======================================================================
-#  Mesh generation
-# ======================================================================
-
-func _generate_height_field() -> PackedFloat32Array:
-	var out := PackedFloat32Array()
-	out.resize(width * depth)
-	for z in depth:
-		for x in width:
-			var n: float = _fractal_value_noise(
-				float(x) * base_frequency,
-				slice_y,
-				float(z) * base_frequency,
-				seed,
-				blend_func
-			)
-			out[z * width + x] = n * height_scale
-	return out
-
-
-func _compute_vertex_normals(heights: PackedFloat32Array) -> Array[Vector3]:
-	## Pre-compute smooth per-vertex normals from the heightfield.
-	## Each normal is derived from the slope to neighboring vertices.
-	var normals: Array[Vector3] = []
-	normals.resize(width * depth)
-
-	for z in depth:
-		for x in width:
-			# Sample neighboring heights (clamped at edges)
-			var xL: int = maxi(x - 1, 0)
-			var xR: int = mini(x + 1, width - 1)
-			var zD: int = maxi(z - 1, 0)
-			var zU: int = mini(z + 1, depth - 1)
-
-			var hL: float = heights[z * width + xL]
-			var hR: float = heights[z * width + xR]
-			var hD: float = heights[zD * width + x]
-			var hU: float = heights[zU * width + x]
-
-			# Central difference: tangent in X and Z, cross product gives normal
-			var dx: float = (xR - xL) * cell_size
-			var dz: float = (zU - zD) * cell_size
-			var n: Vector3 = Vector3(
-				(hL - hR) / dx * 2.0 * cell_size,
-				2.0,
-				(hD - hU) / dz * 2.0 * cell_size
-			).normalized()
-			normals[z * width + x] = n
-
-	return normals
-
-
-func _build_heightmap_mesh(heights: PackedFloat32Array) -> ArrayMesh:
-	var st := SurfaceTool.new()
-	st.begin(Mesh.PRIMITIVE_TRIANGLES)
-
-	# Pre-compute smooth normals so terrain isn't flat-shaded
-	var normals: Array[Vector3] = _compute_vertex_normals(heights)
-
-	var max_x: int = width - 1
-	var max_z: int = depth - 1
-	for z in max_z:
-		for x in max_x:
-			var i00: int = z * width + x
-			var i10: int = i00 + 1
-			var i01: int = i00 + width
-			var i11: int = i01 + 1
-			var p00: Vector3 = Vector3(x * cell_size, heights[i00], z * cell_size)
-			var p10: Vector3 = Vector3((x + 1) * cell_size, heights[i10], z * cell_size)
-			var p01: Vector3 = Vector3(x * cell_size, heights[i01], (z + 1) * cell_size)
-			var p11: Vector3 = Vector3((x + 1) * cell_size, heights[i11], (z + 1) * cell_size)
-
-			# Smooth per-vertex normals
-			var nm00: Vector3 = normals[i00]
-			var nm10: Vector3 = normals[i10]
-			var nm01: Vector3 = normals[i01]
-			var nm11: Vector3 = normals[i11]
-
-			# Triangle 1: p00, p10, p01
-			st.set_normal(nm00)
-			st.set_uv(Vector2(x / float(max_x), z / float(max_z)))
-			st.add_vertex(p00)
-			st.set_normal(nm10)
-			st.set_uv(Vector2((x + 1) / float(max_x), z / float(max_z)))
-			st.add_vertex(p10)
-			st.set_normal(nm01)
-			st.set_uv(Vector2(x / float(max_x), (z + 1) / float(max_z)))
-			st.add_vertex(p01)
-
-			# Triangle 2: p10, p11, p01
-			st.set_normal(nm10)
-			st.set_uv(Vector2((x + 1) / float(max_x), z / float(max_z)))
-			st.add_vertex(p10)
-			st.set_normal(nm11)
-			st.set_uv(Vector2((x + 1) / float(max_x), (z + 1) / float(max_z)))
-			st.add_vertex(p11)
-			st.set_normal(nm01)
-			st.set_uv(Vector2(x / float(max_x), (z + 1) / float(max_z)))
-			st.add_vertex(p01)
-
-	return st.commit()
