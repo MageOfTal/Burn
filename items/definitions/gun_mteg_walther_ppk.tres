@@ -1,0 +1,22 @@
+[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Walther Ppk"
+item_type = 0
+rarity = 1
+description = "Walther Ppk (mteg)"
+base_burn_rate = 0.4
+initial_burn_time = 150.0
+burn_cost_to_extend = 1.0
+time_currency_value = 5.0
+damage = 13.8
+fire_rate = 0.15
+weapon_range = 120.0
+spread = 3.2
+is_hitscan = true
+heat_per_shot = 2.0
+gun_model_path = "res://assets/guns/models/mteg_walther_ppk.glb"
+fire_sound_path = "res://assets/guns/sounds/mteg_walther_ppk_fire.ogg"

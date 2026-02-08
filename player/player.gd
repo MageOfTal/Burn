@@ -46,6 +46,13 @@ var is_alive: bool = true
 var current_weapon: WeaponBase = null
 var _respawn_timer: float = 0.0
 
+## Synced weapon visual paths — clients use these to load 3D model + sound
+var equipped_gun_model_path: String = ""
+var equipped_fire_sound_path: String = ""
+var _current_gun_model: Node3D = null
+var _last_synced_gun_model_path: String = ""
+var _last_synced_fire_sound_path: String = ""
+
 ## Slide/crouch state (server-managed, synced to clients)
 var is_sliding: bool = false
 var is_crouching: bool = false
@@ -68,6 +75,8 @@ var _original_mesh_scale_y: float = 1.0
 @onready var inventory: Inventory = $Inventory
 @onready var heat_system: HeatSystem = $HeatSystem
 @onready var player_hud: Control = $HUDLayer/PlayerHUD
+@onready var weapon_mount: Node3D = $WeaponMount
+@onready var fire_sound_player: AudioStreamPlayer3D = $FireSoundPlayer
 
 signal player_killed(victim_id: int, killer_id: int)
 
@@ -496,6 +505,15 @@ func _client_process(delta: float) -> void:
 
 	# Update mesh visibility based on alive state
 	body_mesh.visible = is_alive
+	weapon_mount.visible = is_alive
+
+	# Check if synced weapon visuals changed — load new model/sound on clients
+	if equipped_gun_model_path != _last_synced_gun_model_path:
+		_last_synced_gun_model_path = equipped_gun_model_path
+		_load_gun_model(equipped_gun_model_path)
+	if equipped_fire_sound_path != _last_synced_fire_sound_path:
+		_last_synced_fire_sound_path = equipped_fire_sound_path
+		_load_fire_sound(equipped_fire_sound_path)
 
 
 func take_damage(amount: float, attacker_id: int) -> void:
@@ -530,6 +548,11 @@ func die(killer_id: int) -> void:
 	if current_weapon:
 		current_weapon.queue_free()
 		current_weapon = null
+	if _current_gun_model:
+		_current_gun_model.queue_free()
+		_current_gun_model = null
+	equipped_gun_model_path = ""
+	equipped_fire_sound_path = ""
 	# Reset heat
 	heat_system.reset()
 	# Give the killer heat for the kill
@@ -561,7 +584,8 @@ func _do_respawn() -> void:
 
 
 func equip_weapon(weapon_data: WeaponData) -> void:
-	## Server-only: equip a weapon by creating a WeaponHitscan node.
+	## Server-only: equip a weapon by creating a WeaponHitscan node
+	## and syncing visual paths so clients load the 3D model + sound.
 	if current_weapon != null:
 		current_weapon.queue_free()
 
@@ -572,6 +596,44 @@ func equip_weapon(weapon_data: WeaponData) -> void:
 
 	current_weapon.setup(weapon_data)
 	add_child(current_weapon)
+
+	# Sync weapon visual paths — clients will pick these up and load the model
+	equipped_gun_model_path = weapon_data.gun_model_path
+	equipped_fire_sound_path = weapon_data.fire_sound_path
+
+	# Server also loads the model (for other players to see)
+	_load_gun_model(weapon_data.gun_model_path)
+	_load_fire_sound(weapon_data.fire_sound_path)
+
+
+func _load_gun_model(model_path: String) -> void:
+	## Load a .glb gun model and attach it to the weapon mount.
+	# Remove old model
+	if _current_gun_model != null:
+		_current_gun_model.queue_free()
+		_current_gun_model = null
+
+	if model_path.is_empty() or not ResourceLoader.exists(model_path):
+		return
+
+	var scene: PackedScene = load(model_path)
+	if scene == null:
+		return
+
+	_current_gun_model = scene.instantiate()
+	# Scale the model down to a reasonable size — .glb imports can vary
+	_current_gun_model.scale = Vector3(0.15, 0.15, 0.15)
+	weapon_mount.add_child(_current_gun_model)
+
+
+func _load_fire_sound(sound_path: String) -> void:
+	## Load a fire sound .ogg into the AudioStreamPlayer3D.
+	if sound_path.is_empty() or not ResourceLoader.exists(sound_path):
+		fire_sound_player.stream = null
+		return
+
+	var stream: AudioStream = load(sound_path)
+	fire_sound_player.stream = stream
 
 
 func _on_item_pickup(world_item: Node) -> void:
@@ -633,7 +695,25 @@ func _drop_item_as_world_item(stack: ItemStack) -> void:
 
 @rpc("authority", "call_local", "unreliable")
 func _show_shot_fx(from_pos: Vector3, to_pos: Vector3) -> void:
-	## Visual effect: tracer line + muzzle flash. Runs on all clients.
+	## Visual effect: tracer line + muzzle flash + fire sound. Runs on all clients.
+
+	# Play fire sound
+	if fire_sound_player and fire_sound_player.stream:
+		# If already playing, don't cut off — let rapid-fire overlap
+		if fire_sound_player.playing:
+			# Spawn a one-shot audio player for overlapping sounds
+			var one_shot := AudioStreamPlayer3D.new()
+			one_shot.stream = fire_sound_player.stream
+			one_shot.max_distance = 60.0
+			one_shot.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+			one_shot.top_level = true
+			add_child(one_shot)
+			one_shot.global_position = global_position
+			one_shot.play()
+			one_shot.finished.connect(one_shot.queue_free)
+		else:
+			fire_sound_player.play()
+
 	# Tracer line using ImmediateMesh
 	var tracer := MeshInstance3D.new()
 	var im := ImmediateMesh.new()

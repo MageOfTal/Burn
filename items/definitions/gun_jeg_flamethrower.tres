@@ -1,0 +1,22 @@
+[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Flamethrower"
+item_type = 0
+rarity = 0
+description = "Flamethrower (jeg)"
+base_burn_rate = 0.3
+initial_burn_time = 180.0
+burn_cost_to_extend = 1.0
+time_currency_value = 5.0
+damage = 3.9
+fire_rate = 0.05
+weapon_range = 20.0
+spread = 16.0
+is_hitscan = true
+heat_per_shot = 0.6
+gun_model_path = "res://assets/guns/models/jeg_flamethrower.glb"
+fire_sound_path = "res://assets/guns/sounds/jeg_flamethrower_fire.ogg"

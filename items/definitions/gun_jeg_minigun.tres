@@ -1,0 +1,22 @@
+[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Minigun"
+item_type = 0
+rarity = 0
+description = "Minigun (jeg)"
+base_burn_rate = 0.3
+initial_burn_time = 180.0
+burn_cost_to_extend = 1.0
+time_currency_value = 5.0
+damage = 5.2
+fire_rate = 0.05
+weapon_range = 120.0
+spread = 8.0
+is_hitscan = true
+heat_per_shot = 0.7
+gun_model_path = "res://assets/guns/models/jeg_minigun.glb"
+fire_sound_path = "res://assets/guns/sounds/jeg_minigun_fire.ogg"

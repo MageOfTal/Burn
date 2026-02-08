@@ -14,3 +14,9 @@ class_name WeaponData
 @export_group("Heat")
 ## How much heat each shot generates.
 @export var heat_per_shot: float = 2.0
+
+@export_group("Visuals")
+## Path to the .glb gun model (res:// path).
+@export var gun_model_path: String = ""
+## Path to the fire sound .ogg (res:// path).
+@export var fire_sound_path: String = ""

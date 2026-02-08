@@ -1,0 +1,22 @@
+[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Hog Bonker"
+item_type = 0
+rarity = 3
+description = "Hog Bonker (mteg)"
+base_burn_rate = 0.7
+initial_burn_time = 90.0
+burn_cost_to_extend = 1.0
+time_currency_value = 5.0
+damage = 33.8
+fire_rate = 0.05
+weapon_range = 82.5
+spread = 20.0
+is_hitscan = true
+heat_per_shot = 4.8
+gun_model_path = "res://assets/guns/models/mteg_hog_bonker.glb"
+fire_sound_path = "res://assets/guns/sounds/mteg_hog_bonker_fire.ogg"

@@ -1,0 +1,22 @@
+[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Double Barrel Shotgun"
+item_type = 0
+rarity = 3
+description = "Double Barrel Shotgun (jeg)"
+base_burn_rate = 0.7
+initial_burn_time = 90.0
+burn_cost_to_extend = 1.0
+time_currency_value = 5.0
+damage = 31.2
+fire_rate = 0.40
+weapon_range = 20.0
+spread = 20.0
+is_hitscan = true
+heat_per_shot = 4.5
+gun_model_path = "res://assets/guns/models/jeg_double_barrel_shotgun.glb"
+fire_sound_path = "res://assets/guns/sounds/jeg_double_barrel_shotgun_fire.ogg"

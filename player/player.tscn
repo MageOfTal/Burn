@@ -44,6 +44,12 @@ properties/7/replication_mode = 1
 properties/8/path = NodePath(".:is_crouching")
 properties/8/spawn = true
 properties/8/replication_mode = 1
+properties/9/path = NodePath(".:equipped_gun_model_path")
+properties/9/spawn = true
+properties/9/replication_mode = 1
+properties/10/path = NodePath(".:equipped_fire_sound_path")
+properties/10/spawn = true
+properties/10/replication_mode = 1
 
 [sub_resource type="SceneReplicationConfig" id="InputSyncConfig"]
 properties/0/path = NodePath("PlayerInput:input_direction")
@@ -94,6 +100,13 @@ collision_mask = 1
 script = ExtResource("2_camera")
 
 [node name="Camera3D" type="Camera3D" parent="CameraPivot/SpringArm3D"]
+
+[node name="WeaponMount" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.3, 1.1, -0.4)
+
+[node name="FireSoundPlayer" type="AudioStreamPlayer3D" parent="."]
+max_distance = 60.0
+attenuation_model = 1
 
 [node name="PlayerInput" type="Node" parent="."]
 script = ExtResource("3_input")

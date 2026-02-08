@@ -1,0 +1,22 @@
+[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Hypersonic Cannon"
+item_type = 0
+rarity = 3
+description = "Hypersonic Cannon (jeg)"
+base_burn_rate = 0.7
+initial_burn_time = 90.0
+burn_cost_to_extend = 1.0
+time_currency_value = 5.0
+damage = 32.5
+fire_rate = 0.50
+weapon_range = 90.0
+spread = 2.4
+is_hitscan = true
+heat_per_shot = 4.6
+gun_model_path = "res://assets/guns/models/jeg_hypersonic_cannon.glb"
+fire_sound_path = "res://assets/guns/sounds/jeg_hypersonic_cannon_fire.ogg"

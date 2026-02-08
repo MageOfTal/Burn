@@ -1,0 +1,22 @@
+[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "M107"
+item_type = 0
+rarity = 4
+description = "M107 (mteg)"
+base_burn_rate = 1.0
+initial_burn_time = 60.0
+burn_cost_to_extend = 1.0
+time_currency_value = 5.0
+damage = 70.0
+fire_rate = 1.00
+weapon_range = 60.0
+spread = 2.4
+is_hitscan = true
+heat_per_shot = 10.0
+gun_model_path = "res://assets/guns/models/mteg_m107.glb"
+fire_sound_path = "res://assets/guns/sounds/mteg_m107_fire.ogg"
