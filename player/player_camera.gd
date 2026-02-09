@@ -15,9 +15,12 @@ func _ready() -> void:
 	# Use a sphere shape instead of a thin ray — prevents the camera from
 	# slipping through cracks between wall blocks and around edges.
 	var sweep_shape := SphereShape3D.new()
-	sweep_shape.radius = 0.15  # Generous margin — camera stays ~15cm from walls
+	sweep_shape.radius = 0.3  # Wide margin — camera stays 30cm from walls
 	shape = sweep_shape
 
-	# Increase margin for additional safety (pushes the camera inward
-	# by this much on top of the shape radius)
-	margin = 0.1
+	# Margin pushes the camera inward on top of the shape radius.
+	# Combined with the 0.3 sphere this keeps the camera ~40cm from surfaces.
+	margin = 0.15
+
+	# Ensure the spring arm checks all world geometry layers
+	collision_mask = 1

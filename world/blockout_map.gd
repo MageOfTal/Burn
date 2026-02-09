@@ -1,45 +1,55 @@
 extends Node3D
 
-## Map logic: spawns initial loot on server, manages world items.
+## Map logic: spawns loot chests, demo items, zone visual, and starts the zone.
 ## The SeedWorld child generates terrain, structures, and spawn points.
 
-## Item definitions split by type for weighted spawning.
+## Item definitions split by type for chest loot pools.
 var weapon_definitions: Array[ItemData] = []
 var shoe_definitions: Array[ItemData] = []
 var fuel_definitions: Array[ItemData] = []
-var ammo_definitions: Array[ItemData] = []
 
-## Loot spawn chances (must sum to 1.0).
-const FUEL_SPAWN_CHANCE := 0.15
-const AMMO_SPAWN_CHANCE := 0.10
-const SHOE_SPAWN_CHANCE := 0.20
-## Remaining 55% = weapons
+## Number of loot chests to spawn (uses a subset of LootSpawnPoints)
+const CHEST_COUNT := 80
+
+## DEBUG: items to spawn near the host player at game start (permanent, no burn timer).
+## These are "demo" pickups — the player can grab them at leisure.
+const DEMO_SPAWN_TABLE: Array[Dictionary] = [
+	{ "path": "res://items/definitions/gun_jeg_rocket_launcher.tres",     "offset": Vector3(2, 0, 2) },
+	{ "path": "res://items/definitions/gun_rubber_ball_launcher.tres",    "offset": Vector3(-2, 0, 2) },
+	{ "path": "res://items/definitions/gun_bubble_blower.tres",           "offset": Vector3(0, 0, 3) },
+	{ "path": "res://items/definitions/gun_bubble_blower.tres",           "offset": Vector3(3, 0, -2) },
+	{ "path": "res://items/definitions/gun_rubber_ball_launcher.tres",    "offset": Vector3(-3, 0, -2) },
+	{ "path": "res://items/definitions/weapon_toad_staff.tres",           "offset": Vector3(0, 0, -3) },
+	{ "path": "res://items/definitions/consumable_kamikaze_missile.tres", "offset": Vector3(4, 0, 0) },
+	{ "path": "res://items/definitions/gadget_grappling_hook.tres",       "offset": Vector3(-4, 0, 0) },
+]
+
+## Zone visual
+var _zone_mesh: MeshInstance3D = null
+var _zone_material: StandardMaterial3D = null
 
 
 func _ready() -> void:
 	if not multiplayer.is_server():
 		return
 
-	# Load all item definitions
 	_load_item_definitions()
 
-	# Start the burn clock
 	if has_node("/root/BurnClock"):
 		get_node("/root/BurnClock").start()
 
-	# Wait for terrain and structures to generate.
-	# SeedWorld._ready waits 1.5s for voxel chunks, then spawns structures/points.
-	# We wait longer to ensure everything is placed before spawning loot on top.
-	await get_tree().create_timer(3.0).timeout
-	_spawn_initial_loot()
-	_spawn_debug_rocket_launcher()
-	_spawn_debug_rubber_ball()
-	_spawn_debug_bubble_blower()
-	_spawn_debug_ammo()
+	# SeedWorld._ready() already ran (child _ready before parent) and spawned
+	# lightweight markers (PlayerSpawnPoints, LootSpawnPoints) synchronously.
+	# Heavy structures (walls, ramps) are batched across frames in the background.
+	_spawn_loot_chests()
+	# NOTE: _spawn_demo_items() is called from network_manager._start_host()
+	# after the host player is spawned (it needs Players/1 to exist).
+	_create_zone_visual()
+	_start_zone()
 
 
 func _load_item_definitions() -> void:
-	## Load item definitions and split into categories for weighted spawning.
+	## Load item definitions and split into categories for chest loot pools.
 	var dir := DirAccess.open("res://items/definitions/")
 	if dir == null:
 		push_warning("Could not open items/definitions/ directory")
@@ -56,48 +66,156 @@ func _load_item_definitions() -> void:
 						shoe_definitions.append(res)
 					ItemData.ItemType.FUEL:
 						fuel_definitions.append(res)
-					ItemData.ItemType.AMMO:
-						ammo_definitions.append(res)
 					_:
 						weapon_definitions.append(res)
 		file_name = dir.get_next()
 	dir.list_dir_end()
-	print("Loaded %d weapons, %d shoes, %d fuel, %d ammo" % [weapon_definitions.size(), shoe_definitions.size(), fuel_definitions.size(), ammo_definitions.size()])
+	print("Loaded %d weapons, %d shoes, %d fuel" % [
+		weapon_definitions.size(), shoe_definitions.size(),
+		fuel_definitions.size()])
 
 
-func _spawn_initial_loot() -> void:
+# ======================================================================
+#  Loot Chests (replace old scattered loot system)
+# ======================================================================
+
+func _spawn_loot_chests() -> void:
+	## Spawn loot chests at a subset of LootSpawnPoints.
 	var loot_spawn_points := get_node_or_null("LootSpawnPoints")
 	if loot_spawn_points == null:
 		push_warning("No LootSpawnPoints node found — terrain may not have generated yet")
 		return
 
-	for spawn_point in loot_spawn_points.get_children():
-		if spawn_point is Marker3D:
-			_spawn_random_at(spawn_point.global_position)
+	var points: Array[Node] = []
+	for child in loot_spawn_points.get_children():
+		if child is Marker3D:
+			points.append(child)
 
-	print("Spawned loot at %d locations" % loot_spawn_points.get_child_count())
+	# Shuffle and take first CHEST_COUNT points
+	points.shuffle()
+	var count := mini(CHEST_COUNT, points.size())
+
+	var chest_scene := preload("res://world/loot_chest.tscn")
+	var container := get_node_or_null("WorldItems")
+	if container == null:
+		container = self
+
+	for i in count:
+		var chest: LootChest = chest_scene.instantiate()
+		# Pass loot pools to chest so it can generate its own loot
+		chest.weapon_pool = weapon_definitions
+		chest.shoe_pool = shoe_definitions
+		chest.fuel_pool = fuel_definitions
+		chest.position = points[i].global_position
+		container.add_child(chest, true)
+
+	print("Spawned %d loot chests" % count)
 
 
-func _spawn_random_at(pos: Vector3) -> void:
-	## Weighted random spawn: 15% fuel, 10% ammo, 20% shoes, 55% weapons.
-	var item_data: ItemData = null
-	var roll := randf()
+# ======================================================================
+#  Demo Items (permanent pickups near host player)
+# ======================================================================
 
-	if roll < FUEL_SPAWN_CHANCE and not fuel_definitions.is_empty():
-		item_data = fuel_definitions[randi() % fuel_definitions.size()]
-	elif roll < FUEL_SPAWN_CHANCE + AMMO_SPAWN_CHANCE and not ammo_definitions.is_empty():
-		item_data = ammo_definitions[randi() % ammo_definitions.size()]
-	elif roll < FUEL_SPAWN_CHANCE + AMMO_SPAWN_CHANCE + SHOE_SPAWN_CHANCE and not shoe_definitions.is_empty():
-		item_data = shoe_definitions[randi() % shoe_definitions.size()]
-	elif not weapon_definitions.is_empty():
-		item_data = weapon_definitions[randi() % weapon_definitions.size()]
-	else:
+func _spawn_demo_items() -> void:
+	## Spawn demo items in front of the host player. These never expire.
+	if DEMO_SPAWN_TABLE.is_empty():
 		return
 
+	var players_node := get_node_or_null("Players")
+	if players_node == null:
+		return
+
+	# Find host player (peer_id 1)
+	var host_player := players_node.get_node_or_null("1")
+	if host_player == null:
+		push_warning("Host player not found for demo item spawning")
+		return
+
+	var host_pos: Vector3 = host_player.global_position
+	var container := get_node_or_null("WorldItems")
+	if container == null:
+		container = self
+
+	var count := 0
+	for entry: Dictionary in DEMO_SPAWN_TABLE:
+		var item_data := load(entry["path"]) as ItemData
+		if item_data == null:
+			push_warning("DEMO: Could not load %s" % entry["path"])
+			continue
+		var offset: Vector3 = entry["offset"]
+
+		var world_item_scene := preload("res://items/world_item.tscn")
+		var world_item: WorldItem = world_item_scene.instantiate()
+		world_item.setup(item_data)
+		# Make permanent — burn_time_remaining >= PERMANENT_THRESHOLD means never expires
+		world_item.burn_time_remaining = 999999.0
+		world_item.position = host_pos + offset
+		container.add_child(world_item, true)
+		count += 1
+
+	if count > 0:
+		print("DEMO: Spawned %d permanent test items near host player" % count)
+
+
+# ======================================================================
+#  Zone visual (shrinking circle wall)
+# ======================================================================
+
+func _create_zone_visual() -> void:
+	## Create a semi-transparent cylinder at the zone boundary.
+	## Updated each frame in _process() to match ZoneManager.zone_radius.
+	var cylinder := CylinderMesh.new()
+	cylinder.top_radius = 1.0  # We'll scale via node.scale
+	cylinder.bottom_radius = 1.0
+	cylinder.height = 50.0
+	cylinder.radial_segments = 64
+
+	_zone_material = StandardMaterial3D.new()
+	_zone_material.albedo_color = Color(0.2, 0.4, 1.0, 0.12)
+	_zone_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_zone_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	_zone_material.cull_mode = BaseMaterial3D.CULL_FRONT  # Render inside face only
+	_zone_material.no_depth_test = true
+
+	_zone_mesh = MeshInstance3D.new()
+	_zone_mesh.mesh = cylinder
+	_zone_mesh.material_override = _zone_material
+	_zone_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_zone_mesh.position.y = 25.0  # Center vertically
+	add_child(_zone_mesh)
+
+
+func _start_zone() -> void:
+	## Start the shrinking zone system.
+	if has_node("/root/ZoneManager"):
+		var seed_world := get_node_or_null("SeedWorld")
+		var map_size: float = 400.0
+		if seed_world and "map_size" in seed_world:
+			map_size = seed_world.map_size
+		get_node("/root/ZoneManager").start_zone(map_size * 0.5, Vector2.ZERO)
+
+
+func _process(_delta: float) -> void:
+	# Update zone visual to match current zone radius
+	if _zone_mesh and has_node("/root/ZoneManager"):
+		var zm := get_node("/root/ZoneManager")
+		var r: float = zm.zone_radius
+		_zone_mesh.scale.x = r
+		_zone_mesh.scale.z = r
+		# Position at zone center
+		_zone_mesh.position.x = zm.zone_center.x
+		_zone_mesh.position.z = zm.zone_center.y
+
+
+# ======================================================================
+#  Shared helper (kept for compatibility)
+# ======================================================================
+
+func _place_world_item(item_data: ItemData, pos: Vector3) -> void:
+	## Instantiate a WorldItem, set it up, and add it to the WorldItems container.
 	var world_item_scene := preload("res://items/world_item.tscn")
 	var world_item: WorldItem = world_item_scene.instantiate()
 	world_item.setup(item_data)
-	# Use local position before adding to tree (global_position requires being in tree)
 	world_item.position = pos
 
 	var container := get_node_or_null("WorldItems")
@@ -105,118 +223,3 @@ func _spawn_random_at(pos: Vector3) -> void:
 		container.add_child(world_item, true)
 	else:
 		add_child(world_item, true)
-
-
-func _spawn_debug_rocket_launcher() -> void:
-	## DEBUG: Spawn a rocket launcher at every player spawn point for testing.
-	## Remove this function when done testing!
-	var rocket_data := load("res://items/definitions/gun_jeg_rocket_launcher.tres") as ItemData
-	if rocket_data == null:
-		return
-
-	var spawn_points := get_node_or_null("PlayerSpawnPoints")
-	if spawn_points == null:
-		return
-
-	for spawn in spawn_points.get_children():
-		var world_item_scene := preload("res://items/world_item.tscn")
-		var world_item: WorldItem = world_item_scene.instantiate()
-		world_item.setup(rocket_data)
-		world_item.position = spawn.global_position + Vector3(2, 0, 2)
-
-		var container := get_node_or_null("WorldItems")
-		if container:
-			container.add_child(world_item, true)
-		else:
-			add_child(world_item, true)
-
-	print("DEBUG: Spawned rocket launchers at all spawn points")
-
-
-func _spawn_debug_rubber_ball() -> void:
-	## DEBUG: Spawn a rubber ball launcher at every player spawn point for testing.
-	## Remove this function when done testing!
-	var ball_data := load("res://items/definitions/gun_rubber_ball_launcher.tres") as ItemData
-	if ball_data == null:
-		return
-
-	var spawn_points := get_node_or_null("PlayerSpawnPoints")
-	if spawn_points == null:
-		return
-
-	for spawn in spawn_points.get_children():
-		var world_item_scene := preload("res://items/world_item.tscn")
-		var world_item: WorldItem = world_item_scene.instantiate()
-		world_item.setup(ball_data)
-		world_item.position = spawn.global_position + Vector3(-2, 0, 2)
-
-		var container := get_node_or_null("WorldItems")
-		if container:
-			container.add_child(world_item, true)
-		else:
-			add_child(world_item, true)
-
-	print("DEBUG: Spawned rubber ball launchers at all spawn points")
-
-
-func _spawn_debug_bubble_blower() -> void:
-	## DEBUG: Spawn a bubble blower at every player spawn point for testing.
-	## Remove this function when done testing!
-	var bubble_data := load("res://items/definitions/gun_bubble_blower.tres") as ItemData
-	if bubble_data == null:
-		return
-
-	var spawn_points := get_node_or_null("PlayerSpawnPoints")
-	if spawn_points == null:
-		return
-
-	for spawn in spawn_points.get_children():
-		var world_item_scene := preload("res://items/world_item.tscn")
-		var world_item: WorldItem = world_item_scene.instantiate()
-		world_item.setup(bubble_data)
-		world_item.position = spawn.global_position + Vector3(0, 0, 3)
-
-		var container := get_node_or_null("WorldItems")
-		if container:
-			container.add_child(world_item, true)
-		else:
-			add_child(world_item, true)
-
-	print("DEBUG: Spawned bubble blowers at all spawn points")
-
-
-func _spawn_debug_ammo() -> void:
-	## DEBUG: Spawn extra bubble blowers and rubber ball launchers near spawn points.
-	## These weapons double as ammo — pick one up, slot it into another gun.
-	## Remove this function when done testing!
-	var bubble_data := load("res://items/definitions/gun_bubble_blower.tres") as ItemData
-	var ball_data := load("res://items/definitions/gun_rubber_ball_launcher.tres") as ItemData
-
-	var spawn_points := get_node_or_null("PlayerSpawnPoints")
-	if spawn_points == null:
-		return
-
-	for spawn in spawn_points.get_children():
-		if bubble_data:
-			var world_item_scene := preload("res://items/world_item.tscn")
-			var world_item: WorldItem = world_item_scene.instantiate()
-			world_item.setup(bubble_data)
-			world_item.position = spawn.global_position + Vector3(3, 0, -2)
-			var container := get_node_or_null("WorldItems")
-			if container:
-				container.add_child(world_item, true)
-			else:
-				add_child(world_item, true)
-
-		if ball_data:
-			var world_item_scene := preload("res://items/world_item.tscn")
-			var world_item: WorldItem = world_item_scene.instantiate()
-			world_item.setup(ball_data)
-			world_item.position = spawn.global_position + Vector3(-3, 0, -2)
-			var container := get_node_or_null("WorldItems")
-			if container:
-				container.add_child(world_item, true)
-			else:
-				add_child(world_item, true)
-
-	print("DEBUG: Spawned dual-use weapons (ammo-capable) at all spawn points")

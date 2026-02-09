@@ -18,10 +18,14 @@ var action_slide := false
 var action_aim := false  ## Right-click ADS (held)
 var action_extend := false  ## F key: spend fuel to extend equipped item's lifespan
 var action_scrap := false  ## X key: scrap nearby ground item or equipped item into fuel
+var action_marker := false  ## MMB: place/remove compass marker
 ## Weapon slot selection (1-6, 0 = no change this frame).
 var action_slot := 0
 ## Inventory UI state — when open, gameplay inputs are zeroed and mouse is freed.
 var inventory_open := false
+
+## When true, this PlayerInput is driven by BotBrain — skip all keyboard/mouse handling.
+var is_bot := false
 
 const MOUSE_SENSITIVITY := 0.002
 
@@ -36,13 +40,24 @@ func _ready() -> void:
 
 
 func _try_capture_mouse() -> void:
+	if is_bot:
+		return  # Bots don't capture the mouse
 	if is_multiplayer_authority():
+		# Skip capture if loading screen is still up — _on_loading_screen_hidden()
+		# will capture the mouse once the loading screen is removed.
+		if has_node("/root/NetworkManager") and get_node("/root/NetworkManager")._loading_screen != null:
+			return
 		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
 
 func _input(event: InputEvent) -> void:
+	if is_bot:
+		return  # Bot input is set by BotBrain, not keyboard
 	# Use _input (not _unhandled_input) so mouse motion is never blocked
 	if not is_multiplayer_authority():
+		return
+	# Don't process input while pause menu is open
+	if has_node("/root/PauseMenu") and get_node("/root/PauseMenu").is_open:
 		return
 
 	# Toggle inventory with Tab key
@@ -61,9 +76,7 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
 		_mouse_delta += event.relative
 
-	# Escape releases mouse
-	if event.is_action_pressed("ui_cancel"):
-		Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+	# Escape is handled by PauseMenu autoload — no longer release mouse here.
 
 	# Any mouse click re-captures if needed (but does NOT consume the event,
 	# so the click still registers as shoot/pickup/etc.)
@@ -74,7 +87,17 @@ func _input(event: InputEvent) -> void:
 
 
 func _physics_process(_delta: float) -> void:
+	if is_bot:
+		return  # BotBrain writes inputs directly; skip keyboard polling
 	if not is_multiplayer_authority():
+		return
+	# Don't poll keyboard while pause menu is open
+	if has_node("/root/PauseMenu") and get_node("/root/PauseMenu").is_open:
+		input_direction = Vector2.ZERO
+		action_jump = false
+		action_shoot = false
+		action_slot = 0
+		_mouse_delta = Vector2.ZERO
 		return
 
 	# When inventory is open, zero all gameplay inputs
@@ -87,6 +110,7 @@ func _physics_process(_delta: float) -> void:
 		action_aim = false
 		action_extend = false
 		action_scrap = false
+		action_marker = false
 		action_slot = 0
 		_mouse_delta = Vector2.ZERO
 		return
@@ -108,6 +132,7 @@ func _physics_process(_delta: float) -> void:
 	action_aim = Input.is_action_pressed("aim")
 	action_extend = Input.is_action_just_pressed("extend_item")
 	action_scrap = Input.is_action_just_pressed("scrap_item")
+	action_marker = Input.is_action_just_pressed("place_marker")
 
 	# Weapon slot keys (1-6)
 	action_slot = 0

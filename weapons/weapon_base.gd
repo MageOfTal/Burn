@@ -6,9 +6,8 @@ class_name WeaponBase
 
 var weapon_data: WeaponData = null
 var cooldown_remaining: float = 0.0
-## Set by player before firing. If non-null, ammo overrides the weapon's projectile.
-## Can be AmmoData or WeaponData (with can_slot_as_ammo).
-var ammo_data: Resource = null
+## Set by player before firing. If non-null, overrides the weapon's projectile.
+var ammo_data: WeaponData = null
 
 
 func setup(data: WeaponData) -> void:
@@ -40,39 +39,29 @@ func _physics_process(delta: float) -> void:
 
 
 ## --- Ammo helper methods ---
-## These extract ammo properties from either AmmoData or WeaponData (can_slot_as_ammo).
+## These extract ammo properties from a WeaponData with can_slot_as_ammo.
 
 func has_ammo_override() -> bool:
 	## Returns true if ammo_data is set and has a projectile scene.
-	if ammo_data is AmmoData and ammo_data.projectile_scene:
-		return true
-	if ammo_data is WeaponData and ammo_data.can_slot_as_ammo and ammo_data.projectile_scene:
-		return true
-	return false
+	return ammo_data != null and ammo_data.can_slot_as_ammo and ammo_data.projectile_scene != null
 
 
 func get_ammo_projectile_scene() -> PackedScene:
-	## Returns the projectile scene from ammo (AmmoData or WeaponData).
-	if ammo_data is AmmoData:
-		return ammo_data.projectile_scene
-	if ammo_data is WeaponData:
+	## Returns the projectile scene from slotted ammo.
+	if ammo_data != null:
 		return ammo_data.projectile_scene
 	return null
 
 
 func get_ammo_damage_mult() -> float:
-	## Returns the damage multiplier from ammo.
-	if ammo_data is AmmoData:
-		return ammo_data.damage_mult
-	if ammo_data is WeaponData:
+	## Returns the damage multiplier from slotted ammo.
+	if ammo_data != null:
 		return ammo_data.ammo_damage_mult
 	return 1.0
 
 
 func get_ammo_explosion_spawn_count() -> int:
-	## Returns the explosion scatter count from ammo.
-	if ammo_data is AmmoData:
-		return ammo_data.explosion_spawn_count
-	if ammo_data is WeaponData:
+	## Returns the explosion scatter count from slotted ammo.
+	if ammo_data != null:
 		return ammo_data.ammo_explosion_spawn_count
 	return 0

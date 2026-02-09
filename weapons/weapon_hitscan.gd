@@ -6,7 +6,7 @@ class_name WeaponHitscan
 ## Server-side only.
 
 func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
-	# If ammo is slotted with a projectile scene, fire projectiles instead of raycasting
+	# If ammo is slotted with a projectile scene, fire projectiles instead
 	if has_ammo_override():
 		return _fire_ammo_projectile(shooter, aim_origin, aim_direction)
 
@@ -15,28 +15,12 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 
 	var pellets: Array[Dictionary] = []
 	for i in count:
-		var pellet_dir := aim_direction
-		# Apply spread independently per pellet
-		if weapon_data.spread > 0.0:
-			var spread_rad := deg_to_rad(weapon_data.spread)
-			# Random point in a cone using uniform disc sampling for even distribution
-			var angle := randf() * TAU
-			var radius := randf_range(0.0, spread_rad)
-			# Build perpendicular axes to aim_direction
-			var right := aim_direction.cross(Vector3.UP)
-			if right.length() < 0.001:
-				right = aim_direction.cross(Vector3.RIGHT)
-			right = right.normalized()
-			var up := right.cross(aim_direction).normalized()
-			pellet_dir = aim_direction.rotated(right, radius * cos(angle))
-			pellet_dir = pellet_dir.rotated(up, radius * sin(angle))
-			pellet_dir = pellet_dir.normalized()
-
+		var pellet_dir := _apply_spread(aim_direction)
 		var end_point := aim_origin + pellet_dir * weapon_data.weapon_range
 
 		var query := PhysicsRayQueryParameters3D.create(aim_origin, end_point)
 		query.exclude = [shooter.get_rid()]
-		query.collision_mask = 0xFFFFFFFF  # Hit everything
+		query.collision_mask = 0xFFFFFFFF
 
 		var result := space_state.intersect_ray(query)
 
@@ -50,20 +34,17 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 				"shot_end": result.position,
 			})
 
-	# For single-pellet weapons, keep the old flat format for compatibility
+	# Single-pellet: flat format for compatibility
 	if count == 1:
 		return pellets[0]
 
-	# Multi-pellet: return pellets array
 	return {"pellets": pellets}
 
 
 func _fire_ammo_projectile(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
 	## Fire ammo projectile(s) instead of raycasting when ammo is slotted.
-	## Multi-pellet weapons (shotguns) fire one projectile per pellet, each with spread.
 	var count := maxi(weapon_data.pellet_count, 1)
 
-	# Rarity damage bonus + ammo damage mult, split across pellets
 	var rarity_mult: float = 1.0 + weapon_data.rarity * 0.15
 	var per_projectile_damage: float = (weapon_data.damage * rarity_mult * get_ammo_damage_mult()) / count
 
@@ -79,23 +60,9 @@ func _fire_ammo_projectile(shooter: CharacterBody3D, aim_origin: Vector3, aim_di
 		map.add_child(container)
 
 	for i in count:
-		var pellet_dir := aim_direction
-		# Apply spread per pellet
-		if weapon_data.spread > 0.0:
-			var spread_rad := deg_to_rad(weapon_data.spread)
-			var angle := randf() * TAU
-			var radius := randf_range(0.0, spread_rad)
-			var right := aim_direction.cross(Vector3.UP)
-			if right.length() < 0.001:
-				right = aim_direction.cross(Vector3.RIGHT)
-			right = right.normalized()
-			var up := right.cross(aim_direction).normalized()
-			pellet_dir = aim_direction.rotated(right, radius * cos(angle))
-			pellet_dir = pellet_dir.rotated(up, radius * sin(angle))
-			pellet_dir = pellet_dir.normalized()
+		var pellet_dir := _apply_spread(aim_direction)
 
 		var projectile: Node3D = proj_scene.instantiate()
-
 		if projectile.has_method("launch"):
 			projectile.launch(pellet_dir, shooter.peer_id, per_projectile_damage)
 
@@ -116,5 +83,29 @@ func _fire_ammo_projectile(shooter: CharacterBody3D, aim_origin: Vector3, aim_di
 
 		projectile.global_position = aim_origin + pellet_dir * spawn_offset
 
-	# Return shot_end for muzzle flash
 	return {"shot_end": aim_origin + aim_direction * 2.0}
+
+
+# ======================================================================
+#  Shared spread helper (used by both hitscan and ammo-projectile paths)
+# ======================================================================
+
+func _apply_spread(base_direction: Vector3) -> Vector3:
+	## Apply random cone spread to a direction. Returns base_direction unchanged if spread == 0.
+	if weapon_data.spread <= 0.0:
+		return base_direction
+
+	var spread_rad := deg_to_rad(weapon_data.spread)
+	var angle := randf() * TAU
+	var radius := randf_range(0.0, spread_rad)
+
+	# Build perpendicular axes
+	var right := base_direction.cross(Vector3.UP)
+	if right.length() < 0.001:
+		right = base_direction.cross(Vector3.RIGHT)
+	right = right.normalized()
+	var up := right.cross(base_direction).normalized()
+
+	var result := base_direction.rotated(right, radius * cos(angle))
+	result = result.rotated(up, radius * sin(angle))
+	return result.normalized()

@@ -54,7 +54,6 @@ var _block_script: GDScript = preload("res://world/wall_block.gd")
 var _mesh_instance: MeshInstance3D = null
 var _mesh_dirty: bool = false
 
-
 func _ready() -> void:
 	var tier_info: Dictionary = TIER_DATA[wall_tier]
 	_block_hp = tier_info["block_hp"]

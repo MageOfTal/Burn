@@ -29,6 +29,7 @@ surface_material_override/0 = SubResource("DummyMat")
 
 [node name="Label3D" type="Label3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.2, 0)
+billboard = 1
 text = "HP: 100 / 100"
 font_size = 32
 outline_size = 8

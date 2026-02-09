@@ -1,0 +1,16 @@
+[gd_resource type="Resource" script_class="GadgetData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/gadget_data.gd" id="1_script"]
+
+[resource]
+script = ExtResource("1_script")
+item_name = "Grappling Hook"
+item_type = 2
+rarity = 2
+description = "Fire at surfaces to swing through the air. WASD steers your arc, Jump releases with an upward boost. Multi-use until burn timer expires."
+base_burn_rate = 0.4
+initial_burn_time = 150.0
+burn_cost_to_extend = 1.5
+time_currency_value = 12.0
+mesh_color = Color(0.3, 0.7, 1.0, 1.0)
+gadget_type = 0

@@ -8,9 +8,9 @@ class_name ItemStack
 @export var burn_time_remaining: float = 0.0
 @export var quantity: int = 1
 
-## Runtime: AmmoData currently slotted into this weapon (null = no ammo).
+## Runtime: WeaponData (can_slot_as_ammo) currently merged into this weapon (null = no ammo).
 ## Only meaningful when item_data is WeaponData.
-var slotted_ammo: Resource = null  # AmmoData
+var slotted_ammo: WeaponData = null
 ## The inventory slot index where the ammo ItemStack lives (for burn timer tracking).
 ## -1 = no ammo slotted.
 var slotted_ammo_source_index: int = -1

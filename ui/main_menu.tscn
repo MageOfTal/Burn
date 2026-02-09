@@ -1,8 +1,8 @@
-[gd_scene load_steps=2 format=3 uid="uid://mainmenu001"]
+[gd_scene format=3 uid="uid://mainmenu001"]
 
-[ext_resource type="Script" path="res://ui/main_menu.gd" id="1_menu"]
+[ext_resource type="Script" uid="uid://djcqel6e2s8ke" path="res://ui/main_menu.gd" id="1_menu"]
 
-[node name="MainMenu" type="Control"]
+[node name="MainMenu" type="Control" unique_id=2110090502]
 layout_mode = 3
 anchors_preset = 15
 anchor_right = 1.0
@@ -11,7 +11,7 @@ grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("1_menu")
 
-[node name="CenterContainer" type="CenterContainer" parent="."]
+[node name="CenterContainer" type="CenterContainer" parent="." unique_id=2102448083]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
@@ -19,58 +19,58 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 
-[node name="VBoxContainer" type="VBoxContainer" parent="CenterContainer"]
+[node name="VBoxContainer" type="VBoxContainer" parent="CenterContainer" unique_id=1849744398]
 layout_mode = 2
 theme_override_constants/separation = 12
 
-[node name="Title" type="Label" parent="CenterContainer/VBoxContainer"]
+[node name="Title" type="Label" parent="CenterContainer/VBoxContainer" unique_id=1841529062]
 layout_mode = 2
 text = "BURN ROYALE"
 horizontal_alignment = 1
 vertical_alignment = 1
 
-[node name="Spacer" type="Control" parent="CenterContainer/VBoxContainer"]
-layout_mode = 2
+[node name="Spacer" type="Control" parent="CenterContainer/VBoxContainer" unique_id=1170502862]
 custom_minimum_size = Vector2(0, 20)
-
-[node name="HostButton" type="Button" parent="CenterContainer/VBoxContainer"]
 layout_mode = 2
+
+[node name="HostButton" type="Button" parent="CenterContainer/VBoxContainer" unique_id=299096969]
 custom_minimum_size = Vector2(200, 40)
+layout_mode = 2
 text = "Host Game"
 
-[node name="Separator" type="HSeparator" parent="CenterContainer/VBoxContainer"]
+[node name="Separator" type="HSeparator" parent="CenterContainer/VBoxContainer" unique_id=190649340]
 layout_mode = 2
 
-[node name="AddressLabel" type="Label" parent="CenterContainer/VBoxContainer"]
+[node name="AddressLabel" type="Label" parent="CenterContainer/VBoxContainer" unique_id=1278336477]
 layout_mode = 2
 text = "Server Address:"
 
-[node name="AddressInput" type="LineEdit" parent="CenterContainer/VBoxContainer"]
-layout_mode = 2
+[node name="AddressInput" type="LineEdit" parent="CenterContainer/VBoxContainer" unique_id=308486310]
 custom_minimum_size = Vector2(200, 0)
+layout_mode = 2
 text = "127.0.0.1"
 placeholder_text = "127.0.0.1"
 
-[node name="JoinButton" type="Button" parent="CenterContainer/VBoxContainer"]
-layout_mode = 2
+[node name="JoinButton" type="Button" parent="CenterContainer/VBoxContainer" unique_id=2110255774]
 custom_minimum_size = Vector2(200, 40)
+layout_mode = 2
 text = "Join Game"
 
-[node name="Spacer2" type="Control" parent="CenterContainer/VBoxContainer"]
-layout_mode = 2
+[node name="Spacer2" type="Control" parent="CenterContainer/VBoxContainer" unique_id=2136252891]
 custom_minimum_size = Vector2(0, 20)
-
-[node name="QuitButton" type="Button" parent="CenterContainer/VBoxContainer"]
 layout_mode = 2
+
+[node name="QuitButton" type="Button" parent="CenterContainer/VBoxContainer" unique_id=1604572930]
 custom_minimum_size = Vector2(200, 40)
+layout_mode = 2
 text = "Quit"
 
-[node name="StatusLabel" type="Label" parent="CenterContainer/VBoxContainer"]
-layout_mode = 2
+[node name="StatusLabel" type="Label" parent="CenterContainer/VBoxContainer" unique_id=12654191]
 custom_minimum_size = Vector2(300, 0)
+layout_mode = 2
+theme_override_colors/font_color = Color(1, 0.9, 0.3, 1)
 horizontal_alignment = 1
 autowrap_mode = 2
-theme_override_colors/font_color = Color(1, 0.9, 0.3, 1)
 
 [connection signal="pressed" from="CenterContainer/VBoxContainer/HostButton" to="." method="_on_host_pressed"]
 [connection signal="pressed" from="CenterContainer/VBoxContainer/JoinButton" to="." method="_on_join_pressed"]

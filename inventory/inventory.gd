@@ -10,7 +10,7 @@ const STARTING_FUEL := 1000.0
 var items: Array[ItemStack] = []
 var time_currency: float = 0.0
 var equipped_index: int = -1
-var burn_fuel: float = STARTING_FUEL  ## Player's burn fuel pool (used to fire weapons)
+var burn_fuel: float = STARTING_FUEL
 
 ## Shoe equipment slot (separate from the 6 item slots)
 var equipped_shoe: ItemStack = null
@@ -23,6 +23,10 @@ signal weapon_equipped(index: int)
 signal shoe_changed
 signal fuel_changed(new_amount: float)
 
+
+# ======================================================================
+#  Core item management
+# ======================================================================
 
 func add_item(item_data: ItemData) -> int:
 	## Add an item to inventory. Returns slot index, or -1 if full.
@@ -38,10 +42,10 @@ func add_item(item_data: ItemData) -> int:
 
 
 func equip_slot(index: int) -> void:
-	## Equip the weapon in the given slot.
+	## Equip the weapon, consumable, or gadget in the given slot.
 	if index < 0 or index >= items.size():
 		return
-	if items[index].item_data is WeaponData:
+	if items[index].item_data is WeaponData or items[index].item_data is ConsumableData or items[index].item_data is GadgetData:
 		equipped_index = index
 		weapon_equipped.emit(index)
 
@@ -53,11 +57,7 @@ func remove_item(index: int) -> ItemStack:
 
 	var stack := items[index]
 	items.remove_at(index)
-	# Adjust equipped index after removal
-	if equipped_index == index:
-		equipped_index = -1
-	elif equipped_index > index:
-		equipped_index -= 1
+	_adjust_equipped_after_removal(index)
 	item_removed.emit(index)
 	inventory_changed.emit()
 	return stack
@@ -75,17 +75,11 @@ func sacrifice_item(sacrifice_index: int, target_index: int) -> bool:
 	var sacrifice := items[sacrifice_index]
 	var target := items[target_index]
 
-	# Calculate time added based on sacrifice value and target's cost
 	var time_added: float = sacrifice.item_data.time_currency_value / target.item_data.burn_cost_to_extend
 	target.burn_time_remaining += time_added
 
-	# Remove the sacrificed item (adjust target index if needed)
 	items.remove_at(sacrifice_index)
-	# Adjust equipped index after removal
-	if equipped_index == sacrifice_index:
-		equipped_index = -1
-	elif equipped_index > sacrifice_index:
-		equipped_index -= 1
+	_adjust_equipped_after_removal(sacrifice_index)
 	item_removed.emit(sacrifice_index)
 	inventory_changed.emit()
 	return true
@@ -101,11 +95,7 @@ func convert_to_time_currency(index: int) -> float:
 	time_currency += value
 
 	items.remove_at(index)
-	# Adjust equipped index after removal
-	if equipped_index == index:
-		equipped_index = -1
-	elif equipped_index > index:
-		equipped_index -= 1
+	_adjust_equipped_after_removal(index)
 	item_removed.emit(index)
 	inventory_changed.emit()
 	return value
@@ -135,7 +125,7 @@ func remove_expired_items() -> Array[String]:
 			expired_names.append(items[i].item_data.item_name)
 			item_expired.emit(i, items[i].item_data.item_name)
 
-			# Clear ammo references from any weapons that had this item slotted
+			# Clear ammo references pointing at this item
 			for j in items.size():
 				if items[j].slotted_ammo_source_index == i:
 					items[j].slotted_ammo = null
@@ -144,17 +134,17 @@ func remove_expired_items() -> Array[String]:
 					items[j].slotted_ammo_source_index -= 1
 
 			items.remove_at(i)
-			# Adjust equipped index
-			if equipped_index == i:
-				equipped_index = -1
-			elif equipped_index > i:
-				equipped_index -= 1
+			_adjust_equipped_after_removal(i)
 		i -= 1
 
 	if expired_names.size() > 0:
 		inventory_changed.emit()
 	return expired_names
 
+
+# ======================================================================
+#  Shoe slot
+# ======================================================================
 
 func equip_shoe(shoe_data: ItemData) -> ItemStack:
 	## Equip a shoe. Returns the previously equipped shoe (or null).
@@ -166,7 +156,6 @@ func equip_shoe(shoe_data: ItemData) -> ItemStack:
 
 
 func remove_shoe() -> ItemStack:
-	## Remove and return the equipped shoe.
 	var old := equipped_shoe
 	equipped_shoe = null
 	shoe_changed.emit()
@@ -175,30 +164,24 @@ func remove_shoe() -> ItemStack:
 
 
 func get_shoe_speed_bonus() -> float:
-	## Returns the speed bonus from the equipped shoe (0.0 if none).
-	if equipped_shoe == null:
+	if equipped_shoe == null or equipped_shoe.item_data == null:
 		return 0.0
-	if equipped_shoe.item_data and equipped_shoe.item_data.item_type == ItemData.ItemType.SHOE:
-		return equipped_shoe.item_data.get("speed_bonus") if equipped_shoe.item_data.get("speed_bonus") != null else 0.0
+	if equipped_shoe.item_data.item_type == ItemData.ItemType.SHOE:
+		var spd = equipped_shoe.item_data.get("speed_bonus")
+		return spd if spd != null else 0.0
 	return 0.0
 
 
-func get_serialized() -> Array:
-	## Serialize the full inventory for network transmission.
-	var result: Array = []
-	for stack in items:
-		result.append(stack.serialize())
-	return result
-
+# ======================================================================
+#  Fuel
+# ======================================================================
 
 func add_fuel(amount: float) -> void:
-	## Add burn fuel to the player's pool.
 	burn_fuel += amount
 	fuel_changed.emit(burn_fuel)
 
 
 func spend_fuel(amount: float) -> bool:
-	## Spend burn fuel. Returns true if successful, false if insufficient.
 	if burn_fuel < amount:
 		return false
 	burn_fuel -= amount
@@ -207,9 +190,12 @@ func spend_fuel(amount: float) -> bool:
 
 
 func has_fuel(amount: float) -> bool:
-	## Check if the player has enough burn fuel.
 	return burn_fuel >= amount
 
+
+# ======================================================================
+#  Utility
+# ======================================================================
 
 func clear_all() -> void:
 	## Remove all items (used on death/respawn).
@@ -220,3 +206,18 @@ func clear_all() -> void:
 	shoe_changed.emit()
 	inventory_changed.emit()
 	fuel_changed.emit(burn_fuel)
+
+
+func get_serialized() -> Array:
+	var result: Array = []
+	for stack in items:
+		result.append(stack.serialize())
+	return result
+
+
+func _adjust_equipped_after_removal(removed_index: int) -> void:
+	## Fix equipped_index after an item is removed from the array.
+	if equipped_index == removed_index:
+		equipped_index = -1
+	elif equipped_index > removed_index:
+		equipped_index -= 1

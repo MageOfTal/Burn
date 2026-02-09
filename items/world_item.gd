@@ -14,12 +14,29 @@ var _immune_peer_id: int = -1
 var _immune_timer: float = 0.0
 const PICKUP_IMMUNITY_TIME := 2.0
 
-const SCRAP_POPUP_RANGE := 4.0  ## Distance to show the scrap popup
-const SCRAP_FUEL_BY_RARITY := [30.0, 75.0, 175.0, 400.0, 800.0]
+const SCRAP_POPUP_RANGE := 4.0
+const SCRAP_FUEL_BY_RARITY := [10.0, 25.0, 50.0, 100.0, 200.0]
+
+## Rarity colors for world item boxes
+const RARITY_COLORS := {
+	ItemData.Rarity.COMMON: Color(0.6, 0.6, 0.6, 1),
+	ItemData.Rarity.UNCOMMON: Color(0.2, 0.8, 0.2, 1),
+	ItemData.Rarity.RARE: Color(0.3, 0.5, 1.0, 1),
+	ItemData.Rarity.EPIC: Color(0.7, 0.3, 0.9, 1),
+	ItemData.Rarity.LEGENDARY: Color(1.0, 0.7, 0.1, 1),
+}
+
+const PICKUP_POPUP_RANGE := 4.0
 
 @onready var mesh: MeshInstance3D = $MeshInstance3D
 @onready var label: Label3D = $Label3D
 var _scrap_label: Label3D = null
+var _pickup_label: Label3D = null
+
+## Cached local player reference (avoids tree traversal every frame)
+var _cached_local_player: Node = null
+var _player_cache_timer: float = 0.0
+const PLAYER_CACHE_INTERVAL := 1.0
 
 
 func _ready() -> void:
@@ -29,7 +46,6 @@ func _ready() -> void:
 
 	body_entered.connect(_on_body_entered)
 
-	# Ensure item isn't stuck in terrain or structures (server only, deferred so position is set)
 	if multiplayer.is_server():
 		_ensure_above_ground.call_deferred()
 
@@ -42,107 +58,144 @@ func setup(data: ItemData) -> void:
 
 
 func set_pickup_immunity(peer_id: int) -> void:
-	## Prevent a specific player from picking this item up for a short time.
 	_immune_peer_id = peer_id
 	_immune_timer = PICKUP_IMMUNITY_TIME
 
 
+const PERMANENT_THRESHOLD := 999990.0  ## Items with burn_time >= this never expire
+
 func _process(delta: float) -> void:
-	# Update label with remaining time
+	# Update floating label
 	if label and item_data:
-		var time_str := "%ds" % ceili(burn_time_remaining)
-		label.text = "%s [%s]" % [item_data.item_name, time_str]
+		if burn_time_remaining >= PERMANENT_THRESHOLD:
+			label.text = item_data.item_name
+		else:
+			label.text = "%s [%ds]" % [item_data.item_name, ceili(burn_time_remaining)]
 
-	# Server decrements burn timer for ground items (at base rate only)
+	# Server: burn timer + immunity
 	if multiplayer.is_server():
-		burn_time_remaining -= item_data.base_burn_rate * delta if item_data else 0.0
-		if burn_time_remaining <= 0.0:
-			queue_free()
+		if item_data and burn_time_remaining < PERMANENT_THRESHOLD:
+			burn_time_remaining -= item_data.base_burn_rate * delta
+			if burn_time_remaining <= 0.0:
+				queue_free()
+				return
 
-		# Decrement pickup immunity timer
 		if _immune_timer > 0.0:
 			_immune_timer -= delta
 			if _immune_timer <= 0.0:
 				_immune_peer_id = -1
 
-	# Show/hide scrap popup when local player is nearby (client-side only)
-	_update_scrap_popup()
+	# Client: proximity popups (cached player lookup)
+	_update_popups(delta)
 
-
-## Rarity colors for world item boxes (matches common BR color schemes)
-const RARITY_COLORS := {
-	ItemData.Rarity.COMMON: Color(0.6, 0.6, 0.6, 1),       # Gray
-	ItemData.Rarity.UNCOMMON: Color(0.2, 0.8, 0.2, 1),      # Green
-	ItemData.Rarity.RARE: Color(0.3, 0.5, 1.0, 1),          # Blue
-	ItemData.Rarity.EPIC: Color(0.7, 0.3, 0.9, 1),          # Purple
-	ItemData.Rarity.LEGENDARY: Color(1.0, 0.7, 0.1, 1),     # Gold
-}
 
 func _update_visual() -> void:
-	if mesh and item_data:
-		var mat := StandardMaterial3D.new()
-		# Use the item's mesh_color if it's set (shoes have custom colors),
-		# otherwise fall back to rarity-based color
-		if item_data.mesh_color != Color.WHITE:
-			mat.albedo_color = item_data.mesh_color
-		else:
-			mat.albedo_color = RARITY_COLORS.get(item_data.rarity, Color.WHITE)
-		# Add glow for epic and legendary items
-		if item_data.rarity >= ItemData.Rarity.EPIC:
-			mat.emission_enabled = true
-			mat.emission = mat.albedo_color
-			mat.emission_energy_multiplier = 1.5
-		mesh.material_override = mat
+	if mesh == null or item_data == null:
+		return
+	var mat := StandardMaterial3D.new()
+	if item_data.mesh_color != Color.WHITE:
+		mat.albedo_color = item_data.mesh_color
+	else:
+		mat.albedo_color = RARITY_COLORS.get(item_data.rarity, Color.WHITE)
+	if item_data.rarity >= ItemData.Rarity.EPIC:
+		mat.emission_enabled = true
+		mat.emission = mat.albedo_color
+		mat.emission_energy_multiplier = 1.5
+	mesh.material_override = mat
 
 
 func is_immune_to(peer_id: int) -> bool:
-	## Returns true if this specific player can't pick up the item yet.
 	return _immune_peer_id == peer_id and _immune_timer > 0.0
 
 
 func _on_body_entered(body: Node3D) -> void:
-	## When a player walks into the pickup area, they can pick it up.
-	## For simplicity, auto-pickup on contact. Can change to button press later.
 	if not multiplayer.is_server():
 		return
 	if body is CharacterBody3D and body.has_method("_on_item_pickup"):
-		# Check pickup immunity
-		if body.has_method("get") and body.get("peer_id") is int:
+		if body.get("peer_id") is int:
 			if is_immune_to(body.peer_id):
 				return
-		body._on_item_pickup(self)
+		# Only auto-pickup fuel items — everything else requires pressing E
+		if item_data and item_data.item_type == ItemData.ItemType.FUEL:
+			body._on_item_pickup(self)
 
 
-func _update_scrap_popup() -> void:
-	## Client-side: show a floating "X: SCRAP [+fuel]" popup when the local player is nearby.
+# ======================================================================
+#  Proximity popups (client-side, cached player lookup)
+# ======================================================================
+
+func _update_popups(delta: float) -> void:
 	if item_data == null:
 		return
 
-	# Find the local player
-	var players_container := get_tree().current_scene.get_node_or_null("Players")
-	if players_container == null:
+	# Re-find local player periodically instead of every frame
+	_player_cache_timer -= delta
+	if _player_cache_timer <= 0.0 or not is_instance_valid(_cached_local_player):
+		_player_cache_timer = PLAYER_CACHE_INTERVAL
+		_cached_local_player = _find_local_player()
+
+	if _cached_local_player == null:
 		_hide_scrap_popup()
+		_hide_pickup_popup()
 		return
 
-	var local_id := multiplayer.get_unique_id()
-	var local_player: Node = players_container.get_node_or_null(str(local_id))
-	if local_player == null:
+	# Fuel items are auto-picked up — no popups for them
+	if item_data.item_type == ItemData.ItemType.FUEL:
 		_hide_scrap_popup()
+		_hide_pickup_popup()
 		return
 
-	var dist: float = global_position.distance_to(local_player.global_position)
-	if dist < SCRAP_POPUP_RANGE:
+	var dist: float = global_position.distance_to(_cached_local_player.global_position)
+	var in_range: bool = dist < PICKUP_POPUP_RANGE
+
+	if not in_range:
+		_hide_scrap_popup()
+		_hide_pickup_popup()
+		return
+
+	# Only show popups on the CLOSEST non-fuel item — prevents popup spam
+	# when multiple items are within range.
+	var am_closest: bool = _is_closest_item_to_player(dist)
+
+	if am_closest:
 		_show_scrap_popup()
+		_show_pickup_popup()
 	else:
 		_hide_scrap_popup()
+		_hide_pickup_popup()
+
+
+func _is_closest_item_to_player(my_dist: float) -> bool:
+	## Return true if this WorldItem is the closest non-fuel item to the local player.
+	var world_items := get_tree().current_scene.get_node_or_null("WorldItems")
+	if world_items == null:
+		return true  # Only item around
+	var player_pos: Vector3 = _cached_local_player.global_position
+	for child in world_items.get_children():
+		if child == self:
+			continue
+		if not child is Area3D or not ("item_data" in child) or child.item_data == null:
+			continue
+		if child.item_data.item_type == ItemData.ItemType.FUEL:
+			continue
+		var other_dist: float = player_pos.distance_to(child.global_position)
+		if other_dist < my_dist:
+			return false  # Another non-fuel item is closer
+	return true
+
+
+func _find_local_player() -> Node:
+	var players := get_tree().current_scene.get_node_or_null("Players")
+	if players == null:
+		return null
+	return players.get_node_or_null(str(multiplayer.get_unique_id()))
 
 
 func _show_scrap_popup() -> void:
 	if _scrap_label != null:
-		return  # Already showing
+		return
 
-	var rarity: int = item_data.rarity
-	var fuel: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
+	var fuel: float = SCRAP_FUEL_BY_RARITY[clampi(item_data.rarity, 0, 4)]
 	fuel += burn_time_remaining * 0.1
 
 	_scrap_label = Label3D.new()
@@ -151,7 +204,7 @@ func _show_scrap_popup() -> void:
 	_scrap_label.modulate = Color(1.0, 0.6, 0.2)
 	_scrap_label.outline_modulate = Color(0, 0, 0)
 	_scrap_label.outline_size = 6
-	_scrap_label.position = Vector3(0, 1.2, 0)
+	_scrap_label.position = Vector3(0, 1.5, 0)
 	_scrap_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	add_child(_scrap_label)
 
@@ -162,23 +215,40 @@ func _hide_scrap_popup() -> void:
 		_scrap_label = null
 
 
+func _show_pickup_popup() -> void:
+	if _pickup_label != null:
+		return
+
+	_pickup_label = Label3D.new()
+	_pickup_label.text = "[E] PICKUP"
+	_pickup_label.font_size = 48
+	_pickup_label.modulate = Color(0.3, 1.0, 0.4)
+	_pickup_label.outline_modulate = Color(0, 0, 0)
+	_pickup_label.outline_size = 6
+	_pickup_label.position = Vector3(0, 1.2, 0)
+	_pickup_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	add_child(_pickup_label)
+
+
+func _hide_pickup_popup() -> void:
+	if _pickup_label != null:
+		_pickup_label.queue_free()
+		_pickup_label = null
+
+
 func _ensure_above_ground() -> void:
-	## Raycast downward to find the actual surface, then snap the item on top.
-	## Prevents items from spawning inside terrain or under structures.
 	var space_state := get_world_3d().direct_space_state
 	if space_state == null:
 		return
 
-	# Cast a ray from well above the item straight down to find the surface
 	var ray_start := global_position + Vector3(0, 5.0, 0)
 	var ray_end := global_position - Vector3(0, 10.0, 0)
 	var query := PhysicsRayQueryParameters3D.create(ray_start, ray_end)
-	query.collision_mask = 1  # Terrain / structures layer
+	query.collision_mask = 1
 	query.collide_with_areas = false
 
 	var result := space_state.intersect_ray(query)
 	if not result.is_empty():
-		# Snap to 0.5m above the surface so the item sits visibly on top
 		var surface_y: float = result.position.y
 		if global_position.y < surface_y + 0.3:
 			global_position.y = surface_y + 0.5

@@ -27,15 +27,10 @@ func launch(direction: Vector3, shooter_id: int, damage: float) -> void:
 	_damage = damage
 
 
-func set_ammo_override(ammo: Resource) -> void:
+func set_ammo_override(ammo: WeaponData) -> void:
 	## Called by WeaponProjectile when ammo is slotted.
 	## On explosion, this rocket will scatter ammo projectiles instead of dealing AOE damage.
-	## Accepts both AmmoData and WeaponData (with can_slot_as_ammo).
-	if ammo and ammo is AmmoData:
-		_ammo_projectile_scene = ammo.projectile_scene
-		_ammo_explosion_spawn_count = ammo.explosion_spawn_count
-		_ammo_damage_mult = ammo.damage_mult
-	elif ammo and ammo is WeaponData and ammo.can_slot_as_ammo:
+	if ammo and ammo.can_slot_as_ammo:
 		_ammo_projectile_scene = ammo.projectile_scene
 		_ammo_explosion_spawn_count = ammo.ammo_explosion_spawn_count
 		_ammo_damage_mult = ammo.ammo_damage_mult

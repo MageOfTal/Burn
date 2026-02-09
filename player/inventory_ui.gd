@@ -123,14 +123,12 @@ func _rebuild_ui() -> void:
 		_draw_weapon_slot(i, stack, center_x - 400, slot_y)
 
 	# --- Ammo items (right side) ---
-	# Shows both AmmoData items and WeaponData items with can_slot_as_ammo
+	# Shows WeaponData items with can_slot_as_ammo
 	var ammo_y := start_y
 	var ammo_count := 0
 	for i in _inventory.items.size():
 		var stack: ItemStack = _inventory.items[i]
-		var is_ammo: bool = stack.item_data is AmmoData
-		var is_weapon_ammo: bool = stack.item_data is WeaponData and stack.item_data.can_slot_as_ammo
-		if not is_ammo and not is_weapon_ammo:
+		if not (stack.item_data is WeaponData and stack.item_data.can_slot_as_ammo):
 			continue
 
 		_draw_ammo_item(i, stack, center_x + 100, ammo_y)
@@ -260,18 +258,11 @@ func _draw_weapon_slot(index: int, stack: ItemStack, x: float, y: float) -> void
 
 
 func _draw_ammo_item(index: int, stack: ItemStack, x: float, y: float) -> void:
-	# Extract ammo properties from either AmmoData or WeaponData (can_slot_as_ammo)
-	var item_name: String = stack.item_data.item_name
-	var rarity: int = stack.item_data.rarity
-	var burn_cost: float = 0.0
-	var dmg_mult: float = 1.0
-
-	if stack.item_data is AmmoData:
-		burn_cost = stack.item_data.burn_cost_per_shot
-		dmg_mult = stack.item_data.damage_mult
-	elif stack.item_data is WeaponData:
-		burn_cost = stack.item_data.ammo_burn_cost_per_shot
-		dmg_mult = stack.item_data.ammo_damage_mult
+	var weapon: WeaponData = stack.item_data as WeaponData
+	var item_name: String = weapon.item_name
+	var rarity: int = weapon.rarity
+	var burn_cost: float = weapon.ammo_burn_cost_per_shot
+	var dmg_mult: float = weapon.ammo_damage_mult
 
 	var rarity_color: Color = RARITY_COLORS.get(rarity, Color.WHITE)
 	var is_selected: bool = (_selected_ammo_index == index)

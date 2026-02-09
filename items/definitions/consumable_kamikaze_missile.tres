@@ -1,0 +1,16 @@
+[gd_resource type="Resource" script_class="ConsumableData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/consumable_data.gd" id="1_script"]
+
+[resource]
+script = ExtResource("1_script")
+item_name = "Kamikaze Missile"
+item_type = 1
+rarity = 3
+description = "Become the missile. Launch skyward, dive at your enemies, and explode on impact. The faster you go, the bigger the boom."
+base_burn_rate = 0.5
+initial_burn_time = 120.0
+burn_cost_to_extend = 2.0
+time_currency_value = 15.0
+mesh_color = Color(1.0, 0.3, 0.1, 1.0)
+consumable_effect = 0

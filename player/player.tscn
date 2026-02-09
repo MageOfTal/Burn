@@ -1,4 +1,4 @@
-[gd_scene load_steps=13 format=3 uid="uid://player001"]
+[gd_scene load_steps=19 format=3 uid="uid://player001"]
 
 [ext_resource type="Script" path="res://player/player.gd" id="1_player"]
 [ext_resource type="Script" path="res://player/player_camera.gd" id="2_camera"]
@@ -8,6 +8,12 @@
 [ext_resource type="PackedScene" path="res://player/player_hud.tscn" id="6_hud"]
 [ext_resource type="Script" path="res://player/heat_system.gd" id="7_heat"]
 [ext_resource type="PackedScene" path="res://player/inventory_ui.tscn" id="8_inventory_ui"]
+[ext_resource type="Script" path="res://player/slide_crouch_system.gd" id="9_slide"]
+[ext_resource type="Script" path="res://player/kamikaze_system.gd" id="10_kamikaze"]
+[ext_resource type="Script" path="res://player/combat_vfx.gd" id="11_combat_vfx"]
+[ext_resource type="Script" path="res://player/item_manager.gd" id="12_item_mgr"]
+[ext_resource type="Script" path="res://player/grapple_system.gd" id="13_grapple"]
+[ext_resource type="Script" path="res://player/demon_system.gd" id="14_demon"]
 
 [sub_resource type="CapsuleShape3D" id="CapsuleShape3D_001"]
 radius = 0.4
@@ -39,10 +45,10 @@ properties/5/replication_mode = 1
 properties/6/path = NodePath("HeatSystem:is_fever")
 properties/6/spawn = true
 properties/6/replication_mode = 1
-properties/7/path = NodePath(".:is_sliding")
+properties/7/path = NodePath("SlideCrouchSystem:is_sliding")
 properties/7/spawn = true
 properties/7/replication_mode = 1
-properties/8/path = NodePath(".:is_crouching")
+properties/8/path = NodePath("SlideCrouchSystem:is_crouching")
 properties/8/spawn = true
 properties/8/replication_mode = 1
 properties/9/path = NodePath(".:equipped_gun_model_path")
@@ -57,6 +63,30 @@ properties/11/replication_mode = 1
 properties/12/path = NodePath("Inventory:burn_fuel")
 properties/12/spawn = true
 properties/12/replication_mode = 1
+properties/13/path = NodePath(".:in_toad_dimension")
+properties/13/spawn = true
+properties/13/replication_mode = 1
+properties/14/path = NodePath("KamikazeSystem:is_kamikaze")
+properties/14/spawn = true
+properties/14/replication_mode = 1
+properties/15/path = NodePath("GrappleSystem:is_grappling")
+properties/15/spawn = true
+properties/15/replication_mode = 1
+properties/16/path = NodePath("GrappleSystem:anchor_point")
+properties/16/spawn = true
+properties/16/replication_mode = 1
+properties/17/path = NodePath("DemonSystem:demon_active")
+properties/17/spawn = true
+properties/17/replication_mode = 1
+properties/18/path = NodePath("DemonSystem:demon_position")
+properties/18/spawn = true
+properties/18/replication_mode = 1
+properties/19/path = NodePath("DemonSystem:demon_speed")
+properties/19/spawn = true
+properties/19/replication_mode = 1
+properties/20/path = NodePath("DemonSystem:is_eliminated")
+properties/20/spawn = true
+properties/20/replication_mode = 1
 
 [sub_resource type="SceneReplicationConfig" id="InputSyncConfig"]
 properties/0/path = NodePath("PlayerInput:input_direction")
@@ -144,6 +174,24 @@ script = ExtResource("4_inventory")
 
 [node name="BurnTimerManager" type="Node" parent="."]
 script = ExtResource("5_burn_timer")
+
+[node name="SlideCrouchSystem" type="Node" parent="."]
+script = ExtResource("9_slide")
+
+[node name="KamikazeSystem" type="Node" parent="."]
+script = ExtResource("10_kamikaze")
+
+[node name="CombatVFX" type="Node" parent="."]
+script = ExtResource("11_combat_vfx")
+
+[node name="ItemManager" type="Node" parent="."]
+script = ExtResource("12_item_mgr")
+
+[node name="GrappleSystem" type="Node" parent="."]
+script = ExtResource("13_grapple")
+
+[node name="DemonSystem" type="Node" parent="."]
+script = ExtResource("14_demon")
 
 [node name="HUDLayer" type="CanvasLayer" parent="."]
 

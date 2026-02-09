@@ -16,7 +16,7 @@ extends Node3D
 
 ## Terrain size and shape
 @export_group("Terrain")
-@export var map_size: float = 224.0         ## World units per side (~56 cells × 4m)
+@export var map_size: float = 400.0         ## Circular map diameter (world units)
 @export var height_scale: float = 16.0      ## Max height variation (meters)
 @export var noise_period: float = 128.0     ## Noise repeat period (larger = broader hills)
 @export var height_range: float = 32.0      ## VoxelGeneratorNoise2D height range
@@ -24,16 +24,22 @@ extends Node3D
 ## Structure generation
 @export_group("Structures")
 @export var num_walls: int = 200
-@export var num_ramps: int = 100
-@export var num_player_spawns: int = 8
-@export var num_loot_spawns: int = 30
-@export var num_dummies: int = 8
-@export var structure_margin: float = 15.0  ## Keep structures this far from edges
+@export var num_ramps: int = 200
+@export var num_player_spawns: int = 40
+@export var num_loot_spawns: int = 500
+@export var num_dummies: int = 0
+@export var structure_margin: float = 25.0  ## Keep structures this far from edges
+
+## Signals
+signal world_generation_complete
 
 ## Internal refs
 var _voxel_terrain: VoxelTerrain = null
 var _voxel_tool: VoxelTool = null
+var _noise: FastNoiseLite = null
 var _terrain_ready := false
+var structures_complete := false  ## True after all walls/ramps have been spawned
+var _structure_rng: RandomNumberGenerator = null  ## Stored for deferred heavy spawning
 
 
 func _ready() -> void:
@@ -54,6 +60,7 @@ func _ready() -> void:
 	noise.fractal_lacunarity = 2.0
 	noise.fractal_gain = 0.45
 	noise.seed = 10293847
+	_noise = noise  # Store for direct height queries
 	generator.noise = noise
 	# height_start: Y position of the lowest terrain surface.
 	# height_range: vertical span the noise covers above height_start.
@@ -103,17 +110,11 @@ func _ready() -> void:
 		sun.rotation_degrees = Vector3(-50, -45, 0)
 		add_child(sun)
 
-	# --- Sky + Environment ---
+	# --- Sky + Environment (with clouds) ---
 	if not get_parent().has_node("WorldEnvironment"):
-		var sky_mat := ProceduralSkyMaterial.new()
-		sky_mat.sky_top_color = Color(0.3, 0.5, 0.88)          # Bright blue top
-		sky_mat.sky_horizon_color = Color(0.6, 0.72, 0.9)     # Lighter blue horizon
-		sky_mat.ground_bottom_color = Color(0.22, 0.32, 0.14) # Dark ground
-		sky_mat.ground_horizon_color = Color(0.45, 0.55, 0.4) # Greenish horizon
-		sky_mat.sky_curve = 0.15
-		sky_mat.ground_curve = 0.02
-		sky_mat.sky_energy_multiplier = 0.5
-		sky_mat.use_debanding = true
+		var sky_shader := _create_cloud_sky_shader()
+		var sky_mat := ShaderMaterial.new()
+		sky_mat.shader = sky_shader
 
 		var sky := Sky.new()
 		sky.sky_material = sky_mat
@@ -143,22 +144,37 @@ func _ready() -> void:
 
 	_terrain_ready = true
 
-	# --- Spawn structures after terrain is ready ---
-	# Wait for chunks to load and mesh before placing structures
-	await get_tree().create_timer(1.5).timeout
-
+	# --- Spawn structures directly on the ground using noise height ---
+	# No settle system needed — ground Y computed instantly from noise.
 	var rng := RandomNumberGenerator.new()
 	rng.seed = 10293847
 
+	# Lightweight markers are created synchronously in _ready() so they
+	# exist immediately when network_manager needs PlayerSpawnPoints.
+	_spawn_player_spawns(rng)
+	_spawn_loot_points(rng)
+
+	# Heavy structures (walls, ramps) are started externally by network_manager
+	# AFTER all synchronous setup is done. Calling call_deferred() on async
+	# functions from _ready() crashes Godot 4.6.
+	_structure_rng = rng
+
+
+func _spawn_heavy_structures() -> void:
+	## Spread heavy wall/ramp spawning across frames.
+	## Called from network_manager after all synchronous setup is done.
+	var rng := _structure_rng
 	var structures_node := Node3D.new()
 	structures_node.name = "Structures"
 	add_child(structures_node)
 
-	_spawn_walls(rng, structures_node)
-	_spawn_ramps(rng, structures_node)
-	_spawn_player_spawns(rng)
-	_spawn_loot_points(rng)
+	await _spawn_walls_batched(rng, structures_node)
+	await _spawn_ramps_batched(rng, structures_node)
 	_spawn_dummies(rng)
+
+	structures_complete = true
+	world_generation_complete.emit()
+	print("[SeedWorld] World generation complete — all structures placed")
 
 
 # ======================================================================
@@ -189,19 +205,43 @@ func get_normal_at(world_x: float, world_z: float) -> Vector3:
 	return Vector3(hL - hR, 2.0 * eps, hD - hU).normalized()
 
 
-func _get_random_surface_pos(rng: RandomNumberGenerator) -> Vector3:
-	## Pick a random XZ position within margins, return the surface point.
-	var half := map_size * 0.5
-	var x := rng.randf_range(-half + structure_margin, half - structure_margin)
-	var z := rng.randf_range(-half + structure_margin, half - structure_margin)
-	var y := get_height_at(x, z)
-	return Vector3(x, y, z)
+func get_height_from_noise(world_x: float, world_z: float) -> float:
+	## Returns the exact terrain height at (x, z) by computing the same noise
+	## that VoxelGeneratorNoise2D uses. No raycasts, no physics, instant.
+	## NOTE: Does NOT account for craters (use get_height_at() for that).
+	if _noise == null:
+		return 0.0
+	var n: float = _noise.get_noise_2d(world_x, world_z)
+	return (n + 1.0) * 0.5 * height_range
 
 
-func _get_slope_at(world_x: float, world_z: float) -> float:
-	## Returns the slope angle in degrees at the given position.
-	var n := get_normal_at(world_x, world_z)
-	return rad_to_deg(acos(clampf(n.dot(Vector3.UP), -1.0, 1.0)))
+func _get_slope_from_noise(world_x: float, world_z: float) -> float:
+	## Returns the slope angle in degrees using noise height samples.
+	## Same central-difference technique as get_normal_at() but instant.
+	var eps := 2.0
+	var hL := get_height_from_noise(world_x - eps, world_z)
+	var hR := get_height_from_noise(world_x + eps, world_z)
+	var hD := get_height_from_noise(world_x, world_z - eps)
+	var hU := get_height_from_noise(world_x, world_z + eps)
+	var normal := Vector3(hL - hR, 2.0 * eps, hD - hU).normalized()
+	return rad_to_deg(acos(clampf(normal.dot(Vector3.UP), -1.0, 1.0)))
+
+
+func _get_random_ground_pos(rng: RandomNumberGenerator, y_offset: float = 0.0,
+		max_slope: float = 90.0, max_attempts: int = 10) -> Vector3:
+	## Pick a random XZ within the circular map, compute ground Y from noise.
+	## Retries if slope exceeds max_slope. Returns Vector3.INF on failure.
+	var max_radius: float = map_size * 0.5 - structure_margin
+	for attempt in max_attempts:
+		var angle: float = rng.randf_range(0, TAU)
+		var radius: float = sqrt(rng.randf()) * max_radius
+		var x := cos(angle) * radius
+		var z := sin(angle) * radius
+		if max_slope < 90.0:
+			if _get_slope_from_noise(x, z) > max_slope:
+				continue
+		return Vector3(x, get_height_from_noise(x, z) + y_offset, z)
+	return Vector3.INF
 
 
 # ======================================================================
@@ -239,8 +279,9 @@ func _apply_crater(world_pos: Vector3, radius: float) -> void:
 #  Structure spawning (walls, ramps, spawns, loot, dummies)
 # ======================================================================
 
-func _spawn_walls(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn destructible walls with random tiers on the terrain surface.
+func _spawn_walls_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
+	## Spawn destructible walls, yielding every few walls to keep the
+	## loading screen responsive and let the engine process frames.
 	var wall_scene := preload("res://world/destructible_wall.tscn")
 	var wall_sizes := [
 		Vector3(10, 4, 1),
@@ -250,13 +291,9 @@ func _spawn_walls(rng: RandomNumberGenerator, parent: Node3D) -> void:
 		Vector3(14, 4, 1),
 	]
 	var tier_weights := [0.30, 0.35, 0.25, 0.10]
+	var spawned := 0
 
 	for i in num_walls:
-		var pos := _get_random_surface_pos(rng)
-		var slope := _get_slope_at(pos.x, pos.z)
-		if slope > 30.0:
-			continue
-
 		var wall_size: Vector3 = wall_sizes[rng.randi() % wall_sizes.size()]
 		var y_rot := rng.randf_range(0, TAU)
 
@@ -269,35 +306,46 @@ func _spawn_walls(rng: RandomNumberGenerator, parent: Node3D) -> void:
 				tier = t
 				break
 
+		var pos := _get_random_ground_pos(rng, wall_size.y * 0.5, 30.0)
+		if pos == Vector3.INF:
+			continue
+
 		var wall: Node3D = wall_scene.instantiate()
-		wall.name = "Wall_%d" % i
+		wall.name = "Wall_%d" % spawned
 		wall.wall_size = wall_size
 		wall.wall_tier = tier
-		wall.position = Vector3(pos.x, pos.y + wall_size.y * 0.5, pos.z)
+		wall.position = pos
 		wall.rotation.y = y_rot
 		parent.add_child(wall)
+		spawned += 1
+
+		# Yield every 5 walls so the loading screen stays responsive
+		if spawned % 5 == 0:
+			await get_tree().process_frame
+
+	print("[SeedWorld] Spawned %d walls" % spawned)
 
 
-func _spawn_ramps(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn ramp structures on the terrain surface.
+func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
+	## Spawn ramp structures, yielding every batch to spread load.
 	var ramp_size := Vector3(4, 0.3, 8)
 	var ramp_mat := StandardMaterial3D.new()
 	ramp_mat.albedo_color = Color(0.5, 0.6, 0.5, 1)
 
 	var angles_deg := [15.0, 20.0, 25.0, 30.0]
+	var spawned := 0
 
 	for i in num_ramps:
-		var pos := _get_random_surface_pos(rng)
-		var slope := _get_slope_at(pos.x, pos.z)
-		if slope > 25.0:
-			continue
-
 		var ramp_angle: float = angles_deg[rng.randi() % angles_deg.size()]
 		var y_rot := rng.randf_range(0, TAU)
 
+		var pos := _get_random_ground_pos(rng, 0.3, 25.0)
+		if pos == Vector3.INF:
+			continue
+
 		var ramp := StaticBody3D.new()
-		ramp.name = "Ramp_%d" % i
-		ramp.position = Vector3(pos.x, pos.y + 0.3, pos.z)
+		ramp.name = "Ramp_%d" % spawned
+		ramp.position = pos
 		ramp.rotation.y = y_rot
 		ramp.rotation.x = deg_to_rad(ramp_angle)
 		parent.add_child(ramp)
@@ -314,10 +362,15 @@ func _spawn_ramps(rng: RandomNumberGenerator, parent: Node3D) -> void:
 		mesh_inst.mesh = box_mesh
 		mesh_inst.material_override = ramp_mat
 		ramp.add_child(mesh_inst)
+		spawned += 1
+
+		# Yield every 20 ramps (each is just 3 nodes, much lighter than walls)
+		if spawned % 20 == 0:
+			await get_tree().process_frame
 
 
 func _spawn_player_spawns(rng: RandomNumberGenerator) -> void:
-	## Create PlayerSpawnPoints node with markers on the terrain.
+	## Create PlayerSpawnPoints markers directly on the ground.
 	var container := get_parent().get_node_or_null("PlayerSpawnPoints")
 	if container == null:
 		container = Node3D.new()
@@ -327,20 +380,20 @@ func _spawn_player_spawns(rng: RandomNumberGenerator) -> void:
 	for child in container.get_children():
 		child.queue_free()
 
+	var spawned := 0
 	for i in num_player_spawns:
-		var pos := _get_random_surface_pos(rng)
-		var slope := _get_slope_at(pos.x, pos.z)
-		if slope > 20.0:
-			pos = _get_random_surface_pos(rng)
-
+		var pos := _get_random_ground_pos(rng, 1.0, 20.0)
+		if pos == Vector3.INF:
+			continue
 		var marker := Marker3D.new()
-		marker.name = "Spawn%d" % (i + 1)
-		marker.position = Vector3(pos.x, pos.y + 1.0, pos.z)
+		marker.name = "Spawn%d" % (spawned + 1)
+		marker.position = pos
 		container.add_child(marker)
+		spawned += 1
 
 
 func _spawn_loot_points(rng: RandomNumberGenerator) -> void:
-	## Create LootSpawnPoints node with markers on the terrain.
+	## Create LootSpawnPoints markers directly on the ground.
 	var container := get_parent().get_node_or_null("LootSpawnPoints")
 	if container == null:
 		container = Node3D.new()
@@ -350,16 +403,20 @@ func _spawn_loot_points(rng: RandomNumberGenerator) -> void:
 	for child in container.get_children():
 		child.queue_free()
 
+	var spawned := 0
 	for i in num_loot_spawns:
-		var pos := _get_random_surface_pos(rng)
+		var pos := _get_random_ground_pos(rng, 0.5)
+		if pos == Vector3.INF:
+			continue
 		var marker := Marker3D.new()
-		marker.name = "Loot%d" % (i + 1)
-		marker.position = Vector3(pos.x, pos.y + 0.5, pos.z)
+		marker.name = "Loot%d" % (spawned + 1)
+		marker.position = pos
 		container.add_child(marker)
+		spawned += 1
 
 
 func _spawn_dummies(rng: RandomNumberGenerator) -> void:
-	## Spawn target dummies on the terrain surface.
+	## Spawn target dummies directly on the ground.
 	var dummy_scene := load("res://world/target_dummy.tscn")
 	if dummy_scene == null:
 		return
@@ -373,13 +430,109 @@ func _spawn_dummies(rng: RandomNumberGenerator) -> void:
 	for child in container.get_children():
 		child.queue_free()
 
+	var spawned := 0
 	for i in num_dummies:
-		var pos := _get_random_surface_pos(rng)
-		var slope := _get_slope_at(pos.x, pos.z)
-		if slope > 25.0:
-			pos = _get_random_surface_pos(rng)
-
+		var pos := _get_random_ground_pos(rng, 0.0, 25.0)
+		if pos == Vector3.INF:
+			continue
 		var dummy: Node3D = dummy_scene.instantiate()
-		dummy.name = "Dummy%d" % (i + 1)
+		dummy.name = "Dummy%d" % (spawned + 1)
 		dummy.position = pos
 		container.add_child(dummy)
+		spawned += 1
+
+
+func _create_cloud_sky_shader() -> Shader:
+	## Creates a sky shader with procedural clouds using layered noise.
+	var shader := Shader.new()
+	shader.code = """
+shader_type sky;
+
+// Sky colors
+uniform vec3 sky_top_color : source_color = vec3(0.3, 0.5, 0.88);
+uniform vec3 sky_horizon_color : source_color = vec3(0.6, 0.72, 0.9);
+uniform vec3 ground_bottom_color : source_color = vec3(0.22, 0.32, 0.14);
+uniform vec3 ground_horizon_color : source_color = vec3(0.45, 0.55, 0.4);
+uniform float sky_curve : hint_range(0.0, 1.0) = 0.15;
+
+// Cloud parameters
+uniform vec3 cloud_color : source_color = vec3(1.0, 1.0, 1.0);
+uniform vec3 cloud_shadow_color : source_color = vec3(0.7, 0.75, 0.85);
+uniform float cloud_speed : hint_range(0.0, 0.1) = 0.008;
+uniform float cloud_coverage : hint_range(0.0, 1.0) = 0.45;
+uniform float cloud_sharpness : hint_range(0.0, 20.0) = 6.0;
+uniform float cloud_density : hint_range(0.0, 1.0) = 0.7;
+uniform float cloud_height : hint_range(0.0, 1.0) = 0.35;
+
+// Hash-based noise (no texture needed)
+float hash(vec2 p) {
+	vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+	p3 += dot(p3, p3.yzx + 33.33);
+	return fract((p3.x + p3.y) * p3.z);
+}
+
+float noise(vec2 p) {
+	vec2 i = floor(p);
+	vec2 f = fract(p);
+	f = f * f * (3.0 - 2.0 * f);
+	float a = hash(i);
+	float b = hash(i + vec2(1.0, 0.0));
+	float c = hash(i + vec2(0.0, 1.0));
+	float d = hash(i + vec2(1.0, 1.0));
+	return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm(vec2 p) {
+	float value = 0.0;
+	float amplitude = 0.5;
+	for (int i = 0; i < 5; i++) {
+		value += amplitude * noise(p);
+		p *= 2.0;
+		amplitude *= 0.5;
+	}
+	return value;
+}
+
+void sky() {
+	vec3 dir = EYEDIR;
+	float horizon_blend = smoothstep(-0.05, 0.0, dir.y);
+
+	// Ground color
+	float ground_t = clamp(-dir.y * 10.0, 0.0, 1.0);
+	vec3 ground = mix(ground_horizon_color, ground_bottom_color, ground_t);
+
+	// Sky gradient
+	float sky_t = clamp(pow(max(dir.y, 0.0), sky_curve), 0.0, 1.0);
+	vec3 sky = mix(sky_horizon_color, sky_top_color, sky_t);
+
+	// Base sky (ground below horizon, sky above)
+	vec3 col = mix(ground, sky, horizon_blend);
+
+	// Clouds — project onto a flat plane at cloud_height
+	if (dir.y > 0.01) {
+		vec2 cloud_uv = dir.xz / (dir.y + cloud_height) * 3.0;
+		cloud_uv += TIME * cloud_speed;
+
+		float n = fbm(cloud_uv * 3.0);
+		n += 0.5 * fbm(cloud_uv * 6.0 + vec2(1.7, 3.2));
+		n *= 0.5;
+
+		// Shape clouds
+		float cloud = smoothstep(1.0 - cloud_coverage, 1.0 - cloud_coverage + (1.0 / cloud_sharpness), n);
+		cloud *= cloud_density;
+
+		// Fade clouds near horizon to avoid hard cutoff
+		float horizon_fade = smoothstep(0.01, 0.15, dir.y);
+		cloud *= horizon_fade;
+
+		// Lit side vs shadow side based on noise detail
+		float detail = fbm(cloud_uv * 12.0 + vec2(5.3, 2.1));
+		vec3 cloud_col = mix(cloud_shadow_color, cloud_color, detail);
+
+		col = mix(col, cloud_col, cloud * 0.85);
+	}
+
+	COLOR = col;
+}
+"""
+	return shader
