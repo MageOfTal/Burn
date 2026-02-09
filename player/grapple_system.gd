@@ -23,13 +23,23 @@ const ROPE_PULL_STRENGTH := 6.0      ## Upward pull when below anchor — keeps 
 const RELEASE_UPWARD_BOOST := 3.0     ## Vertical speed added on jump-release
 const MIN_ROPE_LENGTH := 3.0          ## Stop reeling at this distance
 
+## Proximity dampening — reduces steering/pull when close to anchor to prevent
+## bobbing and jittery oscillation near walls.
+const PROXIMITY_DAMPEN_RANGE := 8.0   ## Distance below which dampening begins (meters)
+const PROXIMITY_MIN_FACTOR := 0.1     ## Minimum multiplier at point-blank (10% control)
+
 ## Ground friction while grappled — normal-force-dependent, same feel as slide friction.
 ## Friction = GROUND_FRICTION_COEFF * normal_force
 ## Normal force = gravity * (1 - rope_upward_component)
 ## Anchor above you → rope lifts you → near-zero friction (graze and keep going).
 ## Anchor level/below → no lift → full friction (dragging yourself is slow).
-const GROUND_FRICTION_COEFF := 0.44   ## Friction coefficient — slightly above slide (0.35)
+const GROUND_FRICTION_COEFF := 0.53   ## Friction coefficient — ~20% above old value (was 0.44)
 const GROUND_STEER_MULT := 0.3        ## WASD steering is weaker on ground
+
+## Ground-stick — makes it progressively harder to leave the ground while grappling
+## along the surface. Ramps up over ~1 second of continuous ground contact.
+const GROUND_STICK_MAX := 14.0        ## Maximum downward force at full ramp (m/s²)
+const GROUND_STICK_RAMP_TIME := 1.0   ## Seconds to reach full ground-stick strength
 
 ## Rope line-of-sight — cut if geometry obstructs the line
 const ROPE_LOS_MARGIN := 2.0          ## Ignore obstruction within this distance of anchor
@@ -82,6 +92,18 @@ func setup(p: CharacterBody3D) -> void:
 
 func is_active() -> bool:
 	return is_grappling
+
+
+func _get_proximity_factor() -> float:
+	## Returns 1.0 at full range, smoothly drops to PROXIMITY_MIN_FACTOR near the anchor.
+	## Uses smoothstep for a natural feel — no dampening far away, progressive near anchor.
+	var dist: float = player.global_position.distance_to(anchor_point)
+	if dist >= PROXIMITY_DAMPEN_RANGE:
+		return 1.0
+	var t: float = dist / PROXIMITY_DAMPEN_RANGE  # 0 at anchor, 1 at threshold
+	# Smoothstep: 3t² - 2t³ (starts and ends with zero derivative)
+	var smooth: float = t * t * (3.0 - 2.0 * t)
+	return lerpf(PROXIMITY_MIN_FACTOR, 1.0, smooth)
 
 
 func handle_shoot_input(shoot_held: bool) -> void:
@@ -193,6 +215,10 @@ func process(delta: float) -> void:
 			player.velocity.y = 0.0
 
 	# --- 3. Apply WASD steering (camera-relative horizontal) ---
+	# Proximity dampening: reduce player control when very close to the anchor
+	# to prevent jittery bobbing near walls.
+	var prox: float = _get_proximity_factor()
+
 	var input_dir: Vector2 = player.player_input.input_direction
 	if input_dir.length() > 0.01:
 		var cam_forward: Vector3 = -player.camera.global_transform.basis.z
@@ -207,25 +233,26 @@ func process(delta: float) -> void:
 		# Steering is heavily nerfed on ground
 		var steer_mult: float = GROUND_STEER_MULT if on_floor else 1.0
 
-		# Lateral steering (left/right)
-		var steer: Vector3 = cam_right * input_dir.x * SWING_STEER_STRENGTH * steer_mult
-		# Forward pumping — only works in the air
+		# Lateral steering (left/right) — scaled by proximity
+		var steer: Vector3 = cam_right * input_dir.x * SWING_STEER_STRENGTH * steer_mult * prox
+		# Forward pumping — only works in the air, scaled by proximity
 		if not on_floor and input_dir.y < -0.1 and player.velocity.length() > 0.5:
 			var swing_dir: Vector3 = player.velocity.normalized()
-			steer += swing_dir * SWING_PUMP_STRENGTH * absf(input_dir.y)
-		# Backward = slight brake
+			steer += swing_dir * SWING_PUMP_STRENGTH * absf(input_dir.y) * prox
+		# Backward = slight brake, scaled by proximity
 		elif input_dir.y > 0.1:
-			steer += cam_forward * input_dir.y * SWING_STEER_STRENGTH * 0.5 * steer_mult
+			steer += cam_forward * input_dir.y * SWING_STEER_STRENGTH * 0.5 * steer_mult * prox
 
 		player.velocity += steer * delta
 
 	# --- 4. Upward rope pull — prevents sinking into the ground ---
 	# When the anchor is above you, the taut rope actively pulls you upward.
 	# Stronger when you're near or on the floor and the anchor is overhead.
+	# Dampened by proximity to prevent oscillation when close to the anchor.
 	var pull_dir: Vector3 = anchor_point - player.global_position
 	var anchor_above: float = clampf(pull_dir.normalized().y, 0.0, 1.0)
 	if anchor_above > 0.1:
-		var pull_force: float = ROPE_PULL_STRENGTH * anchor_above
+		var pull_force: float = ROPE_PULL_STRENGTH * anchor_above * prox
 		# Stronger pull when falling or on the ground — prevents dragging
 		if player.velocity.y <= 0.0:
 			player.velocity.y += pull_force * delta

@@ -178,7 +178,7 @@ func _explode() -> void:
 	if seed_world == null:
 		seed_world = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld")
 	if seed_world and seed_world.has_method("create_crater"):
-		seed_world.create_crater(explosion_pos, EXPLOSION_RADIUS * 0.4, 1.5)
+		seed_world.create_crater(explosion_pos, EXPLOSION_RADIUS * 0.4, 1.5, _shooter_id)
 
 	# Show explosion VFX + crater on all clients
 	_show_explosion.rpc(explosion_pos)

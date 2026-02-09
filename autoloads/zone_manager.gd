@@ -34,6 +34,18 @@ var _initial_radius: float = 200.0       ## Starting radius (set once)
 var _active: bool = false                 ## Zone system running
 
 
+func reset() -> void:
+	## Reset zone to idle state (called when returning to main menu).
+	_active = false
+	zone_radius = 200.0
+	target_radius = 200.0
+	zone_center = Vector2.ZERO
+	zone_phase = 0
+	is_shrinking = false
+	shrink_speed = 0.0
+	next_shrink_time = 0.0
+
+
 func start_zone(initial_radius: float, center: Vector2) -> void:
 	## Called by blockout_map after terrain settles.
 	_initial_radius = initial_radius
@@ -54,6 +66,8 @@ func start_zone(initial_radius: float, center: Vector2) -> void:
 
 func _physics_process(delta: float) -> void:
 	if not _active:
+		return
+	if multiplayer.multiplayer_peer == null:
 		return
 	if not multiplayer.is_server():
 		return

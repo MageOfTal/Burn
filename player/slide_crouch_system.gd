@@ -16,7 +16,8 @@ const SLIDE_CAMERA_OFFSET := -0.5
 const SLIDE_AIRBORNE_GRACE := 0.2
 const SLIDE_SNAP_DOWN := 4.0
 const SLIDE_TO_CROUCH_DELAY := 0.3   ## Seconds coasting at low speed before crouch transition
-const SLIDE_MAX_SPEED := 20.0        ## Hard cap — raised for fast downhill/momentum slides
+const SLIDE_MAX_SPEED := 40.0        ## Soft cap — extra drag kicks in above this speed
+const SLIDE_OVERCAP_DRAG := 8.0      ## Extra deceleration per m/s over the soft cap
 const SLIDE_LATERAL_FRICTION := 6.0   ## Reduced so player steering actually works
 const SLIDE_STEER_STRENGTH := 8.0    ## How aggressively WASD redirects the slide
 
@@ -41,6 +42,13 @@ var _wants_slide_on_land: bool = false             ## Queue slide when landing f
 var _slide_on_land_grace: float = 0.0              ## Grace window after landing to trigger slide
 var _was_on_floor: bool = true                     ## Track floor state for landing detection
 var _pre_land_velocity_y: float = 0.0              ## Vertical speed right before landing
+
+## --- Post-slide jump window ---
+const POST_SLIDE_WINDOW := 0.125         ## Seconds after slide ends where jump preserves speed
+const POST_SLIDE_DECEL := 80.0           ## Rapid deceleration during post-slide window (m/s^2)
+var _post_slide_timer: float = 0.0       ## Time remaining in post-slide window
+var _post_slide_speed: float = 0.0       ## Stored slide speed for jump restoration
+var _post_slide_dir: Vector3 = Vector3.ZERO  ## Stored slide direction for jump restoration
 
 ## --- Stored geometry defaults ---
 var _original_capsule_height: float = 1.8
@@ -201,7 +209,10 @@ func process_slide(delta: float) -> void:
 	# Apply force as speed change
 	var spd := _slide_velocity.length()
 	spd = maxf(spd + slope_force * delta, 0.0)
-	spd = minf(spd, SLIDE_MAX_SPEED)
+	# Soft cap: above SLIDE_MAX_SPEED, apply increasing drag that bleeds off excess
+	if spd > SLIDE_MAX_SPEED:
+		var excess: float = spd - SLIDE_MAX_SPEED
+		spd = maxf(spd - excess * SLIDE_OVERCAP_DRAG * delta, SLIDE_MAX_SPEED)
 	if spd > 0.01 and slide_dir.length() > 0.001:
 		_slide_velocity = slide_dir * spd
 	else:
@@ -246,6 +257,10 @@ func process_slide(delta: float) -> void:
 
 
 func end_slide() -> void:
+	# Store slide momentum BEFORE clearing state (for post-slide jump window)
+	var slide_spd := _slide_velocity.length()
+	var slide_dir := _slide_velocity.normalized() if slide_spd > 0.5 else Vector3.ZERO
+
 	is_sliding = false
 	_slide_cooldown_timer = SLIDE_COOLDOWN
 	_slide_low_speed_timer = 0.0
@@ -264,11 +279,51 @@ func end_slide() -> void:
 		else:
 			player.velocity.x = 0.0
 			player.velocity.z = 0.0
+		_post_slide_timer = 0.0  # No jump window when transitioning to crouch
 		start_crouch()
 	else:
-		player.velocity.x = 0.0
-		player.velocity.z = 0.0
+		# Keep current velocity (will be decelerated by process_post_slide_window)
+		# Start the post-slide jump window
+		_post_slide_timer = POST_SLIDE_WINDOW
+		_post_slide_speed = slide_spd
+		_post_slide_dir = slide_dir
 		apply_standing_pose()
+
+
+## ---- Post-slide jump window ----
+
+func process_post_slide_window(delta: float) -> bool:
+	## Called from player._server_process each frame.
+	## Returns true if we consumed the frame (player should skip normal movement).
+	if _post_slide_timer <= 0.0:
+		return false
+
+	_post_slide_timer -= delta
+
+	# If player jumps during the window, restore slide speed and jump
+	if player.player_input.action_jump and player.is_on_floor():
+		player.velocity.x = _post_slide_dir.x * _post_slide_speed
+		player.velocity.z = _post_slide_dir.z * _post_slide_speed
+		player.velocity.y = player.JUMP_VELOCITY
+		_post_slide_timer = 0.0
+		_post_slide_speed = 0.0
+		_post_slide_dir = Vector3.ZERO
+		return true
+
+	# Rapidly decelerate during the window
+	var horiz := Vector2(player.velocity.x, player.velocity.z)
+	var walk_speed: float = player.SPEED
+	if horiz.length() > walk_speed:
+		horiz = horiz.move_toward(horiz.normalized() * walk_speed, POST_SLIDE_DECEL * delta)
+		player.velocity.x = horiz.x
+		player.velocity.z = horiz.y
+
+	# If window expired, clear stored speed
+	if _post_slide_timer <= 0.0:
+		_post_slide_speed = 0.0
+		_post_slide_dir = Vector3.ZERO
+
+	return false
 
 
 ## ---- Crouch mechanics (server-only) ----

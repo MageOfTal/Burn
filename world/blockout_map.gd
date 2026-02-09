@@ -27,9 +27,17 @@ const DEMO_SPAWN_TABLE: Array[Dictionary] = [
 ## Zone visual
 var _zone_mesh: MeshInstance3D = null
 var _zone_material: StandardMaterial3D = null
+## Fire particles along zone edge
+var _zone_fire_ring: Node3D = null
+const ZONE_FIRE_EMITTER_COUNT := 48  ## Number of fire particle emitters around the ring
+var _fire_ring_update_timer: float = 0.0  ## Throttle fire position updates
+var _fire_ring_last_radius: float = -1.0  ## Track radius changes
 
 
 func _ready() -> void:
+	# Zone visual is cosmetic — create on ALL peers so everyone sees the ring + fire
+	_create_zone_visual()
+
 	if not multiplayer.is_server():
 		return
 
@@ -44,7 +52,6 @@ func _ready() -> void:
 	_spawn_loot_chests()
 	# NOTE: _spawn_demo_items() is called from network_manager._start_host()
 	# after the host player is spawned (it needs Players/1 to exist).
-	_create_zone_visual()
 	_start_zone()
 
 
@@ -162,8 +169,12 @@ func _spawn_demo_items() -> void:
 # ======================================================================
 
 func _create_zone_visual() -> void:
-	## Create a semi-transparent cylinder at the zone boundary.
+	## Create the zone boundary visual: a red semi-transparent cylinder wall
+	## visible only from OUTSIDE the safe zone, plus a ring of fire particles
+	## along the base of the circle.
 	## Updated each frame in _process() to match ZoneManager.zone_radius.
+
+	# --- Red wall cylinder (visible from outside only) ---
 	var cylinder := CylinderMesh.new()
 	cylinder.top_radius = 1.0  # We'll scale via node.scale
 	cylinder.bottom_radius = 1.0
@@ -171,10 +182,10 @@ func _create_zone_visual() -> void:
 	cylinder.radial_segments = 64
 
 	_zone_material = StandardMaterial3D.new()
-	_zone_material.albedo_color = Color(0.2, 0.4, 1.0, 0.12)
+	_zone_material.albedo_color = Color(0.8, 0.1, 0.0, 0.15)  # Red-orange, semi-transparent
 	_zone_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	_zone_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	_zone_material.cull_mode = BaseMaterial3D.CULL_FRONT  # Render inside face only
+	_zone_material.cull_mode = BaseMaterial3D.CULL_BACK  # Render outside face only — visible when OUTSIDE the zone
 	_zone_material.no_depth_test = true
 
 	_zone_mesh = MeshInstance3D.new()
@@ -183,6 +194,58 @@ func _create_zone_visual() -> void:
 	_zone_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	_zone_mesh.position.y = 25.0  # Center vertically
 	add_child(_zone_mesh)
+
+	# --- Fire particle ring along the base of the zone boundary ---
+	_zone_fire_ring = Node3D.new()
+	_zone_fire_ring.name = "ZoneFireRing"
+	add_child(_zone_fire_ring)
+
+	for i in ZONE_FIRE_EMITTER_COUNT:
+		var fire := _create_fire_emitter()
+		_zone_fire_ring.add_child(fire)
+
+
+func _create_fire_emitter() -> GPUParticles3D:
+	## Create a single fire/ember emitter for the zone boundary ring.
+	var particles := GPUParticles3D.new()
+	particles.emitting = true
+	particles.amount = 12
+	particles.lifetime = 1.2
+	particles.explosiveness = 0.0
+	particles.visibility_aabb = AABB(Vector3(-3, -1, -3), Vector3(6, 8, 6))
+
+	var mat := ParticleProcessMaterial.new()
+	mat.direction = Vector3(0, 1, 0)
+	mat.spread = 15.0
+	mat.initial_velocity_min = 1.5
+	mat.initial_velocity_max = 4.0
+	mat.gravity = Vector3(0, 1.5, 0)  # Fire rises
+	mat.scale_min = 0.3
+	mat.scale_max = 0.8
+	mat.damping_min = 1.0
+	mat.damping_max = 2.0
+
+	var gradient := Gradient.new()
+	gradient.add_point(0.0, Color(1.0, 0.6, 0.1, 0.9))   # Bright orange-yellow
+	gradient.add_point(0.3, Color(1.0, 0.25, 0.0, 0.7))   # Deep orange
+	gradient.add_point(0.7, Color(0.6, 0.08, 0.0, 0.4))   # Dark red
+	gradient.add_point(1.0, Color(0.2, 0.05, 0.0, 0.0))   # Fades to nothing
+	var grad_tex := GradientTexture1D.new()
+	grad_tex.gradient = gradient
+	mat.color_ramp = grad_tex
+	particles.process_material = mat
+
+	var quad := QuadMesh.new()
+	quad.size = Vector2(0.6, 0.6)
+	var draw_mat := StandardMaterial3D.new()
+	draw_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	draw_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	draw_mat.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
+	draw_mat.vertex_color_use_as_albedo = true
+	quad.material = draw_mat
+	particles.draw_pass_1 = quad
+
+	return particles
 
 
 func _start_zone() -> void:
@@ -195,7 +258,7 @@ func _start_zone() -> void:
 		get_node("/root/ZoneManager").start_zone(map_size * 0.5, Vector2.ZERO)
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	# Update zone visual to match current zone radius
 	if _zone_mesh and has_node("/root/ZoneManager"):
 		var zm := get_node("/root/ZoneManager")
@@ -205,6 +268,30 @@ func _process(_delta: float) -> void:
 		# Position at zone center
 		_zone_mesh.position.x = zm.zone_center.x
 		_zone_mesh.position.z = zm.zone_center.y
+
+		# Position fire emitters evenly around the zone circumference.
+		# Throttled: only recalculate positions every 0.5s or when radius changes significantly.
+		if _zone_fire_ring:
+			_fire_ring_update_timer -= delta
+			var radius_changed := absf(r - _fire_ring_last_radius) > 1.0
+			if _fire_ring_update_timer <= 0.0 or radius_changed:
+				_fire_ring_update_timer = 0.5
+				_fire_ring_last_radius = r
+				var seed_world := get_node_or_null("SeedWorld")
+				var emitters := _zone_fire_ring.get_children()
+				var emitter_count := emitters.size()
+				for i in emitter_count:
+					var angle := float(i) / float(emitter_count) * TAU
+					var emitter: GPUParticles3D = emitters[i]
+					var ex: float = zm.zone_center.x + cos(angle) * r
+					var ez: float = zm.zone_center.y + sin(angle) * r
+					# Get terrain height at emitter position
+					var ey := 0.0
+					if seed_world and seed_world.has_method("get_height_at"):
+						ey = seed_world.get_height_at(ex, ez)
+					emitter.global_position = Vector3(ex, ey, ez)
+					# Only emit if radius is reasonable
+					emitter.emitting = r > 5.0
 
 
 # ======================================================================

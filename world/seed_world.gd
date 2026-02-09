@@ -41,6 +41,11 @@ var _terrain_ready := false
 var structures_complete := false  ## True after all walls/ramps have been spawned
 var _structure_rng: RandomNumberGenerator = null  ## Stored for deferred heavy spawning
 
+## Spiral tower reference (for crater carving integration)
+var _tower: Node = null
+var _tower_position: Vector3 = Vector3.INF  ## Tower center XZ for exclusion zone
+const TOWER_EXCLUSION_RADIUS := 15.0        ## No walls/ramps within this of tower
+
 
 func _ready() -> void:
 	# --- Create VoxelTerrain node ---
@@ -168,8 +173,13 @@ func _spawn_heavy_structures() -> void:
 	structures_node.name = "Structures"
 	add_child(structures_node)
 
+	# Pre-compute tower position so walls/ramps can respect the exclusion zone.
+	# The tower itself is spawned last (it awaits voxel generation).
+	_precompute_tower_position(rng)
+
 	await _spawn_walls_batched(rng, structures_node)
 	await _spawn_ramps_batched(rng, structures_node)
+	await _spawn_tower(rng, structures_node)
 	_spawn_dummies(rng)
 
 	structures_complete = true
@@ -248,14 +258,22 @@ func _get_random_ground_pos(rng: RandomNumberGenerator, y_offset: float = 0.0,
 #  Terrain deformation (craters) via VoxelTool
 # ======================================================================
 
-func create_crater(world_pos: Vector3, radius: float, _crater_depth: float) -> void:
+func create_crater(world_pos: Vector3, radius: float, _crater_depth: float,
+		attacker_id: int = -1) -> void:
 	## Deform the terrain to create a crater at the given world position.
 	## Uses VoxelTool.do_sphere() with MODE_REMOVE for smooth SDF subtraction.
+	## Also carves the spiral tower if one exists.
 	## Server calls this, then syncs to clients.
 	if _voxel_tool == null:
 		return
 
 	_apply_crater(world_pos, radius)
+
+	# Also carve the tower (if it exists and is in range)
+	if _tower and _tower.has_method("carve"):
+		if attacker_id >= 0:
+			_tower.set_last_attacker(attacker_id)
+		_tower.carve(world_pos, radius)
 
 	if multiplayer.is_server():
 		_sync_crater.rpc(world_pos, radius)
@@ -265,6 +283,10 @@ func create_crater(world_pos: Vector3, radius: float, _crater_depth: float) -> v
 func _sync_crater(world_pos: Vector3, radius: float) -> void:
 	## Client-side: apply the same crater deformation locally.
 	_apply_crater(world_pos, radius)
+
+	# Also carve the tower on clients (no integrity check — server handles that)
+	if _tower and _tower.has_method("carve_no_check"):
+		_tower.carve_no_check(world_pos, radius)
 
 
 func _apply_crater(world_pos: Vector3, radius: float) -> void:
@@ -310,6 +332,12 @@ func _spawn_walls_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 		if pos == Vector3.INF:
 			continue
 
+		# Skip if inside tower exclusion zone
+		if _tower_position != Vector3.INF:
+			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
+			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
+				continue
+
 		var wall: Node3D = wall_scene.instantiate()
 		wall.name = "Wall_%d" % spawned
 		wall.wall_size = wall_size
@@ -342,6 +370,12 @@ func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 		var pos := _get_random_ground_pos(rng, 0.3, 25.0)
 		if pos == Vector3.INF:
 			continue
+
+		# Skip if inside tower exclusion zone
+		if _tower_position != Vector3.INF:
+			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
+			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
+				continue
 
 		var ramp := StaticBody3D.new()
 		ramp.name = "Ramp_%d" % spawned
@@ -440,6 +474,39 @@ func _spawn_dummies(rng: RandomNumberGenerator) -> void:
 		dummy.position = pos
 		container.add_child(dummy)
 		spawned += 1
+
+
+func _precompute_tower_position(rng: RandomNumberGenerator) -> void:
+	## Place the tower at map center (0, ground_height, 0).
+	## Called before walls/ramps so they can respect the exclusion zone.
+	## Consumes one RNG value to keep the seed sequence consistent.
+	var _unused := rng.randi()  # Keep RNG sequence deterministic
+
+	var ground_y := get_height_from_noise(0.0, 0.0)
+	_tower_position = Vector3(0.0, ground_y, 0.0)
+	print("[SeedWorld] Tower position: map center at %s" % str(_tower_position))
+
+
+func _spawn_tower(_rng: RandomNumberGenerator, parent: Node3D) -> void:
+	## Spawn the spiral tower at the pre-computed position.
+	## Instantiates spiral_tower.tscn and awaits its voxel generation.
+	if _tower_position == Vector3.INF:
+		return  # Position wasn't computed
+
+	var tower_scene := preload("res://world/spiral_tower.tscn")
+	var tower: Node3D = tower_scene.instantiate()
+	tower.name = "SpiralTower"
+	tower.position = _tower_position
+	parent.add_child(tower)
+
+	# Store reference for crater integration
+	_tower = tower
+
+	# Wait for the tower's voxel generation to finish before continuing
+	if tower.has_signal("generation_complete"):
+		await tower.generation_complete
+
+	print("[SeedWorld] Spiral tower spawned at %s" % str(_tower_position))
 
 
 func _create_cloud_sky_shader() -> Shader:

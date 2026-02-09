@@ -26,7 +26,7 @@ const RESPAWN_DELAY := 3.0
 const ACCELERATION := 45.0         # ~0.16s to full speed — snappy
 const DECELERATION := 30.0         # ~0.23s to stop — slight momentum
 const AIR_ACCELERATION := 15.0
-const AIR_DECELERATION := 5.0
+const AIR_DECELERATION := 0.0        # No air friction — full momentum preservation
 
 ## Rarity damage bonus: +15% per rarity tier
 const RARITY_DAMAGE_BONUS := 0.15
@@ -236,24 +236,28 @@ func _server_process(delta: float) -> void:
 	elif slide_crouch.is_crouching:
 		slide_crouch.process_crouch(delta)
 	else:
-		# Jump (slide-jump is handled in process_slide; crouch-jump in process_crouch)
-		if player_input.action_jump and is_on_floor():
-			velocity.y = JUMP_VELOCITY
-			slide_crouch.clear_slide_on_land()
-
-		# While airborne, queue slide for when we land
-		if not is_on_floor() and player_input.action_slide:
-			slide_crouch.queue_slide_on_land()
-
-		# Check if we should start a slide
-		if player_input.action_slide and slide_crouch.can_start_slide():
-			slide_crouch.start_slide()
-			slide_crouch.process_slide(delta)
-		elif player_input.action_slide and is_on_floor():
-			slide_crouch.start_crouch()
-			slide_crouch.process_crouch(delta)
+		# Post-slide jump window: rapidly decelerate, but jumping restores slide speed
+		if slide_crouch.process_post_slide_window(delta):
+			pass  # Jump was consumed by post-slide window — skip normal movement
 		else:
-			_process_normal_movement(delta)
+			# Jump (slide-jump is handled in process_slide; crouch-jump in process_crouch)
+			if player_input.action_jump and is_on_floor():
+				velocity.y = JUMP_VELOCITY
+				slide_crouch.clear_slide_on_land()
+
+			# While airborne, queue slide for when we land
+			if not is_on_floor() and player_input.action_slide:
+				slide_crouch.queue_slide_on_land()
+
+			# Check if we should start a slide
+			if player_input.action_slide and slide_crouch.can_start_slide():
+				slide_crouch.start_slide()
+				slide_crouch.process_slide(delta)
+			elif player_input.action_slide and is_on_floor():
+				slide_crouch.start_crouch()
+				slide_crouch.process_crouch(delta)
+			else:
+				_process_normal_movement(delta)
 
 	# Track pre-land velocity for slide-on-land momentum transfer
 	slide_crouch.track_pre_land_velocity()
@@ -419,8 +423,18 @@ func _process_normal_movement(delta: float) -> void:
 
 	if direction:
 		var target := Vector2(direction.x, direction.z) * current_speed
-		var accel := ACCELERATION if on_floor else AIR_ACCELERATION
-		horizontal = horizontal.move_toward(target, accel * delta)
+		if on_floor:
+			horizontal = horizontal.move_toward(target, ACCELERATION * delta)
+		else:
+			# In the air: preserve momentum when inputting WITH your velocity,
+			# but allow braking when inputting AGAINST it.
+			var current_mag := horizontal.length()
+			var input_dot := horizontal.normalized().dot(target.normalized()) if current_mag > 0.1 else 1.0
+			horizontal = horizontal.move_toward(target, AIR_ACCELERATION * delta)
+			if horizontal.length() < current_mag and input_dot > 0.0:
+				# Input is roughly with our momentum — preserve speed, keep new direction
+				horizontal = horizontal.normalized() * current_mag
+			# When input_dot <= 0 (pushing against momentum), let move_toward brake freely
 	else:
 		var decel := DECELERATION if on_floor else AIR_DECELERATION
 		horizontal = horizontal.move_toward(Vector2.ZERO, decel * delta)
@@ -465,7 +479,11 @@ func _client_process(delta: float) -> void:
 		# Smooth mesh scale for all players (slide/crouch visual)
 		var lowered := slide_crouch.is_sliding or slide_crouch.is_crouching
 		var target_scale_y := SlideCrouchSystem.CROUCH_MESH_SCALE_Y if lowered else slide_crouch._original_mesh_scale_y
-		body_mesh.scale.y = lerpf(body_mesh.scale.y, target_scale_y, 12.0 * delta)
+		# During post-slide window, snap to standing immediately (no lerp through crouch)
+		if slide_crouch._post_slide_timer > 0.0:
+			body_mesh.scale.y = slide_crouch._original_mesh_scale_y
+		else:
+			body_mesh.scale.y = lerpf(body_mesh.scale.y, target_scale_y, 12.0 * delta)
 		body_mesh.scale.x = lerpf(body_mesh.scale.x, 1.0, 12.0 * delta)
 		body_mesh.scale.z = lerpf(body_mesh.scale.z, 1.0, 12.0 * delta)
 		# Reset rotation back to upright when not in kamikaze
@@ -667,7 +685,7 @@ func die(killer_id: int) -> void:
 
 
 func _do_respawn() -> void:
-	## Server-only: respawn at a random spawn point.
+	## Server-only: respawn at a random spawn point inside the current zone.
 	# Demon-eliminated players cannot respawn
 	if demon_system.is_eliminated:
 		return
@@ -679,7 +697,30 @@ func _do_respawn() -> void:
 	var map := get_tree().current_scene
 	var spawns := map.get_node("PlayerSpawnPoints").get_children()
 	if spawns.size() > 0:
-		var spawn_point: Marker3D = spawns[randi() % spawns.size()]
+		# Filter to spawn points inside the current safe zone
+		var zone: Node = get_node_or_null("/root/ZoneManager")
+		var valid_spawns: Array[Node] = []
+		if zone:
+			for sp in spawns:
+				if not zone.is_outside_zone(sp.global_position):
+					valid_spawns.append(sp)
+
+			# If no spawns are inside the zone, pick the closest one to zone center
+			if valid_spawns.is_empty():
+				var best_spawn: Node = spawns[0]
+				var best_dist: float = INF
+				for sp in spawns:
+					var sp_xz := Vector2(sp.global_position.x, sp.global_position.z)
+					var dist := sp_xz.distance_to(zone.zone_center)
+					if dist < best_dist:
+						best_dist = dist
+						best_spawn = sp
+				valid_spawns.append(best_spawn)
+		else:
+			for sp in spawns:
+				valid_spawns.append(sp)
+
+		var spawn_point: Marker3D = valid_spawns[randi() % valid_spawns.size()]
 		global_position = spawn_point.global_position
 		velocity = Vector3.ZERO
 

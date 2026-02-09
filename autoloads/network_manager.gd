@@ -215,6 +215,18 @@ func disconnect_game() -> void:
 	multiplayer.multiplayer_peer = null
 	is_server = false
 	players.clear()
+
+	# Reset autoloads so they stop ticking without a multiplayer peer
+	var zone_mgr := get_node_or_null("/root/ZoneManager")
+	if zone_mgr and zone_mgr.has_method("reset"):
+		zone_mgr.reset()
+	var burn_clock := get_node_or_null("/root/BurnClock")
+	if burn_clock and burn_clock.has_method("stop"):
+		burn_clock.stop()
+	var game_mgr := get_node_or_null("/root/GameManager")
+	if game_mgr:
+		game_mgr.current_state = game_mgr.GameState.MENU
+
 	get_tree().change_scene_to_file("res://ui/main_menu.tscn")
 
 
@@ -368,6 +380,13 @@ func _on_server_disconnected() -> void:
 	print("[Client] Server disconnected!")
 	_is_connecting = false
 	multiplayer.multiplayer_peer = null
+	# Reset autoloads to prevent errors when peer is null
+	var zone_mgr := get_node_or_null("/root/ZoneManager")
+	if zone_mgr and zone_mgr.has_method("reset"):
+		zone_mgr.reset()
+	var burn_clock_node := get_node_or_null("/root/BurnClock")
+	if burn_clock_node and burn_clock_node.has_method("stop"):
+		burn_clock_node.stop()
 	connection_failed.emit()
 
 

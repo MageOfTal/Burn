@@ -30,6 +30,8 @@ func get_burn_multiplier() -> float:
 func _physics_process(delta: float) -> void:
 	if not _active:
 		return
+	if multiplayer.multiplayer_peer == null:
+		return
 	if not multiplayer.is_server():
 		return
 

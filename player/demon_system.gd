@@ -126,27 +126,19 @@ func process(delta: float) -> void:
 	if not player.is_alive:
 		return
 
-	# Move toward player on the XZ plane only — demon floats at a fixed hover height
-	var to_player_xz := Vector3(
-		player.global_position.x - demon_position.x,
-		0.0,
-		player.global_position.z - demon_position.z
-	)
-	var flat_move_dist: float = to_player_xz.length()
+	# Move toward player in full 3D — demon must physically reach the player,
+	# not just match their XZ position and float to their height
+	var target_pos := player.global_position + Vector3(0, 1.0, 0)  # Aim at body center
+	var to_player := target_pos - demon_position
+	var dist := to_player.length()
 
-	if flat_move_dist > 0.1:
-		var move_dir: Vector3 = to_player_xz.normalized()
+	if dist > 0.1:
+		var move_dir := to_player.normalized()
 		demon_position += move_dir * demon_speed * delta
-	# Match player body center height (not floating above)
-	var target_y: float = player.global_position.y + 1.0
-	demon_position.y = lerpf(demon_position.y, target_y, 3.0 * delta)
 
-	# Catch check
-	var flat_dist: float = Vector2(
-		player.global_position.x - demon_position.x,
-		player.global_position.z - demon_position.z
-	).length()
-	if flat_dist < DEMON_CATCH_RADIUS:
+	# Catch check — full 3D distance so the demon can't kill through floors/ceilings
+	var dist_3d: float = player.global_position.distance_to(demon_position)
+	if dist_3d < DEMON_CATCH_RADIUS:
 		_eliminate_player()
 
 

@@ -187,9 +187,11 @@ func try_scrap_item() -> void:
 		return
 
 	var rarity: int = stack.item_data.rarity
-	var fuel_gained: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
-	# Bonus fuel based on remaining burn time (more time left = more value)
-	fuel_gained += stack.burn_time_remaining * 0.1
+	var max_fuel: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
+	# Fuel scales linearly with time remaining: full timer = full fuel, expired = nothing
+	var initial_time: float = maxf(stack.item_data.initial_burn_time, 0.1)
+	var time_fraction: float = clampf(stack.burn_time_remaining / initial_time, 0.0, 1.0)
+	var fuel_gained: float = max_fuel * time_fraction
 
 	var item_name: String = stack.item_data.item_name
 	var idx := inventory.equipped_index
@@ -230,9 +232,13 @@ func _try_scrap_ground_item() -> bool:
 	if item_data.item_type == ItemData.ItemType.FUEL:
 		return false
 	var rarity: int = item_data.rarity
-	var fuel_gained: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
+	var max_fuel: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
+	# Fuel scales linearly with time remaining: full timer = full fuel, expired = nothing
+	var initial_time: float = maxf(item_data.initial_burn_time, 0.1)
+	var time_fraction: float = 1.0
 	if "burn_time_remaining" in best_item:
-		fuel_gained += best_item.burn_time_remaining * 0.1
+		time_fraction = clampf(best_item.burn_time_remaining / initial_time, 0.0, 1.0)
+	var fuel_gained: float = max_fuel * time_fraction
 
 	player.inventory.add_fuel(fuel_gained)
 	print("Player %d scrapped ground item %s for %.0f fuel" % [player.peer_id, item_data.item_name, fuel_gained])

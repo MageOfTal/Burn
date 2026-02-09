@@ -115,14 +115,30 @@ func _physics_process(_delta: float) -> void:
 		_mouse_delta = Vector2.ZERO
 		return
 
-	# Movement
-	input_direction = Input.get_vector("move_left", "move_right", "move_forward", "move_back")
-
-	# Look — accumulate mouse motion into yaw/pitch
+	# Look — accumulate mouse motion into yaw/pitch (always active)
 	look_yaw -= _mouse_delta.x * MOUSE_SENSITIVITY
 	look_pitch -= _mouse_delta.y * MOUSE_SENSITIVITY
 	look_pitch = clampf(look_pitch, -1.48, 1.2)
 	_mouse_delta = Vector2.ZERO
+
+	# During kamikaze flight: only mouse look is active, all other inputs are ignored.
+	# This prevents arrow keys, WASD, slot switches, etc. from doing anything mid-flight.
+	var player_node := get_parent()
+	if player_node and "kamikaze_system" in player_node and player_node.kamikaze_system.is_active():
+		input_direction = Vector2.ZERO
+		action_jump = false
+		action_shoot = false
+		action_pickup = false
+		action_slide = false
+		action_aim = false
+		action_extend = false
+		action_scrap = false
+		action_marker = false
+		action_slot = 0
+		return
+
+	# Movement
+	input_direction = Input.get_vector("move_left", "move_right", "move_forward", "move_back")
 
 	# Actions (pressed this frame)
 	action_jump = Input.is_action_just_pressed("jump")

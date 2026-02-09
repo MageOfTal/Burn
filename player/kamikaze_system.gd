@@ -11,9 +11,16 @@ const LAUNCH_DURATION := 2.5     ## Seconds of straight-up launch
 ## --- Flight ---
 const REF_SPEED := 100.0          ## Reference speed for scaling damage/visuals (1.0 ratio)
 const MIN_SPEED := 10.0          ## Minimum flight speed (can't stall)
+const MAX_SPEED := 65.0          ## Speed cap — altitude after cap still boosts explosion
 const GRAVITY := 17.5            ## Gravity contribution to flight
 const AIR_FRICTION := 0.12       ## Low drag — lets speed build up on long dives
 const STEER_SPEED := 2.5         ## How fast the player can redirect flight direction
+const MIN_DESCENT_ANGLE := 15.0  ## Minimum downward angle in degrees (can't fly level/up)
+## --- Camera ---
+const CAMERA_BASE_SPRING := 4.0  ## Spring arm length at min speed (zoomed out from default 2.2)
+const CAMERA_MAX_SPRING := 8.0   ## Spring arm length at max speed (really pulled back)
+const CAMERA_BASE_FOV := 80.0    ## FOV at min speed (wider than normal 70)
+const CAMERA_MAX_FOV := 115.0    ## FOV at max speed
 ## --- Explosion ---
 const MIN_DAMAGE := 40.0         ## Explosion damage at minimum speed
 const MAX_DAMAGE := 300.0        ## Explosion damage at ref speed (scales beyond)
@@ -38,6 +45,14 @@ var _speed: float = 0.0
 var _launch_timer: float = 0.0
 var _trail: GPUParticles3D = null  ## Flight trail particles (client-side)
 var _flashbang_overlay: FlashbangOverlay = null
+## Altitude tracking: Y position when flight phase starts, used for explosion bonus
+var _flight_start_y: float = 0.0
+## Total altitude dropped while at max speed (extra explosion scaling)
+var _altitude_drop_at_cap: float = 0.0
+## Whether we're currently at the speed cap
+var _was_at_cap: bool = false
+## Y position when we first hit the speed cap
+var _cap_hit_y: float = 0.0
 
 ## Player reference
 var player: CharacterBody3D
@@ -92,6 +107,10 @@ func reset_state() -> void:
 	_direction = Vector3.UP
 	_speed = 0.0
 	_launch_timer = 0.0
+	_flight_start_y = 0.0
+	_altitude_drop_at_cap = 0.0
+	_was_at_cap = false
+	_cap_hit_y = 0.0
 	# Clean up flight trail particles
 	if _trail and is_instance_valid(_trail):
 		_trail.emitting = false
@@ -119,19 +138,40 @@ func _process_launch(delta: float) -> void:
 		# Transition to Phase 2: flight
 		_phase = 2
 		_speed = LAUNCH_SPEED * 0.5
+		_flight_start_y = player.global_position.y
+		_altitude_drop_at_cap = 0.0
+		_was_at_cap = false
 		var cam_forward: Vector3 = -player.camera.global_transform.basis.z
 		_direction = cam_forward.normalized()
 
 
 func _process_flight(delta: float) -> void:
 	## Phase 2: Mouse-steered flight with gravity-based acceleration.
+	## The mouse controls the camera freely (aim cursor). The missile steers
+	## toward where the player is looking, with a forced minimum descent angle.
+	## The body mesh is oriented headfirst by client_process_visuals().
+
+	# Let mouse control the camera normally — this is what the player aims with
 	player.rotation.y = player.player_input.look_yaw
 	player.camera_pivot.rotation.x = player.player_input.look_pitch
+
+	# Build desired direction from where the camera is pointing
 	var desired_direction: Vector3 = -player.camera.global_transform.basis.z
 	desired_direction = desired_direction.normalized()
 
+	# Enforce minimum downward pitch of 15 degrees — can't fly level or upward.
+	var min_descent_y := -sin(deg_to_rad(MIN_DESCENT_ANGLE))  # e.g. -0.259
+	if desired_direction.y > min_descent_y:
+		desired_direction.y = min_descent_y
+		desired_direction = desired_direction.normalized()
+
 	# Smoothly steer toward desired direction
 	_direction = _direction.lerp(desired_direction, STEER_SPEED * delta).normalized()
+
+	# Safety clamp: ensure actual direction always descends
+	if _direction.y > min_descent_y:
+		_direction.y = min_descent_y
+		_direction = _direction.normalized()
 
 	# Gravity component: diving = accelerate, climbing = decelerate
 	var gravity_accel: float = GRAVITY * _direction.dot(Vector3.DOWN)
@@ -140,10 +180,22 @@ func _process_flight(delta: float) -> void:
 	# Air friction (linear drag)
 	_speed *= (1.0 - AIR_FRICTION * delta)
 
-	# No upper cap — pure physics
-	_speed = maxf(_speed, MIN_SPEED)
+	# Speed cap — but altitude dropped while at cap still boosts explosion
+	_speed = clampf(_speed, MIN_SPEED, MAX_SPEED)
 
-	# Set velocity and move
+	# Track altitude dropped while at (or near) speed cap
+	if _speed >= MAX_SPEED * 0.95:
+		if not _was_at_cap:
+			_was_at_cap = true
+			_cap_hit_y = player.global_position.y
+		else:
+			# Accumulate altitude drop since we hit the cap
+			var current_y := player.global_position.y
+			if current_y < _cap_hit_y:
+				_altitude_drop_at_cap = _cap_hit_y - current_y
+
+	# Set velocity and move — do NOT touch player.rotation or camera_pivot here,
+	# that's the mouse's job. Body mesh orientation is handled client-side.
 	player.velocity = _direction * _speed
 
 	# Collision detection: pre-frame raycast to catch tunneling
@@ -176,12 +228,24 @@ func _process_flight(delta: float) -> void:
 
 func _explode() -> void:
 	## Server-only: explode at current position. Damage, crater, VFX, then die.
+	## Explosion scales with speed AND altitude dropped while at speed cap.
 	var explosion_pos := player.global_position
 	var speed_ratio := maxf((_speed - MIN_SPEED) / (REF_SPEED - MIN_SPEED), 0.0)
 
-	var damage: float = lerpf(MIN_DAMAGE, MAX_DAMAGE, speed_ratio)
-	var radius: float = lerpf(MIN_RADIUS, MAX_RADIUS, speed_ratio)
-	var flash_energy: float = lerpf(MIN_FLASH_ENERGY, MAX_FLASH_ENERGY, speed_ratio)
+	# Altitude bonus: extra scaling for diving distance after hitting speed cap.
+	# Every 10m of altitude dropped at cap adds +0.1 to the ratio (so 50m drop = +0.5).
+	var altitude_bonus := _altitude_drop_at_cap / 10.0 * 0.1
+	# Also add a smaller bonus for total altitude change from flight start
+	var total_drop := maxf(_flight_start_y - explosion_pos.y, 0.0)
+	var total_drop_bonus := total_drop / 40.0 * 0.15  # 40m drop = +0.15
+	var effective_ratio := speed_ratio + altitude_bonus + total_drop_bonus
+
+	var damage: float = lerpf(MIN_DAMAGE, MAX_DAMAGE, effective_ratio)
+	var radius: float = lerpf(MIN_RADIUS, MAX_RADIUS, effective_ratio)
+	var flash_energy: float = lerpf(MIN_FLASH_ENERGY, MAX_FLASH_ENERGY, effective_ratio)
+
+	print("Kamikaze explosion: speed=%.1f, speed_ratio=%.2f, alt_drop_at_cap=%.1f, total_drop=%.1f, effective_ratio=%.2f" % [
+		_speed, speed_ratio, _altitude_drop_at_cap, total_drop, effective_ratio])
 
 	# --- Pass 1: Physics sphere query for nearby bodies ---
 	var already_damaged: Array[Node] = []
@@ -236,10 +300,10 @@ func _explode() -> void:
 	if seed_world == null:
 		seed_world = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld")
 	if seed_world and seed_world.has_method("create_crater"):
-		seed_world.create_crater(explosion_pos, radius * 0.4, 1.5)
+		seed_world.create_crater(explosion_pos, radius * 0.4, 1.5, player.peer_id)
 
-	# --- Broadcast explosion VFX to all clients ---
-	_show_kamikaze_explosion.rpc(explosion_pos, radius, flash_energy, speed_ratio)
+	# --- Broadcast explosion VFX to all clients (use effective_ratio for visual scale) ---
+	_show_kamikaze_explosion.rpc(explosion_pos, radius, flash_energy, effective_ratio)
 
 	# --- Self-damage with 90% resistance ---
 	var self_damage: float = damage * SELF_DAMAGE_MULT
@@ -687,26 +751,40 @@ func client_process_visuals(delta: float) -> void:
 	body_mesh.scale.z = lerpf(body_mesh.scale.z, 1.0, 10.0 * delta)
 	body_mesh.position.y = original_mesh_y
 
-	# Orient body mesh head-first along flight direction
+	# Orient body mesh head-first along the flight direction.
+	# The player character stands upright by default (Y up). To point headfirst
+	# into a dive, we need to pitch the mesh forward by 90° + the dive angle.
+	# fly_pitch_angle: 0 = horizontal, PI/2 = straight down
 	var fly_dir := player.velocity.normalized() if player.velocity.length() > 1.0 else Vector3.DOWN
-	var fly_pitch := asin(clampf(-fly_dir.y, -1.0, 1.0))
-	body_mesh.rotation.x = lerpf(body_mesh.rotation.x, fly_pitch, 8.0 * delta)
+	var fly_pitch_angle := asin(clampf(-fly_dir.y, -1.0, 1.0))  # 0=level, PI/2=down
+
+	# Pitch the mesh: a standing mesh at rotation.x=0 is upright.
+	# rotation.x = PI/2 makes it horizontal (face down), rotation.x = PI is fully inverted.
+	# For headfirst dive: tilt = PI/2 (horizontal) + fly_pitch_angle (extra for steep dives)
+	# Clamp so it doesn't go past straight-down
+	var headfirst_pitch := (PI * 0.5) + fly_pitch_angle  # e.g. ~1.83 rad for 15° dive
+	body_mesh.rotation.x = lerpf(body_mesh.rotation.x, headfirst_pitch, 10.0 * delta)
+
+	# Yaw the mesh to face the horizontal flight direction (relative to player yaw)
 	var fly_flat := Vector3(fly_dir.x, 0.0, fly_dir.z)
 	if fly_flat.length() > 0.01:
 		var target_yaw := atan2(fly_flat.x, fly_flat.z)
 		var relative_yaw := target_yaw - player.rotation.y
-		body_mesh.rotation.y = lerpf(body_mesh.rotation.y, relative_yaw, 8.0 * delta)
+		# Wrap to [-PI, PI]
+		relative_yaw = fmod(relative_yaw + PI, TAU) - PI
+		body_mesh.rotation.y = lerpf(body_mesh.rotation.y, relative_yaw, 10.0 * delta)
 
-	# Local player: camera FOV widens with speed, spring arm pulls close
+	# Local player: camera zooms OUT so you can see where you're going.
+	# Both FOV and spring arm length increase with speed for a rush feeling.
 	if is_local:
-		var base_fov := 70.0
-		if player.has_node("/root/PauseMenu"):
-			base_fov = player.get_node("/root/PauseMenu")._settings.get("fov", 70.0)
 		var vel_speed := player.velocity.length()
-		var speed_t := clampf(vel_speed / REF_SPEED, 0.0, 1.0)
-		var target_fov := lerpf(base_fov, 110.0, speed_t)
-		player.camera.fov = lerpf(player.camera.fov, target_fov, 8.0 * delta)
-		player.spring_arm.spring_length = lerpf(player.spring_arm.spring_length, 0.5, 8.0 * delta)
+		var speed_t := clampf(vel_speed / MAX_SPEED, 0.0, 1.0)
+		# FOV: wider at higher speed
+		var target_fov := lerpf(CAMERA_BASE_FOV, CAMERA_MAX_FOV, speed_t)
+		player.camera.fov = lerpf(player.camera.fov, target_fov, 6.0 * delta)
+		# Spring arm: pull camera BACK (further out) for better visibility
+		var target_spring := lerpf(CAMERA_BASE_SPRING, CAMERA_MAX_SPRING, speed_t)
+		player.spring_arm.spring_length = lerpf(player.spring_arm.spring_length, target_spring, 6.0 * delta)
 
 	# Weapon mount hidden during kamikaze
 	player.weapon_mount.visible = false
