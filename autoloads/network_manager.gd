@@ -116,12 +116,23 @@ func get_peer_status_string() -> String:
 
 
 ## Returns the best local LAN IP (192.168.x.x or 10.x.x.x).
+## Skips virtual adapter ranges (172.16-31.x.x often used by Docker/WSL/Hyper-V).
+## Prints all detected IPs to Output so you can verify.
 func get_local_ip() -> String:
-	for ip in IP.get_local_addresses():
-		if ip.begins_with("192.168.") or ip.begins_with("10."):
+	var all_ips := IP.get_local_addresses()
+	print("[Net] All local IPs from Godot: %s" % str(all_ips))
+
+	# Pass 1: prefer 192.168.x.x (most common home LAN)
+	for ip in all_ips:
+		if ip.begins_with("192.168."):
 			return ip
-	for ip in IP.get_local_addresses():
-		if "." in ip and ip != "127.0.0.1":
+	# Pass 2: 10.x.x.x (some LANs use this)
+	for ip in all_ips:
+		if ip.begins_with("10."):
+			return ip
+	# Pass 3: any IPv4 that isn't loopback or link-local
+	for ip in all_ips:
+		if "." in ip and ip != "127.0.0.1" and not ip.begins_with("169.254."):
 			return ip
 	return "unknown"
 
