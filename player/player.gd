@@ -151,6 +151,9 @@ func _ready() -> void:
 			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 		if player_hud and player_hud.has_method("setup"):
 			player_hud.setup(self)
+		var gadget_xhair := player_hud.get_node_or_null("GadgetCrosshair") if player_hud else null
+		if gadget_xhair and gadget_xhair.has_method("setup"):
+			gadget_xhair.setup(self)
 		if inventory_ui and inventory_ui.has_method("setup"):
 			inventory_ui.setup(self)
 			inventory_ui.visible = false
