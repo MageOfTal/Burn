@@ -14,6 +14,7 @@ var debug_disable_zone_damage: bool = false
 var debug_skip_structures: bool = false
 var debug_grapple_ground_pump: bool = false
 var debug_grapple_reel_speed: float = 3.0  # Matches GrappleSystem.ROPE_REEL_SPEED default
+var debug_grapple_visuals: bool = false     # Show pill, angle display, spheres, raycasts
 var debug_freecam_active: bool = false      # Set by DebugFreecam autoload
 
 signal game_state_changed(new_state: GameState)

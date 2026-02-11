@@ -62,17 +62,13 @@ const ROPE_LOS_INTERVAL := 3
 ## Each half is a half-capsule: flat face on the split plane, hemisphere outward.
 ## If blocked, shrink radius and retry.
 const PILL_RADIUS := 0.35             ## Capsule radius for the go-around check
-const ARC_CONTACT_RADIUS := 2.0       ## Different-object contacts beyond this from the cloud are ignored
-const CLOUD_FAN_RAYS := 5             ## Rays fanned across swing plane to map center obstacle extent
+const ARC_CONTACT_RADIUS := 3.0       ## Different-object contacts beyond this from center contact are ignored
 const HALF_CAPSULE_SEGS := 6          ## Circumference segments for half-capsule vertices
 const HALF_CAPSULE_HEMI_STEPS := 3    ## Latitude steps for the hemisphere cap
 ## Center sweep — a flat triangle (prev_chest, current_chest, anchor) covering
 ## the area the rope swept through between LOS checks.  Uses ConvexPolygonShape3D
 ## with 3 coplanar vertices — the physics engine treats this as a triangle.
 
-## Bend-angle tolerance — rope survives small deflections around thin obstacles.
-const MAX_BEND_ANGLE_DEG := 5.0       ## Rope tolerates up to this bend before cutting
-const BEND_STRAIGHTENED_DEG := 0.5    ## Below this = rope considered straight again
 
 # ======================================================================
 #  Synced state (replicated via ServerSync)
@@ -94,10 +90,10 @@ var _low_momentum_timer: float = 0.0  ## Tracks how long angular rate has been b
 var _last_los_chest: Vector3 = Vector3.ZERO  ## Player chest pos at last LOS check (for fan sweep)
 var _fresh_grapple: bool = false      ## True until player first exceeds angular threshold
 
-## Bend-angle tolerance — tracks whether the rope is deflected around an obstacle.
-var _rope_is_bent: bool = false
-var _bend_contact_point: Vector3 = Vector3.ZERO  ## Obstacle contact causing the bend
-var _bend_angle_deg: float = 0.0                 ## Current bend angle in degrees at anchor
+
+## Debug timing — spike detection
+var _debug_last_print_time: float = 0.0          ## Throttle prints to 1/sec
+const DEBUG_SPIKE_THRESHOLD_US := 500.0           ## Print if any section takes > 500µs
 
 # ======================================================================
 #  Client VFX state
@@ -108,9 +104,19 @@ var _anchor_light: OmniLight3D = null
 var _rope_material: StandardMaterial3D = null
 var _pill_mesh_instance: MeshInstance3D = null
 var _contact_mesh_instance: MeshInstance3D = null
-var _bent_rope_mesh: MeshInstance3D = null
-var _bent_rope_material: StandardMaterial3D = null
-var _bent_contact_material: StandardMaterial3D = null
+
+## Pre-cached debug materials (created once in setup, reused every frame)
+var _pill_clear_left_mat: StandardMaterial3D = null      # Green (left half clear)
+var _pill_clear_right_mat: StandardMaterial3D = null      # Yellow (right half clear)
+var _pill_blocked_mat: StandardMaterial3D = null           # Red (half blocked)
+var _pill_subdiv_clear_left_mat: StandardMaterial3D = null # Green 40% (subdivision clear)
+var _pill_subdiv_clear_right_mat: StandardMaterial3D = null # Yellow 40% (subdivision clear)
+var _pill_subdiv_blocked_mat: StandardMaterial3D = null    # Red 40% (subdivision blocked)
+var _sweep_wire_mat: StandardMaterial3D = null             # Blue wireframe (center sweep triangle)
+var _contact_center_mat: StandardMaterial3D = null         # Bright cyan (center contact)
+var _contact_cloud_mat: StandardMaterial3D = null          # Dim cyan (cloud points)
+var _contact_arc_mat: StandardMaterial3D = null            # Green-blue (arc contacts)
+var _contact_sphere_mat: StandardMaterial3D = null         # White semi-transparent (radius sphere)
 
 ## Pill debug state — set by server obstruction check, read by client visuals.
 ## 0 = clear, 1 = blocked.  Index 0 = left half (swing direction), 1 = right half.
@@ -144,6 +150,9 @@ var _center_contact_rid: RID = RID()
 ## Index 0 = left half contacts, 1 = right half contacts.
 var _arc_contacts: Array[Array] = [[], []]
 
+## Debug: on-screen label showing bend angle, wrap count, rope state.
+var _debug_label: Label = null
+
 # ======================================================================
 #  Player reference
 # ======================================================================
@@ -154,28 +163,36 @@ var player: CharacterBody3D
 func setup(p: CharacterBody3D) -> void:
 	player = p
 	_rope_material = StandardMaterial3D.new()
-	_rope_material.albedo_color = Color(0.4, 0.75, 1.0, 0.95)
+	_rope_material.albedo_color = Color(0.3, 0.6, 1.0, 1.0)
 	_rope_material.emission_enabled = true
-	_rope_material.emission = Color(0.3, 0.6, 1.0)
-	_rope_material.emission_energy_multiplier = 4.0
-	_rope_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_rope_material.emission = Color(0.2, 0.5, 1.0)
+	_rope_material.emission_energy_multiplier = 2.0
 	_rope_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	_rope_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 
-	# Pre-create bent rope debug materials (cached to avoid per-frame allocation)
-	_bent_rope_material = StandardMaterial3D.new()
-	_bent_rope_material.albedo_color = Color(1.0, 0.6, 0.1, 0.85)
-	_bent_rope_material.emission_enabled = true
-	_bent_rope_material.emission = Color(1.0, 0.5, 0.0)
-	_bent_rope_material.emission_energy_multiplier = 3.0
-	_bent_rope_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	_bent_rope_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	_bent_rope_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+	# Pre-cache pill half-capsule debug materials (avoids 8-13 allocations per frame)
+	_pill_clear_left_mat = _make_pill_mat(Color(0.1, 1.0, 0.2, 0.15))
+	_pill_clear_right_mat = _make_pill_mat(Color(1.0, 1.0, 0.1, 0.15))
+	_pill_blocked_mat = _make_pill_mat(Color(1.0, 0.15, 0.1, 0.25))
+	_pill_subdiv_clear_left_mat = _make_pill_mat(Color(0.1, 1.0, 0.2, 0.06))
+	_pill_subdiv_clear_right_mat = _make_pill_mat(Color(1.0, 1.0, 0.1, 0.06))
+	_pill_subdiv_blocked_mat = _make_pill_mat(Color(1.0, 0.15, 0.1, 0.1))
 
-	_bent_contact_material = StandardMaterial3D.new()
-	_bent_contact_material.albedo_color = Color(1.0, 0.4, 0.0, 0.9)
-	_bent_contact_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	_bent_contact_material.no_depth_test = true
+	# Pre-cache center sweep wireframe material
+	_sweep_wire_mat = StandardMaterial3D.new()
+	_sweep_wire_mat.albedo_color = Color(0.4, 0.75, 1.0, 0.4)
+	_sweep_wire_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_sweep_wire_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	# Pre-cache contact debug materials
+	_contact_center_mat = _make_contact_mat(Color(0.2, 0.9, 1.0, 0.9))
+	_contact_cloud_mat = _make_contact_mat(Color(0.15, 0.7, 0.85, 0.7))
+	_contact_arc_mat = _make_contact_mat(Color(0.1, 0.8, 0.6, 0.9))
+	_contact_sphere_mat = StandardMaterial3D.new()
+	_contact_sphere_mat.albedo_color = Color(1.0, 1.0, 1.0, 0.3)
+	_contact_sphere_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_contact_sphere_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	_contact_sphere_mat.no_depth_test = true
 
 	# Pre-create half-capsule shapes for pill obstruction checks
 	_left_half_shape = ConvexPolygonShape3D.new()
@@ -199,6 +216,36 @@ func setup(p: CharacterBody3D) -> void:
 	_center_sweep_query.collision_mask = 1
 	_center_sweep_query.collide_with_bodies = true
 	_center_sweep_query.collide_with_areas = false
+
+	# Debug HUD label — shows bend angle, wrap count, rope state on screen
+	_debug_label = Label.new()
+	_debug_label.add_theme_font_size_override("font_size", 20)
+	_debug_label.add_theme_color_override("font_color", Color(1.0, 1.0, 0.3))
+	_debug_label.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.8))
+	_debug_label.add_theme_constant_override("shadow_offset_x", 2)
+	_debug_label.add_theme_constant_override("shadow_offset_y", 2)
+	_debug_label.position = Vector2(20, 200)
+	_debug_label.visible = false
+	var hud_layer := player.get_node_or_null("HUDLayer")
+	if hud_layer:
+		hud_layer.add_child(_debug_label)
+
+
+func _make_pill_mat(color: Color) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = color
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
+	return m
+
+
+func _make_contact_mat(color: Color) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = color
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.no_depth_test = true
+	return m
 
 
 func is_active() -> bool:
@@ -256,9 +303,6 @@ func try_fire() -> void:
 	is_grappling = true
 	_shoot_was_held = true
 	_last_los_chest = hand_origin
-	_rope_is_bent = false
-	_bend_contact_point = Vector3.ZERO
-	_bend_angle_deg = 0.0
 
 	# End crouch if active
 	var slide_crouch: SlideCrouchSystem = player.slide_crouch
@@ -298,6 +342,8 @@ func process(delta: float) -> void:
 	## from the SAME constraint correction, so there's no speed change.
 	if not is_grappling:
 		return
+
+	var _t0 := Time.get_ticks_usec()
 
 	# --- Camera look ---
 	player.rotation.y = player.player_input.look_yaw
@@ -469,7 +515,9 @@ func process(delta: float) -> void:
 	#    velocity, so the player glides horizontally.  In the air, the
 	#    full velocity applies.
 	# =================================================================
+	var _t_move := Time.get_ticks_usec()
 	player.move_and_slide()
+	var _t_move_end := Time.get_ticks_usec()
 
 	# --- Release conditions ---
 	if player.player_input.action_jump:
@@ -477,12 +525,16 @@ func process(delta: float) -> void:
 		return
 
 	# --- Rope LOS check ---
+	var _t_los: int = 0
+	var _t_los_end: int = 0
 	_los_frame_counter += 1
 	if _los_frame_counter >= ROPE_LOS_INTERVAL:
 		_los_frame_counter = 0
+		_t_los = Time.get_ticks_usec()
 		if _is_rope_obstructed():
 			_do_release(false)
 			return
+		_t_los_end = Time.get_ticks_usec()
 
 	# --- Safety: absurd distance = release ---
 	if player.global_position.distance_to(anchor_point) > MAX_GRAPPLE_RANGE * 1.5:
@@ -490,34 +542,39 @@ func process(delta: float) -> void:
 
 	_was_on_floor = on_floor
 
+	# --- Debug timing report ---
+	var _t_total := Time.get_ticks_usec()
+	var total_us: float = _t_total - _t0
+	var move_us: float = _t_move_end - _t_move
+	var los_us: float = (_t_los_end - _t_los) if _t_los > 0 else 0.0
+	var now_sec: float = Time.get_ticks_msec() / 1000.0
+	if total_us > DEBUG_SPIKE_THRESHOLD_US and (now_sec - _debug_last_print_time) > 1.0:
+		_debug_last_print_time = now_sec
+		print("[GRAPPLE SPIKE] total=%.0fµs  move_and_slide=%.0fµs  LOS_check=%.0fµs  other=%.0fµs" % [
+			total_us, move_us, los_us, total_us - move_us - los_us])
+
 
 func _is_rope_obstructed() -> bool:
-	## Rope obstruction check with swept triangle + half-capsule "go around" paths.
+	## Rope obstruction check — pill-based.
 	##
-	## 1. Center check — two parts:
-	##    a. Swept-triangle: a flat triangle (prev_chest, current_chest, anchor)
-	##       tests the exact area the rope swept through between LOS checks.
-	##    b. Current rope: single ray from current chest → anchor.
-	##    First hit = center contact.
-	## 2. Cloud fan: CLOUD_FAN_RAYS spread in the swing plane to map the center
-	##    obstacle's 2D extent.  Same-RID hits build the contact cloud.
-	## 3. One pill centered on the rope, split into left/right halves (thin shells).
-	##    Each half is a ConvexPolygonShape3D — the outer shell surface of one
-	##    side of the capsule.  This checks the path the rope would take going
-	##    around the obstacle, not the full interior volume.
-	##    If blocked, shrink the radius (0.5×, 0.25×, 0.75×) to see if the rope
-	##    can squeeze through a narrower gap.
-	##    a. intersect_shape() — if center obstacle RID overlaps → blocked (same object).
-	##    b. collide_shape() — different objects: only contacts within ARC_CONTACT_RADIUS
-	##       of the nearest cloud point count.
-	## 4. Both halves blocked at all subdivisions → rope cut.
+	## 1. Center check — detect obstruction:
+	##    a. Swept prism (prev_chest, current_chest, anchor).
+	##    b. Player-to-anchor ray.
+	##    c. Anchor-to-player ray (catches backface hits).
+	## 2. If blocked, pill check — left/right half-capsules test if there's
+	##    a way around.  At least one half clear -> don't cut.  Both blocked -> CUT.
+	var _los_t0 := Time.get_ticks_usec()
 	var space_state := player.get_world_3d().direct_space_state
-	# Use hand position — matches the fire raycast origin, so the LOS
-	# check and fire ray agree on what terrain blocks the rope.
 	var player_chest: Vector3 = player.global_position + Vector3(0, 1.2, 0)
+
+	# Exclude self, anchor collider, and all other players
 	var excludes: Array[RID] = [player.get_rid()]
 	if _anchor_collider_rid.is_valid():
 		excludes.append(_anchor_collider_rid)
+	for peer_id in NetworkManager.players:
+		var other_player: CharacterBody3D = NetworkManager.players[peer_id]
+		if other_player and other_player != player:
+			excludes.append(other_player.get_rid())
 
 	var rope_vec: Vector3 = anchor_point - player_chest
 	var rope_len: float = rope_vec.length()
@@ -541,37 +598,39 @@ func _is_rope_obstructed() -> bool:
 
 	_pill_swing_normal = swing_normal
 
+	var _los_t_center := Time.get_ticks_usec()
 	# --- Step 1: Center rope check with swept-triangle detection ---
-	# The rope sweeps a triangle between LOS checks: prev_chest → current_chest
-	# → anchor.  A flat ConvexPolygonShape3D (3 coplanar verts) tests if ANY
-	# geometry intersects this swept area — no gaps, no discrete rays.
-	# If the triangle is degenerate (player didn't move), falls back to a
-	# single ray from current_chest → anchor.
 	_has_center_contact = false
 	_center_contact_cloud = []
 	_center_contact_rid = RID()
 	_arc_contacts = [[], []]
 
 	var prev_chest: Vector3 = _last_los_chest if _last_los_chest.length() > 0.1 else player_chest
-	_prev_los_chest = prev_chest  # Store for debug visualization
-	_last_los_chest = player_chest  # Update for next check
+	_prev_los_chest = prev_chest
+	_last_los_chest = player_chest
 
 	var center_hit_result: Dictionary = {}
 
-	# A) Swept-triangle check — flat triangle (prev_chest, current_chest, anchor)
+	# A) Swept-triangle check — thin prism (prev_chest, current_chest, anchor)
 	var sweep_vec: Vector3 = player_chest - prev_chest
 	var sweep_len: float = sweep_vec.length()
 	if sweep_len > 0.05:
-		# Set the 3 vertices of the triangle directly in world space.
-		# ConvexPolygonShape3D points are in local space of the query transform,
-		# so we use an identity transform and pass world-space coords.
-		_center_sweep_shape.points = PackedVector3Array([prev_chest, player_chest, anchor_point])
+		var edge_a: Vector3 = player_chest - prev_chest
+		var edge_b: Vector3 = anchor_point - prev_chest
+		var tri_normal: Vector3 = edge_a.cross(edge_b)
+		var tri_n_len: float = tri_normal.length()
+		if tri_n_len > 0.001:
+			tri_normal /= tri_n_len
+		else:
+			tri_normal = Vector3.UP
+		var offset: Vector3 = tri_normal * 0.005
+		_center_sweep_shape.points = PackedVector3Array([
+			prev_chest + offset, player_chest + offset, anchor_point + offset,
+			prev_chest - offset, player_chest - offset, anchor_point - offset])
 		_center_sweep_query.transform = Transform3D.IDENTITY
 		_center_sweep_query.exclude = excludes
 		var sweep_overlaps := space_state.intersect_shape(_center_sweep_query, 8)
 		if not sweep_overlaps.is_empty():
-			# Geometry intersects the swept triangle — find the contact point.
-			# Ray from prev_chest toward anchor to locate the actual hit.
 			var confirm_query := PhysicsRayQueryParameters3D.create(prev_chest, anchor_point)
 			confirm_query.exclude = excludes
 			confirm_query.collision_mask = 1
@@ -580,7 +639,7 @@ func _is_rope_obstructed() -> bool:
 				if confirm_result.position.distance_to(anchor_point) >= ROPE_LOS_MARGIN:
 					center_hit_result = confirm_result
 
-	# B) Current rope ray — standard single ray from current chest to anchor
+	# B) Current rope ray — player chest to anchor
 	if center_hit_result.is_empty():
 		var rope_query := PhysicsRayQueryParameters3D.create(player_chest, anchor_point)
 		rope_query.exclude = excludes
@@ -590,129 +649,65 @@ func _is_rope_obstructed() -> bool:
 			if rope_result.position.distance_to(anchor_point) >= ROPE_LOS_MARGIN:
 				center_hit_result = rope_result
 
+	# C) Anchor to player ray — catches obstacles the player-side ray misses
+	var anchor_ray_query := PhysicsRayQueryParameters3D.create(anchor_point, player_chest)
+	anchor_ray_query.exclude = excludes
+	anchor_ray_query.collision_mask = 1
+	var anchor_ray_result := space_state.intersect_ray(anchor_ray_query)
+	if not anchor_ray_result.is_empty():
+		if anchor_ray_result.position.distance_to(player_chest) >= ROPE_LOS_MARGIN:
+			if center_hit_result.is_empty():
+				center_hit_result = anchor_ray_result
+
+	# --- Clear path: no obstruction ---
 	if center_hit_result.is_empty():
 		_pill_half_blocked = [0, 0]
-		if _rope_is_bent:
-			# Obstacle left the center ray.  Only snap if the bend was
-			# significant — i.e. the angle had grown past the straightened
-			# threshold while the obstacle was present.  For thin bars the
-			# angle never gets large so the rope just clears.
-			if _bend_angle_deg > BEND_STRAIGHTENED_DEG:
-				# Rope was meaningfully bent and obstacle vanished → snap
-				_rope_is_bent = false
-				_bend_angle_deg = 0.0
-				return true
-			# Bend was negligible — just clear state
-			_rope_is_bent = false
-			_bend_angle_deg = 0.0
 		return false
 
-	# Record center contact
+	# --- Blocked: run pill check ---
 	_center_contact_point = center_hit_result.position
 	_center_contact_rid = center_hit_result.get("rid", RID())
 	_has_center_contact = true
 
-	# Track bend angle at contact point
-	_bend_angle_deg = _compute_bend_angle_deg(player_chest, _center_contact_point)
-	_bend_contact_point = _center_contact_point
-	_rope_is_bent = true
+	var pill_xform := _build_pill_transform(player_chest, rope_dir, swing_normal, rope_len)
 
-	# --- Step 2: Build contact cloud via fan rays ---
-	# Cast rays fanned out in the swing plane across the obstacle to map its
-	# 2D extent.  Only hits on the same RID contribute to the cloud.
-	_center_contact_cloud.append(_center_contact_point)  # The center hit is always in the cloud
+	var left_pts := _build_half_capsule_points(rope_len, PILL_RADIUS, 1.0)
+	_left_half_shape.points = left_pts
+	_left_half_query.transform = pill_xform
+	_left_half_query.exclude = excludes
 
-	var fan_spread: float = PILL_RADIUS  # Max offset from center in swing_normal direction
-	for fi in CLOUD_FAN_RAYS:
-		# Spread from -fan_spread to +fan_spread
-		var t: float = -1.0 + 2.0 * float(fi) / float(CLOUD_FAN_RAYS - 1) if CLOUD_FAN_RAYS > 1 else 0.0
-		var fan_offset: Vector3 = swing_normal * t * fan_spread
-		var fan_from: Vector3 = player_chest + fan_offset
-		var fan_to: Vector3 = anchor_point + fan_offset
-		var fan_query := PhysicsRayQueryParameters3D.create(fan_from, fan_to)
-		fan_query.exclude = excludes
-		fan_query.collision_mask = 1
-		var fan_result := space_state.intersect_ray(fan_query)
-		if not fan_result.is_empty():
-			var hit_rid: RID = fan_result.get("rid", RID())
-			if hit_rid == _center_contact_rid:
-				_center_contact_cloud.append(fan_result.position)
+	var right_pts := _build_half_capsule_points(rope_len, PILL_RADIUS, -1.0)
+	_right_half_shape.points = right_pts
+	_right_half_query.transform = pill_xform
+	_right_half_query.exclude = excludes
 
-	# --- Step 3-4: Check half-capsule shapes with shrinking radius ---
-	# One pill centered on the rope, split into left/right halves along the
-	# swing plane.  Each half is a ConvexPolygonShape3D (flat face on the
-	# split plane, hemisphere on the outside).  If blocked, shrink radius
-	# and retry to see if it can squeeze through a gap.
-	#
-	# Subdivision levels (radius multiplier):
-	# Level 0: 1.0× (full radius)
-	# Level 1: 0.5× (half radius)
-	# Level 2: 0.25×, 0.75× (quarter and three-quarter)
-	# Stop at the first clear path.
+	var left_contacts: Array[Vector3] = []
+	var left_blocked := _check_pill_half_blocked(space_state, _left_half_query, left_contacts)
 
-	# Build the pill transform: centered on the rope, Y = rope direction,
-	# X = swing_normal (the split direction).
-	var pill_transform := _build_pill_transform(player_chest, rope_dir, swing_normal, rope_len)
+	var right_contacts: Array[Vector3] = []
+	var right_blocked := _check_pill_half_blocked(space_state, _right_half_query, right_contacts)
 
-	var subdiv_levels: Array[Array] = [
-		[1.0],
-		[0.5],
-		[0.25, 0.75],
-	]
+	_pill_half_blocked = [1 if left_blocked else 0, 1 if right_blocked else 0]
+	_arc_contacts = [left_contacts, right_contacts]
 
-	for half_idx in 2:
-		var sign_dir: float = 1.0 if half_idx == 0 else -1.0
-		var half_shape: ConvexPolygonShape3D = _left_half_shape if half_idx == 0 else _right_half_shape
-		var half_query: PhysicsShapeQueryParameters3D = _left_half_query if half_idx == 0 else _right_half_query
-		var half_is_blocked := true
-		var half_contacts: Array[Vector3] = []
-
-		for level in subdiv_levels:
-			var level_clear := false
-			for frac: float in level:
-				var draw_radius: float = PILL_RADIUS * frac
-				# Build half-capsule vertices in local space, then set shape
-				var verts := _build_half_capsule_points(
-					rope_len, draw_radius, sign_dir)
-				half_shape.points = verts
-				half_query.transform = pill_transform
-				half_query.exclude = excludes
-
-				var is_blocked := _check_pill_half_blocked(
-					space_state, half_query, half_contacts)
-				if not is_blocked:
-					level_clear = true
-					break  # This radius is clear → half is clear
-
-			if level_clear:
-				half_is_blocked = false
-				break  # No need to check finer subdivisions
-
-		_arc_contacts[half_idx] = half_contacts
-		_pill_half_blocked[half_idx] = 1 if half_is_blocked else 0
-
-		# Lazy evaluation: if left half is clear, skip right half
-		if half_idx == 0 and _pill_half_blocked[0] == 0:
-			_pill_half_blocked[1] = 0
-			return false
-
-	# Both halves blocked — but does the bend angle exceed tolerance?
-	var both_blocked: bool = _pill_half_blocked[0] == 1 and _pill_half_blocked[1] == 1
-	if both_blocked:
-		if _bend_angle_deg <= MAX_BEND_ANGLE_DEG:
-			return false  # Within bend tolerance — rope survives
-		_rope_is_bent = false
-		_bend_angle_deg = 0.0
-		return true  # Exceeds tolerance → cut
-	return false
+	if not left_blocked or not right_blocked:
+		return false  # Way around — don't cut
+	return true  # Both halves blocked — CUT
 
 
-func _compute_bend_angle_deg(player_chest: Vector3, contact_point: Vector3) -> float:
-	## Compute the bend angle at the anchor between the straight and bent rope.
-	## Straight: anchor → player_chest.  Bent: anchor → contact_point.
-	var straight_dir: Vector3 = (player_chest - anchor_point).normalized()
-	var bent_dir: Vector3 = (contact_point - anchor_point).normalized()
-	return rad_to_deg(acos(clampf(straight_dir.dot(bent_dir), -1.0, 1.0)))
+func _log_los_timing(t0: int, t_center: int, t_fan: int, t_pill: int, outcome: String) -> void:
+	## Print LOS check timing breakdown if it exceeds the spike threshold.
+	var t_end := Time.get_ticks_usec()
+	var total_us: float = t_end - t0
+	var now_sec: float = Time.get_ticks_msec() / 1000.0
+	if total_us > DEBUG_SPIKE_THRESHOLD_US and (now_sec - _debug_last_print_time) > 0.5:
+		_debug_last_print_time = now_sec
+		var center_us: float = (t_fan - t_center) if t_fan > 0 else (t_end - t_center)
+		var fan_us: float = (t_pill - t_fan) if (t_fan > 0 and t_pill > 0) else 0.0
+		var pill_us: float = (t_end - t_pill) if t_pill > 0 else 0.0
+		var setup_us: float = t_center - t0
+		print("[LOS SPIKE] total=%.0fµs  setup=%.0fµs  center=%.0fµs  fan=%.0fµs  pill=%.0fµs  outcome=%s" % [
+			total_us, setup_us, center_us, fan_us, pill_us, outcome])
 
 
 func _build_half_capsule_points(rope_len: float, radius: float,
@@ -819,32 +814,36 @@ func _check_pill_half_blocked(space_state: PhysicsDirectSpaceState3D,
 	## Check if a single half-capsule is blocked.
 	## Returns true if blocked, false if clear path exists.
 
-	# Step A: Check if the center obstacle itself overlaps this half
+	# Step A: Check if the center obstruction obstacle overlaps this half
 	var overlaps := space_state.intersect_shape(query, 32)
+	var found_obstruction := false
 	for overlap in overlaps:
-		if overlap.get("rid", RID()) == _center_contact_rid:
+		var rid: RID = overlap.get("rid", RID())
+		if rid == _center_contact_rid:
 			out_contacts.append(_center_contact_point)
-			return true
+			found_obstruction = true
+	if found_obstruction:
+		return true
 
-	# Step B: Different objects — get contact points, filter by cloud distance
+	# Step B: Different objects — only contacts within ARC_CONTACT_RADIUS (3m)
+	# of the center contact count.  Prevents distant unrelated objects from
+	# accidentally blocking the pill half.
 	var contacts: Array[Vector3] = []
 	contacts.assign(space_state.collide_shape(query, 32))
 
 	var found_nearby := false
 	for ci in range(1, contacts.size(), 2):
 		var contact_pos: Vector3 = contacts[ci]
-		# Skip contacts near the anchor
+		# Skip contacts near the anchor or player (safe zones)
 		if contact_pos.distance_to(anchor_point) < ROPE_LOS_MARGIN:
 			continue
-		# Check distance to nearest cloud point
-		var min_dist: float = INF
-		for cloud_pt in _center_contact_cloud:
-			var d: float = contact_pos.distance_to(cloud_pt)
-			if d < min_dist:
-				min_dist = d
-		if min_dist <= ARC_CONTACT_RADIUS:
-			out_contacts.append(contact_pos)
-			found_nearby = true
+		if contact_pos.distance_to(player.global_position) < ROPE_LOS_MARGIN:
+			continue
+		# Only count if within range of the center contact point
+		if contact_pos.distance_to(_center_contact_point) > ARC_CONTACT_RADIUS:
+			continue
+		out_contacts.append(contact_pos)
+		found_nearby = true
 
 	return found_nearby
 
@@ -863,9 +862,6 @@ func _do_release(with_boost: bool) -> void:
 	anchor_point = Vector3.ZERO
 	_rope_length = 0.0
 	_anchor_collider_rid = RID()
-	_rope_is_bent = false
-	_bend_contact_point = Vector3.ZERO
-	_bend_angle_deg = 0.0
 	_show_grapple_release.rpc(release_pos)
 	print("Player %d released grapple (speed: %.1f, boost: %s)" % [
 		player.peer_id, player.velocity.length(), str(with_boost)])
@@ -882,9 +878,6 @@ func reset_state() -> void:
 	_low_momentum_timer = 0.0
 	_last_los_chest = Vector3.ZERO
 	_fresh_grapple = false
-	_rope_is_bent = false
-	_bend_contact_point = Vector3.ZERO
-	_bend_angle_deg = 0.0
 	_pill_half_blocked = [0, 0]
 	_pill_swing_normal = Vector3.ZERO
 	_prev_los_chest = Vector3.ZERO
@@ -903,40 +896,28 @@ func reset_state() -> void:
 func client_process_visuals(_delta: float) -> void:
 	cleanup()
 	if not is_grappling:
+		if _debug_label:
+			_debug_label.visible = false
 		return
 
 	var player_hand: Vector3 = player.global_position + Vector3(0, 1.2, 0)
 	var cam_pos: Vector3 = player.camera.global_position if player.camera else player_hand
-
 	var scene_root := get_tree().current_scene
 
-	# --- Bent rope replaces regular rope when active ---
-	var show_bent: bool = _rope_is_bent and _bend_contact_point.length() > 0.1
-	if show_bent:
-		# Draw the bent rope: hand → contact → anchor (orange, two segments)
-		var im_bent := ImmediateMesh.new()
-		_bent_rope_mesh = MeshInstance3D.new()
-		_bent_rope_mesh.mesh = im_bent
-		_bent_rope_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		_bent_rope_mesh.top_level = true
-		_bent_rope_mesh.material_override = _bent_rope_material
-		_build_rope_ribbon(im_bent, player_hand, _bend_contact_point, cam_pos)
-		_build_rope_ribbon(im_bent, _bend_contact_point, anchor_point, cam_pos)
-		_draw_debug_circle(im_bent, _bent_contact_material, _bend_contact_point, 0.2, 12)
-		if scene_root:
-			scene_root.add_child(_bent_rope_mesh)
-	else:
-		# Draw the straight rope: hand → anchor (blue)
-		var im := ImmediateMesh.new()
-		_rope_mesh_instance = MeshInstance3D.new()
-		_rope_mesh_instance.mesh = im
-		_rope_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		_rope_mesh_instance.top_level = true
-		_rope_mesh_instance.material_override = _rope_material
-		_build_rope_ribbon(im, player_hand, anchor_point, cam_pos)
-		if scene_root:
-			scene_root.add_child(_rope_mesh_instance)
+	# --- Red rope — always visible ---
+	var im := ImmediateMesh.new()
+	_rope_mesh_instance = MeshInstance3D.new()
+	_rope_mesh_instance.mesh = im
+	_rope_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_rope_mesh_instance.top_level = true
+	_rope_mesh_instance.material_override = _rope_material
 
+	_build_rope_ribbon(im, player_hand, anchor_point, cam_pos)
+
+	if scene_root:
+		scene_root.add_child(_rope_mesh_instance)
+
+	# --- Anchor light ---
 	_anchor_light = OmniLight3D.new()
 	_anchor_light.light_color = Color(0.3, 0.6, 1.0)
 	_anchor_light.light_energy = 2.5
@@ -946,11 +927,28 @@ func client_process_visuals(_delta: float) -> void:
 	if scene_root:
 		scene_root.add_child(_anchor_light)
 
-	# --- Pill debug visualization ---
-	_build_pill_visual(player_hand)
+	var show_debug: bool = GameManager.debug_grapple_visuals
 
-	# --- Contact point + sphere debug visualization ---
-	_build_contact_debug_visual()
+	# --- Debug HUD label — rope state, pill status ---
+	if _debug_label and show_debug:
+		_debug_label.visible = true
+		var lines: PackedStringArray = PackedStringArray()
+		lines.append("Rope Length: %.1fm" % _rope_length)
+		if _has_center_contact:
+			lines.append("Contact: (%.1f, %.1f, %.1f)" % [_center_contact_point.x, _center_contact_point.y, _center_contact_point.z])
+		lines.append("Pills: L=%s  R=%s" % [
+			"BLOCKED" if _pill_half_blocked[0] == 1 else "clear",
+			"BLOCKED" if _pill_half_blocked[1] == 1 else "clear"])
+		_debug_label.text = "\n".join(lines)
+	elif _debug_label:
+		_debug_label.visible = false
+
+	if show_debug:
+		# --- Pill debug visualization ---
+		_build_pill_visual(player_hand)
+
+		# --- Contact point + sphere debug visualization ---
+		_build_contact_debug_visual()
 
 
 func _build_rope_ribbon(im: ImmediateMesh, from: Vector3, to: Vector3, cam_pos: Vector3) -> void:
@@ -959,7 +957,7 @@ func _build_rope_ribbon(im: ImmediateMesh, from: Vector3, to: Vector3, cam_pos: 
 	if rope_length < 0.01:
 		return
 
-	const HALF_WIDTH := 0.06
+	const HALF_WIDTH := 0.04  ## Thin rope
 	const SEGMENTS := 12
 
 	im.surface_begin(Mesh.PRIMITIVE_TRIANGLE_STRIP)
@@ -990,9 +988,6 @@ func cleanup() -> void:
 	if _contact_mesh_instance and is_instance_valid(_contact_mesh_instance):
 		_contact_mesh_instance.queue_free()
 		_contact_mesh_instance = null
-	if _bent_rope_mesh and is_instance_valid(_bent_rope_mesh):
-		_bent_rope_mesh.queue_free()
-		_bent_rope_mesh = null
 
 
 # ======================================================================
@@ -1001,12 +996,12 @@ func cleanup() -> void:
 
 func _build_pill_visual(player_chest: Vector3) -> void:
 	## Draw solid half-capsule shells (left/right of the rope).
-	## The pill is centered on the rope — one shape, two halves.
 	## Color coding:
 	##   Left half:  green (clear) / red (blocked)
 	##   Right half: yellow (clear) / red (blocked)
 	## Inner subdivisions (shrunk radius) drawn at 40% opacity.
-	var rope_vec: Vector3 = anchor_point - player_chest
+	var pill_anchor: Vector3 = anchor_point
+	var rope_vec: Vector3 = pill_anchor - player_chest
 	var rope_len: float = rope_vec.length()
 	if rope_len < 0.5:
 		return
@@ -1028,46 +1023,34 @@ func _build_pill_visual(player_chest: Vector3) -> void:
 	_pill_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	_pill_mesh_instance.top_level = true
 
-	# Colors per half
-	var half_colors: Array[Color] = []
-	for half_idx in 2:
-		if _pill_half_blocked[half_idx] == 1:
-			half_colors.append(Color(1.0, 0.15, 0.1, 0.25))  # Red (blocked)
-		else:
-			if half_idx == 0:
-				half_colors.append(Color(0.1, 1.0, 0.2, 0.15))  # Green (clear)
-			else:
-				half_colors.append(Color(1.0, 1.0, 0.1, 0.15))  # Yellow (clear)
-
-	# Draw shells for all subdivision levels
+	# Pick cached materials per half (full opacity for first subdivision, dim for rest)
 	var all_fracs: Array[float] = [1.0, 0.5, 0.25, 0.75]
 
 	for half_idx in 2:
 		var sign_dir: float = 1.0 if half_idx == 0 else -1.0
-		var base_color: Color = half_colors[half_idx]
+		var blocked: bool = _pill_half_blocked[half_idx] == 1
 
 		for fi in all_fracs.size():
 			var frac: float = all_fracs[fi]
 			var draw_radius: float = PILL_RADIUS * frac
+			var is_subdiv: bool = fi > 0
 
-			var alpha_mult: float = 1.0 if fi == 0 else 0.4
-			var draw_color := Color(
-				base_color.r, base_color.g, base_color.b,
-				base_color.a * alpha_mult)
+			var mat: StandardMaterial3D
+			if blocked:
+				mat = _pill_subdiv_blocked_mat if is_subdiv else _pill_blocked_mat
+			elif half_idx == 0:
+				mat = _pill_subdiv_clear_left_mat if is_subdiv else _pill_clear_left_mat
+			else:
+				mat = _pill_subdiv_clear_right_mat if is_subdiv else _pill_clear_right_mat
 
 			_draw_half_capsule_solid(im, pill_xform, draw_radius,
-				rope_len, sign_dir, draw_color)
+				rope_len, sign_dir, mat)
 
-	# Also draw the center sweep triangle
+	# Also draw the center sweep triangle (using cached material)
 	var prev_chest: Vector3 = _prev_los_chest if _prev_los_chest.length() > 0.1 else player_chest
 	var sweep_vec: Vector3 = player_chest - prev_chest
 	if sweep_vec.length() > 0.05:
-		var center_wire_mat := StandardMaterial3D.new()
-		center_wire_mat.albedo_color = Color(0.4, 0.75, 1.0, 0.4)
-		center_wire_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		center_wire_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-
-		im.surface_begin(Mesh.PRIMITIVE_LINE_STRIP, center_wire_mat)
+		im.surface_begin(Mesh.PRIMITIVE_LINE_STRIP, _sweep_wire_mat)
 		im.surface_add_vertex(prev_chest)
 		im.surface_add_vertex(player_chest)
 		im.surface_add_vertex(anchor_point)
@@ -1080,7 +1063,7 @@ func _build_pill_visual(player_chest: Vector3) -> void:
 
 
 func _draw_half_capsule_solid(im: ImmediateMesh, xform: Transform3D,
-		radius: float, rope_len: float, side_sign: float, color: Color) -> void:
+		radius: float, rope_len: float, side_sign: float, mat: StandardMaterial3D) -> void:
 	## Draw a solid (filled) half-capsule shell (one side of the pill).
 	## xform: origin = player chest, Y = rope dir, X = swing_normal.
 	## side_sign: +1.0 = left half (+X), -1.0 = right half (-X).
@@ -1088,12 +1071,6 @@ func _draw_half_capsule_solid(im: ImmediateMesh, xform: Transform3D,
 	const ARC_SEGS := 8   # circumference segments for the half-circle
 	const CYL_RINGS := 3  # number of rings along the cylinder body
 	const HEMI_RINGS := 3 # latitude rings per hemisphere cap
-
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = color
-	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 
 	var half_cyl: float = maxf((rope_len - 2.0 * radius) * 0.5, 0.0)
 	var mid_y: float = rope_len * 0.5
@@ -1184,47 +1161,23 @@ func _build_contact_debug_visual() -> void:
 	_contact_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	_contact_mesh_instance.top_level = true
 
-	# Material for the center contact circle (bright cyan)
-	var center_mat := StandardMaterial3D.new()
-	center_mat.albedo_color = Color(0.2, 0.9, 1.0, 0.9)
-	center_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	center_mat.no_depth_test = true
+	# All materials are pre-cached in setup() — no per-frame allocation.
 
-	# Material for cloud points (dimmer cyan — shows the obstacle extent mapping)
-	var cloud_mat := StandardMaterial3D.new()
-	cloud_mat.albedo_color = Color(0.15, 0.7, 0.85, 0.7)
-	cloud_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	cloud_mat.no_depth_test = true
+	# --- Player-side contact (center hit, bright cyan) ---
+	_draw_debug_circle(im, _contact_center_mat, _center_contact_point, 0.15, 12)
 
-	# Material for arc contact circles (green-blue)
-	var arc_mat := StandardMaterial3D.new()
-	arc_mat.albedo_color = Color(0.1, 0.8, 0.6, 0.9)
-	arc_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	arc_mat.no_depth_test = true
+	# --- Anchor-side contact (dimmer cyan, from anchor→player ray) ---
+	for pt in _center_contact_cloud:
+		if pt.distance_to(_center_contact_point) > 0.01:
+			_draw_debug_circle(im, _contact_cloud_mat, pt, 0.12, 10)
 
-	# Material for the 1.5m sphere wireframe (white, semi-transparent)
-	var sphere_mat := StandardMaterial3D.new()
-	sphere_mat.albedo_color = Color(1.0, 1.0, 1.0, 0.3)
-	sphere_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	sphere_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	sphere_mat.no_depth_test = true
-
-	# --- Center contact circle (main hit, larger) ---
-	_draw_debug_circle(im, center_mat, _center_contact_point, 0.15, 12)
-
-	# --- Cloud points (fan ray hits on same obstacle, smaller) ---
-	for cloud_pt in _center_contact_cloud:
-		if cloud_pt.distance_to(_center_contact_point) > 0.01:  # Skip duplicate of center
-			_draw_debug_circle(im, cloud_mat, cloud_pt, 0.08, 8)
-
-	# --- Arc contact circles ---
+	# --- Arc contact circles (pill half contacts) ---
 	for half_idx in 2:
 		for contact_pos in _arc_contacts[half_idx]:
-			_draw_debug_circle(im, arc_mat, contact_pos, 0.1, 10)
+			_draw_debug_circle(im, _contact_arc_mat, contact_pos, 0.1, 10)
 
-	# --- 1.5m wireframe sphere around each cloud point (merged envelope) ---
-	# Just draw around center contact to keep it clean — the cloud points show the extent
-	_draw_debug_sphere_wireframe(im, sphere_mat, _center_contact_point, ARC_CONTACT_RADIUS, 16, 8)
+	# --- 3m range sphere around center contact (ARC_CONTACT_RADIUS filter boundary) ---
+	_draw_debug_sphere_wireframe(im, _contact_sphere_mat, _center_contact_point, ARC_CONTACT_RADIUS, 16, 8)
 
 	var scene_root := get_tree().current_scene
 	if scene_root:

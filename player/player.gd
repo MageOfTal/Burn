@@ -466,7 +466,12 @@ func _client_process(delta: float) -> void:
 
 	# --- Grapple rope client visuals ---
 	if grapple_system.is_grappling:
+		var _vt0 := Time.get_ticks_usec()
 		grapple_system.client_process_visuals(delta)
+		var _vt1 := Time.get_ticks_usec()
+		var _vis_us: float = _vt1 - _vt0
+		if _vis_us > 500.0:
+			print("[GRAPPLE VIS SPIKE] %.0fµs" % _vis_us)
 	else:
 		grapple_system.cleanup()
 

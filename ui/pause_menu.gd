@@ -24,6 +24,7 @@ var _fps_label: Label = null
 var _fps_timer: float = 0.0
 var _ground_pump_button: CheckButton = null
 var _reel_speed_input: LineEdit = null
+var _grapple_debug_visuals_button: CheckButton = null
 
 ## Saved settings
 var _settings := {
@@ -206,6 +207,9 @@ func _build_ui() -> void:
 	reel_hbox.add_child(_reel_speed_input)
 	vbox.add_child(reel_hbox)
 
+	_grapple_debug_visuals_button = _add_check("Debug Visuals (pill, angles, spheres)", false, vbox)
+	_grapple_debug_visuals_button.toggled.connect(_on_grapple_debug_visuals_toggled)
+
 	# Separator
 	vbox.add_child(HSeparator.new())
 
@@ -359,6 +363,11 @@ func _on_reel_speed_submitted(text: String) -> void:
 		print("[PauseMenu] Grapple reel speed set to %.1f" % val)
 	else:
 		_reel_speed_input.text = "%.1f" % GameManager.debug_grapple_reel_speed
+
+
+func _on_grapple_debug_visuals_toggled(pressed: bool) -> void:
+	GameManager.debug_grapple_visuals = pressed
+	print("[PauseMenu] Grapple debug visuals: %s" % ("ON" if pressed else "OFF"))
 
 
 func _on_quit_pressed() -> void:
