@@ -28,7 +28,8 @@ extends Node3D
 @export var num_player_spawns: int = 40
 @export var num_loot_spawns: int = 500
 @export var num_dummies: int = 0
-@export var num_bars: int = 150
+@export var num_bars: int = 50
+@export var num_donuts: int = 100
 @export var structure_margin: float = 25.0  ## Keep structures this far from edges
 
 ## Signals
@@ -182,6 +183,7 @@ func _spawn_heavy_structures() -> void:
 		await _spawn_walls_batched(rng, structures_node)
 		await _spawn_ramps_batched(rng, structures_node)
 		await _spawn_bars_batched(rng, structures_node)
+		await _spawn_donuts_batched(rng, structures_node)
 		await _spawn_tower(rng, structures_node)
 	else:
 		print("[SeedWorld] Skipping walls/ramps/tower (debug toggle)")
@@ -452,6 +454,73 @@ func _spawn_bars_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 			await get_tree().process_frame
 
 	print("[SeedWorld] Spawned %d bars" % spawned)
+
+
+func _spawn_donuts_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
+	## Spawn thin vertical torus rings (~7.2m diameter, 0.1m tube thickness).
+	## Collision is a trimesh (ConcavePolygonShape3D) built from the TorusMesh
+	## — perfectly solid, no gaps.
+	var donut_major_radius := 3.5   ## Center of tube circle (half of ~7m diameter)
+	var donut_tube_radius := 0.1    ## Tube thickness (thin)
+	var donut_mat := StandardMaterial3D.new()
+	donut_mat.albedo_color = Color(0.65, 0.5, 0.35)
+	var spawned := 0
+
+	# Build the torus mesh once and reuse for all donuts (visual + collision).
+	var torus := TorusMesh.new()
+	torus.inner_radius = donut_major_radius - donut_tube_radius
+	torus.outer_radius = donut_major_radius + donut_tube_radius
+	torus.rings = 32
+	torus.ring_segments = 12
+
+	# Build a rotated trimesh shape that matches the upright visual.
+	# TorusMesh lies flat by default; we rotate faces 90° around X so the
+	# collision matches the visual (standing upright, hole faces sideways).
+	var raw_faces: PackedVector3Array = torus.get_faces()
+	var rot_basis := Basis(Vector3.RIGHT, deg_to_rad(90.0))
+	var rotated_faces := PackedVector3Array()
+	rotated_faces.resize(raw_faces.size())
+	for fi in raw_faces.size():
+		rotated_faces[fi] = rot_basis * raw_faces[fi]
+	var trimesh_shape := ConcavePolygonShape3D.new()
+	trimesh_shape.set_faces(rotated_faces)
+
+	for i in num_donuts:
+		var y_rot := rng.randf_range(0, TAU)
+		var pos := _get_random_ground_pos(rng, donut_major_radius + donut_tube_radius, 30.0)
+		if pos == Vector3.INF:
+			continue
+
+		# Skip if inside tower exclusion zone
+		if _tower_position != Vector3.INF:
+			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
+			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
+				continue
+
+		var donut := StaticBody3D.new()
+		donut.name = "Donut_%d" % spawned
+		donut.position = pos
+		donut.rotation.y = y_rot
+		parent.add_child(donut)
+
+		# Visual — TorusMesh standing upright (rotated so the hole faces sideways)
+		var mesh_inst := MeshInstance3D.new()
+		mesh_inst.mesh = torus
+		mesh_inst.material_override = donut_mat
+		mesh_inst.rotation.x = deg_to_rad(90.0)
+		donut.add_child(mesh_inst)
+
+		# Collision — trimesh from the torus mesh, already rotated to match visual
+		var col := CollisionShape3D.new()
+		col.shape = trimesh_shape
+		donut.add_child(col)
+
+		spawned += 1
+
+		if spawned % 5 == 0:
+			await get_tree().process_frame
+
+	print("[SeedWorld] Spawned %d donuts" % spawned)
 
 
 func _spawn_player_spawns(rng: RandomNumberGenerator) -> void:

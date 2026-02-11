@@ -55,7 +55,7 @@ const CLEARANCE_FORCE := 12.0
 
 ## Rope line-of-sight — cut if geometry obstructs the line.
 const ROPE_LOS_MARGIN := 3.0
-const ROPE_LOS_INTERVAL := 3
+const ROPE_LOS_INTERVAL := 1
 
 ## Pill obstruction shape — one capsule centered on the rope, split into
 ## two ConvexPolygonShape3D halves (left/right of the swing plane).
