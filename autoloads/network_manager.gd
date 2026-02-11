@@ -149,30 +149,26 @@ func host_game(port: int = NetConstants.DEFAULT_PORT) -> Error:
 
 
 func _start_host() -> void:
-	## Deferred: load map, spawn players, show loading screen during setup.
-	## After _load_game_map(), all remaining setup is synchronous.
-	## _spawn_heavy_structures() is fire-and-forget (async coroutine that builds
-	## wall blocks in small batches across frames). Loading screen hides via
-	## _on_structures_complete signal callback once all structures are placed.
+	print("[Server] _start_host() — beginning host setup...")
 	_show_loading_screen("Loading game map...")
+	print("[Server] Step 1/5: Loading game map...")
 	await _load_game_map()
-	# --- Synchronous player/bot setup ---
+	print("[Server] Step 2/5: Spawning host player (peer 1)...")
 	_update_loading_status("Spawning players...")
 	_spawn_player(1)
 	_reposition_to_spawn_point(1)
 	# Debug: spawn demon near host for testing
 	if players.has(1):
 		players[1].demon_system.debug_spawn_nearby()
+	print("[Server] Step 3/5: Spawning bots...")
 	_spawn_bots()
-	# Spawn demo items now that the host player exists
+	print("[Server] Step 4/5: Spawning demo items...")
 	var map := get_tree().current_scene
 	if map and map.has_method("_spawn_demo_items"):
 		map._spawn_demo_items()
 	if map and map.has_method("spawn_lemon_shapes"):
 		map.spawn_lemon_shapes()
-	# Start heavy structure spawning now that all synchronous setup is done.
-	# This is triggered here (not from SeedWorld._ready) because call_deferred()
-	# on async functions from _ready() crashes Godot 4.6.
+	print("[Server] Step 5/5: Building structures...")
 	var seed_world := get_tree().current_scene.get_node_or_null("SeedWorld")
 	if seed_world:
 		_update_loading_status("Building structures...")
@@ -181,6 +177,7 @@ func _start_host() -> void:
 	else:
 		_update_loading_status("Ready!")
 		_loading_hide_countdown = 20
+	print("[Server] Host setup complete. Total players: %d" % players.size())
 
 
 func _on_structures_complete() -> void:
@@ -233,46 +230,60 @@ func disconnect_game() -> void:
 
 
 func _load_game_map() -> void:
-	print("[Net] Loading game map...")
+	print("[Net] _load_game_map() — calling change_scene_to_file...")
 	get_tree().change_scene_to_file("res://world/blockout_map.tscn")
-	# change_scene_to_file is deferred — poll until the new scene is actually ready
+	var poll_frames := 0
 	while get_tree().current_scene == null or get_tree().current_scene.scene_file_path != "res://world/blockout_map.tscn":
+		poll_frames += 1
 		await get_tree().process_frame
-	# Extra frame to ensure _ready() has run on the new scene
 	await get_tree().process_frame
-	# Get references to the spawner and container from the map
+	poll_frames += 1
+	print("[Net] Map scene ready after %d poll frames" % poll_frames)
 	var map := get_tree().current_scene
-	player_spawner = map.get_node("PlayerSpawner")
-	player_container = map.get_node("Players")
-	print("[Net] Map loaded. Spawner and container ready.")
+	player_spawner = map.get_node_or_null("PlayerSpawner")
+	player_container = map.get_node_or_null("Players")
+	print("[Net] Map loaded. spawner=%s  container=%s" % [
+		str(player_spawner != null), str(player_container != null)])
+	if player_spawner == null:
+		push_error("[Net] FAIL: PlayerSpawner not found in map scene!")
+	if player_container == null:
+		push_error("[Net] FAIL: Players container not found in map scene!")
 
 
 func _spawn_player(peer_id: int) -> void:
+	print("[Server] _spawn_player(%d) called" % peer_id)
 	if player_container == null:
-		push_error("[Server] Player container not set — map not loaded?")
+		push_error("[Server] FAIL: player_container is null — map not loaded?")
 		return
 
 	if players.has(peer_id):
-		print("[Server] Player %d already spawned, skipping." % peer_id)
+		print("[Server] Player %d already in players dict, skipping." % peer_id)
 		return
 
+	print("[Server]   Instantiating player scene for peer %d..." % peer_id)
 	var player_node := PLAYER_SCENE.instantiate()
 	player_node.name = str(peer_id)
-	# Set spawn position from PlayerSpawnPoints (already at ground level via noise height)
+
 	var map := get_tree().current_scene
 	var spawn_container := map.get_node_or_null("PlayerSpawnPoints")
 	var spawn_points: Array[Node] = spawn_container.get_children() if spawn_container else []
 	if spawn_points.size() > 0:
 		var spawn_idx := players.size() % spawn_points.size()
 		player_node.position = spawn_points[spawn_idx].position
+		print("[Server]   Using spawn point %d/%d at %s" % [spawn_idx, spawn_points.size(), str(player_node.position)])
 	else:
 		player_node.position = Vector3(0, 20, 0)
 		push_warning("[Server] No spawn points available — spawning at fallback position")
 
+	print("[Server]   Adding to player_container (current children: %d)..." % player_container.get_child_count())
 	player_container.add_child(player_node, true)
 	players[peer_id] = player_node
 	player_connected.emit(peer_id)
-	print("[Server] Spawned player for peer %d at %s" % [peer_id, str(player_node.position)])
+	print("[Server]   SUCCESS: Player %d spawned at %s (container now has %d children)" % [
+		peer_id, str(player_node.position), player_container.get_child_count()])
+	print("[Server]   player_spawner=%s, spawner.get_spawnable_scenes()=%s" % [
+		str(player_spawner != null),
+		str(player_spawner.get_spawnable_scenes()) if player_spawner else "N/A"])
 
 
 func _despawn_player(peer_id: int) -> void:
@@ -334,14 +345,19 @@ func _spawn_bot(bot_peer_id: int) -> void:
 
 
 func _on_peer_connected(peer_id: int) -> void:
-	print("[Net] Peer connected: %d" % peer_id)
-	# Do NOT spawn immediately — wait for client_ready RPC so the client
-	# has loaded the map and the MultiplayerSpawner can replicate correctly.
-	# (The host player is spawned directly in _start_host, not here.)
+	print("[Net] ======== Peer connected: %d ========" % peer_id)
+	print("[Net]   is_server=%s  total_players=%d" % [str(is_server), players.size()])
+	print("[Net]   player_container=%s  player_spawner=%s" % [
+		str(player_container != null), str(player_spawner != null)])
+	if is_server:
+		print("[Net]   (Server) Waiting for client_ready RPC from peer %d before spawning..." % peer_id)
+	else:
+		print("[Net]   (Client) Server peer %d appeared in our peer list" % peer_id)
 
 
 func _on_peer_disconnected(peer_id: int) -> void:
-	print("[Net] Peer disconnected: %d" % peer_id)
+	print("[Net] ======== Peer disconnected: %d ========" % peer_id)
+	print("[Net]   was in players dict: %s" % str(players.has(peer_id)))
 	if is_server:
 		_despawn_player(peer_id)
 
@@ -351,16 +367,27 @@ func _on_connected_to_server() -> void:
 	print("[Client] ========================================")
 	print("[Client] Connected to server! My peer ID: %d" % multiplayer.get_unique_id())
 	print("[Client] ========================================")
+	print("[Client] Step 1/5: Showing loading screen...")
 	_show_loading_screen("Loading game map...")
+	print("[Client] Step 2/5: Loading game map (await)...")
 	await _load_game_map()
+	print("[Client] Step 3/5: Map loaded. player_container=%s, player_spawner=%s" % [
+		str(player_container != null), str(player_spawner != null)])
+	if player_container:
+		print("[Client]   Players container children: %d" % player_container.get_child_count())
 	_update_loading_status("Joining game...")
-	# Tell the server we have loaded the map and are ready for our player to spawn
+	print("[Client] Step 4/5: Sending client_ready RPC to server...")
 	_client_ready.rpc_id(1)
-	print("[Client] Sent client_ready to server.")
-	# Brief pause so client can receive initial state (avoid create_timer — crashes in nested coroutines)
+	print("[Client]   client_ready RPC sent. Waiting 30 frames for server to spawn our player...")
 	for i in 30:
 		await get_tree().process_frame
+	print("[Client] Step 5/5: Hiding loading screen. Players container children: %d" % (
+		player_container.get_child_count() if player_container else -1))
+	if player_container:
+		for child in player_container.get_children():
+			print("[Client]   Player node: '%s'" % child.name)
 	_hide_loading_screen()
+	print("[Client] ======== Join complete! ========")
 	connection_succeeded.emit()
 
 
@@ -395,10 +422,13 @@ func _on_server_disconnected() -> void:
 @rpc("any_peer", "reliable")
 func _client_ready() -> void:
 	## Server-only: called when a client has loaded the map and is ready.
-	if not multiplayer.is_server():
-		return
 	var sender_id: int = multiplayer.get_remote_sender_id()
-	print("[Server] Received client_ready from peer %d" % sender_id)
+	print("[Server] ======== _client_ready RPC received from peer %d ========" % sender_id)
+	if not multiplayer.is_server():
+		print("[Server] WARN: _client_ready called on non-server (peer %d), ignoring" % multiplayer.get_unique_id())
+		return
+	print("[Server]   GameState=%d  players_count=%d  is_server=%s" % [
+		GameManager.current_state, players.size(), str(is_server)])
 	_spawn_player(sender_id)
 
 

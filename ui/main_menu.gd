@@ -28,11 +28,14 @@ func _process(delta: float) -> void:
 
 
 func _on_host_pressed() -> void:
+	print("[MainMenu] Host button pressed")
 	var local_ip := NetworkManager.get_local_ip()
 	var err := NetworkManager.host_game()
 	if err != OK:
+		print("[MainMenu] host_game() FAILED: %s" % error_string(err))
 		status_label.text = "Failed to start server!"
 	else:
+		print("[MainMenu] host_game() OK — server on port %d, LAN IP: %s" % [NetConstants.DEFAULT_PORT, local_ip])
 		status_label.text = "Server running on UDP port %d\nTell others to connect to: %s" % [NetConstants.DEFAULT_PORT, local_ip]
 
 
@@ -40,11 +43,14 @@ func _on_join_pressed() -> void:
 	var address := address_input.text.strip_edges()
 	if address.is_empty():
 		address = "127.0.0.1"
+	print("[MainMenu] Join button pressed — connecting to %s:%d" % [address, NetConstants.DEFAULT_PORT])
 	status_label.text = "Connecting to %s:%d..." % [address, NetConstants.DEFAULT_PORT]
 	var err := NetworkManager.join_game(address)
 	if err != OK:
+		print("[MainMenu] join_game() FAILED: %s" % error_string(err))
 		status_label.text = "Failed to connect!"
 	else:
+		print("[MainMenu] join_game() OK — waiting for connection...")
 		_is_connecting = true
 		_connect_timer = 0.0
 

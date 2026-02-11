@@ -93,6 +93,10 @@ signal player_killed(victim_id: int, killer_id: int)
 
 func _ready() -> void:
 	peer_id = name.to_int()
+	var my_id: int = multiplayer.get_unique_id()
+	var is_local: bool = (peer_id == my_id)
+	print("[Player] _ready() — peer_id=%d  my_id=%d  is_local=%s  is_bot=%s  is_server=%s" % [
+		peer_id, my_id, str(is_local), str(is_bot), str(multiplayer.is_server())])
 
 	# Bots: server owns input, skip InputSync replication
 	if is_bot:
@@ -144,6 +148,7 @@ func _ready() -> void:
 		return
 
 	if peer_id == multiplayer.get_unique_id():
+		print("[Player] peer_id=%d is LOCAL — setting up camera, HUD, input" % peer_id)
 		camera.current = true
 		# Mouse capture is deferred via player_input._try_capture_mouse() —
 		# don't capture here if loading screen is still up.
@@ -157,7 +162,9 @@ func _ready() -> void:
 		if inventory_ui and inventory_ui.has_method("setup"):
 			inventory_ui.setup(self)
 			inventory_ui.visible = false
+		print("[Player] LOCAL player %d ready!" % peer_id)
 	else:
+		print("[Player] peer_id=%d is REMOTE — hiding HUD/camera" % peer_id)
 		camera.current = false
 		camera_pivot.visible = false
 		if player_hud:
