@@ -281,9 +281,9 @@ func _spawn_player(peer_id: int) -> void:
 	player_connected.emit(peer_id)
 	print("[Server]   SUCCESS: Player %d spawned at %s (container now has %d children)" % [
 		peer_id, str(player_node.position), player_container.get_child_count()])
-	print("[Server]   player_spawner=%s, spawner.get_spawnable_scenes()=%s" % [
+	print("[Server]   player_spawner=%s, spawn_path=%s" % [
 		str(player_spawner != null),
-		str(player_spawner.get_spawnable_scenes()) if player_spawner else "N/A"])
+		str(player_spawner.spawn_path) if player_spawner else "N/A"])
 
 
 func _despawn_player(peer_id: int) -> void:
