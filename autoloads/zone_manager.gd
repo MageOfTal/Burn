@@ -110,6 +110,8 @@ func _physics_process(delta: float) -> void:
 
 
 func _damage_outside_players(delta: float) -> void:
+	if GameManager.debug_disable_zone_damage:
+		return
 	var players_container := get_tree().current_scene.get_node_or_null("Players")
 	if players_container == null:
 		return

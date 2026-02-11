@@ -28,6 +28,7 @@ extends Node3D
 @export var num_player_spawns: int = 40
 @export var num_loot_spawns: int = 500
 @export var num_dummies: int = 0
+@export var num_bars: int = 150
 @export var structure_margin: float = 25.0  ## Keep structures this far from edges
 
 ## Signals
@@ -177,9 +178,14 @@ func _spawn_heavy_structures() -> void:
 	# The tower itself is spawned last (it awaits voxel generation).
 	_precompute_tower_position(rng)
 
-	await _spawn_walls_batched(rng, structures_node)
-	await _spawn_ramps_batched(rng, structures_node)
-	await _spawn_tower(rng, structures_node)
+	if not GameManager.debug_skip_structures:
+		await _spawn_walls_batched(rng, structures_node)
+		await _spawn_ramps_batched(rng, structures_node)
+		await _spawn_bars_batched(rng, structures_node)
+		await _spawn_tower(rng, structures_node)
+	else:
+		print("[SeedWorld] Skipping walls/ramps/tower (debug toggle)")
+		await get_tree().process_frame  # Yield once so signal timing stays consistent
 	_spawn_dummies(rng)
 
 	structures_complete = true
@@ -401,6 +407,51 @@ func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 		# Yield every 20 ramps (each is just 3 nodes, much lighter than walls)
 		if spawned % 20 == 0:
 			await get_tree().process_frame
+
+
+func _spawn_bars_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
+	## Spawn skinny vertical bars (0.1m wide, 20m tall) across the map.
+	## Great for testing grapple rope obstruction with narrow obstacles.
+	var bar_width := 0.1
+	var bar_height := 20.0
+	var bar_mat := StandardMaterial3D.new()
+	bar_mat.albedo_color = Color(0.6, 0.55, 0.5)
+	var spawned := 0
+
+	for i in num_bars:
+		var pos := _get_random_ground_pos(rng, bar_height * 0.5, 30.0)
+		if pos == Vector3.INF:
+			continue
+
+		# Skip if inside tower exclusion zone
+		if _tower_position != Vector3.INF:
+			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
+			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
+				continue
+
+		var bar := StaticBody3D.new()
+		bar.name = "Bar_%d" % spawned
+		bar.position = pos
+		parent.add_child(bar)
+
+		var col := CollisionShape3D.new()
+		var box_shape := BoxShape3D.new()
+		box_shape.size = Vector3(bar_width, bar_height, bar_width)
+		col.shape = box_shape
+		bar.add_child(col)
+
+		var mesh_inst := MeshInstance3D.new()
+		var box_mesh := BoxMesh.new()
+		box_mesh.size = Vector3(bar_width, bar_height, bar_width)
+		mesh_inst.mesh = box_mesh
+		mesh_inst.material_override = bar_mat
+		bar.add_child(mesh_inst)
+		spawned += 1
+
+		if spawned % 20 == 0:
+			await get_tree().process_frame
+
+	print("[SeedWorld] Spawned %d bars" % spawned)
 
 
 func _spawn_player_spawns(rng: RandomNumberGenerator) -> void:

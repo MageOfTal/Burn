@@ -53,6 +53,10 @@ var _marker_dist_label: Label = null
 var _demon_icon: Label = null
 var _demon_dist_label: Label = null
 
+## Actual-hit crosshair — gray translucent X showing where a hand-level
+## shot would land (may differ from screen center if terrain blocks the hand).
+var _actual_crosshair: Label = null
+
 
 func setup(player: CharacterBody3D) -> void:
 	_player = player
@@ -96,6 +100,20 @@ func setup(player: CharacterBody3D) -> void:
 	# Build compass strip
 	_create_compass()
 
+	# Actual-hit crosshair — small gray X drawn at the screen projection
+	# of where a hand-level raycast hits.  Shows the player if terrain
+	# blocks their hand-level shot even when the camera can see over it.
+	_actual_crosshair = Label.new()
+	_actual_crosshair.text = "x"
+	_actual_crosshair.add_theme_font_size_override("font_size", 16)
+	_actual_crosshair.add_theme_color_override("font_color", Color(0.75, 0.75, 0.75, 0.5))
+	_actual_crosshair.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_actual_crosshair.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_actual_crosshair.size = Vector2(20, 20)
+	_actual_crosshair.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_actual_crosshair.visible = false
+	add_child(_actual_crosshair)
+
 
 func _process(_delta: float) -> void:
 	if _player == null:
@@ -108,6 +126,7 @@ func _process(_delta: float) -> void:
 	_update_inventory_display()
 	_update_zone_display()
 	_update_compass()
+	_update_actual_crosshair()
 	_handle_marker_input()
 
 
@@ -242,6 +261,48 @@ func _update_zone_display() -> void:
 		_zone_label.remove_theme_color_override("font_color")
 
 	_zone_label.text = text
+
+
+# ======================================================================
+#  Actual-hit crosshair — hand-level raycast projection
+# ======================================================================
+
+func _update_actual_crosshair() -> void:
+	## Cast a ray from the player's hand position (Y+1.2) along the camera
+	## forward direction and project the hit point to screen space.  If the
+	## hit point differs noticeably from screen center, the gray X shows
+	## the player where their shot would actually land.
+	if _actual_crosshair == null or _player == null:
+		return
+	var camera: Camera3D = _player.camera
+	if camera == null or not camera.is_inside_tree():
+		_actual_crosshair.visible = false
+		return
+
+	var hand_pos: Vector3 = _player.global_position + Vector3(0, 1.2, 0)
+	var cam_forward: Vector3 = -camera.global_transform.basis.z
+	var far_point: Vector3 = hand_pos + cam_forward * 200.0
+
+	var space_state := _player.get_world_3d().direct_space_state
+	var query := PhysicsRayQueryParameters3D.create(hand_pos, far_point)
+	query.exclude = [_player.get_rid()]
+	query.collision_mask = 1
+	var result := space_state.intersect_ray(query)
+
+	var hit_point: Vector3
+	if not result.is_empty():
+		hit_point = result.position
+	else:
+		hit_point = far_point
+
+	# Project to screen space
+	if camera.is_position_behind(hit_point):
+		_actual_crosshair.visible = false
+		return
+
+	var screen_pos: Vector2 = camera.unproject_position(hit_point)
+	_actual_crosshair.position = screen_pos - _actual_crosshair.size * 0.5
+	_actual_crosshair.visible = true
 
 
 # ======================================================================

@@ -22,6 +22,11 @@ BurnClock="*res://autoloads/burn_clock.gd"
 PauseMenu="*res://ui/pause_menu.gd"
 ToadDimension="*res://world/toad_dimension.gd"
 ZoneManager="*res://autoloads/zone_manager.gd"
+DebugFreecam="*res://autoloads/debug_freecam.gd"
+
+[physics]
+
+common/physics_ticks_per_second=240
 
 [display]
 

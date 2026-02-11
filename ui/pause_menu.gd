@@ -22,6 +22,8 @@ var _brightness_label: Label = null
 var _fog_button: CheckButton = null
 var _fps_label: Label = null
 var _fps_timer: float = 0.0
+var _ground_pump_button: CheckButton = null
+var _reel_speed_input: LineEdit = null
 
 ## Saved settings
 var _settings := {
@@ -83,8 +85,8 @@ func _build_ui() -> void:
 	# Center panel
 	_panel = PanelContainer.new()
 	_panel.set_anchors_preset(Control.PRESET_CENTER)
-	_panel.custom_minimum_size = Vector2(500, 600)
-	_panel.position = Vector2(-250, -300)
+	_panel.custom_minimum_size = Vector2(500, 750)
+	_panel.position = Vector2(-250, -375)
 	_overlay.add_child(_panel)
 
 	# Panel style
@@ -179,6 +181,30 @@ func _build_ui() -> void:
 	# --- Fog ---
 	_fog_button = _add_check("Fog", true, vbox)
 	_fog_button.toggled.connect(_on_fog_toggled)
+
+	# Separator
+	vbox.add_child(HSeparator.new())
+
+	# --- Grapple Debug ---
+	var grapple_title := Label.new()
+	grapple_title.text = "Grapple Debug"
+	grapple_title.add_theme_font_size_override("font_size", 18)
+	grapple_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	grapple_title.add_theme_color_override("font_color", Color(0.4, 0.75, 1.0))
+	vbox.add_child(grapple_title)
+
+	var reel_hbox := HBoxContainer.new()
+	var reel_label := Label.new()
+	reel_label.text = "Reel Speed"
+	reel_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	reel_hbox.add_child(reel_label)
+	_reel_speed_input = LineEdit.new()
+	_reel_speed_input.text = "3.0"
+	_reel_speed_input.custom_minimum_size = Vector2(80, 0)
+	_reel_speed_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_reel_speed_input.text_submitted.connect(_on_reel_speed_submitted)
+	reel_hbox.add_child(_reel_speed_input)
+	vbox.add_child(reel_hbox)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -324,6 +350,15 @@ func _on_fog_toggled(pressed: bool) -> void:
 	var env := _find_environment()
 	if env:
 		env.fog_enabled = pressed
+
+
+func _on_reel_speed_submitted(text: String) -> void:
+	var val := text.to_float()
+	if val > 0.0 and val <= 50.0:
+		GameManager.debug_grapple_reel_speed = val
+		print("[PauseMenu] Grapple reel speed set to %.1f" % val)
+	else:
+		_reel_speed_input.text = "%.1f" % GameManager.debug_grapple_reel_speed
 
 
 func _on_quit_pressed() -> void:

@@ -7,7 +7,7 @@ class_name SlideCrouchSystem
 
 ## --- Slide constants ---
 const SLIDE_INITIAL_SPEED := 12.0    ## Only used as fallback if somehow speed is 0
-const SLIDE_FRICTION_COEFF := 0.25   ## Ground friction (lowered for longer, smoother slides)
+const SLIDE_FRICTION_COEFF := 0.30   ## Ground friction
 const SLIDE_MIN_SPEED := 0.5        ## Low threshold — let slides die naturally via physics
 const SLIDE_MIN_ENTRY_SPEED := 3.5
 const SLIDE_COOLDOWN := 0.4
@@ -16,15 +16,15 @@ const SLIDE_CAMERA_OFFSET := -0.5
 const SLIDE_AIRBORNE_GRACE := 0.2
 const SLIDE_SNAP_DOWN := 4.0
 const SLIDE_TO_CROUCH_DELAY := 0.3   ## Seconds coasting at low speed before crouch transition
-const SLIDE_MAX_SPEED := 40.0        ## Soft cap — extra drag kicks in above this speed
+const SLIDE_MAX_SPEED := 32.0        ## Soft cap — extra drag kicks in above this speed
 const SLIDE_OVERCAP_DRAG := 8.0      ## Extra deceleration per m/s over the soft cap
 const SLIDE_LATERAL_FRICTION := 6.0   ## Reduced so player steering actually works
-const SLIDE_STEER_STRENGTH := 8.0    ## How aggressively WASD redirects the slide
+const SLIDE_STEER_STRENGTH := 18.0   ## How aggressively WASD redirects the slide
 
 ## --- Crouch constants ---
 const CROUCH_CAPSULE_HEIGHT := 1.0
 const CROUCH_CAMERA_OFFSET := -0.5
-const CROUCH_SPEED_MULT := 0.5
+const CROUCH_SPEED_MULT := 0.35
 const CROUCH_MESH_SCALE_Y := 0.55  # Visual squish
 
 ## --- Synced state (replicated via ServerSync) ---
@@ -180,21 +180,38 @@ func process_slide(delta: float) -> void:
 		slide_dir = _slide_velocity.normalized() if _slide_velocity.length() > 0.01 else Vector3.ZERO
 		alignment = slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
 
-	# --- Player steering during slide (camera-relative A/D) ---
+	# --- Player steering during slide ---
+	# A/D redirects the slide velocity toward the camera's lateral axis without
+	# adding or removing speed. The velocity vector rotates, preserving magnitude.
 	var steer_input: Vector2 = player.player_input.input_direction
-	if steer_input.length() > 0.1 and _slide_velocity.length() > 1.0:
+	if absf(steer_input.x) > 0.1 and _slide_velocity.length() > 1.0:
 		var cam_right: Vector3 = player.camera.global_transform.basis.x
 		cam_right.y = 0.0
 		if cam_right.length() > 0.001:
 			cam_right = cam_right.normalized()
-		# Steer laterally based on A/D input (x component)
-		var steer_dir: Vector3 = cam_right * steer_input.x * SLIDE_STEER_STRENGTH * delta
-		_slide_velocity += steer_dir
-		# Update forward dir to track the new velocity direction
-		if _slide_velocity.length() > 0.5:
-			_slide_forward_dir = _slide_velocity.normalized()
+		# Compute a turn rate in radians/sec, then rotate the velocity vector
+		var turn_rate: float = SLIDE_STEER_STRENGTH * 0.08 * absf(steer_input.x)  # rad/s
+		var turn_angle: float = turn_rate * delta * signf(steer_input.x)
+		# Determine turn direction: positive = toward cam_right, negative = away
+		# Use the sign of cam_right dot with the perpendicular of slide_dir
+		var slide_perp := Vector3(-_slide_velocity.z, 0.0, _slide_velocity.x).normalized()
+		var cam_side: float = cam_right.dot(slide_perp)
+		turn_angle *= signf(cam_side) if absf(cam_side) > 0.01 else 1.0
+		# Rotate velocity around Y axis
+		var spd := _slide_velocity.length()
+		var cos_a := cos(turn_angle)
+		var sin_a := sin(turn_angle)
+		_slide_velocity = Vector3(
+			_slide_velocity.x * cos_a - _slide_velocity.z * sin_a,
+			0.0,
+			_slide_velocity.x * sin_a + _slide_velocity.z * cos_a
+		)
+		# Preserve exact speed (no gain, no loss)
+		_slide_velocity = _slide_velocity.normalized() * spd
+		# Update reference direction
+		_slide_forward_dir = _slide_velocity.normalized()
 		# Recalculate slide_dir after steering
-		slide_dir = _slide_velocity.normalized() if _slide_velocity.length() > 0.01 else Vector3.ZERO
+		slide_dir = _slide_forward_dir
 		alignment = slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
 
 	# --- Unified physics-based slope force ---

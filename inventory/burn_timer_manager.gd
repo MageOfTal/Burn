@@ -21,6 +21,8 @@ func _ready() -> void:
 func _physics_process(delta: float) -> void:
 	if not multiplayer.is_server() or inventory == null:
 		return
+	if GameManager.debug_disable_burn_timers:
+		return
 
 	var global_mult: float = _burn_clock.get_burn_multiplier() if _burn_clock else 1.0
 	var heat_mult: float = heat_system.get_burn_rate_multiplier() if heat_system else 1.0

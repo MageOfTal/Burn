@@ -79,6 +79,8 @@ func debug_spawn_nearby() -> void:
 
 func on_player_death() -> void:
 	## Server-only: increment death count, reposition demon, increase speed.
+	if GameManager.debug_disable_demon:
+		return
 	_death_count += 1
 	demon_speed = DEMON_BASE_SPEED + (_death_count * DEMON_SPEED_PER_DEATH)
 
@@ -119,6 +121,8 @@ func on_player_death() -> void:
 
 func process(delta: float) -> void:
 	## Server-only: move demon toward player, check catch distance.
+	if GameManager.debug_disable_demon:
+		return
 	if not demon_active or is_eliminated:
 		return
 

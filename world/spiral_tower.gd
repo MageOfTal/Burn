@@ -700,9 +700,10 @@ func _bake_chunk_meshes(sever_y: float, section_height: float, chunk_count: int)
 
 	# Divide the section into vertical slices (angular pie slices).
 	# Each chunk covers a portion of the tower's angular range and a vertical band.
+	@warning_ignore("integer_division")
 	var vertical_splits := maxi(1, chunk_count / 3)  # 1-3 vertical bands
+	@warning_ignore("integer_division")
 	var angular_splits := maxi(2, chunk_count / vertical_splits)  # 2-4 angular slices per band
-	var actual_count := vertical_splits * angular_splits
 
 	var band_height := section_height / float(vertical_splits)
 	var slice_angle := TAU / float(angular_splits)

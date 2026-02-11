@@ -73,6 +73,10 @@ func _input(event: InputEvent) -> void:
 	if inventory_open:
 		return
 
+	# Skip mouse capture when debug freecam is active
+	if has_node("/root/GameManager") and get_node("/root/GameManager").debug_freecam_active:
+		return
+
 	if event is InputEventMouseMotion:
 		_mouse_delta += event.relative
 
@@ -90,6 +94,10 @@ func _physics_process(_delta: float) -> void:
 	if is_bot:
 		return  # BotBrain writes inputs directly; skip keyboard polling
 	if not is_multiplayer_authority():
+		return
+	# Don't poll keyboard while debug freecam is active
+	if has_node("/root/GameManager") and get_node("/root/GameManager").debug_freecam_active:
+		_mouse_delta = Vector2.ZERO
 		return
 	# Don't poll keyboard while pause menu is open
 	if has_node("/root/PauseMenu") and get_node("/root/PauseMenu").is_open:
@@ -118,7 +126,7 @@ func _physics_process(_delta: float) -> void:
 	# Look — accumulate mouse motion into yaw/pitch (always active)
 	look_yaw -= _mouse_delta.x * MOUSE_SENSITIVITY
 	look_pitch -= _mouse_delta.y * MOUSE_SENSITIVITY
-	look_pitch = clampf(look_pitch, -1.48, 1.2)
+	look_pitch = clampf(look_pitch, -PI / 2.0, PI / 2.0)
 	_mouse_delta = Vector2.ZERO
 
 	# During kamikaze flight: only mouse look is active, all other inputs are ignored.

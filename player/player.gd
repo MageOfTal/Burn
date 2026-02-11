@@ -172,13 +172,14 @@ func _physics_process(delta: float) -> void:
 	if peer_id == multiplayer.get_unique_id() and inventory_ui:
 		inventory_ui.visible = player_input.inventory_open
 
-	if multiplayer.is_server():
+	# Debug freecam: freeze player physics but keep rendering visuals
+	var freecam_frozen: bool = GameManager.debug_freecam_active and peer_id == multiplayer.get_unique_id()
+
+	if multiplayer.is_server() and not freecam_frozen:
 		_server_process(delta)
-		# On a listen server the host needs client visuals for ALL player nodes
-		# (own camera/ADS, other players' health bars, grapple rope, demon, etc.)
-		_client_process(delta)
-	else:
-		_client_process(delta)
+	# On a listen server the host needs client visuals for ALL player nodes
+	# (own camera/ADS, other players' health bars, grapple rope, demon, etc.)
+	_client_process(delta)
 
 
 ## ======================================================================

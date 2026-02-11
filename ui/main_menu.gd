@@ -61,3 +61,18 @@ func _on_connection_succeeded() -> void:
 func _on_connection_failed() -> void:
 	_is_connecting = false
 	status_label.text = "Connection failed!\n- Is the server running?\n- Correct IP? (check host's Output panel)\n- Windows Firewall: allow Godot.exe for UDP"
+
+
+# ---- Debug toggles ----
+
+func _on_burn_timers_toggled(enabled: bool) -> void:
+	GameManager.debug_disable_burn_timers = enabled
+
+func _on_demon_toggled(enabled: bool) -> void:
+	GameManager.debug_disable_demon = enabled
+
+func _on_zone_damage_toggled(enabled: bool) -> void:
+	GameManager.debug_disable_zone_damage = enabled
+
+func _on_skip_structures_toggled(enabled: bool) -> void:
+	GameManager.debug_skip_structures = enabled

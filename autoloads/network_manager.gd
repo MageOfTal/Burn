@@ -168,6 +168,8 @@ func _start_host() -> void:
 	var map := get_tree().current_scene
 	if map and map.has_method("_spawn_demo_items"):
 		map._spawn_demo_items()
+	if map and map.has_method("spawn_lemon_shapes"):
+		map.spawn_lemon_shapes()
 	# Start heavy structure spawning now that all synchronous setup is done.
 	# This is triggered here (not from SeedWorld._ready) because call_deferred()
 	# on async functions from _ready() crashes Godot 4.6.
