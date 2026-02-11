@@ -59,14 +59,10 @@ func setup(player: CharacterBody3D) -> void:
 	_heat_system = player.get_node_or_null("HeatSystem")
 	_inventory = player.get_node_or_null("Inventory")
 
-	# Show local IP addresses so others can connect
+	# Show the LAN IP so others can connect
 	if ip_label:
-		var ips := IP.get_local_addresses()
-		var display_ip := "IP: "
-		for addr in ips:
-			if "." in addr and addr != "127.0.0.1":
-				display_ip += addr + " "
-		ip_label.text = display_ip.strip_edges()
+		var lan_ip: String = NetworkManager.get_local_ip()
+		ip_label.text = "IP: %s" % lan_ip
 
 	# Pre-create the 6 inventory slot labels once (never freed, just updated)
 	if inventory_list:
