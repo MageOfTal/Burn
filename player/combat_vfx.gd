@@ -176,19 +176,28 @@ func show_shotgun_fx(from_pos: Vector3, shot_ends: Array[Vector3]) -> void:
 
 func _play_fire_sound() -> void:
 	## Play fire sound with overlap support.
-	if player.fire_sound_player and player.fire_sound_player.stream:
-		if player.fire_sound_player.playing:
-			var one_shot := AudioStreamPlayer3D.new()
-			one_shot.stream = player.fire_sound_player.stream
-			one_shot.max_distance = 60.0
-			one_shot.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
-			one_shot.top_level = true
-			player.add_child(one_shot)
-			one_shot.global_position = player.global_position
-			one_shot.play()
-			one_shot.finished.connect(one_shot.queue_free)
-		else:
-			player.fire_sound_player.play()
+	## If the stream hasn't been loaded yet (RPC arrived before ServerSync
+	## delivered the sound path), load it on-demand from the synced path.
+	if player.fire_sound_player == null:
+		return
+	if player.fire_sound_player.stream == null and player.equipped_fire_sound_path != "":
+		if ResourceLoader.exists(player.equipped_fire_sound_path):
+			player.fire_sound_player.stream = load(player.equipped_fire_sound_path)
+			player._last_synced_fire_sound_path = player.equipped_fire_sound_path
+	if player.fire_sound_player.stream == null:
+		return
+	if player.fire_sound_player.playing:
+		var one_shot := AudioStreamPlayer3D.new()
+		one_shot.stream = player.fire_sound_player.stream
+		one_shot.max_distance = 60.0
+		one_shot.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+		one_shot.top_level = true
+		player.add_child(one_shot)
+		one_shot.global_position = player.global_position
+		one_shot.play()
+		one_shot.finished.connect(one_shot.queue_free)
+	else:
+		player.fire_sound_player.play()
 
 
 ## ======================================================================
