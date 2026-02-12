@@ -33,6 +33,20 @@ vertical_alignment = 1
 custom_minimum_size = Vector2(0, 20)
 layout_mode = 2
 
+[node name="UsernameLabel" type="Label" parent="CenterContainer/VBoxContainer"]
+layout_mode = 2
+text = "Username:"
+
+[node name="UsernameInput" type="LineEdit" parent="CenterContainer/VBoxContainer"]
+custom_minimum_size = Vector2(200, 0)
+layout_mode = 2
+placeholder_text = "Enter username..."
+max_length = 20
+
+[node name="Spacer1b" type="Control" parent="CenterContainer/VBoxContainer"]
+custom_minimum_size = Vector2(0, 10)
+layout_mode = 2
+
 [node name="HostButton" type="Button" parent="CenterContainer/VBoxContainer" unique_id=299096969]
 custom_minimum_size = Vector2(200, 40)
 layout_mode = 2

@@ -127,30 +127,76 @@ func _build_tower() -> void:
 	_voxel_terrain.collision_mask = 0    # Static — doesn't collide with anything itself
 
 	# Bounds: VoxelTerrain bounds are in voxel coordinates (1:1 with world units).
-	# Since this VoxelTerrain is a child of the SpiralTower node, and do_sphere()
-	# uses global_position, the bounds must cover the world-space area around the
-	# tower. We use large bounds to be safe — the generator is cheap (flat plane)
-	# and only a few blocks will actually get loaded near the tower.
+	# Since do_sphere() uses local coords (relative to the VoxelTerrain), bounds
+	# must cover the local tower volume. The tower is ~11m radius, 40m tall.
+	# Using tight bounds so fewer blocks need to be loaded by the streaming system.
+	# Block size is 16, so we need blocks covering roughly -16 to +16 in XZ
+	# and -16 to +48 in Y. Round to block boundaries with some margin.
 	_voxel_terrain.bounds = AABB(
-		Vector3(-256, -64, -256),
-		Vector3(512, 256, 512)
+		Vector3(-32, -16, -32),
+		Vector3(64, 80, 64)
 	)
 
 	_voxel_terrain.material_override = _tower_material
 	add_child(_voxel_terrain)
 
-	# Let the streaming system process a few frames so blocks around the tower
-	# position get loaded. Without this, do_sphere() may hit unloaded blocks.
-	for i in 5:
-		await get_tree().process_frame
+	# VoxelTerrain requires a VoxelViewer to know which blocks to stream/load.
+	# In the lobby flow, no players (and therefore no cameras/viewers) exist yet,
+	# so the streaming system has nothing to target and loads zero blocks.
+	# We add a temporary VoxelViewer at the tower position during construction,
+	# then remove it after painting is complete.
+	var _temp_viewer: Node3D = null
+	if ClassDB.class_exists(&"VoxelViewer"):
+		_temp_viewer = ClassDB.instantiate(&"VoxelViewer")
+		_temp_viewer.name = "TempBuildViewer"
+		_voxel_terrain.add_child(_temp_viewer)
+		print("[SpiralTower] Added temporary VoxelViewer for block streaming")
 
-	# Get VoxelTool for writing
+	# Wait for the streaming system to load all blocks the tower needs.
+	# With the VoxelViewer present, blocks should start loading within a few frames.
+	# We wait until do_sphere would succeed by testing if a voxel read returns
+	# a valid SDF value (positive = air from our flat generator at Y=-100).
 	_voxel_tool = _voxel_terrain.get_voxel_tool()
+	var max_wait := 300  # Up to 5 seconds at 60fps
+	var blocks_ready := false
+	for i in max_wait:
+		await get_tree().process_frame
+		_voxel_tool = _voxel_terrain.get_voxel_tool()
+		if _voxel_tool != null:
+			# Test multiple positions across the tower volume to ensure all blocks loaded
+			var test_base := _voxel_tool.get_voxel_f(Vector3(0, 0, 0))
+			var test_mid := _voxel_tool.get_voxel_f(Vector3(0, TOWER_HEIGHT * 0.5, 0))
+			var test_top := _voxel_tool.get_voxel_f(Vector3(0, TOWER_HEIGHT, 0))
+			# Our flat generator at Y=-100 means all blocks should have positive SDF (air).
+			# If all three test points return positive values, blocks are loaded.
+			if test_base > 0.0 and test_mid > 0.0 and test_top > 0.0:
+				blocks_ready = true
+				print("[SpiralTower] Blocks ready after %d frames (SDF: base=%.2f mid=%.2f top=%.2f)" % [
+					i, test_base, test_mid, test_top])
+				break
+		if i > 0 and i % 60 == 0:
+			print("[SpiralTower] Still waiting for blocks to load... (frame %d)" % i)
+
+	if _voxel_tool == null:
+		push_error("[SpiralTower] Failed to get VoxelTool — tower won't generate!")
+		if _temp_viewer:
+			_temp_viewer.queue_free()
+		generation_complete.emit()
+		return
+
+	if not blocks_ready:
+		push_warning("[SpiralTower] Blocks may not be fully loaded after %d frames — attempting paint anyway" % max_wait)
 
 	print("[SpiralTower] Painting tower at global_position=%s" % str(global_position))
 
 	# Paint the spiral shape using spheres along the core and ramp paths
 	await _paint_tower_shape()
+
+	# Remove the temporary viewer — once painted, the tower data is stored
+	# by VoxelStreamMemory and no longer needs active streaming.
+	if _temp_viewer and is_instance_valid(_temp_viewer):
+		_temp_viewer.queue_free()
+		print("[SpiralTower] Removed temporary VoxelViewer")
 
 	_is_built = true
 	generation_complete.emit()
@@ -206,6 +252,9 @@ func _paint_tower_shape() -> void:
 		if frames_since_yield >= yield_interval:
 			frames_since_yield = 0
 			await get_tree().process_frame
+			# Re-acquire VoxelTool after yield — streaming may have loaded new blocks
+			_voxel_tool = _voxel_terrain.get_voxel_tool()
+			_voxel_tool.mode = VoxelTool.MODE_ADD
 
 		y += core_step
 
@@ -239,6 +288,9 @@ func _paint_tower_shape() -> void:
 		if frames_since_yield >= yield_interval:
 			frames_since_yield = 0
 			await get_tree().process_frame
+			# Re-acquire VoxelTool after yield — streaming may have loaded new blocks
+			_voxel_tool = _voxel_terrain.get_voxel_tool()
+			_voxel_tool.mode = VoxelTool.MODE_ADD
 
 		y += ramp_step
 

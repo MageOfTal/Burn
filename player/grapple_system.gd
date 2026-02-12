@@ -23,12 +23,12 @@ class_name GrappleSystem
 const MAX_GRAPPLE_RANGE := 60.0       ## Raycast distance for finding anchor
 const SWING_GRAVITY := 17.5           ## Same as player gravity
 ## Release boost — tilts velocity upward and adds speed on release.
-const RELEASE_PITCH_UP := deg_to_rad(10.0)   ## Tilt velocity 10° upward on release
-const RELEASE_PITCH_MAX := deg_to_rad(15.0)  ## Never tilt above 15° upward
+const RELEASE_PITCH_UP := deg_to_rad(25.0)   ## Tilt velocity 25° upward on release
+const RELEASE_PITCH_MAX := deg_to_rad(30.0)  ## Never tilt above 30° upward
 const RELEASE_BOOST_MIN_SPEED := 2.0         ## No boost below this speed (m/s)
-const RELEASE_BOOST_MAX_SPEED := 25.0        ## Full boost at this speed (m/s)
+const RELEASE_BOOST_MAX_SPEED := 50.0        ## Full boost at this speed (m/s)
 const RELEASE_BOOST_MIN := 1.0               ## Boost at min speed (m/s)
-const RELEASE_BOOST_MAX := 5.0               ## Boost at max speed (m/s)
+const RELEASE_BOOST_MAX := 10.0              ## Boost at max speed (m/s)
 const MIN_ROPE_LENGTH := 3.0          ## Stop reeling at this distance
 const ROPE_REEL_SPEED := 3.0          ## Rope shortens this many m/s (creates pull)
 
@@ -301,10 +301,12 @@ func try_fire() -> void:
 	var aim_dist: float = to_target.length()
 	if aim_dist < 0.1:
 		return
-	# Clamp ray length to grapple range
-	var ray_dist: float = minf(aim_dist, MAX_GRAPPLE_RANGE)
 	var aim_dir: Vector3 = to_target / aim_dist
-	var far_point := hand_origin + aim_dir * ray_dist
+
+	# Single long ray (500m) — matches crosshair preview exactly.
+	# Check hit distance afterwards instead of clamping the ray length,
+	# so narrow geometry at the edge of range doesn't get missed.
+	var far_point := hand_origin + aim_dir * 500.0
 
 	var query := PhysicsRayQueryParameters3D.create(hand_origin, far_point)
 	query.exclude = [player.get_rid()]
@@ -312,6 +314,10 @@ func try_fire() -> void:
 
 	var result := space_state.intersect_ray(query)
 	if result.is_empty():
+		return
+
+	# Reject hits beyond grapple range
+	if hand_origin.distance_to(result.position) > MAX_GRAPPLE_RANGE:
 		return
 
 	anchor_point = result.position
@@ -931,13 +937,16 @@ func _apply_release_boost() -> bool:
 			player.velocity.z = horiz_dir.y * new_horiz
 			player.velocity.y = new_vert
 
-	# --- Speed boost: 1 m/s at 2 m/s, scaling to 5 m/s at 25 m/s ---
+	# --- Speed boost: 1 m/s at 2 m/s, scaling to 10 m/s at 50 m/s ---
 	speed = player.velocity.length()  # Re-read after pitch change
 	var t := clampf((speed - RELEASE_BOOST_MIN_SPEED) /
 		(RELEASE_BOOST_MAX_SPEED - RELEASE_BOOST_MIN_SPEED), 0.0, 1.0)
 	var boost := lerpf(RELEASE_BOOST_MIN, RELEASE_BOOST_MAX, t)
 	var boost_dir := player.velocity.normalized()
 	player.velocity += boost_dir * boost
+
+	# --- Flat vertical boost: always add 2 m/s upward ---
+	player.velocity.y += 2.0
 	return true
 
 

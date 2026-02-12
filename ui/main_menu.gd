@@ -4,6 +4,7 @@ extends Control
 
 @onready var address_input: LineEdit = $CenterContainer/VBoxContainer/AddressInput
 @onready var status_label: Label = $CenterContainer/VBoxContainer/StatusLabel
+@onready var username_input: LineEdit = $CenterContainer/VBoxContainer/UsernameInput
 
 var _connect_timer: float = 0.0
 var _is_connecting := false
@@ -27,8 +28,16 @@ func _process(delta: float) -> void:
 			NetworkManager.disconnect_game()
 
 
+func _store_username() -> void:
+	var username := username_input.text.strip_edges()
+	if username.is_empty():
+		username = "Player"
+	GameManager.local_username = username
+
+
 func _on_host_pressed() -> void:
-	print("[MainMenu] Host button pressed")
+	_store_username()
+	print("[MainMenu] Host button pressed (username: %s)" % GameManager.local_username)
 	var local_ip := NetworkManager.get_local_ip()
 	var err := NetworkManager.host_game()
 	if err != OK:
@@ -40,6 +49,7 @@ func _on_host_pressed() -> void:
 
 
 func _on_join_pressed() -> void:
+	_store_username()
 	var address := address_input.text.strip_edges()
 	if address.is_empty():
 		address = "127.0.0.1"

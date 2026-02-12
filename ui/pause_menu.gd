@@ -25,6 +25,7 @@ var _fps_timer: float = 0.0
 var _ground_pump_button: CheckButton = null
 var _reel_speed_input: LineEdit = null
 var _grapple_debug_visuals_button: CheckButton = null
+var _quit_btn: Button = null
 
 ## Saved settings
 var _settings := {
@@ -49,9 +50,11 @@ func _ready() -> void:
 
 func _input(event: InputEvent) -> void:
 	if event.is_action_pressed("ui_cancel"):
-		# Don't open pause menu on the main menu screen
+		# Don't open pause menu on the main menu screen or in the lobby
 		var scene := get_tree().current_scene
 		if scene and scene.scene_file_path == "res://ui/main_menu.tscn" and not is_open:
+			return
+		if GameManager.current_state == GameManager.GameState.LOBBY and not is_open:
 			return
 		_toggle_menu()
 		get_viewport().set_input_as_handled()
@@ -71,6 +74,7 @@ func _toggle_menu() -> void:
 	_overlay.visible = is_open
 	if is_open:
 		Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+		_update_quit_button()
 	else:
 		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
@@ -224,11 +228,11 @@ func _build_ui() -> void:
 	resume_btn.pressed.connect(_toggle_menu)
 	btn_row.add_child(resume_btn)
 
-	var quit_btn := Button.new()
-	quit_btn.text = "Quit to Menu"
-	quit_btn.custom_minimum_size = Vector2(140, 40)
-	quit_btn.pressed.connect(_on_quit_pressed)
-	btn_row.add_child(quit_btn)
+	_quit_btn = Button.new()
+	_quit_btn.text = "Quit to Menu"
+	_quit_btn.custom_minimum_size = Vector2(140, 40)
+	_quit_btn.pressed.connect(_on_quit_pressed)
+	btn_row.add_child(_quit_btn)
 
 	vbox.add_child(btn_row)
 
@@ -368,6 +372,28 @@ func _on_reel_speed_submitted(text: String) -> void:
 func _on_grapple_debug_visuals_toggled(pressed: bool) -> void:
 	GameManager.debug_grapple_visuals = pressed
 	print("[PauseMenu] Grapple debug visuals: %s" % ("ON" if pressed else "OFF"))
+
+
+func _update_quit_button() -> void:
+	if _quit_btn == null:
+		return
+	# Disconnect old signals
+	if _quit_btn.pressed.is_connected(_on_quit_pressed):
+		_quit_btn.pressed.disconnect(_on_quit_pressed)
+	if _quit_btn.pressed.is_connected(_on_reset_pressed):
+		_quit_btn.pressed.disconnect(_on_reset_pressed)
+	# Reconnect based on role
+	if NetworkManager.is_server:
+		_quit_btn.text = "Reset Game"
+		_quit_btn.pressed.connect(_on_reset_pressed)
+	else:
+		_quit_btn.text = "Disconnect"
+		_quit_btn.pressed.connect(_on_quit_pressed)
+
+
+func _on_reset_pressed() -> void:
+	_toggle_menu()
+	NetworkManager.reset_game()
 
 
 func _on_quit_pressed() -> void:

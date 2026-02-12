@@ -379,6 +379,15 @@ func _cleanup_demon_mesh() -> void:
 		_demon_mesh = null
 
 
+func _exit_tree() -> void:
+	## Clean up top-level nodes that survive player despawning (e.g. on game reset).
+	_cleanup_demon_mesh()
+	_cleanup_warning_label()
+	if _game_over_overlay and is_instance_valid(_game_over_overlay):
+		_game_over_overlay.queue_free()
+		_game_over_overlay = null
+
+
 # ======================================================================
 #  RPCs — elimination VFX
 # ======================================================================

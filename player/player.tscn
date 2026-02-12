@@ -75,21 +75,18 @@ properties/15/replication_mode = 1
 properties/16/path = NodePath("GrappleSystem:anchor_point")
 properties/16/spawn = true
 properties/16/replication_mode = 1
-properties/17/path = NodePath("GrappleSystem:wrap_points_flat")
+properties/17/path = NodePath("DemonSystem:demon_active")
 properties/17/spawn = true
 properties/17/replication_mode = 1
-properties/18/path = NodePath("DemonSystem:demon_active")
+properties/18/path = NodePath("DemonSystem:demon_position")
 properties/18/spawn = true
 properties/18/replication_mode = 1
-properties/19/path = NodePath("DemonSystem:demon_position")
+properties/19/path = NodePath("DemonSystem:demon_speed")
 properties/19/spawn = true
 properties/19/replication_mode = 1
-properties/20/path = NodePath("DemonSystem:demon_speed")
+properties/20/path = NodePath("DemonSystem:is_eliminated")
 properties/20/spawn = true
 properties/20/replication_mode = 1
-properties/21/path = NodePath("DemonSystem:is_eliminated")
-properties/21/spawn = true
-properties/21/replication_mode = 1
 
 [sub_resource type="SceneReplicationConfig" id="InputSyncConfig"]
 properties/0/path = NodePath("PlayerInput:input_direction")

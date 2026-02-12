@@ -43,15 +43,9 @@ func _ready() -> void:
 	_load_item_definitions()
 	_spawn_loot_chests()
 
-	if not multiplayer.is_server():
-		return
-
-	if has_node("/root/BurnClock"):
-		get_node("/root/BurnClock").start()
-
-	# NOTE: _spawn_demo_items() is called from network_manager._start_host()
-	# after the host player is spawned (it needs Players/1 to exist).
-	_start_zone()
+	# NOTE: BurnClock.start(), _start_zone(), and _spawn_demo_items() are now
+	# called from NetworkManager._start_match() when the host starts the game
+	# from the lobby. They are no longer auto-started in _ready().
 
 
 func _load_item_definitions() -> void:
