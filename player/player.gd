@@ -737,6 +737,19 @@ func die(killer_id: int) -> void:
 	player_killed.emit(peer_id, killer_id)
 	print("Player %d killed by Player %d" % [peer_id, killer_id])
 
+	# Kill feed: broadcast to all players
+	var killer_name := GameManager.get_username(killer_id)
+	var victim_name := GameManager.get_username(peer_id)
+	var weapon_name := ""
+	if players_container:
+		var killer_node_for_feed := players_container.get_node_or_null(str(killer_id))
+		if killer_node_for_feed and killer_node_for_feed.current_weapon and killer_node_for_feed.current_weapon.weapon_data:
+			weapon_name = killer_node_for_feed.current_weapon.weapon_data.item_name
+	var feed_text := "%s [color=gray][%s][/color] %s" % [killer_name, weapon_name, victim_name]
+	var net_mgr := get_node_or_null("/root/NetworkManager")
+	if net_mgr and net_mgr.has_method("broadcast_kill_feed"):
+		net_mgr.broadcast_kill_feed(feed_text)
+
 
 func reset_movement_states() -> void:
 	## Server-only: cancel any active movement abilities (grapple, kamikaze,

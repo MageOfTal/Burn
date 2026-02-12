@@ -297,9 +297,18 @@ func _spawn_player(peer_id: int) -> void:
 		str(player_spawner != null),
 		str(player_spawner.spawn_path) if player_spawner else "N/A"])
 
+	# Kill feed: announce human players joining (not bots)
+	if peer_id < BOT_PEER_ID_START:
+		var uname := GameManager.get_username(peer_id)
+		broadcast_kill_feed("[color=teal]%s joined[/color]" % uname)
+
 
 func _despawn_player(peer_id: int) -> void:
 	if players.has(peer_id):
+		# Kill feed: announce human players leaving (not bots)
+		if peer_id < BOT_PEER_ID_START:
+			var uname := GameManager.get_username(peer_id)
+			broadcast_kill_feed("[color=teal]%s disconnected[/color]" % uname)
 		var player_node: Node = players[peer_id]
 		player_node.queue_free()
 		players.erase(peer_id)
@@ -762,6 +771,32 @@ func _rpc_reset_to_lobby() -> void:
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	GameManager.change_state(GameManager.GameState.LOBBY)
 	_show_lobby_ui()
+
+
+# ======================================================================
+#  Kill Feed Broadcast (server → all clients)
+# ======================================================================
+
+func broadcast_kill_feed(bbcode_text: String) -> void:
+	## Server-only: send a kill feed entry to all peers.
+	if not multiplayer.is_server():
+		return
+	_rpc_kill_feed.rpc(bbcode_text)
+
+
+@rpc("authority", "call_local", "reliable")
+func _rpc_kill_feed(bbcode_text: String) -> void:
+	## All peers: find the local player's HUD and add the entry.
+	var players_node := get_tree().current_scene.get_node_or_null("Players")
+	if players_node == null:
+		return
+	var my_id := multiplayer.get_unique_id()
+	for child in players_node.get_children():
+		if child.name.to_int() == my_id:
+			var hud := child.get_node_or_null("HUDLayer/PlayerHUD")
+			if hud and hud.has_method("add_kill_feed_entry"):
+				hud.add_kill_feed_entry(bbcode_text)
+			break
 
 
 # ======================================================================

@@ -29,6 +29,12 @@ const RARITY_TAGS := ["C", "U", "R", "E", "L"]
 ## Zone info label (created in code, shown at bottom center)
 var _zone_label: Label = null
 
+## Kill feed (left side, scrolling event log)
+var _kill_feed_container: VBoxContainer = null
+const KILL_FEED_MAX := 6
+const KILL_FEED_DISPLAY_TIME := 5.0
+const KILL_FEED_FADE_TIME := 1.0
+
 # ======================================================================
 #  Compass strip
 # ======================================================================
@@ -100,6 +106,9 @@ func setup(player: CharacterBody3D) -> void:
 
 	# Build compass strip
 	_create_compass()
+
+	# Build kill feed container (left side, below stats)
+	_create_kill_feed()
 
 
 func _process(_delta: float) -> void:
@@ -461,6 +470,66 @@ func _update_compass() -> void:
 	else:
 		_demon_icon.visible = false
 		_demon_dist_label.visible = false
+
+
+# ======================================================================
+#  Kill feed (scrolling event log on left side)
+# ======================================================================
+
+func _create_kill_feed() -> void:
+	## Build the kill feed container on the left side of the screen.
+	_kill_feed_container = VBoxContainer.new()
+	_kill_feed_container.set_anchors_preset(Control.PRESET_TOP_LEFT)
+	_kill_feed_container.offset_left = 12.0
+	_kill_feed_container.offset_top = 220.0
+	_kill_feed_container.offset_right = 362.0
+	_kill_feed_container.offset_bottom = 500.0
+	_kill_feed_container.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# Newest entries at the top
+	add_child(_kill_feed_container)
+
+
+func add_kill_feed_entry(bbcode_text: String) -> void:
+	## Add a new entry to the kill feed. Called by NetworkManager RPC.
+	if _kill_feed_container == null:
+		return
+
+	var entry := RichTextLabel.new()
+	entry.bbcode_enabled = true
+	entry.fit_content = true
+	entry.scroll_active = false
+	entry.text = bbcode_text
+	entry.add_theme_font_size_override("normal_font_size", 13)
+	entry.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	entry.custom_minimum_size = Vector2(350, 0)
+
+	# Semi-transparent dark background for readability
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(0.0, 0.0, 0.0, 0.4)
+	style.content_margin_left = 4.0
+	style.content_margin_right = 4.0
+	style.content_margin_top = 2.0
+	style.content_margin_bottom = 2.0
+	style.corner_radius_top_left = 3
+	style.corner_radius_top_right = 3
+	style.corner_radius_bottom_left = 3
+	style.corner_radius_bottom_right = 3
+	entry.add_theme_stylebox_override("normal", style)
+
+	# Insert at top (index 0)
+	_kill_feed_container.add_child(entry)
+	_kill_feed_container.move_child(entry, 0)
+
+	# Remove oldest if over limit
+	while _kill_feed_container.get_child_count() > KILL_FEED_MAX:
+		var oldest := _kill_feed_container.get_child(_kill_feed_container.get_child_count() - 1)
+		oldest.queue_free()
+
+	# Auto-fade after display time
+	var tween := create_tween()
+	tween.tween_interval(KILL_FEED_DISPLAY_TIME)
+	tween.tween_property(entry, "modulate:a", 0.0, KILL_FEED_FADE_TIME)
+	tween.tween_callback(entry.queue_free)
 
 
 # ======================================================================
