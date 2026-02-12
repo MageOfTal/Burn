@@ -18,7 +18,7 @@ const WeaponProjectileScript = preload("res://weapons/weapon_projectile.gd")
 const WeaponMeleeScript = preload("res://weapons/weapon_melee.gd")
 
 const SPEED := 7.0
-const JUMP_VELOCITY := 9.0
+const JUMP_VELOCITY := 10.5
 const MAX_HEALTH := 100.0
 const RESPAWN_DELAY := 3.0
 
@@ -698,6 +698,21 @@ func die(killer_id: int) -> void:
 			killer_node.get_node("HeatSystem").on_kill()
 	player_killed.emit(peer_id, killer_id)
 	print("Player %d killed by Player %d" % [peer_id, killer_id])
+
+
+func reset_movement_states() -> void:
+	## Server-only: cancel any active movement abilities (grapple, kamikaze,
+	## slide/crouch) and zero velocity.  Does NOT touch health, inventory,
+	## heat, demon, or death state — used for toad dimension teleports.
+	if slide_crouch.is_sliding:
+		slide_crouch.end_slide()
+	if slide_crouch.is_crouching:
+		slide_crouch.end_crouch()
+	if kamikaze_system.is_active():
+		kamikaze_system.reset_state()
+	if grapple_system.is_active():
+		grapple_system.reset_state()
+	velocity = Vector3.ZERO
 
 
 func _do_respawn() -> void:

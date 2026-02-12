@@ -78,6 +78,14 @@ func _ready() -> void:
 	generator.channel = VoxelBuffer.CHANNEL_SDF
 	_voxel_terrain.generator = generator
 
+	# --- Stream: keep SDF edits (craters, tower carving) in memory ---
+	# Without a stream, chunks unloaded by the viewer (e.g. toad dimension
+	# teleport to Y=-500) lose all edits and regenerate from the noise generator.
+	# VoxelStreamMemory stores only modified blocks in RAM — unedited chunks
+	# are still generated on the fly from the noise, so memory cost is minimal.
+	var stream := VoxelStreamMemory.new()
+	_voxel_terrain.stream = stream
+
 	# --- Terrain settings ---
 	_voxel_terrain.mesh_block_size = 16
 	_voxel_terrain.max_view_distance = 256

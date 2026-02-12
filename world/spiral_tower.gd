@@ -114,6 +114,11 @@ func _build_tower() -> void:
 	generator.height = -100.0
 	_voxel_terrain.generator = generator
 
+	# Keep carved voxel data in memory so the tower survives chunk unloading
+	# (e.g. toad dimension teleport to Y=-500 and back).
+	var stream := VoxelStreamMemory.new()
+	_voxel_terrain.stream = stream
+
 	# Settings matching the terrain
 	_voxel_terrain.mesh_block_size = 16
 	_voxel_terrain.max_view_distance = 128

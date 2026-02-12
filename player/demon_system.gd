@@ -130,6 +130,10 @@ func process(delta: float) -> void:
 	if not player.is_alive:
 		return
 
+	# Freeze demon while player is in the toad dimension
+	if player.in_toad_dimension:
+		return
+
 	# Move toward player in full 3D — demon must physically reach the player,
 	# not just match their XZ position and float to their height
 	var target_pos := player.global_position + Vector3(0, 1.0, 0)  # Aim at body center

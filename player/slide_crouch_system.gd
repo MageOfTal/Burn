@@ -26,6 +26,7 @@ const CROUCH_CAPSULE_HEIGHT := 1.0
 const CROUCH_CAMERA_OFFSET := -0.5
 const CROUCH_SPEED_MULT := 0.35
 const CROUCH_MESH_SCALE_Y := 0.55  # Visual squish
+const CROUCH_AIRBORNE_GRACE := 0.25  ## Stay crouched this long after leaving ground
 
 ## --- Synced state (replicated via ServerSync) ---
 var is_sliding: bool = false
@@ -42,6 +43,7 @@ var _wants_slide_on_land: bool = false             ## Queue slide when landing f
 var _slide_on_land_grace: float = 0.0              ## Grace window after landing to trigger slide
 var _was_on_floor: bool = true                     ## Track floor state for landing detection
 var _pre_land_velocity_y: float = 0.0              ## Vertical speed right before landing
+var _crouch_airborne_timer: float = 0.0            ## Crouch airborne grace (like slide)
 
 ## --- Post-slide jump window ---
 const POST_SLIDE_WINDOW := 0.125         ## Seconds after slide ends where jump preserves speed
@@ -284,8 +286,9 @@ func end_slide() -> void:
 	_slide_velocity = Vector3.ZERO
 	_slide_forward_dir = Vector3.ZERO
 
-	# Transition to crouch if still holding Ctrl, or if there's no headroom
-	if player.player_input.action_slide or not has_headroom():
+	# Transition to crouch if still holding Ctrl, or if there's no headroom.
+	# Only transition on the ground — don't start crouching mid-air.
+	if player.is_on_floor() and (player.player_input.action_slide or not has_headroom()):
 		var input_dir: Vector2 = player.player_input.input_direction
 		if input_dir.length() > 0.1:
 			var shoe_bonus: float = player.inventory.get_shoe_speed_bonus() if player.inventory else 0.0
@@ -346,24 +349,43 @@ func process_post_slide_window(delta: float) -> bool:
 ## ---- Crouch mechanics (server-only) ----
 
 func start_crouch() -> void:
+	# Never start crouching in the air
+	if not player.is_on_floor():
+		return
 	is_crouching = true
 	is_sliding = false
+	_crouch_airborne_timer = 0.0
 	apply_lowered_pose(CROUCH_CAPSULE_HEIGHT, CROUCH_CAMERA_OFFSET)
 
 
 func process_crouch(delta: float) -> void:
 	## Server-only: crouched movement with reduced speed.
+
+	# Airborne grace — stay crouched when briefly leaving the ground (bumpy hills).
+	# Only end crouch after the grace expires.
+	var on_floor := player.is_on_floor()
+	if on_floor:
+		_crouch_airborne_timer = 0.0
+	else:
+		_crouch_airborne_timer += delta
+		if _crouch_airborne_timer > CROUCH_AIRBORNE_GRACE:
+			end_crouch()
+			return
+
 	if not player.player_input.action_slide and has_headroom():
 		end_crouch()
 		return
 
-	# Allow jumping out of crouch
-	if player.player_input.action_jump and player.is_on_floor() and has_headroom():
+	# Allow jumping out of crouch (must actually be on floor, not just in grace)
+	if player.player_input.action_jump and on_floor and has_headroom():
 		end_crouch()
 		player.velocity.y = player.JUMP_VELOCITY
 		return
 
-	# Crouched movement — slower, same acceleration feel
+	# Crouched movement — slower, same acceleration feel (only when grounded)
+	if not on_floor:
+		return
+
 	var shoe_bonus: float = player.inventory.get_shoe_speed_bonus() if player.inventory else 0.0
 	var current_speed: float = player.SPEED * (player.heat_system.get_speed_multiplier() + shoe_bonus) * CROUCH_SPEED_MULT
 	var input_dir: Vector2 = player.player_input.input_direction

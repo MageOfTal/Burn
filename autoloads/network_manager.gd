@@ -378,21 +378,32 @@ func _on_connected_to_server() -> void:
 	print("[Client] ========================================")
 	print("[Client] Connected to server! My peer ID: %d" % multiplayer.get_unique_id())
 	print("[Client] ========================================")
-	print("[Client] Step 1/5: Showing loading screen...")
+	print("[Client] Step 1/6: Showing loading screen...")
 	_show_loading_screen("Loading game map...")
-	print("[Client] Step 2/5: Loading game map (await)...")
+	print("[Client] Step 2/6: Loading game map (await)...")
 	await _load_game_map()
-	print("[Client] Step 3/5: Map loaded. player_container=%s, player_spawner=%s" % [
+	print("[Client] Step 3/6: Map loaded. player_container=%s, player_spawner=%s" % [
 		str(player_container != null), str(player_spawner != null)])
 	if player_container:
 		print("[Client]   Players container children: %d" % player_container.get_child_count())
+
+	# Step 4: Build structures locally (deterministic — same seed as server)
+	print("[Client] Step 4/6: Building structures...")
+	var seed_world := get_tree().current_scene.get_node_or_null("SeedWorld")
+	if seed_world:
+		_update_loading_status("Building structures...")
+		seed_world._spawn_heavy_structures()
+		if not seed_world.structures_complete:
+			await seed_world.world_generation_complete
+		print("[Client] Structures complete.")
+
 	_update_loading_status("Joining game...")
-	print("[Client] Step 4/5: Sending client_ready RPC to server...")
+	print("[Client] Step 5/6: Sending client_ready RPC to server...")
 	_client_ready.rpc_id(1)
 	print("[Client]   client_ready RPC sent. Waiting 30 frames for server to spawn our player...")
 	for i in 30:
 		await get_tree().process_frame
-	print("[Client] Step 5/5: Hiding loading screen. Players container children: %d" % (
+	print("[Client] Step 6/6: Hiding loading screen. Players container children: %d" % (
 		player_container.get_child_count() if player_container else -1))
 	if player_container:
 		for child in player_container.get_children():

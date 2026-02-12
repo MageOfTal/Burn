@@ -84,12 +84,14 @@ func enter(attacker: CharacterBody3D, victim: CharacterBody3D) -> void:
 	session.victim_saved_pos = victim.global_position
 	session.timer = SESSION_DURATION
 
+	# Cancel any active movement abilities before teleporting
+	attacker.reset_movement_states()
+	victim.reset_movement_states()
+
 	# Teleport players — spread them out a bit so multiple pairs don't stack
 	var pair_offset := Vector3(randf_range(-8, 8), 0, randf_range(-8, 8))
 	attacker.in_toad_dimension = true
 	victim.in_toad_dimension = true
-	attacker.velocity = Vector3.ZERO
-	victim.velocity = Vector3.ZERO
 	attacker.global_position = _arena_center + pair_offset + Vector3(-3, 0, 0)
 	victim.global_position = _arena_center + pair_offset + Vector3(3, 0, 0)
 
@@ -159,16 +161,17 @@ func _process(_delta: float) -> void:
 func _end_session(session: SessionData) -> void:
 	session.ended = true
 
-	# Teleport survivors back
+	# Cancel active abilities and teleport survivors back — place on terrain
+	# surface so they don't end up underground if it was cratered.
 	if is_instance_valid(session.attacker) and session.attacker.is_alive:
+		session.attacker.reset_movement_states()
 		session.attacker.in_toad_dimension = false
-		session.attacker.global_position = session.attacker_saved_pos
-		session.attacker.velocity = Vector3.ZERO
+		session.attacker.global_position = _get_safe_return_pos(session.attacker_saved_pos)
 
 	if is_instance_valid(session.victim) and session.victim.is_alive:
+		session.victim.reset_movement_states()
 		session.victim.in_toad_dimension = false
-		session.victim.global_position = session.victim_saved_pos
-		session.victim.velocity = Vector3.ZERO
+		session.victim.global_position = _get_safe_return_pos(session.victim_saved_pos)
 
 	_on_exit_toad_dimension.rpc(
 		session.attacker.peer_id if is_instance_valid(session.attacker) else -1,
@@ -178,6 +181,17 @@ func _end_session(session: SessionData) -> void:
 	print("[ToadDimension] Session %d ended (%d sessions remain)" % [
 		session.session_id, _sessions.size() - 1
 	])
+
+
+func _get_safe_return_pos(saved_pos: Vector3) -> Vector3:
+	## Return the saved position, but if it's now underground (e.g. terrain
+	## was cratered while in the toad dimension), move Y up to the surface.
+	var seed_world := get_tree().current_scene.get_node_or_null("SeedWorld")
+	if seed_world and seed_world.has_method("get_height_at"):
+		var surface_y: float = seed_world.get_height_at(saved_pos.x, saved_pos.z)
+		if saved_pos.y < surface_y:
+			return Vector3(saved_pos.x, surface_y, saved_pos.z)
+	return saved_pos
 
 
 func _scatter_and_despawn_toads() -> void:

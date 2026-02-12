@@ -38,18 +38,17 @@ func _ready() -> void:
 	# Zone visual is cosmetic — create on ALL peers so everyone sees the ring + fire
 	_create_zone_visual()
 
+	# Item definitions and loot chests run on ALL peers so clients can see chests.
+	# Chest gameplay logic (loot generation, opening) is server-only via is_server() guards.
+	_load_item_definitions()
+	_spawn_loot_chests()
+
 	if not multiplayer.is_server():
 		return
-
-	_load_item_definitions()
 
 	if has_node("/root/BurnClock"):
 		get_node("/root/BurnClock").start()
 
-	# SeedWorld._ready() already ran (child _ready before parent) and spawned
-	# lightweight markers (PlayerSpawnPoints, LootSpawnPoints) synchronously.
-	# Heavy structures (walls, ramps) are batched across frames in the background.
-	_spawn_loot_chests()
 	# NOTE: _spawn_demo_items() is called from network_manager._start_host()
 	# after the host player is spawned (it needs Players/1 to exist).
 	_start_zone()
@@ -98,8 +97,15 @@ func _spawn_loot_chests() -> void:
 		if child is Marker3D:
 			points.append(child)
 
-	# Shuffle and take first CHEST_COUNT points
-	points.shuffle()
+	# Shuffle deterministically so all peers pick the same CHEST_COUNT points.
+	# Godot's Array.shuffle() uses the global RNG which differs per peer.
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 55555
+	for i in range(points.size() - 1, 0, -1):
+		var j := rng.randi_range(0, i)
+		var tmp: Node = points[i]
+		points[i] = points[j]
+		points[j] = tmp
 	var count := mini(CHEST_COUNT, points.size())
 
 	var chest_scene := preload("res://world/loot_chest.tscn")
