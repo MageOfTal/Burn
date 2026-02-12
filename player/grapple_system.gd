@@ -22,7 +22,13 @@ class_name GrappleSystem
 
 const MAX_GRAPPLE_RANGE := 60.0       ## Raycast distance for finding anchor
 const SWING_GRAVITY := 17.5           ## Same as player gravity
-const RELEASE_UPWARD_BOOST := 3.0     ## Vertical speed added on jump-release
+## Release boost — tilts velocity upward and adds speed on release.
+const RELEASE_PITCH_UP := deg_to_rad(10.0)   ## Tilt velocity 10° upward on release
+const RELEASE_PITCH_MAX := deg_to_rad(15.0)  ## Never tilt above 15° upward
+const RELEASE_BOOST_MIN_SPEED := 2.0         ## No boost below this speed (m/s)
+const RELEASE_BOOST_MAX_SPEED := 25.0        ## Full boost at this speed (m/s)
+const RELEASE_BOOST_MIN := 1.0               ## Boost at min speed (m/s)
+const RELEASE_BOOST_MAX := 5.0               ## Boost at max speed (m/s)
 const MIN_ROPE_LENGTH := 3.0          ## Stop reeling at this distance
 const ROPE_REEL_SPEED := 3.0          ## Rope shortens this many m/s (creates pull)
 
@@ -266,7 +272,9 @@ func handle_shoot_input(shoot_held: bool) -> void:
 	_shoot_was_held = shoot_held
 	if just_pressed:
 		if is_grappling:
-			_do_release(false)
+			# Boost on release unless player is holding Ctrl
+			var boost: bool = not player.player_input.action_ctrl
+			_do_release(boost)
 		else:
 			try_fire()
 
@@ -880,16 +888,57 @@ func _check_pill_half_blocked(space_state: PhysicsDirectSpaceState3D,
 func _do_release(with_boost: bool) -> void:
 	if not is_grappling:
 		return
+
+	var boosted := false
 	if with_boost:
-		player.velocity.y += RELEASE_UPWARD_BOOST
+		boosted = _apply_release_boost()
+
 	var release_pos: Vector3 = player.global_position + Vector3(0, 1.2, 0)
 	is_grappling = false
 	anchor_point = Vector3.ZERO
 	_rope_length = 0.0
 	_anchor_collider_rid = RID()
 	_show_grapple_release.rpc(release_pos)
+	if boosted:
+		_play_release_woosh.rpc(release_pos)
 	print("Player %d released grapple (speed: %.1f, boost: %s)" % [
 		player.peer_id, player.velocity.length(), str(with_boost)])
+
+
+func _apply_release_boost() -> bool:
+	## Tilt velocity upward by 10° (capped at 15° above horizontal)
+	## and add a speed boost that scales with current speed.
+	## Returns true if the boost was actually applied.
+	var vel := player.velocity
+	var speed := vel.length()
+	if speed < RELEASE_BOOST_MIN_SPEED:
+		return false
+
+	# --- Pitch tilt: rotate velocity upward by 10°, capped at 15° ---
+	var horiz_speed := Vector2(vel.x, vel.z).length()
+	if horiz_speed > 0.1:
+		# Current pitch angle (negative = downward, positive = upward)
+		var current_pitch := atan2(vel.y, horiz_speed)
+		# Target pitch after adding 10°, capped at 15° upward
+		var new_pitch := minf(current_pitch + RELEASE_PITCH_UP, RELEASE_PITCH_MAX)
+		# Only apply if we're actually tilting upward from current
+		if new_pitch > current_pitch:
+			# Preserve total speed, redistribute between vertical and horizontal
+			var horiz_dir := Vector2(vel.x, vel.z).normalized()
+			var new_horiz := cos(new_pitch) * speed
+			var new_vert := sin(new_pitch) * speed
+			player.velocity.x = horiz_dir.x * new_horiz
+			player.velocity.z = horiz_dir.y * new_horiz
+			player.velocity.y = new_vert
+
+	# --- Speed boost: 1 m/s at 2 m/s, scaling to 5 m/s at 25 m/s ---
+	speed = player.velocity.length()  # Re-read after pitch change
+	var t := clampf((speed - RELEASE_BOOST_MIN_SPEED) /
+		(RELEASE_BOOST_MAX_SPEED - RELEASE_BOOST_MIN_SPEED), 0.0, 1.0)
+	var boost := lerpf(RELEASE_BOOST_MIN, RELEASE_BOOST_MAX, t)
+	var boost_dir := player.velocity.normalized()
+	player.velocity += boost_dir * boost
+	return true
 
 
 func reset_state() -> void:
@@ -1309,3 +1358,56 @@ func _show_grapple_release(pos: Vector3) -> void:
 	var tween := get_tree().create_tween()
 	tween.tween_property(flash, "light_energy", 0.0, 0.2)
 	tween.tween_callback(flash.queue_free)
+
+
+@rpc("authority", "call_local", "reliable")
+func _play_release_woosh(pos: Vector3) -> void:
+	## Procedural whoosh sound on boosted grapple release.
+	var sfx := AudioStreamPlayer3D.new()
+	sfx.top_level = true
+	sfx.max_distance = 40.0
+	sfx.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+
+	# Generate a short burst of filtered noise as a woosh
+	var sample_rate := 22050
+	var duration := 0.35
+	var num_samples := int(sample_rate * duration)
+	var gen := AudioStreamGenerator.new()
+	gen.mix_rate = sample_rate
+	gen.buffer_length = duration + 0.05
+
+	sfx.stream = gen
+	var scene_root := get_tree().current_scene
+	if scene_root == null:
+		sfx.queue_free()
+		return
+	scene_root.add_child(sfx)
+	sfx.global_position = pos
+	sfx.play()
+
+	# Push samples: band-passed noise with pitch sweep and volume envelope
+	var playback: AudioStreamGeneratorPlayback = sfx.get_stream_playback()
+	var rng := RandomNumberGenerator.new()
+	rng.randomize()
+	# Simple biquad low-pass state
+	var lp_prev := 0.0
+	var lp_prev2 := 0.0
+	for i in num_samples:
+		var t := float(i) / float(num_samples)
+		# Volume envelope: quick attack, smooth decay
+		var env := (1.0 - t) * (1.0 - t)
+		if t < 0.05:
+			env *= t / 0.05
+		# Noise source
+		var noise := rng.randf_range(-1.0, 1.0)
+		# Low-pass cutoff sweeps down over time (woosh character)
+		var cutoff := lerpf(0.6, 0.15, t)
+		# Simple one-pole low-pass
+		lp_prev = lp_prev + cutoff * (noise - lp_prev)
+		var sample := lp_prev * env * 0.7
+		playback.push_frame(Vector2(sample, sample))
+
+	# Auto-cleanup after playback
+	var cleanup_tween := get_tree().create_tween()
+	cleanup_tween.tween_interval(duration + 0.1)
+	cleanup_tween.tween_callback(sfx.queue_free)

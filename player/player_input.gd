@@ -19,6 +19,7 @@ var action_aim := false  ## Right-click ADS (held)
 var action_extend := false  ## F key: spend fuel to extend equipped item's lifespan
 var action_scrap := false  ## X key: scrap nearby ground item or equipped item into fuel
 var action_marker := false  ## MMB: place/remove compass marker
+var action_ctrl := false    ## Ctrl held: suppress grapple release boost
 ## Weapon slot selection (1-6, 0 = no change this frame).
 var action_slot := 0
 ## Inventory UI state — when open, gameplay inputs are zeroed and mouse is freed.
@@ -157,6 +158,7 @@ func _physics_process(_delta: float) -> void:
 	action_extend = Input.is_action_just_pressed("extend_item")
 	action_scrap = Input.is_action_just_pressed("scrap_item")
 	action_marker = Input.is_action_just_pressed("place_marker")
+	action_ctrl = Input.is_key_pressed(KEY_CTRL)
 
 	# Weapon slot keys (1-6)
 	action_slot = 0

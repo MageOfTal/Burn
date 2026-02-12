@@ -128,6 +128,9 @@ properties/10/replication_mode = 1
 properties/11/path = NodePath("PlayerInput:action_scrap")
 properties/11/spawn = true
 properties/11/replication_mode = 1
+properties/12/path = NodePath("PlayerInput:action_ctrl")
+properties/12/spawn = true
+properties/12/replication_mode = 1
 
 [node name="Player" type="CharacterBody3D"]
 collision_mask = 17
