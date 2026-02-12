@@ -111,13 +111,25 @@ func reset_state() -> void:
 	_altitude_drop_at_cap = 0.0
 	_was_at_cap = false
 	_cap_hit_y = 0.0
-	# Clean up flight trail particles
+	# Clean up flight trail on ALL peers (launch RPC created trails on all clients)
+	_cleanup_trail()
+	_rpc_cleanup_trail.rpc()
+	# Re-enable collision
+	player.get_node("CollisionShape3D").set_deferred("disabled", false)
+
+
+func _cleanup_trail() -> void:
+	## Remove the flight trail particles (local to this peer).
 	if _trail and is_instance_valid(_trail):
 		_trail.emitting = false
 		get_tree().create_timer(1.0).timeout.connect(_trail.queue_free)
 		_trail = null
-	# Re-enable collision
-	player.get_node("CollisionShape3D").set_deferred("disabled", false)
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_cleanup_trail() -> void:
+	## Client-side: server tells us to clean up kamikaze trail particles.
+	_cleanup_trail()
 
 
 ## ======================================================================

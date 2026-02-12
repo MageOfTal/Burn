@@ -657,9 +657,9 @@ func _start_match() -> void:
 			_spawn_player(peer_id)
 			_reposition_to_spawn_point(peer_id)
 
-		# Debug: spawn demon near host for testing
-		if players.has(1):
-			players[1].demon_system.debug_spawn_nearby()
+		# Debug: spawn demon near ALL players for testing
+		for pid in players:
+			players[pid].demon_system.debug_spawn_nearby()
 
 		# Spawn bots
 		_spawn_bots()
