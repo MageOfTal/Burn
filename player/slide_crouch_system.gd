@@ -127,7 +127,7 @@ func process_slide(delta: float) -> void:
 	## Uses real inclined-plane physics: a = g * (sin(angle)*alignment - friction*cos(angle))
 
 	# --- Jump out of slide: keep all horizontal momentum ---
-	if player.player_input.action_jump and player.is_on_floor():
+	if player._frame_jump and player.is_on_floor():
 		var saved_hx: float = _slide_velocity.x
 		var saved_hz: float = _slide_velocity.z
 		# End slide state (may try to transition to crouch, which we override)
@@ -321,7 +321,7 @@ func process_post_slide_window(delta: float) -> bool:
 	_post_slide_timer -= delta
 
 	# If player jumps during the window, restore slide speed and jump
-	if player.player_input.action_jump and player.is_on_floor():
+	if player._frame_jump and player.is_on_floor():
 		player.velocity.x = _post_slide_dir.x * _post_slide_speed
 		player.velocity.z = _post_slide_dir.z * _post_slide_speed
 		player.velocity.y = player.JUMP_VELOCITY
@@ -377,7 +377,7 @@ func process_crouch(delta: float) -> void:
 		return
 
 	# Allow jumping out of crouch (must actually be on floor, not just in grace)
-	if player.player_input.action_jump and on_floor and has_headroom():
+	if player._frame_jump and on_floor and has_headroom():
 		end_crouch()
 		player.velocity.y = player.JUMP_VELOCITY
 		return

@@ -89,7 +89,7 @@ func _physics_process(delta: float) -> void:
 		if _stuck_timer > STUCK_TIME:
 			_stuck_timer = 0.0
 			_pick_new_wander_target()
-			_player_input.action_jump = true
+			_player_input.jump_count += 1
 	else:
 		_stuck_timer = 0.0
 
@@ -130,9 +130,7 @@ func _do_wander(delta: float) -> void:
 	_random_jump_timer -= delta
 	if _random_jump_timer <= 0.0:
 		_random_jump_timer = _rng.randf_range(4.0, 12.0)
-		_player_input.action_jump = true
-	else:
-		_player_input.action_jump = false
+		_player_input.jump_count += 1
 
 	_player_input.action_shoot = false
 	_player_input.action_aim = false
@@ -167,7 +165,6 @@ func _do_combat(_delta: float) -> void:
 	var angle_to_target := facing_dir.angle_to(horiz_to.normalized()) if horiz_to.length() > 0.5 else PI
 	_player_input.action_shoot = dist < SHOOT_RANGE and angle_to_target < SHOOT_ANGLE
 	_player_input.action_aim = dist > 15.0 and dist < SHOOT_RANGE
-	_player_input.action_jump = false
 
 
 func _scan_for_targets() -> void:
@@ -263,10 +260,6 @@ func _apply_edge_avoidance(_delta: float) -> void:
 
 func _clear_inputs() -> void:
 	_player_input.input_direction = Vector2.ZERO
-	_player_input.action_jump = false
 	_player_input.action_shoot = false
 	_player_input.action_aim = false
 	_player_input.action_slide = false
-	_player_input.action_extend = false
-	_player_input.action_scrap = false
-	_player_input.action_slot = 0

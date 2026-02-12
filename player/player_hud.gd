@@ -48,6 +48,7 @@ var _compass_center_mark: ColorRect = null
 var _player_marker_pos: Vector3 = Vector3.INF
 var _marker_icon: Label = null
 var _marker_dist_label: Label = null
+var _last_marker_count := 0
 
 ## Demon indicator on compass
 var _demon_icon: Label = null
@@ -471,8 +472,9 @@ func _handle_marker_input() -> void:
 	if _player == null:
 		return
 	var pi := _player.get_node_or_null("PlayerInput")
-	if pi == null or not pi.action_marker:
+	if pi == null or pi.marker_count <= _last_marker_count:
 		return
+	_last_marker_count = pi.marker_count
 
 	# Raycast from camera center forward to find terrain
 	var camera: Camera3D = _player.camera

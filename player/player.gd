@@ -51,6 +51,17 @@ var is_aiming: bool = false
 var current_weapon: WeaponBase = null
 var _respawn_timer: float = 0.0
 
+## Input counter consumption — server tracks last-consumed count for each
+## monotonic counter in PlayerInput. See player_input.gd for details.
+var _last_jump := 0
+var _last_pickup := 0
+var _last_extend := 0
+var _last_scrap := 0
+var _last_slot := 0
+## Frame-local flag: true if jump was pressed this frame. Set at the top of
+## _server_process() and read by subsystems (slide_crouch_system, etc.)
+var _frame_jump := false
+
 ## Synced weapon visual paths — clients use these to load 3D model + sound
 var equipped_gun_model_path: String = ""
 var equipped_fire_sound_path: String = ""
@@ -203,6 +214,23 @@ func _physics_process(delta: float) -> void:
 ## ======================================================================
 
 func _server_process(delta: float) -> void:
+	# --- Consume one-shot input counters (once per frame, before anything reads them) ---
+	_frame_jump = player_input.jump_count > _last_jump
+	if _frame_jump:
+		_last_jump = player_input.jump_count
+	var wants_pickup := player_input.pickup_count > _last_pickup
+	if wants_pickup:
+		_last_pickup = player_input.pickup_count
+	var wants_extend := player_input.extend_count > _last_extend
+	if wants_extend:
+		_last_extend = player_input.extend_count
+	var wants_scrap := player_input.scrap_count > _last_scrap
+	if wants_scrap:
+		_last_scrap = player_input.scrap_count
+	var wants_slot := player_input.slot_count > _last_slot
+	if wants_slot:
+		_last_slot = player_input.slot_count
+
 	# Demon always ticks (chases even while player is dead/respawning)
 	demon_system.process(delta)
 
@@ -258,7 +286,7 @@ func _server_process(delta: float) -> void:
 			pass  # Jump was consumed by post-slide window — skip normal movement
 		else:
 			# Jump (slide-jump is handled in process_slide; crouch-jump in process_crouch)
-			if player_input.action_jump and is_on_floor():
+			if _frame_jump and is_on_floor():
 				velocity.y = JUMP_VELOCITY
 				slide_crouch.clear_slide_on_land()
 
@@ -287,8 +315,8 @@ func _server_process(delta: float) -> void:
 	slide_crouch.process_landing(delta)
 
 	# Weapon slot switching (1-6)
-	if player_input.action_slot > 0:
-		var slot_idx: int = player_input.action_slot - 1
+	if wants_slot:
+		var slot_idx: int = player_input.slot_select - 1
 		if inventory and slot_idx < inventory.items.size():
 			inventory.equip_slot(slot_idx)
 			var stack: ItemStack = inventory.items[slot_idx]
@@ -303,16 +331,16 @@ func _server_process(delta: float) -> void:
 				grapple_system._do_release(false)
 
 	# --- Extend equipped item lifespan (F key) ---
-	if player_input.action_extend and inventory:
+	if wants_extend and inventory:
 		item_manager.try_extend_equipped_item()
 
 	# --- Open nearby chest OR pickup nearby item (E key) ---
-	if player_input.action_pickup and inventory:
+	if wants_pickup and inventory:
 		if not _try_open_nearby_chest():
 			item_manager.try_pickup_nearby_item()
 
 	# --- Scrap nearby ground item or equipped item (X key) ---
-	if player_input.action_scrap and inventory:
+	if wants_scrap and inventory:
 		item_manager.try_scrap_item()
 
 	# --- Consumable activation: shoot while a consumable is equipped ---
@@ -760,6 +788,13 @@ func _do_respawn() -> void:
 		var spawn_point: Marker3D = valid_spawns[randi() % valid_spawns.size()]
 		global_position = spawn_point.global_position
 		velocity = Vector3.ZERO
+
+	# Sync input counters so presses during death don't phantom-fire on respawn
+	_last_jump = player_input.jump_count
+	_last_pickup = player_input.pickup_count
+	_last_extend = player_input.extend_count
+	_last_scrap = player_input.scrap_count
+	_last_slot = player_input.slot_count
 
 	print("Player %d respawned" % peer_id)
 

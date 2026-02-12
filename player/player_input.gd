@@ -3,6 +3,15 @@ extends Node
 ## Captures local player input and exposes it as synced properties.
 ## The InputSync MultiplayerSynchronizer reads these properties and
 ## sends them to the server. Only the owning client writes to these.
+##
+## ONE-SHOT ACTIONS use monotonic counters (jump_count, pickup_count, etc.)
+## instead of booleans. Each press increments the counter by 1. The server
+## compares against its last-consumed count to detect new presses. This
+## prevents lost inputs over the network — booleans that flip true→false
+## in a single frame are unreliable with ON_CHANGE replication.
+##
+## HELD ACTIONS (shoot, slide, aim, ctrl) remain booleans because they
+## stay true across multiple frames while the key is held.
 
 ## Movement direction (WASD mapped to Vector2).
 var input_direction := Vector2.ZERO
@@ -10,19 +19,24 @@ var input_direction := Vector2.ZERO
 var look_yaw := 0.0
 ## Camera pitch (vertical look).
 var look_pitch := 0.0
-## Action flags — true on the frame the action is pressed.
-var action_jump := false
-var action_shoot := false
-var action_pickup := false
-var action_slide := false
-var action_aim := false  ## Right-click ADS (held)
-var action_extend := false  ## F key: spend fuel to extend equipped item's lifespan
-var action_scrap := false  ## X key: scrap nearby ground item or equipped item into fuel
-var action_marker := false  ## MMB: place/remove compass marker
-var action_ctrl := false    ## Ctrl held: suppress grapple release boost
-## Weapon slot selection (1-6, 0 = no change this frame).
-var action_slot := 0
-## Inventory UI state — when open, gameplay inputs are zeroed and mouse is freed.
+
+## --- One-shot action counters (monotonically increasing) ---
+## Server compares these against its _last_* trackers to detect presses.
+var jump_count := 0       ## Space: jump
+var pickup_count := 0     ## E: pickup item / open chest
+var extend_count := 0     ## F: extend equipped item lifespan
+var scrap_count := 0      ## X: scrap item into fuel
+var marker_count := 0     ## MMB: place/remove compass marker (client-only)
+var slot_count := 0       ## Weapon slot change event count
+var slot_select := 0      ## Which slot (1-6) was last selected
+
+## --- Held action booleans (true while key is held) ---
+var action_shoot := false  ## Left-click: fire weapon
+var action_slide := false  ## Shift: slide/crouch
+var action_aim := false    ## Right-click: ADS
+var action_ctrl := false   ## Ctrl: suppress grapple release boost
+
+## Inventory UI state — when open, gameplay inputs are suppressed and mouse is freed.
 var inventory_open := false
 
 ## When true, this PlayerInput is driven by BotBrain — skip all keyboard/mouse handling.
@@ -100,27 +114,19 @@ func _physics_process(_delta: float) -> void:
 	if has_node("/root/GameManager") and get_node("/root/GameManager").debug_freecam_active:
 		_mouse_delta = Vector2.ZERO
 		return
-	# Don't poll keyboard while pause menu is open
+	# Don't poll keyboard while pause menu is open — zero held inputs only
 	if has_node("/root/PauseMenu") and get_node("/root/PauseMenu").is_open:
 		input_direction = Vector2.ZERO
-		action_jump = false
 		action_shoot = false
-		action_slot = 0
 		_mouse_delta = Vector2.ZERO
 		return
 
-	# When inventory is open, zero all gameplay inputs
+	# When inventory is open, zero held gameplay inputs (counters just don't increment)
 	if inventory_open:
 		input_direction = Vector2.ZERO
-		action_jump = false
 		action_shoot = false
-		action_pickup = false
 		action_slide = false
 		action_aim = false
-		action_extend = false
-		action_scrap = false
-		action_marker = false
-		action_slot = 0
 		_mouse_delta = Vector2.ZERO
 		return
 
@@ -135,34 +141,35 @@ func _physics_process(_delta: float) -> void:
 	var player_node := get_parent()
 	if player_node and "kamikaze_system" in player_node and player_node.kamikaze_system.is_active():
 		input_direction = Vector2.ZERO
-		action_jump = false
 		action_shoot = false
-		action_pickup = false
 		action_slide = false
 		action_aim = false
-		action_extend = false
-		action_scrap = false
-		action_marker = false
-		action_slot = 0
 		return
 
 	# Movement
 	input_direction = Input.get_vector("move_left", "move_right", "move_forward", "move_back")
 
-	# Actions (pressed this frame)
-	action_jump = Input.is_action_just_pressed("jump")
+	# Held actions
 	action_shoot = Input.is_action_pressed("shoot")
-	action_pickup = Input.is_action_just_pressed("pickup")
 	action_slide = Input.is_action_pressed("slide")
 	action_aim = Input.is_action_pressed("aim")
-	action_extend = Input.is_action_just_pressed("extend_item")
-	action_scrap = Input.is_action_just_pressed("scrap_item")
-	action_marker = Input.is_action_just_pressed("place_marker")
 	action_ctrl = Input.is_key_pressed(KEY_CTRL)
 
-	# Weapon slot keys (1-6)
-	action_slot = 0
+	# One-shot actions — increment counter on press (never reset to 0)
+	if Input.is_action_just_pressed("jump"):
+		jump_count += 1
+	if Input.is_action_just_pressed("pickup"):
+		pickup_count += 1
+	if Input.is_action_just_pressed("extend_item"):
+		extend_count += 1
+	if Input.is_action_just_pressed("scrap_item"):
+		scrap_count += 1
+	if Input.is_action_just_pressed("place_marker"):
+		marker_count += 1
+
+	# Weapon slot keys (1-6) — increment counter + record which slot
 	for i in range(1, 7):
 		if Input.is_action_just_pressed("slot_%d" % i):
-			action_slot = i
+			slot_select = i
+			slot_count += 1
 			break
