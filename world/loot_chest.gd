@@ -199,7 +199,7 @@ func _update_prompt(delta: float) -> void:
 		_player_cache_timer = PLAYER_CACHE_INTERVAL
 		_cached_local_player = _find_local_player()
 
-	if _cached_local_player == null:
+	if _cached_local_player == null or not _cached_local_player.is_inside_tree():
 		_prompt_label.visible = false
 		return
 

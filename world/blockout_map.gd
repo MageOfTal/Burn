@@ -83,13 +83,15 @@ func _spawn_loot_chests() -> void:
 	## Spawn loot chests at a subset of LootSpawnPoints.
 	var loot_spawn_points := get_node_or_null("LootSpawnPoints")
 	if loot_spawn_points == null:
-		push_warning("No LootSpawnPoints node found — terrain may not have generated yet")
+		push_warning("[Chests] No LootSpawnPoints node found — terrain may not have generated yet")
 		return
 
 	var points: Array[Node] = []
 	for child in loot_spawn_points.get_children():
 		if child is Marker3D:
 			points.append(child)
+
+	print("[Chests] Found %d LootSpawnPoints markers" % points.size())
 
 	# Shuffle deterministically so all peers pick the same CHEST_COUNT points.
 	# Godot's Array.shuffle() uses the global RNG which differs per peer.
@@ -116,7 +118,8 @@ func _spawn_loot_chests() -> void:
 		chest.position = points[i].global_position
 		container.add_child(chest, true)
 
-	print("Spawned %d loot chests" % count)
+	print("[Chests] Spawned %d loot chests (weapons=%d shoes=%d fuel=%d)" % [
+		count, weapon_definitions.size(), shoe_definitions.size(), fuel_definitions.size()])
 
 
 # ======================================================================

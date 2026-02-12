@@ -91,21 +91,26 @@ var _original_mesh_scale_y: float = 1.0
 signal player_killed(victim_id: int, killer_id: int)
 
 
+func _enter_tree() -> void:
+	# Set multiplayer authority in _enter_tree, NOT _ready.
+	# Godot's MultiplayerSpawner requires synchronizer authority to be set
+	# here so they get their network IDs before replication starts.
+	# @onready vars aren't available yet, so use $NodePath directly.
+	peer_id = name.to_int()
+	if is_bot:
+		$InputSync.set_multiplayer_authority(1)
+		$PlayerInput.set_multiplayer_authority(1)
+	else:
+		$InputSync.set_multiplayer_authority(peer_id)
+		$PlayerInput.set_multiplayer_authority(peer_id)
+
+
 func _ready() -> void:
 	peer_id = name.to_int()
 	var my_id: int = multiplayer.get_unique_id()
 	var is_local: bool = (peer_id == my_id)
 	print("[Player] _ready() — peer_id=%d  my_id=%d  is_local=%s  is_bot=%s  is_server=%s" % [
 		peer_id, my_id, str(is_local), str(is_bot), str(multiplayer.is_server())])
-
-	# Bots: server owns input, skip InputSync replication
-	if is_bot:
-		player_input.is_bot = true
-		input_sync.set_multiplayer_authority(1)
-		player_input.set_multiplayer_authority(1)
-	else:
-		input_sync.set_multiplayer_authority(peer_id)
-		player_input.set_multiplayer_authority(peer_id)
 
 	# Duplicate collision shape so runtime resize doesn't affect other players
 	var col_shape := $CollisionShape3D
@@ -130,8 +135,9 @@ func _ready() -> void:
 		viewer.name = "VoxelViewer"
 		add_child(viewer)
 
-	# Bots: attach AI brain (server-side only), hide HUD/camera
+	# Bots: flag input as bot, attach AI brain (server-side only), hide HUD/camera
 	if is_bot:
+		player_input.is_bot = true
 		camera.current = false
 		camera_pivot.visible = false
 		if player_hud:
