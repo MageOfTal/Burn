@@ -92,8 +92,15 @@ func enter(attacker: CharacterBody3D, victim: CharacterBody3D) -> void:
 	var pair_offset := Vector3(randf_range(-8, 8), 0, randf_range(-8, 8))
 	attacker.in_toad_dimension = true
 	victim.in_toad_dimension = true
-	attacker.global_position = _arena_center + pair_offset + Vector3(-3, 0, 0)
-	victim.global_position = _arena_center + pair_offset + Vector3(3, 0, 0)
+	var attacker_pos := _arena_center + pair_offset + Vector3(-3, 0, 0)
+	var victim_pos := _arena_center + pair_offset + Vector3(3, 0, 0)
+	attacker.global_position = attacker_pos
+	victim.global_position = victim_pos
+
+	# Face players toward each other
+	var to_victim := victim_pos - attacker_pos
+	attacker.rotation.y = atan2(to_victim.x, to_victim.z)
+	victim.rotation.y = atan2(-to_victim.x, -to_victim.z)
 
 	# Notify clients for VFX / environment swap
 	_on_enter_toad_dimension.rpc(attacker.peer_id, victim.peer_id, session.session_id)
@@ -380,22 +387,29 @@ func _build_arena() -> void:
 	ceil_col.shape = ceil_shape
 	ceil_body.add_child(ceil_col)
 
-	# --- Invisible walls ---
-	var wall_dist := 40.0
+	# --- Invisible cylindrical barrier (non-grappleable, layer 5) ---
+	var barrier_radius := 150.0
+	var barrier_segments := 32  # Number of flat panels forming the cylinder
 	var wall_h := CEILING_HEIGHT
-	for dir in [Vector3(1, 0, 0), Vector3(-1, 0, 0), Vector3(0, 0, 1), Vector3(0, 0, -1)]:
+	for i in barrier_segments:
+		var angle: float = TAU * float(i) / float(barrier_segments)
+		var next_angle: float = TAU * float(i + 1) / float(barrier_segments)
+		var mid_angle: float = (angle + next_angle) * 0.5
+
 		var wall := StaticBody3D.new()
-		wall.collision_layer = 1
+		wall.collision_layer = 16  # Layer 5 — player collides but grapple ignores
 		wall.collision_mask = 0
-		wall.position = Vector3(0, DIMENSION_Y + wall_h * 0.5, 0) + dir * wall_dist
+		var wall_x: float = cos(mid_angle) * barrier_radius
+		var wall_z: float = sin(mid_angle) * barrier_radius
+		wall.position = Vector3(wall_x, DIMENSION_Y + wall_h * 0.5, wall_z)
+		wall.rotation.y = -mid_angle  # Face inward
 		_arena_node.add_child(wall)
 
+		# Panel width = chord length of one segment
+		var panel_width: float = 2.0 * barrier_radius * sin(PI / barrier_segments)
 		var wall_col := CollisionShape3D.new()
 		var wall_shape := BoxShape3D.new()
-		if absf(dir.x) > 0:
-			wall_shape.size = Vector3(1.0, wall_h, wall_dist * 2)
-		else:
-			wall_shape.size = Vector3(wall_dist * 2, wall_h, 1.0)
+		wall_shape.size = Vector3(panel_width, wall_h, 1.0)
 		wall_col.shape = wall_shape
 		wall.add_child(wall_col)
 

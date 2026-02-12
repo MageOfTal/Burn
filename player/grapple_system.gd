@@ -280,13 +280,24 @@ func try_fire() -> void:
 		return
 
 	var space_state := player.get_world_3d().direct_space_state
-	# Fire from hand position (where the rope visually attaches), aim along
-	# camera forward.  This keeps the fire origin consistent with the LOS
-	# check so hills that block the hand also block the shot.
 	var hand_origin: Vector3 = player.global_position + Vector3(0, 1.2, 0)
-	var cam_forward: Vector3 = -player.camera.global_transform.basis.z
 
-	var far_point := hand_origin + cam_forward * MAX_GRAPPLE_RANGE
+	# Two-step aim: first find where the camera crosshair hits the world,
+	# then fire from the hand toward that point.  This makes the grapple
+	# land where the white dot shows unless terrain blocks the hand's path.
+	var cam_origin: Vector3 = player.camera.global_position
+	var cam_forward: Vector3 = -player.camera.global_transform.basis.z
+	var aim_target: Vector3 = _get_grapple_aim_target(space_state, cam_origin, cam_forward, hand_origin)
+
+	var to_target: Vector3 = aim_target - hand_origin
+	var aim_dist: float = to_target.length()
+	if aim_dist < 0.1:
+		return
+	# Clamp ray length to grapple range
+	var ray_dist: float = minf(aim_dist, MAX_GRAPPLE_RANGE)
+	var aim_dir: Vector3 = to_target / aim_dist
+	var far_point := hand_origin + aim_dir * ray_dist
+
 	var query := PhysicsRayQueryParameters3D.create(hand_origin, far_point)
 	query.exclude = [player.get_rid()]
 	query.collision_mask = 1
@@ -320,6 +331,22 @@ func try_fire() -> void:
 	_show_grapple_fire.rpc(hand_pos, anchor_point)
 	print("Player %d fired grapple (anchor: %s, rope: %.1fm)" % [
 		player.peer_id, str(anchor_point), _rope_length])
+
+
+func _get_grapple_aim_target(space_state: PhysicsDirectSpaceState3D,
+		cam_origin: Vector3, cam_forward: Vector3, hand_origin: Vector3) -> Vector3:
+	## Find the world point the camera crosshair is looking at, then return it
+	## as the aim target for the hand.  If the camera ray misses, fall back to
+	## a far point along cam_forward from the hand (directional aim).
+	var cam_far := cam_origin + cam_forward * 1000.0
+	var cam_query := PhysicsRayQueryParameters3D.create(cam_origin, cam_far)
+	cam_query.exclude = [player.get_rid()]
+	cam_query.collision_mask = 1
+	var cam_result := space_state.intersect_ray(cam_query)
+	if not cam_result.is_empty():
+		return cam_result.position
+	# Camera didn't hit anything — aim along cam_forward from hand (sky shot)
+	return hand_origin + cam_forward * MAX_GRAPPLE_RANGE
 
 
 # ======================================================================
@@ -520,9 +547,7 @@ func process(delta: float) -> void:
 	var _t_move_end := Time.get_ticks_usec()
 
 	# --- Release conditions ---
-	if player.player_input.action_jump:
-		_do_release(true)
-		return
+	# Jump no longer cancels grapple — only shoot (click) releases.
 
 	# --- Rope LOS check ---
 	var _t_los: int = 0
