@@ -912,8 +912,9 @@ func _do_release(with_boost: bool) -> void:
 
 
 func _apply_release_boost() -> bool:
-	## Tilt velocity upward by 10° (capped at 15° above horizontal)
-	## and add a speed boost that scales with current speed.
+	## Tilt velocity upward by 25° (capped at 30° above horizontal),
+	## add a speed boost that scales with current speed, and add a flat
+	## 3 m/s vertical boost if vertical speed is under 5 m/s.
 	## Returns true if the boost was actually applied.
 	var vel := player.velocity
 	var speed := vel.length()
@@ -945,8 +946,9 @@ func _apply_release_boost() -> bool:
 	var boost_dir := player.velocity.normalized()
 	player.velocity += boost_dir * boost
 
-	# --- Flat vertical boost: always add 2 m/s upward ---
-	player.velocity.y += 2.0
+	# --- Flat vertical boost: add 3 m/s upward if under 5 m/s vertical ---
+	if player.velocity.y < 5.0:
+		player.velocity.y += 3.0
 	return true
 
 
