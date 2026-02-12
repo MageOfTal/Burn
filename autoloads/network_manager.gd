@@ -693,14 +693,35 @@ func reset_game() -> void:
 
 	print("[Server] ======== RESETTING GAME ========")
 
-	# 1. Despawn all players and bots
+	# 1. Notify clients FIRST so they can clean up before nodes are freed
+	_rpc_reset_to_lobby.rpc()
+
+	# 2. Despawn all players and bots
 	for peer_id in players.keys():
 		var player_node: Node = players[peer_id]
 		if is_instance_valid(player_node):
 			player_node.queue_free()
 	players.clear()
 
-	# 2. Reset autoloads
+	# 3. Clear world items and projectiles
+	var map := get_tree().current_scene
+	if map:
+		var world_items := map.get_node_or_null("WorldItems")
+		if world_items:
+			for child in world_items.get_children():
+				child.queue_free()
+		var projectiles := map.get_node_or_null("Projectiles")
+		if projectiles:
+			for child in projectiles.get_children():
+				child.queue_free()
+
+	# 4. Wait a frame so queue_free'd nodes are fully deallocated.
+	# This prevents stale MultiplayerSynchronizer cache errors —
+	# the InputSync/ServerSync nodes need to be gone before the
+	# multiplayer system tries to reference them again.
+	await get_tree().process_frame
+
+	# 5. Reset autoloads
 	var burn_clock := get_node_or_null("/root/BurnClock")
 	if burn_clock and burn_clock.has_method("stop"):
 		burn_clock.stop()
@@ -709,45 +730,36 @@ func reset_game() -> void:
 		zone_mgr.reset()
 	GameManager.match_time_elapsed = 0.0
 
-	# 3. Reset ToadDimension
+	# 6. Reset ToadDimension
 	var toad_dim := get_node_or_null("/root/ToadDimension")
 	if toad_dim and "_sessions" in toad_dim:
 		toad_dim._sessions.clear()
 
-	# 4. Clear world items (dropped items on the ground)
-	var map := get_tree().current_scene
-	if map:
-		var world_items := map.get_node_or_null("WorldItems")
-		if world_items:
-			for child in world_items.get_children():
-				child.queue_free()
-
-	# 5. Clear bot usernames (keep human usernames)
+	# 7. Clear bot usernames (keep human usernames)
 	for peer_id in GameManager.player_usernames.keys():
 		if peer_id >= BOT_PEER_ID_START:
 			GameManager.player_usernames.erase(peer_id)
 
-	# 6. Rebuild lobby peer list from currently connected peers
+	# 8. Rebuild lobby peer list from currently connected peers
 	_lobby_ready_peers.clear()
 	_lobby_ready_peers.append(1)  # Host
 	for peer_id in multiplayer.get_peers():
 		if peer_id not in _lobby_ready_peers:
 			_lobby_ready_peers.append(peer_id)
 
-	# 7. Change state to LOBBY
+	# 9. Change state to LOBBY
 	GameManager.change_state(GameManager.GameState.LOBBY)
 
-	# 8. Notify clients to reset and show lobby
-	_rpc_reset_to_lobby.rpc()
-
-	# 9. Show lobby on host
+	# 10. Show lobby on host
 	_show_lobby_ui()
 	print("[Server] Reset complete. Back in lobby with %d peers." % _lobby_ready_peers.size())
 
 
 @rpc("authority", "call_remote", "reliable")
 func _rpc_reset_to_lobby() -> void:
-	## Client receives: game is being reset, show lobby.
+	## Client receives: game is being reset, clean up and show lobby.
+	# Release mouse so lobby UI is interactive
+	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	GameManager.change_state(GameManager.GameState.LOBBY)
 	_show_lobby_ui()
 

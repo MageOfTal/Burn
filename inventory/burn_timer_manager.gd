@@ -4,10 +4,15 @@ class_name BurnTimerManager
 ## Server-side: processes burn timers for one player's inventory.
 ## Reads global burn multiplier from BurnClock autoload.
 ## Reads heat burn multiplier from sibling HeatSystem.
+## Periodically syncs burn state to the owning client so their HUD
+## shows live countdowns (not just stale values from the last mutation).
+
+const SYNC_INTERVAL := 1.0  ## Seconds between periodic inventory syncs to client
 
 var inventory: Inventory = null
 var heat_system: HeatSystem = null
 var _burn_clock: Node = null
+var _sync_timer: float = 0.0
 
 
 func _ready() -> void:
@@ -31,7 +36,7 @@ func _physics_process(delta: float) -> void:
 	for stack: ItemStack in inventory.items:
 		stack.burn_time_remaining -= stack.item_data.base_burn_rate * global_mult * heat_mult * delta
 
-	# Remove expired items
+	# Remove expired items (this calls _notify_sync internally)
 	var expired := inventory.remove_expired_items()
 	for item_name in expired:
 		print("Item burned away: %s" % item_name)
@@ -46,3 +51,11 @@ func _physics_process(delta: float) -> void:
 			inventory.shoe_changed.emit()
 			inventory.inventory_changed.emit()
 			print("Shoes burned away: %s" % shoe_name)
+
+	# Periodic sync: push current burn timers to the owning client every SYNC_INTERVAL
+	# so their HUD shows live countdowns, not stale values from the last mutation.
+	_sync_timer += delta
+	if _sync_timer >= SYNC_INTERVAL:
+		_sync_timer = 0.0
+		if inventory.items.size() > 0 or inventory.equipped_shoe != null:
+			inventory._notify_sync()
