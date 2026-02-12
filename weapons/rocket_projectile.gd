@@ -190,16 +190,14 @@ func _explode() -> void:
 func _scatter_ammo_projectiles(explosion_pos: Vector3) -> void:
 	## Scatter ammo projectiles outward from the explosion point.
 	## No structural damage or crater — just a spray of projectiles.
+	## Uses ProjectileSpawner so all clients see the scattered projectiles.
 	var count := _ammo_explosion_spawn_count
 	var per_projectile_damage: float = (_damage * _ammo_damage_mult) / count
 
-	# Get or create Projectiles container
 	var map := get_tree().current_scene
-	var container := map.get_node_or_null("Projectiles")
-	if container == null:
-		container = Node3D.new()
-		container.name = "Projectiles"
-		map.add_child(container)
+	if not map.has_method("spawn_projectile"):
+		push_warning("RocketProjectile: map has no spawn_projectile method")
+		return
 
 	# Distribute projectiles in a sphere using golden angle for even spacing
 	var golden_ratio: float = (1.0 + sqrt(5.0)) / 2.0
@@ -217,13 +215,11 @@ func _scatter_ammo_projectiles(explosion_pos: Vector3) -> void:
 		scatter_dir.y = maxf(scatter_dir.y, -0.2)
 		scatter_dir = scatter_dir.normalized()
 
-		var projectile: Node3D = _ammo_projectile_scene.instantiate()
-
-		if projectile.has_method("launch"):
-			projectile.launch(scatter_dir, _shooter_id, per_projectile_damage)
-
-		container.add_child(projectile, true)
-		projectile.global_position = explosion_pos + scatter_dir * 0.5  # Offset slightly outward
+		var spawn_pos := explosion_pos + scatter_dir * 0.5  # Offset slightly outward
+		map.spawn_projectile(
+			_ammo_projectile_scene.resource_path, spawn_pos, scatter_dir,
+			_shooter_id, per_projectile_damage
+		)
 
 
 func _find_damageable(node: Node) -> Node:

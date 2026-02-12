@@ -43,6 +43,7 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 
 func _fire_ammo_projectile(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
 	## Fire ammo projectile(s) instead of raycasting when ammo is slotted.
+	## Uses ProjectileSpawner so all clients see the projectiles.
 	var count := maxi(weapon_data.pellet_count, 1)
 
 	var rarity_mult: float = 1.0 + weapon_data.rarity * 0.15
@@ -53,20 +54,12 @@ func _fire_ammo_projectile(shooter: CharacterBody3D, aim_origin: Vector3, aim_di
 		return {}
 
 	var map := shooter.get_tree().current_scene
-	var container := map.get_node_or_null("Projectiles")
-	if container == null:
-		container = Node3D.new()
-		container.name = "Projectiles"
-		map.add_child(container)
+	if not map.has_method("spawn_projectile"):
+		push_warning("WeaponHitscan: map has no spawn_projectile method")
+		return {}
 
 	for i in count:
 		var pellet_dir := _apply_spread(aim_direction)
-
-		var projectile: Node3D = proj_scene.instantiate()
-		if projectile.has_method("launch"):
-			projectile.launch(pellet_dir, shooter.peer_id, per_projectile_damage)
-
-		container.add_child(projectile, true)
 
 		# Spawn in front of barrel with wall check
 		var spawn_offset := 1.0
@@ -81,7 +74,11 @@ func _fire_ammo_projectile(shooter: CharacterBody3D, aim_origin: Vector3, aim_di
 			if not ray_result.is_empty():
 				spawn_offset = maxf(aim_origin.distance_to(ray_result.position) - 0.1, 0.2)
 
-		projectile.global_position = aim_origin + pellet_dir * spawn_offset
+		var spawn_pos := aim_origin + pellet_dir * spawn_offset
+		map.spawn_projectile(
+			proj_scene.resource_path, spawn_pos, pellet_dir,
+			shooter.peer_id, per_projectile_damage
+		)
 
 	return {"shot_end": aim_origin + aim_direction * 2.0}
 

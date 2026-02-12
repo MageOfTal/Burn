@@ -39,6 +39,10 @@ func _ready() -> void:
 	var item_spawner := $ItemSpawner
 	item_spawner.spawn_function = _on_spawn_world_item
 
+	# Set up projectile spawner — same pattern for bullets, rockets, bubbles, balls
+	var proj_spawner := $ProjectileSpawner
+	proj_spawner.spawn_function = _on_spawn_projectile
+
 	# Zone visual is cosmetic — create on ALL peers so everyone sees the ring + fire
 	_create_zone_visual()
 
@@ -81,6 +85,49 @@ func spawn_world_item(item_path: String, pos: Vector3, burn_time: float = -1.0, 
 	if immune_peer >= 0:
 		data["immune_peer"] = immune_peer
 	$ItemSpawner.spawn(data)
+
+
+# ======================================================================
+#  Projectile Spawning (via MultiplayerSpawner)
+# ======================================================================
+
+func _on_spawn_projectile(data: Dictionary) -> Node:
+	## Spawn function called on ALL peers when server fires a projectile.
+	## The spawner automatically adds the returned node to Projectiles.
+	var scene: PackedScene = load(data["scene"])
+	var projectile: Node3D = scene.instantiate()
+
+	# Call launch() on ALL peers so each peer has correct initial velocity
+	if projectile.has_method("launch"):
+		projectile.launch(data["dir"], data["shooter"], data["damage"])
+
+	# Pass ammo override (rocket scatter) — server-only since only server explodes
+	if data.has("ammo_scene") and data["ammo_scene"] != "" and projectile.has_method("set_ammo_override"):
+		var ammo_res: WeaponData = load(data["ammo_scene"])
+		if ammo_res:
+			projectile.set_ammo_override(ammo_res)
+
+	projectile.position = data["pos"]
+	return projectile
+
+
+func spawn_projectile(scene_path: String, pos: Vector3, direction: Vector3,
+		shooter_id: int, damage: float, ammo_path: String = "") -> void:
+	## Server-only: spawn a projectile via the ProjectileSpawner.
+	## The spawner replicates to all clients automatically.
+	## queue_free() on server auto-removes on all clients.
+	if not multiplayer.is_server():
+		return
+	var data: Dictionary = {
+		"scene": scene_path,
+		"pos": pos,
+		"dir": direction,
+		"shooter": shooter_id,
+		"damage": damage,
+	}
+	if ammo_path != "":
+		data["ammo_scene"] = ammo_path
+	$ProjectileSpawner.spawn(data)
 
 
 func _load_item_definitions() -> void:
