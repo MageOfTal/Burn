@@ -7,6 +7,7 @@ class_name WorldItem
 @export var item_data: ItemData = null
 
 var burn_time_remaining: float = 0.0
+var _setup_called := false
 
 ## Pickup immunity: the peer_id that just dropped this item can't pick it up
 ## until the timer expires. Prevents drop-pickup loops.
@@ -40,8 +41,12 @@ const PLAYER_CACHE_INTERVAL := 1.0
 
 
 func _ready() -> void:
-	if item_data:
+	# Only set burn_time if setup() wasn't already called (e.g. editor-placed items).
+	# For spawner-created items, setup() runs before _ready() and the spawn function
+	# may set a custom burn_time (like 999999 for permanent items) that we must preserve.
+	if item_data and not _setup_called:
 		burn_time_remaining = item_data.initial_burn_time
+	if item_data:
 		_update_visual()
 
 	body_entered.connect(_on_body_entered)
@@ -53,6 +58,7 @@ func _ready() -> void:
 func setup(data: ItemData) -> void:
 	item_data = data
 	burn_time_remaining = data.initial_burn_time
+	_setup_called = true
 	if is_inside_tree():
 		_update_visual()
 

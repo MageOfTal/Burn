@@ -2,7 +2,7 @@ extends Node
 class_name Inventory
 
 ## Manages 6 weapon slots for one player.
-## All mutations happen on the server. Clients receive updates via RPC.
+## All mutations happen on the server. Clients receive full-state sync via RPC.
 
 const MAX_SLOTS := 6
 const STARTING_FUEL := 1000.0
@@ -14,6 +14,10 @@ var burn_fuel: float = STARTING_FUEL
 
 ## Shoe equipment slot (separate from the 6 item slots)
 var equipped_shoe: ItemStack = null
+
+## Networking: peer_id of the owning player (set by player.gd).
+## Server sends inventory RPCs to this peer when state changes.
+var _owner_peer_id: int = -1
 
 signal item_added(index: int, stack: ItemStack)
 signal item_removed(index: int)
@@ -38,6 +42,7 @@ func add_item(item_data: ItemData) -> int:
 	var idx := items.size() - 1
 	item_added.emit(idx, stack)
 	inventory_changed.emit()
+	_notify_sync()
 	return idx
 
 
@@ -48,6 +53,7 @@ func equip_slot(index: int) -> void:
 	if items[index].item_data is WeaponData or items[index].item_data is ConsumableData or items[index].item_data is GadgetData:
 		equipped_index = index
 		weapon_equipped.emit(index)
+		_notify_sync()
 
 
 func remove_item(index: int) -> ItemStack:
@@ -60,6 +66,7 @@ func remove_item(index: int) -> ItemStack:
 	_adjust_equipped_after_removal(index)
 	item_removed.emit(index)
 	inventory_changed.emit()
+	_notify_sync()
 	return stack
 
 
@@ -82,6 +89,7 @@ func sacrifice_item(sacrifice_index: int, target_index: int) -> bool:
 	_adjust_equipped_after_removal(sacrifice_index)
 	item_removed.emit(sacrifice_index)
 	inventory_changed.emit()
+	_notify_sync()
 	return true
 
 
@@ -98,6 +106,7 @@ func convert_to_time_currency(index: int) -> float:
 	_adjust_equipped_after_removal(index)
 	item_removed.emit(index)
 	inventory_changed.emit()
+	_notify_sync()
 	return value
 
 
@@ -113,6 +122,7 @@ func spend_time_currency(amount: float, target_index: int) -> bool:
 	target.burn_time_remaining += time_added
 	time_currency -= amount
 	inventory_changed.emit()
+	_notify_sync()
 	return true
 
 
@@ -139,6 +149,7 @@ func remove_expired_items() -> Array[String]:
 
 	if expired_names.size() > 0:
 		inventory_changed.emit()
+		_notify_sync()
 	return expired_names
 
 
@@ -152,6 +163,7 @@ func equip_shoe(shoe_data: ItemData) -> ItemStack:
 	equipped_shoe = ItemStack.create(shoe_data)
 	shoe_changed.emit()
 	inventory_changed.emit()
+	_notify_sync()
 	return old_shoe
 
 
@@ -160,6 +172,7 @@ func remove_shoe() -> ItemStack:
 	equipped_shoe = null
 	shoe_changed.emit()
 	inventory_changed.emit()
+	_notify_sync()
 	return old
 
 
@@ -179,6 +192,7 @@ func get_shoe_speed_bonus() -> float:
 func add_fuel(amount: float) -> void:
 	burn_fuel += amount
 	fuel_changed.emit(burn_fuel)
+	_notify_sync()
 
 
 func spend_fuel(amount: float) -> bool:
@@ -186,6 +200,7 @@ func spend_fuel(amount: float) -> bool:
 		return false
 	burn_fuel -= amount
 	fuel_changed.emit(burn_fuel)
+	_notify_sync()
 	return true
 
 
@@ -206,6 +221,7 @@ func clear_all() -> void:
 	shoe_changed.emit()
 	inventory_changed.emit()
 	fuel_changed.emit(burn_fuel)
+	_notify_sync()
 
 
 func get_serialized() -> Array:
@@ -221,3 +237,80 @@ func _adjust_equipped_after_removal(removed_index: int) -> void:
 		equipped_index = -1
 	elif equipped_index > removed_index:
 		equipped_index -= 1
+
+
+# ======================================================================
+#  Network Sync (server → owning client)
+# ======================================================================
+
+func _notify_sync() -> void:
+	## Server-only: send full inventory state to the owning client.
+	## Host (peer 1) doesn't need this — their local Inventory IS the server's.
+	if not multiplayer.is_server():
+		return
+	if _owner_peer_id <= 1:
+		return
+	# Verify the peer is still connected before sending
+	if not multiplayer.multiplayer_peer or not _owner_peer_id in multiplayer.get_peers():
+		return
+	_rpc_sync_inventory.rpc_id(_owner_peer_id, _serialize_full_state())
+
+
+func _serialize_full_state() -> Dictionary:
+	## Pack full inventory into a serializable Dictionary.
+	var item_list: Array = []
+	for stack in items:
+		item_list.append({
+			"path": stack.item_data.resource_path if stack.item_data else "",
+			"burn": stack.burn_time_remaining,
+			"qty": stack.quantity,
+			"fuel_spent": stack.fuel_spent_extending,
+			"ammo_path": stack.slotted_ammo.resource_path if stack.slotted_ammo else "",
+			"ammo_src": stack.slotted_ammo_source_index,
+		})
+	return {
+		"items": item_list,
+		"equipped": equipped_index,
+		"tc": time_currency,
+		"fuel": burn_fuel,
+		"shoe_path": equipped_shoe.item_data.resource_path if equipped_shoe and equipped_shoe.item_data else "",
+		"shoe_burn": equipped_shoe.burn_time_remaining if equipped_shoe else 0.0,
+	}
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_sync_inventory(state: Dictionary) -> void:
+	## Client-side: rebuild local inventory from server state.
+	items.clear()
+	for entry: Dictionary in state["items"]:
+		if entry["path"] == "":
+			continue
+		var data: ItemData = load(entry["path"])
+		if data == null:
+			continue
+		var stack := ItemStack.create(data)
+		stack.burn_time_remaining = entry["burn"]
+		stack.quantity = entry["qty"]
+		stack.fuel_spent_extending = entry["fuel_spent"]
+		if entry["ammo_path"] != "":
+			stack.slotted_ammo = load(entry["ammo_path"])
+			stack.slotted_ammo_source_index = entry["ammo_src"]
+		items.append(stack)
+
+	equipped_index = state["equipped"]
+	time_currency = state["tc"]
+	burn_fuel = state["fuel"]
+
+	if state["shoe_path"] != "":
+		var shoe_data: ItemData = load(state["shoe_path"])
+		if shoe_data:
+			equipped_shoe = ItemStack.create(shoe_data)
+			equipped_shoe.burn_time_remaining = state["shoe_burn"]
+		else:
+			equipped_shoe = null
+	else:
+		equipped_shoe = null
+
+	inventory_changed.emit()
+	shoe_changed.emit()
+	fuel_changed.emit(burn_fuel)

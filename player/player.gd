@@ -140,6 +140,10 @@ func _ready() -> void:
 	grapple_system.setup(self)
 	demon_system.setup(self)
 
+	# Tell inventory which peer owns it so server→client sync works
+	if inventory:
+		inventory._owner_peer_id = peer_id
+
 	# Add VoxelViewer so the voxel terrain generates around each player.
 	if not is_bot and ClassDB.class_exists(&"VoxelViewer"):
 		var viewer: Node3D = ClassDB.instantiate(&"VoxelViewer")
