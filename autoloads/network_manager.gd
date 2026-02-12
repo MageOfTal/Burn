@@ -13,6 +13,7 @@ signal player_connected(peer_id: int)
 signal player_disconnected(peer_id: int)
 signal connection_succeeded
 signal connection_failed
+signal victory_declared(winner_peer_id: int)
 
 var is_server := false
 
@@ -395,6 +396,7 @@ func _on_peer_disconnected(peer_id: int) -> void:
 			_refresh_lobby_player_list()
 		else:
 			_despawn_player(peer_id)
+			check_victory()
 
 
 func _on_connected_to_server() -> void:
@@ -731,6 +733,7 @@ func reset_game() -> void:
 	await get_tree().process_frame
 
 	# 5. Reset autoloads
+	_victory_declared = false
 	var burn_clock := get_node_or_null("/root/BurnClock")
 	if burn_clock and burn_clock.has_method("stop"):
 		burn_clock.stop()
@@ -796,6 +799,79 @@ func _rpc_kill_feed(bbcode_text: String) -> void:
 			var hud := child.get_node_or_null("HUDLayer/PlayerHUD")
 			if hud and hud.has_method("add_kill_feed_entry"):
 				hud.add_kill_feed_entry(bbcode_text)
+			break
+
+
+# ======================================================================
+#  Victory Detection (server-only, checked after eliminations)
+# ======================================================================
+
+var _victory_declared: bool = false
+
+func check_victory() -> void:
+	## Server-only: check if only one non-eliminated player (human or bot) remains.
+	## Called after demon eliminations and disconnects.
+	if not multiplayer.is_server():
+		return
+	if GameManager.current_state != GameManager.GameState.PLAYING:
+		return
+	if _victory_declared:
+		return
+
+	var alive_players: Array[int] = []
+	for peer_id: int in players:
+		var p: Node = players[peer_id]
+		if not is_instance_valid(p):
+			continue
+		var demon_sys: Node = p.get_node_or_null("DemonSystem")
+		if demon_sys and demon_sys.is_eliminated:
+			continue
+		alive_players.append(peer_id)
+
+	if alive_players.size() == 1:
+		var winner_id: int = alive_players[0]
+		_victory_declared = true
+		print("[Server] VICTORY! Player %d (%s) is the last one standing!" % [
+			winner_id, GameManager.get_username(winner_id)])
+
+		# Stop the winner's demon and make them invincible
+		var winner_node: Node = players.get(winner_id)
+		if winner_node:
+			var demon_sys: Node = winner_node.get_node_or_null("DemonSystem")
+			if demon_sys:
+				demon_sys.demon_active = false
+
+		# Set game over state (prevents further damage)
+		GameManager.change_state(GameManager.GameState.GAME_OVER)
+
+		# Broadcast to all clients
+		var winner_name := GameManager.get_username(winner_id)
+		_rpc_victory.rpc(winner_id, winner_name)
+		broadcast_kill_feed("[color=gold]%s wins! Last one standing![/color]" % winner_name)
+		victory_declared.emit(winner_id)
+
+	elif alive_players.size() == 0:
+		# Everyone eliminated — draw
+		_victory_declared = true
+		GameManager.change_state(GameManager.GameState.GAME_OVER)
+		_rpc_victory.rpc(-1, "Nobody")
+		broadcast_kill_feed("[color=gold]DRAW — everyone was eliminated![/color]")
+
+
+@rpc("authority", "call_local", "reliable")
+func _rpc_victory(winner_id: int, winner_name: String) -> void:
+	## All peers: show victory screen overlay on local player's HUD.
+	# Set game over state on clients too (prevents local damage processing)
+	GameManager.change_state(GameManager.GameState.GAME_OVER)
+	var players_node := get_tree().current_scene.get_node_or_null("Players")
+	if players_node == null:
+		return
+	var my_id := multiplayer.get_unique_id()
+	for child in players_node.get_children():
+		if child.name.to_int() == my_id:
+			var hud := child.get_node_or_null("HUDLayer/PlayerHUD")
+			if hud and hud.has_method("show_victory_screen"):
+				hud.show_victory_screen(winner_id, winner_name, my_id)
 			break
 
 

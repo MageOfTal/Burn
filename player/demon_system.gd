@@ -125,6 +125,9 @@ func process(delta: float) -> void:
 		return
 	if not demon_active or is_eliminated:
 		return
+	# Freeze demons after victory
+	if GameManager.current_state == GameManager.GameState.GAME_OVER:
+		return
 
 	# Don't check catch while player is dead (waiting to respawn)
 	if not player.is_alive:
@@ -174,6 +177,10 @@ func _eliminate_player() -> void:
 	var net_mgr := player.get_node_or_null("/root/NetworkManager")
 	if net_mgr and net_mgr.has_method("broadcast_kill_feed"):
 		net_mgr.broadcast_kill_feed("[color=red]%s was caught by THE DEMON[/color]" % victim_name)
+
+	# Check if only one player remains (victory condition)
+	if net_mgr and net_mgr.has_method("check_victory"):
+		net_mgr.check_victory()
 
 
 # ======================================================================

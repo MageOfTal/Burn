@@ -1,24 +1,20 @@
-[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+[gd_resource type="Resource" script_class="WeaponData" format=3 uid="uid://b1qad4ggdm4gy"]
 
-[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+[ext_resource type="Script" uid="uid://bd5kpo5ymkl7u" path="res://items/weapon_data.gd" id="1"]
 
 [resource]
 script = ExtResource("1")
+damage = 45.0
+fire_rate = 1.0
+weapon_range = 200.0
+spread = 1.6
+heat_per_shot = 8.9
+ads_fov = 50.0
+barrel_offset = Vector3(0.1, 0.1, -0.7)
+gun_model_path = "res://assets/guns/models/jeg_grenade_launcher.glb"
+fire_sound_path = "res://assets/guns/sounds/jeg_grenade_launcher_fire.ogg"
 item_name = "Grenade Launcher"
-item_type = 0
 rarity = 3
 description = "Grenade Launcher (jeg)"
 base_burn_rate = 0.7
 initial_burn_time = 90.0
-burn_cost_to_extend = 1.0
-time_currency_value = 5.0
-damage = 62.5
-fire_rate = 1.00
-weapon_range = 200.0
-spread = 1.6
-is_hitscan = true
-heat_per_shot = 8.9
-gun_model_path = "res://assets/guns/models/jeg_grenade_launcher.glb"
-fire_sound_path = "res://assets/guns/sounds/jeg_grenade_launcher_fire.ogg"
-ads_fov = 50.0
-barrel_offset = Vector3(0.1, 0.1, -0.7)

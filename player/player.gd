@@ -65,6 +65,9 @@ var _frame_jump := false
 ## Synced weapon visual paths — clients use these to load 3D model + sound
 var equipped_gun_model_path: String = ""
 var equipped_fire_sound_path: String = ""
+## Synced ADS properties — clients need these for scope/FOV visuals
+var equipped_ads_fov: float = 0.0
+var equipped_has_scope: bool = false
 var _current_gun_model: Node3D = null
 var _last_synced_gun_model_path: String = ""
 var _last_synced_fire_sound_path: String = ""
@@ -507,10 +510,7 @@ func _client_process(delta: float) -> void:
 
 		# ADS visuals (skip if kamikaze — it overrides FOV/spring)
 		if not kamikaze_system.is_kamikaze:
-			var w_data: WeaponData = null
-			if current_weapon and current_weapon.weapon_data:
-				w_data = current_weapon.weapon_data
-			combat_vfx.process_ads_visuals(delta, is_aiming, w_data)
+			combat_vfx.process_ads_visuals(delta, is_aiming, equipped_ads_fov, equipped_has_scope)
 
 	# --- Grapple rope client visuals ---
 	if grapple_system.is_grappling:
@@ -693,6 +693,9 @@ func take_damage(amount: float, attacker_id: int) -> void:
 	## Server-only: apply damage to this player.
 	if not multiplayer.is_server() or not is_alive:
 		return
+	# No damage after victory
+	if GameManager.current_state == GameManager.GameState.GAME_OVER:
+		return
 	health -= amount
 	heat_system.on_damage_taken(amount)
 	if health <= 0.0:
@@ -830,6 +833,8 @@ func clear_equipped_weapon() -> void:
 		_current_gun_model = null
 	equipped_gun_model_path = ""
 	equipped_fire_sound_path = ""
+	equipped_ads_fov = 0.0
+	equipped_has_scope = false
 
 
 func equip_weapon(weapon_data: WeaponData) -> void:
@@ -849,6 +854,8 @@ func equip_weapon(weapon_data: WeaponData) -> void:
 
 	equipped_gun_model_path = weapon_data.gun_model_path
 	equipped_fire_sound_path = weapon_data.fire_sound_path
+	equipped_ads_fov = weapon_data.ads_fov
+	equipped_has_scope = weapon_data.has_scope
 
 	_load_gun_model(weapon_data.gun_model_path)
 	_load_fire_sound(weapon_data.fire_sound_path)

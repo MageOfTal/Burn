@@ -1,26 +1,22 @@
-[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+[gd_resource type="Resource" script_class="WeaponData" format=3 uid="uid://bfokm5ptt57mc"]
 
-[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+[ext_resource type="Script" uid="uid://bd5kpo5ymkl7u" path="res://items/weapon_data.gd" id="1"]
 
 [resource]
 script = ExtResource("1")
-item_name = "Awp"
-item_type = 0
-rarity = 4
-description = "Awp (mteg)"
-base_burn_rate = 1.0
-initial_burn_time = 60.0
-burn_cost_to_extend = 1.0
-time_currency_value = 5.0
-damage = 50.0
-fire_rate = 1.70
+damage = 40.0
+fire_rate = 1.7
 weapon_range = 120.0
 spread = 2.4
-is_hitscan = true
 heat_per_shot = 7.1
-gun_model_path = "res://assets/guns/models/mteg_awp.glb"
-fire_sound_path = "res://assets/guns/sounds/mteg_awp_fire.ogg"
 ads_fov = 20.0
 ads_spread_mult = 0.05
 has_scope = true
 barrel_offset = Vector3(0.1, 0.1, -1.2)
+gun_model_path = "res://assets/guns/models/mteg_awp.glb"
+fire_sound_path = "res://assets/guns/sounds/mteg_awp_fire.ogg"
+item_name = "Awp"
+rarity = 4
+description = "Awp (mteg)"
+base_burn_rate = 1.0
+initial_burn_time = 60.0

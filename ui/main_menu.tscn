@@ -33,17 +33,17 @@ vertical_alignment = 1
 custom_minimum_size = Vector2(0, 20)
 layout_mode = 2
 
-[node name="UsernameLabel" type="Label" parent="CenterContainer/VBoxContainer"]
+[node name="UsernameLabel" type="Label" parent="CenterContainer/VBoxContainer" unique_id=1083660658]
 layout_mode = 2
 text = "Username:"
 
-[node name="UsernameInput" type="LineEdit" parent="CenterContainer/VBoxContainer"]
+[node name="UsernameInput" type="LineEdit" parent="CenterContainer/VBoxContainer" unique_id=460007938]
 custom_minimum_size = Vector2(200, 0)
 layout_mode = 2
 placeholder_text = "Enter username..."
 max_length = 20
 
-[node name="Spacer1b" type="Control" parent="CenterContainer/VBoxContainer"]
+[node name="Spacer1b" type="Control" parent="CenterContainer/VBoxContainer" unique_id=714424873]
 custom_minimum_size = Vector2(0, 10)
 layout_mode = 2
 
@@ -74,29 +74,29 @@ text = "Join Game"
 custom_minimum_size = Vector2(0, 20)
 layout_mode = 2
 
-[node name="DebugLabel" type="Label" parent="CenterContainer/VBoxContainer"]
+[node name="DebugLabel" type="Label" parent="CenterContainer/VBoxContainer" unique_id=2023293620]
 layout_mode = 2
 theme_override_colors/font_color = Color(0.6, 0.6, 0.6, 1)
 text = "— Debug Toggles —"
 horizontal_alignment = 1
 
-[node name="DisableBurnTimers" type="CheckBox" parent="CenterContainer/VBoxContainer"]
+[node name="DisableBurnTimers" type="CheckBox" parent="CenterContainer/VBoxContainer" unique_id=1258340990]
 layout_mode = 2
 text = "Disable Burn Timers"
 
-[node name="DisableDemon" type="CheckBox" parent="CenterContainer/VBoxContainer"]
+[node name="DisableDemon" type="CheckBox" parent="CenterContainer/VBoxContainer" unique_id=907474645]
 layout_mode = 2
 text = "Disable Demon"
 
-[node name="DisableZoneDamage" type="CheckBox" parent="CenterContainer/VBoxContainer"]
+[node name="DisableZoneDamage" type="CheckBox" parent="CenterContainer/VBoxContainer" unique_id=680026138]
 layout_mode = 2
 text = "Disable Zone Damage"
 
-[node name="SkipStructures" type="CheckBox" parent="CenterContainer/VBoxContainer"]
+[node name="SkipStructures" type="CheckBox" parent="CenterContainer/VBoxContainer" unique_id=1518031064]
 layout_mode = 2
 text = "Skip Walls & Ramps"
 
-[node name="Spacer3" type="Control" parent="CenterContainer/VBoxContainer"]
+[node name="Spacer3" type="Control" parent="CenterContainer/VBoxContainer" unique_id=1324201565]
 custom_minimum_size = Vector2(0, 10)
 layout_mode = 2
 
@@ -114,8 +114,8 @@ autowrap_mode = 2
 
 [connection signal="pressed" from="CenterContainer/VBoxContainer/HostButton" to="." method="_on_host_pressed"]
 [connection signal="pressed" from="CenterContainer/VBoxContainer/JoinButton" to="." method="_on_join_pressed"]
-[connection signal="pressed" from="CenterContainer/VBoxContainer/QuitButton" to="." method="_on_quit_pressed"]
 [connection signal="toggled" from="CenterContainer/VBoxContainer/DisableBurnTimers" to="." method="_on_burn_timers_toggled"]
 [connection signal="toggled" from="CenterContainer/VBoxContainer/DisableDemon" to="." method="_on_demon_toggled"]
 [connection signal="toggled" from="CenterContainer/VBoxContainer/DisableZoneDamage" to="." method="_on_zone_damage_toggled"]
 [connection signal="toggled" from="CenterContainer/VBoxContainer/SkipStructures" to="." method="_on_skip_structures_toggled"]
+[connection signal="pressed" from="CenterContainer/VBoxContainer/QuitButton" to="." method="_on_quit_pressed"]

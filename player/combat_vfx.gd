@@ -204,8 +204,10 @@ func _play_fire_sound() -> void:
 ##  ADS visuals + scope overlay (client-side)
 ## ======================================================================
 
-func process_ads_visuals(delta: float, is_aiming: bool, w_data: WeaponData) -> void:
+func process_ads_visuals(delta: float, is_aiming: bool, ads_fov: float, has_scope: bool) -> void:
 	## Client-side: smooth FOV zoom, spring arm pull-in, and scope overlay for ADS.
+	## Uses synced properties (ads_fov, has_scope) instead of weapon node data,
+	## because the weapon node only exists on the server.
 	var base_fov := DEFAULT_FOV
 	if player.has_node("/root/PauseMenu"):
 		base_fov = player.get_node("/root/PauseMenu")._settings.get("fov", DEFAULT_FOV)
@@ -213,10 +215,10 @@ func process_ads_visuals(delta: float, is_aiming: bool, w_data: WeaponData) -> v
 	var target_spring := DEFAULT_SPRING_LENGTH
 	var show_scope := false
 
-	if is_aiming and w_data and w_data.ads_fov > 0.0:
-		target_fov = w_data.ads_fov
+	if is_aiming and ads_fov > 0.0:
+		target_fov = ads_fov
 		target_spring = ADS_SPRING_LENGTH
-		show_scope = w_data.has_scope
+		show_scope = has_scope
 
 	# Smooth FOV transition
 	player.camera.fov = lerpf(player.camera.fov, target_fov, ADS_LERP_SPEED * delta)
