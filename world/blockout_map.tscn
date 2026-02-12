@@ -21,4 +21,7 @@ spawn_path = NodePath("../Players")
 
 [node name="Players" type="Node3D" parent="."]
 
+[node name="ItemSpawner" type="MultiplayerSpawner" parent="."]
+spawn_path = NodePath("../WorldItems")
+
 [node name="WorldItems" type="Node3D" parent="."]

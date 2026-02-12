@@ -29,12 +29,16 @@ var _zone_mesh: MeshInstance3D = null
 var _zone_material: StandardMaterial3D = null
 ## Fire particles along zone edge
 var _zone_fire_ring: Node3D = null
-const ZONE_FIRE_EMITTER_COUNT := 192  ## Number of fire particle emitters around the ring
+const ZONE_FIRE_EMITTER_COUNT := 64  ## Number of fire particle emitters around the ring
 var _fire_ring_update_timer: float = 0.0  ## Throttle fire position updates
 var _fire_ring_last_radius: float = -1.0  ## Track radius changes
 
 
 func _ready() -> void:
+	# Set up item spawner — server spawns trigger _on_spawn_world_item on ALL peers
+	var item_spawner := $ItemSpawner
+	item_spawner.spawn_function = _on_spawn_world_item
+
 	# Zone visual is cosmetic — create on ALL peers so everyone sees the ring + fire
 	_create_zone_visual()
 
@@ -46,6 +50,37 @@ func _ready() -> void:
 	# NOTE: BurnClock.start(), _start_zone(), and _spawn_demo_items() are now
 	# called from NetworkManager._start_match() when the host starts the game
 	# from the lobby. They are no longer auto-started in _ready().
+
+
+# ======================================================================
+#  World Item Spawning (via MultiplayerSpawner)
+# ======================================================================
+
+func _on_spawn_world_item(data: Dictionary) -> Node:
+	## Spawn function called on ALL peers when server spawns a world item.
+	## The spawner automatically adds the returned node to WorldItems.
+	var item_data: ItemData = load(data["path"])
+	var world_item: WorldItem = preload("res://items/world_item.tscn").instantiate()
+	world_item.setup(item_data)
+	world_item.position = data["pos"]
+	if data.has("burn_time"):
+		world_item.burn_time_remaining = data["burn_time"]
+	if data.has("immune_peer"):
+		world_item.set_pickup_immunity(data["immune_peer"])
+	return world_item
+
+
+func spawn_world_item(item_path: String, pos: Vector3, burn_time: float = -1.0, immune_peer: int = -1) -> void:
+	## Server-only: spawn a world item via the ItemSpawner.
+	## The spawner replicates to all clients automatically.
+	if not multiplayer.is_server():
+		return
+	var data: Dictionary = {"path": item_path, "pos": pos}
+	if burn_time >= 0.0:
+		data["burn_time"] = burn_time
+	if immune_peer >= 0:
+		data["immune_peer"] = immune_peer
+	$ItemSpawner.spawn(data)
 
 
 func _load_item_definitions() -> void:
@@ -142,9 +177,6 @@ func _spawn_demo_items() -> void:
 		return
 
 	var host_pos: Vector3 = host_player.global_position
-	var container := get_node_or_null("WorldItems")
-	if container == null:
-		container = self
 
 	var count := 0
 	for entry: Dictionary in DEMO_SPAWN_TABLE:
@@ -154,13 +186,9 @@ func _spawn_demo_items() -> void:
 			continue
 		var offset: Vector3 = entry["offset"]
 
-		var world_item_scene := preload("res://items/world_item.tscn")
-		var world_item: WorldItem = world_item_scene.instantiate()
-		world_item.setup(item_data)
-		# Make permanent — burn_time_remaining >= PERMANENT_THRESHOLD means never expires
-		world_item.burn_time_remaining = 999999.0
-		world_item.position = host_pos + offset
-		container.add_child(world_item, true)
+		# Spawn via ItemSpawner — replicates to all clients automatically.
+		# burn_time 999999.0 = permanent (never expires).
+		spawn_world_item(entry["path"], host_pos + offset, 999999.0)
 		count += 1
 
 	if count > 0:
@@ -472,7 +500,7 @@ func _create_fire_emitter() -> GPUParticles3D:
 	## form a continuous wall of flame around the entire circumference.
 	var particles := GPUParticles3D.new()
 	particles.emitting = true
-	particles.amount = 40
+	particles.amount = 80
 	particles.lifetime = 1.6
 	particles.explosiveness = 0.0
 	particles.visibility_aabb = AABB(Vector3(-5, -2, -5), Vector3(10, 14, 10))
@@ -489,7 +517,7 @@ func _create_fire_emitter() -> GPUParticles3D:
 	mat.damping_max = 1.5
 	# Lateral scatter so particles fill the gap between emitters
 	mat.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_BOX
-	mat.emission_box_extents = Vector3(1.5, 0.3, 1.5)
+	mat.emission_box_extents = Vector3(3.0, 0.3, 3.0)
 
 	var gradient := Gradient.new()
 	gradient.add_point(0.0, Color(1.0, 0.7, 0.15, 0.95))  # Bright yellow-orange core
@@ -566,14 +594,5 @@ func _process(delta: float) -> void:
 # ======================================================================
 
 func _place_world_item(item_data: ItemData, pos: Vector3) -> void:
-	## Instantiate a WorldItem, set it up, and add it to the WorldItems container.
-	var world_item_scene := preload("res://items/world_item.tscn")
-	var world_item: WorldItem = world_item_scene.instantiate()
-	world_item.setup(item_data)
-	world_item.position = pos
-
-	var container := get_node_or_null("WorldItems")
-	if container:
-		container.add_child(world_item, true)
-	else:
-		add_child(world_item, true)
+	## Spawn a WorldItem via the ItemSpawner (replicates to all clients).
+	spawn_world_item(item_data.resource_path, pos)

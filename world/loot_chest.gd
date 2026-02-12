@@ -135,17 +135,12 @@ func open(_peer_id: int) -> void:
 	print("Chest opened at %s — spawned %d items" % [str(global_position), count])
 
 
-func _spawn_world_item(item_data: ItemData, pos: Vector3) -> void:
-	var world_item_scene := preload("res://items/world_item.tscn")
-	var world_item: WorldItem = world_item_scene.instantiate()
-	world_item.setup(item_data)
-	world_item.position = pos
-
-	var container := get_tree().current_scene.get_node_or_null("WorldItems")
-	if container:
-		container.add_child(world_item, true)
+func _spawn_world_item(p_item_data: ItemData, pos: Vector3) -> void:
+	var map := get_tree().current_scene
+	if map.has_method("spawn_world_item"):
+		map.spawn_world_item(p_item_data.resource_path, pos)
 	else:
-		get_tree().current_scene.add_child(world_item, true)
+		push_warning("LootChest: map has no spawn_world_item method")
 
 
 func _process(delta: float) -> void:

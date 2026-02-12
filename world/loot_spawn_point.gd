@@ -31,21 +31,19 @@ func spawn_random_item() -> void:
 	if item_data == null:
 		return
 
-	var world_item_scene := preload("res://items/world_item.tscn")
-	var world_item: WorldItem = world_item_scene.instantiate()
-	world_item.setup(item_data)
-	world_item.global_position = global_position
-	world_item.tree_exited.connect(_on_item_removed)
-
-	# Add to the WorldItems container in the map
 	var map := get_tree().current_scene
-	var container := map.get_node_or_null("WorldItems")
-	if container:
-		container.add_child(world_item, true)
-	else:
-		get_tree().current_scene.add_child(world_item, true)
+	if not map.has_method("spawn_world_item"):
+		push_warning("LootSpawnPoint: map has no spawn_world_item method")
+		return
 
-	_current_item = world_item
+	map.spawn_world_item(item_data.resource_path, global_position)
+
+	# Grab the spawned node (last child of WorldItems) to track for respawn
+	var container := map.get_node_or_null("WorldItems")
+	if container and container.get_child_count() > 0:
+		_current_item = container.get_child(container.get_child_count() - 1)
+		_current_item.tree_exited.connect(_on_item_removed)
+
 	_has_spawned = true
 
 

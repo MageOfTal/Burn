@@ -108,24 +108,20 @@ func on_item_pickup(world_item: Node) -> void:
 
 func drop_item_as_world_item(stack: ItemStack) -> void:
 	## Server-only: spawn a WorldItem on the ground with the remaining burn time.
-	var world_item_scene := preload("res://items/world_item.tscn")
-	var world_item: WorldItem = world_item_scene.instantiate()
-	world_item.setup(stack.item_data)
-	# Override burn time with the remaining time from the stack
-	world_item.burn_time_remaining = stack.burn_time_remaining
-	# Prevent the dropping player from immediately re-picking this up
-	world_item.set_pickup_immunity(player.peer_id)
 	# Drop slightly behind the player
 	var drop_pos := player.global_position - player.transform.basis.z * 1.5
 	drop_pos.y = player.global_position.y
-	world_item.position = drop_pos
 
 	var map := get_tree().current_scene
-	var container := map.get_node_or_null("WorldItems")
-	if container:
-		container.add_child(world_item, true)
+	if map.has_method("spawn_world_item"):
+		map.spawn_world_item(
+			stack.item_data.resource_path,
+			drop_pos,
+			stack.burn_time_remaining,
+			player.peer_id  # pickup immunity
+		)
 	else:
-		map.add_child(world_item, true)
+		push_warning("ItemManager: map has no spawn_world_item method")
 
 
 ## ======================================================================

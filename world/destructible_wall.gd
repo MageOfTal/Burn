@@ -83,12 +83,16 @@ func _ready() -> void:
 	add_child(_mesh_instance)
 	_rebuild_greedy_mesh()
 
+	# Disable per-frame processing — only needed when _mesh_dirty is set
+	set_process(false)
+
 
 func _process(_delta: float) -> void:
-	# Deferred mesh rebuild: if blocks were destroyed, rebuild next frame
+	# Deferred mesh rebuild: blocks were destroyed, rebuild once then sleep
 	if _mesh_dirty:
 		_mesh_dirty = false
 		_rebuild_greedy_mesh()
+		set_process(false)
 
 
 func _spawn_block(bx: int, by: int, bz: int) -> void:
@@ -147,7 +151,8 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		_spawn_debris(block_pos, block_pos + Vector3(0, 0, 0.5), 1)
 		block_body.queue_free()
 		_blocks.erase(key)
-		_mesh_dirty = true  # Rebuild greedy mesh next frame
+		_mesh_dirty = true
+		set_process(true)  # Wake up _process to rebuild mesh next frame
 		_sync_block_destroyed.rpc(key)
 
 		if _blocks.is_empty():
@@ -164,6 +169,7 @@ func _sync_block_destroyed(key: Vector3i) -> void:
 			block_body.queue_free()
 		_blocks.erase(key)
 		_mesh_dirty = true
+		set_process(true)
 
 
 func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attacker_id: int) -> void:
@@ -222,6 +228,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 
 	if destroyed_keys.size() > 0:
 		_mesh_dirty = true
+		set_process(true)
 
 	# If all blocks gone, remove the wall node entirely
 	if _blocks.is_empty():
