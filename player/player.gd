@@ -218,16 +218,16 @@ func _server_process(delta: float) -> void:
 	_frame_jump = player_input.jump_count > _last_jump
 	if _frame_jump:
 		_last_jump = player_input.jump_count
-	var wants_pickup := player_input.pickup_count > _last_pickup
+	var wants_pickup: bool = player_input.pickup_count > _last_pickup
 	if wants_pickup:
 		_last_pickup = player_input.pickup_count
-	var wants_extend := player_input.extend_count > _last_extend
+	var wants_extend: bool = player_input.extend_count > _last_extend
 	if wants_extend:
 		_last_extend = player_input.extend_count
-	var wants_scrap := player_input.scrap_count > _last_scrap
+	var wants_scrap: bool = player_input.scrap_count > _last_scrap
 	if wants_scrap:
 		_last_scrap = player_input.scrap_count
-	var wants_slot := player_input.slot_count > _last_slot
+	var wants_slot: bool = player_input.slot_count > _last_slot
 	if wants_slot:
 		_last_slot = player_input.slot_count
 
