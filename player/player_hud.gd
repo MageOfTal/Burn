@@ -497,12 +497,25 @@ func add_kill_feed_entry(bbcode_text: String) -> void:
 	if _kill_feed_container == null:
 		return
 
-	# Highlight the local player's name in yellow
+	# Resolve player name placeholders ({P:peer_id}) to actual names.
+	# The local player's name is highlighted yellow; everyone else is plain white.
+	# This avoids substring matching issues (e.g. name "a" matching inside words).
 	var display_text := bbcode_text
 	if _player:
-		var my_name := GameManager.get_username(_player.peer_id)
-		if my_name != "" and my_name in display_text:
-			display_text = display_text.replace(my_name, "[color=yellow]%s[/color]" % my_name)
+		var my_id := _player.peer_id
+		var regex := RegEx.new()
+		regex.compile("\\{P:(\\d+)\\}")
+		var result := regex.search(display_text)
+		while result:
+			var pid := int(result.get_string(1))
+			var pname := GameManager.get_username(pid)
+			var replacement: String
+			if pid == my_id:
+				replacement = "[color=yellow]%s[/color]" % pname
+			else:
+				replacement = pname
+			display_text = display_text.substr(0, result.get_start()) + replacement + display_text.substr(result.get_end())
+			result = regex.search(display_text, result.get_start() + replacement.length())
 
 	var entry := RichTextLabel.new()
 	entry.bbcode_enabled = true

@@ -172,11 +172,10 @@ func _eliminate_player() -> void:
 	print("Player %d ELIMINATED by demon! (deaths: %d, final speed: %.1f)" % [
 		player.peer_id, _death_count, demon_speed])
 
-	# Kill feed: red demon elimination message
-	var victim_name := GameManager.get_username(player.peer_id)
+	# Kill feed: red demon elimination message (use {P:id} placeholder)
 	var net_mgr := player.get_node_or_null("/root/NetworkManager")
 	if net_mgr and net_mgr.has_method("broadcast_kill_feed"):
-		net_mgr.broadcast_kill_feed("[color=red]%s was caught by THE DEMON[/color]" % victim_name)
+		net_mgr.broadcast_kill_feed("[color=red]{P:%d} was caught by THE DEMON[/color]" % player.peer_id)
 
 	# Check if only one player remains (victory condition)
 	if net_mgr and net_mgr.has_method("check_victory"):

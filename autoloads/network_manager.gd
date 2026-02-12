@@ -300,16 +300,14 @@ func _spawn_player(peer_id: int) -> void:
 
 	# Kill feed: announce human players joining (not bots)
 	if peer_id < BOT_PEER_ID_START:
-		var uname := GameManager.get_username(peer_id)
-		broadcast_kill_feed("[color=teal]%s joined[/color]" % uname)
+		broadcast_kill_feed("[color=teal]{P:%d} joined[/color]" % peer_id)
 
 
 func _despawn_player(peer_id: int) -> void:
 	if players.has(peer_id):
 		# Kill feed: announce human players leaving (not bots)
 		if peer_id < BOT_PEER_ID_START:
-			var uname := GameManager.get_username(peer_id)
-			broadcast_kill_feed("[color=teal]%s disconnected[/color]" % uname)
+			broadcast_kill_feed("[color=teal]{P:%d} disconnected[/color]" % peer_id)
 		var player_node: Node = players[peer_id]
 		player_node.queue_free()
 		players.erase(peer_id)
@@ -847,7 +845,7 @@ func check_victory() -> void:
 		# Broadcast to all clients
 		var winner_name := GameManager.get_username(winner_id)
 		_rpc_victory.rpc(winner_id, winner_name)
-		broadcast_kill_feed("[color=gold]%s wins! Last one standing![/color]" % winner_name)
+		broadcast_kill_feed("[color=gold]{P:%d} wins! Last one standing![/color]" % winner_id)
 		victory_declared.emit(winner_id)
 
 	elif alive_players.size() == 0:
