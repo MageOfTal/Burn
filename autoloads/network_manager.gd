@@ -415,10 +415,10 @@ func _on_connected_to_server() -> void:
 			await seed_world.world_generation_complete
 		print("[Client] Structures complete.")
 
-	# Send username and ready signal to server
-	print("[Client] Step 4/4: Sending username + client_ready to server...")
+	# Send username and ready signal to server (include version for compatibility check)
+	print("[Client] Step 4/4: Sending username + client_ready to server (version %s)..." % NetConstants.GAME_VERSION)
 	_register_username.rpc_id(1, GameManager.local_username)
-	_client_ready.rpc_id(1)
+	_client_ready.rpc_id(1, NetConstants.GAME_VERSION)
 
 	# Wait a few frames for RPCs to process
 	for i in 10:
@@ -493,7 +493,7 @@ func _serialize_usernames() -> Dictionary:
 # ======================================================================
 
 @rpc("any_peer", "reliable")
-func _client_ready() -> void:
+func _client_ready(client_version: String = "") -> void:
 	## Server-only: called when a client has loaded the map and is ready.
 	var sender_id: int = multiplayer.get_remote_sender_id()
 	print("[Server] ======== _client_ready RPC received from peer %d ========" % sender_id)
@@ -501,11 +501,26 @@ func _client_ready() -> void:
 		print("[Server] WARN: _client_ready called on non-server (peer %d), ignoring" % multiplayer.get_unique_id())
 		return
 
+	# --- Version check: kick client if version doesn't match ---
+	if client_version != NetConstants.GAME_VERSION:
+		print("[Server] VERSION MISMATCH: peer %d has '%s', server has '%s' — kicking!" % [
+			sender_id, client_version, NetConstants.GAME_VERSION])
+		_rpc_version_mismatch.rpc_id(sender_id, NetConstants.GAME_VERSION)
+		# Disconnect the peer after a short delay so the RPC arrives first
+		get_tree().create_timer(0.5).timeout.connect(func():
+			multiplayer.multiplayer_peer.disconnect_peer(sender_id)
+		)
+		return
+
+	# Send server version to client so they can double-check
+	_rpc_server_version.rpc_id(sender_id, NetConstants.GAME_VERSION)
+
 	if GameManager.current_state == GameManager.GameState.LOBBY:
 		# Lobby mode: add to lobby, don't spawn yet
 		if sender_id not in _lobby_ready_peers:
 			_lobby_ready_peers.append(sender_id)
-		print("[Server] Peer %d added to lobby. Total lobby peers: %d" % [sender_id, _lobby_ready_peers.size()])
+		print("[Server] Peer %d added to lobby (version OK: %s). Total lobby peers: %d" % [
+			sender_id, client_version, _lobby_ready_peers.size()])
 		# Broadcast updated lists
 		_sync_all_usernames.rpc(_serialize_usernames())
 		_update_lobby_player_list.rpc(_lobby_ready_peers.duplicate())
@@ -514,6 +529,43 @@ func _client_ready() -> void:
 		# Game already running (late join) — spawn immediately
 		print("[Server] Game already running — spawning peer %d immediately" % sender_id)
 		_spawn_player(sender_id)
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_version_mismatch(server_version: String) -> void:
+	## Client receives: server rejected us due to version mismatch.
+	var my_version := NetConstants.GAME_VERSION
+	print("[Client] ========================================")
+	print("[Client] VERSION MISMATCH — DISCONNECTED")
+	print("[Client]   Your version:   %s" % my_version)
+	print("[Client]   Server version: %s" % server_version)
+	print("[Client] ========================================")
+	_is_connecting = false
+	_hide_loading_screen()
+	multiplayer.multiplayer_peer = null
+	# Show version mismatch in the main menu or connection UI
+	push_warning("Version mismatch! You: %s, Server: %s — please update your game." % [my_version, server_version])
+	connection_failed.emit()
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_server_version(server_version: String) -> void:
+	## Client receives: server accepted us, but double-check version.
+	if server_version != NetConstants.GAME_VERSION:
+		print("[Client] ========================================")
+		print("[Client] VERSION MISMATCH (client-side check)")
+		print("[Client]   Your version:   %s" % NetConstants.GAME_VERSION)
+		print("[Client]   Server version: %s" % server_version)
+		print("[Client] Disconnecting...")
+		print("[Client] ========================================")
+		_hide_loading_screen()
+		_hide_lobby_ui()
+		multiplayer.multiplayer_peer = null
+		push_warning("Version mismatch! You: %s, Server: %s — please update your game." % [
+			NetConstants.GAME_VERSION, server_version])
+		connection_failed.emit()
+	else:
+		print("[Client] Server version matches: %s" % server_version)
 
 
 # ======================================================================
