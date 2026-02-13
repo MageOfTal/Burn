@@ -169,12 +169,15 @@ func host_game(port: int = NetConstants.DEFAULT_PORT) -> Error:
 		push_error("[Server] create_server() FAILED: %s" % error_string(err))
 		return err
 
+	# Enable ENet range coder compression to reduce bandwidth
+	peer.host.compress(ENetConnection.COMPRESS_RANGE_CODER)
+
 	multiplayer.multiplayer_peer = peer
 	is_server = true
 
 	var local_ip := get_local_ip()
 	print("[Server] ========================================")
-	print("[Server] Server started on UDP port %d" % port)
+	print("[Server] Server started on UDP port %d (compression: range coder)" % port)
 	print("[Server] Other players should connect to: %s" % local_ip)
 	print("[Server] All local IPs: %s" % str(IP.get_local_addresses()))
 	print("[Server] ========================================")
@@ -219,6 +222,9 @@ func join_game(address: String, port: int = NetConstants.DEFAULT_PORT) -> Error:
 		push_error("[Client] create_client() FAILED: %s" % error_string(err))
 		return err
 	print("[Client] create_client() returned OK")
+
+	# Enable ENet range coder compression (must match server)
+	peer.host.compress(ENetConnection.COMPRESS_RANGE_CODER)
 
 	multiplayer.multiplayer_peer = peer
 	is_server = false
@@ -557,6 +563,10 @@ func _client_ready(client_version: String = "") -> void:
 		_rpc_enter_waiting_lobby.rpc_id(sender_id)
 		# Send them current match status immediately
 		_send_match_status_to_peer(sender_id)
+		# Sync zone state so they see the correct circle if they rejoin
+		var zone_mgr := get_node_or_null("/root/ZoneManager")
+		if zone_mgr and zone_mgr.has_method("send_state_to_peer"):
+			zone_mgr.send_state_to_peer(sender_id)
 		# Broadcast updated username list so waiting peer sees everyone
 		_sync_all_usernames.rpc(_serialize_usernames())
 

@@ -35,15 +35,16 @@ var _fire_ring_update_timer: float = 0.0  ## Throttle fire position updates
 var _fire_ring_last_radius: float = -1.0  ## Track radius changes
 
 
+func _enter_tree() -> void:
+	# Set up spawn functions in _enter_tree (BEFORE _ready) so they're registered
+	# before the MultiplayerSpawner receives any replication data from the server.
+	# If set in _ready(), the spawner may receive spawn RPCs before the function is
+	# assigned, causing ERR_INVALID_DATA.
+	$ItemSpawner.spawn_function = _on_spawn_world_item
+	$ProjectileSpawner.spawn_function = _on_spawn_projectile
+
+
 func _ready() -> void:
-	# Set up item spawner — server spawns trigger _on_spawn_world_item on ALL peers
-	var item_spawner := $ItemSpawner
-	item_spawner.spawn_function = _on_spawn_world_item
-
-	# Set up projectile spawner — same pattern for bullets, rockets, bubbles, balls
-	var proj_spawner := $ProjectileSpawner
-	proj_spawner.spawn_function = _on_spawn_projectile
-
 	# Zone visual is cosmetic — create on ALL peers so everyone sees the ring + fire
 	_create_zone_visual()
 

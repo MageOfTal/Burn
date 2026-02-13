@@ -76,6 +76,12 @@ var _current_gun_model: Node3D = null
 var _last_synced_gun_model_path: String = ""
 var _last_synced_fire_sound_path: String = ""
 
+## Network interpolation — synced via ServerSync instead of raw position/rotation.
+## Server writes these each physics frame; clients lerp toward them smoothly.
+var sync_position: Vector3 = Vector3.ZERO
+var sync_rotation_y: float = 0.0
+const INTERP_SPEED := 18.0  ## Higher = snappier, lower = smoother (18 ≈ ~55ms to 95%)
+
 ## 3D health bar label (visible to other players above this player's head)
 var _health_label_3d: Label3D = null
 
@@ -129,6 +135,10 @@ func _ready() -> void:
 	var is_local: bool = (peer_id == my_id)
 	print("[Player] _ready() — peer_id=%d  my_id=%d  is_local=%s  is_bot=%s  is_server=%s" % [
 		peer_id, my_id, str(is_local), str(is_bot), str(multiplayer.is_server())])
+
+	# Initialize sync vars to current position so remote clients don't lerp from origin
+	sync_position = global_position
+	sync_rotation_y = rotation.y
 
 	# Duplicate collision shape so runtime resize doesn't affect other players
 	var col_shape := $CollisionShape3D
@@ -215,6 +225,19 @@ func _physics_process(delta: float) -> void:
 
 	if multiplayer.is_server() and not freecam_frozen:
 		_server_process(delta)
+		# Update sync vars AFTER all server movement (normal, grapple, kamikaze, respawn)
+		sync_position = global_position
+		sync_rotation_y = rotation.y
+
+	# --- Client-side interpolation for REMOTE players ---
+	# Local player and server skip this — they use direct physics position.
+	# Remote players smoothly lerp toward the last synced position.
+	var is_local := (peer_id == multiplayer.get_unique_id())
+	if not multiplayer.is_server() and not is_local:
+		var weight := 1.0 - exp(-INTERP_SPEED * delta)
+		global_position = global_position.lerp(sync_position, weight)
+		rotation.y = lerp_angle(rotation.y, sync_rotation_y, weight)
+
 	# On a listen server the host needs client visuals for ALL player nodes
 	# (own camera/ADS, other players' health bars, grapple rope, demon, etc.)
 	_client_process(delta)

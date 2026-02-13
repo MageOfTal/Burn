@@ -40,7 +40,7 @@ func reset() -> void:
 	zone_radius = 200.0
 	target_radius = 200.0
 	zone_center = Vector2.ZERO
-	zone_phase = 0
+	zone_phase = -1
 	is_shrinking = false
 	shrink_speed = 0.0
 	next_shrink_time = 0.0
@@ -62,6 +62,49 @@ func start_zone(initial_radius: float, center: Vector2) -> void:
 		next_shrink_time = ZONE_PHASES[0]["wait"]
 	print("[ZoneManager] Zone started: radius=%.0f, center=%s, first shrink in %.0fs" % [
 		initial_radius, str(center), next_shrink_time])
+
+	# If we're the server, sync zone state to all clients immediately
+	if multiplayer.is_server():
+		_rpc_sync_zone_state.rpc(get_sync_state())
+
+
+func get_sync_state() -> Dictionary:
+	## Returns full zone state for network sync.
+	return {
+		"initial_radius": _initial_radius,
+		"zone_radius": zone_radius,
+		"target_radius": target_radius,
+		"zone_center_x": zone_center.x,
+		"zone_center_y": zone_center.y,
+		"zone_phase": zone_phase,
+		"is_shrinking": is_shrinking,
+		"shrink_speed": shrink_speed,
+		"next_shrink_time": next_shrink_time,
+		"active": _active,
+	}
+
+
+func send_state_to_peer(peer_id: int) -> void:
+	## Server-only: send current zone state to a specific peer (late joiner).
+	if not multiplayer.is_server():
+		return
+	_rpc_sync_zone_state.rpc_id(peer_id, get_sync_state())
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_sync_zone_state(state: Dictionary) -> void:
+	## Client receives full zone state from the server.
+	_initial_radius = state.get("initial_radius", 200.0)
+	zone_radius = state.get("zone_radius", 200.0)
+	target_radius = state.get("target_radius", 200.0)
+	zone_center = Vector2(state.get("zone_center_x", 0.0), state.get("zone_center_y", 0.0))
+	zone_phase = state.get("zone_phase", 0)
+	is_shrinking = state.get("is_shrinking", false)
+	shrink_speed = state.get("shrink_speed", 0.0)
+	next_shrink_time = state.get("next_shrink_time", 0.0)
+	_active = state.get("active", false)
+	print("[ZoneManager] Synced zone from server: phase=%d radius=%.0f active=%s" % [
+		zone_phase, zone_radius, str(_active)])
 
 
 func _physics_process(delta: float) -> void:
