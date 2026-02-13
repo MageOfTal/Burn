@@ -280,6 +280,9 @@ func _server_process(delta: float) -> void:
 			if eq_grapple.item_data is GadgetData and (eq_grapple.item_data as GadgetData).gadget_type == 0:
 				grapple_system.handle_shoot_input(player_input.action_shoot)
 
+	# --- Grapple charge recharge (always ticks, even when not swinging) ---
+	grapple_system.tick_charges(delta)
+
 	# --- Grapple swing state machine ---
 	if grapple_system.is_active():
 		grapple_system.process(delta)

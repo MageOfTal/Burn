@@ -59,6 +59,10 @@ const PROXIMITY_MIN_FACTOR := 0.1
 const SHORT_ROPE_CLEARANCE := 4.0
 const CLEARANCE_FORCE := 12.0
 
+## Charge system — two grapples before cooldown.
+const MAX_CHARGES := 2
+const CHARGE_RECHARGE_TIME := 0.5   ## Seconds to regain one charge
+
 ## Rope line-of-sight — cut if geometry obstructs the line.
 const ROPE_LOS_MARGIN := 3.0
 const ROPE_LOS_INTERVAL := 1
@@ -95,6 +99,13 @@ var _anchor_collider_rid: RID = RID()
 var _low_momentum_timer: float = 0.0  ## Tracks how long angular rate has been below threshold
 var _last_los_chest: Vector3 = Vector3.ZERO  ## Player chest pos at last LOS check (for fan sweep)
 var _fresh_grapple: bool = false      ## True until player first exceeds angular threshold
+
+## Charge system
+var _charges: int = MAX_CHARGES
+var _recharge_timer: float = 0.0      ## Time until next charge is restored
+
+## Boost cooldown — prevents spamming grapple for repeated boosts.
+var _last_boost_time: float = -1.0    ## Engine time of last release boost (-1 = never)
 
 
 ## Debug timing — spike detection
@@ -267,6 +278,18 @@ func _get_proximity_factor() -> float:
 	return lerpf(PROXIMITY_MIN_FACTOR, 1.0, smooth)
 
 
+func tick_charges(delta: float) -> void:
+	## Recharge grapple charges over time. Call every frame (even when not grappling).
+	if _charges < MAX_CHARGES:
+		_recharge_timer -= delta
+		if _recharge_timer <= 0.0:
+			_charges += 1
+			if _charges < MAX_CHARGES:
+				_recharge_timer = CHARGE_RECHARGE_TIME  # Start recharging next charge
+			else:
+				_recharge_timer = 0.0
+
+
 func handle_shoot_input(shoot_held: bool) -> void:
 	var just_pressed: bool = shoot_held and not _shoot_was_held
 	_shoot_was_held = shoot_held
@@ -285,6 +308,10 @@ func handle_shoot_input(shoot_held: bool) -> void:
 
 func try_fire() -> void:
 	if is_grappling:
+		return
+
+	# Check charges
+	if _charges <= 0:
 		return
 
 	var space_state := player.get_world_3d().direct_space_state
@@ -328,6 +355,11 @@ func try_fire() -> void:
 	is_grappling = true
 	_shoot_was_held = true
 	_last_los_chest = hand_origin
+
+	# Consume a charge and start recharging
+	_charges -= 1
+	if _recharge_timer <= 0.0:
+		_recharge_timer = CHARGE_RECHARGE_TIME
 
 	# End crouch if active
 	var slide_crouch: SlideCrouchSystem = player.slide_crouch
@@ -913,9 +945,13 @@ func _do_release(with_boost: bool) -> void:
 
 func _apply_release_boost() -> bool:
 	## Tilt velocity upward by 25° (capped at 30° above horizontal),
-	## add a speed boost that scales with current speed, and add a flat
-	## 3 m/s vertical boost if vertical speed is under 5 m/s.
+	## then add a speed boost that scales with current speed.
 	## Returns true if the boost was actually applied.
+	## Boost is blocked if less than 0.5s since the last boost.
+	var now := Time.get_ticks_msec() / 1000.0
+	if _last_boost_time >= 0.0 and (now - _last_boost_time) < 0.5:
+		return false
+
 	var vel := player.velocity
 	var speed := vel.length()
 	if speed < RELEASE_BOOST_MIN_SPEED:
@@ -946,9 +982,7 @@ func _apply_release_boost() -> bool:
 	var boost_dir := player.velocity.normalized()
 	player.velocity += boost_dir * boost
 
-	# --- Flat vertical boost: add 3 m/s upward if under 5 m/s vertical ---
-	if player.velocity.y < 5.0:
-		player.velocity.y += 3.0
+	_last_boost_time = now
 	return true
 
 
@@ -963,6 +997,9 @@ func reset_state() -> void:
 	_low_momentum_timer = 0.0
 	_last_los_chest = Vector3.ZERO
 	_fresh_grapple = false
+	_charges = MAX_CHARGES
+	_recharge_timer = 0.0
+	_last_boost_time = -1.0
 	_pill_half_blocked = [0, 0]
 	_pill_swing_normal = Vector3.ZERO
 	_prev_los_chest = Vector3.ZERO
