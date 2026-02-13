@@ -291,9 +291,10 @@ func _explode() -> void:
 						already_damaged.append(target)
 
 	# --- Pass 2: Scene-tree scan for destructible walls ---
-	var structures := get_tree().current_scene.get_node_or_null("SeedWorld/Structures")
-	if structures == null:
-		structures = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld/Structures")
+	var cs := get_tree().current_scene
+	var structures: Node = cs.get_node_or_null("SeedWorld/Structures") if cs else null
+	if structures == null and cs:
+		structures = cs.get_node_or_null("BlockoutMap/SeedWorld/Structures")
 	if structures:
 		for child in structures.get_children():
 			if child in already_damaged:
@@ -308,9 +309,9 @@ func _explode() -> void:
 					already_damaged.append(child)
 
 	# --- Create terrain crater (scaled with speed) ---
-	var seed_world := get_tree().current_scene.get_node_or_null("SeedWorld")
-	if seed_world == null:
-		seed_world = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld")
+	var seed_world: Node = cs.get_node_or_null("SeedWorld") if cs else null
+	if seed_world == null and cs:
+		seed_world = cs.get_node_or_null("BlockoutMap/SeedWorld")
 	if seed_world and seed_world.has_method("create_crater"):
 		seed_world.create_crater(explosion_pos, radius * 0.4, 1.5, player.peer_id)
 
@@ -354,6 +355,8 @@ func _find_damageable(node: Node) -> Node:
 func _show_kamikaze_launch(pos: Vector3) -> void:
 	## Visual: orange glow at feet when launching + attach flight trail.
 	var scene_root := get_tree().current_scene
+	if scene_root == null:
+		return
 
 	var flash := OmniLight3D.new()
 	flash.light_color = Color(1.0, 0.5, 0.1)
@@ -459,6 +462,8 @@ func _show_kamikaze_launch(pos: Vector3) -> void:
 func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, speed_ratio: float) -> void:
 	## Visual: speed-scaled explosion with particles, fireball mesh, shockwave, and flash.
 	var scene_root := get_tree().current_scene
+	if scene_root == null:
+		return
 	var vfx_ratio := clampf(speed_ratio, 0.0, 2.5)
 
 	# --- Bright flash light ---
@@ -701,31 +706,48 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 
 func _check_flashbang(explosion_pos: Vector3, _radius: float, _flash_energy: float, speed_ratio: float) -> void:
 	## Client-side: check if the local player should be flashbanged by this explosion.
+	## Find the LOCAL player on this machine (not necessarily the kamikaze owner).
 	var local_id := multiplayer.get_unique_id()
-	if player.peer_id != local_id:
+
+	# Find the local player node in the Players container
+	var scene := get_tree().current_scene
+	if scene == null:
 		return
-	if not player.is_alive:
-		return
-	if player.camera == null:
+	var players_container := scene.get_node_or_null("Players")
+	if players_container == null:
 		return
 
-	var cam_pos: Vector3 = player.camera.global_position
+	var local_player: CharacterBody3D = null
+	for child in players_container.get_children():
+		if child is CharacterBody3D and child.name.to_int() == local_id:
+			local_player = child
+			break
+
+	if local_player == null:
+		return
+	if not local_player.is_alive:
+		return
+	var local_camera: Camera3D = local_player.get_node_or_null("CameraPivot/SpringArm3D/Camera3D")
+	if local_camera == null:
+		return
+
+	var cam_pos: Vector3 = local_camera.global_position
 	var dist: float = cam_pos.distance_to(explosion_pos)
 	if dist > FLASH_MAX_RANGE:
 		return
 
-	var cam_forward: Vector3 = -player.camera.global_transform.basis.z
+	var cam_forward: Vector3 = -local_camera.global_transform.basis.z
 	var dir_to_explosion: Vector3 = (explosion_pos - cam_pos).normalized()
 	var dot: float = cam_forward.dot(dir_to_explosion)
 	if dot < FLASH_DOT_THRESHOLD:
 		return
 
 	# Line of sight check
-	var space_state := player.get_world_3d().direct_space_state
+	var space_state := local_player.get_world_3d().direct_space_state
 	if space_state:
 		var query := PhysicsRayQueryParameters3D.create(cam_pos, explosion_pos)
 		query.collision_mask = 1
-		query.exclude = [player.get_rid()]
+		query.exclude = [local_player.get_rid()]
 		var result := space_state.intersect_ray(query)
 		if not result.is_empty():
 			var hit_dist: float = cam_pos.distance_to(result.position)
@@ -740,9 +762,10 @@ func _check_flashbang(explosion_pos: Vector3, _radius: float, _flash_energy: flo
 	if intensity < 0.05:
 		return
 
-	if _flashbang_overlay == null:
+	# Find or create the flashbang overlay on the LOCAL player's HUD
+	if _flashbang_overlay == null or not is_instance_valid(_flashbang_overlay):
 		_flashbang_overlay = FlashbangOverlay.new()
-		var hud_layer := player.get_node_or_null("HUDLayer")
+		var hud_layer := local_player.get_node_or_null("HUDLayer")
 		if hud_layer:
 			hud_layer.add_child(_flashbang_overlay)
 	if _flashbang_overlay:
