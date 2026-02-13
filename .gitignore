@@ -1,6 +1,6 @@
 # Godot 4 ignores
 .godot/
-*.uid
+# Do NOT ignore *.uid files - Godot 4 needs them for cross-machine scene linking
 
 # Export
 export/

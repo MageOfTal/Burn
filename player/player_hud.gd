@@ -502,7 +502,7 @@ func add_kill_feed_entry(bbcode_text: String) -> void:
 	# This avoids substring matching issues (e.g. name "a" matching inside words).
 	var display_text := bbcode_text
 	if _player:
-		var my_id := _player.peer_id
+		var my_id: int = _player.peer_id
 		var regex := RegEx.new()
 		regex.compile("\\{P:(\\d+)\\}")
 		var result := regex.search(display_text)
