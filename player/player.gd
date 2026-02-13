@@ -232,11 +232,17 @@ func _physics_process(delta: float) -> void:
 	# --- Client-side interpolation for REMOTE players ---
 	# Local player and server skip this — they use direct physics position.
 	# Remote players smoothly lerp toward the last synced position.
+	# If distance is large (spawn, respawn, teleport), snap immediately.
 	var is_local := (peer_id == multiplayer.get_unique_id())
 	if not multiplayer.is_server() and not is_local:
-		var weight := 1.0 - exp(-INTERP_SPEED * delta)
-		global_position = global_position.lerp(sync_position, weight)
-		rotation.y = lerp_angle(rotation.y, sync_rotation_y, weight)
+		var dist_sq := global_position.distance_squared_to(sync_position)
+		if dist_sq > 25.0:  # > 5 meters — snap (spawn/respawn/teleport)
+			global_position = sync_position
+			rotation.y = sync_rotation_y
+		else:
+			var weight := 1.0 - exp(-INTERP_SPEED * delta)
+			global_position = global_position.lerp(sync_position, weight)
+			rotation.y = lerp_angle(rotation.y, sync_rotation_y, weight)
 
 	# On a listen server the host needs client visuals for ALL player nodes
 	# (own camera/ADS, other players' health bars, grapple rope, demon, etc.)
