@@ -112,66 +112,11 @@ func _explode() -> void:
 		queue_free()
 		return
 
-	# --- Normal explosion: damage nearby damageable nodes ---
-	# We use a two-pass approach:
-	#  1) Physics shape query for dynamic bodies (players, rigid bodies)
-	#  2) Direct scene-tree scan for static bodies (destructible walls)
-	# This is needed because intersect_shape can miss StaticBody3D nodes
-	# or fill results with terrain triangles.
-
-	var already_damaged: Array[Node] = []
-
-	# Pass 1: Physics query (catches CharacterBody3D / RigidBody3D reliably)
-	var space_state := get_world_3d().direct_space_state
-	var query := PhysicsShapeQueryParameters3D.new()
-	var sphere := SphereShape3D.new()
-	sphere.radius = EXPLOSION_RADIUS
-	query.shape = sphere
-	query.transform = Transform3D(Basis(), explosion_pos)
-	query.collision_mask = 0xFFFFFFFF
-	query.collide_with_bodies = true
-	query.collide_with_areas = true
-
-	var results := space_state.intersect_shape(query, 64)
-
-	for result in results:
-		var collider: Node = result["collider"]
-		if collider == self:
-			continue
-		# Walk up the tree in case the collider is a child of the damageable node
-		var target := _find_damageable(collider)
-		if target and target not in already_damaged:
-			# Use spatial damage for walls (per-block destruction)
-			if target.has_method("take_damage_at"):
-				target.take_damage_at(explosion_pos, _damage, EXPLOSION_RADIUS, _shooter_id)
-				already_damaged.append(target)
-			else:
-				var dist := explosion_pos.distance_to(target.global_position)
-				var falloff := clampf(1.0 - (dist / EXPLOSION_RADIUS), 0.0, 1.0)
-				var dmg := _damage * falloff
-				if dmg > 0.5:
-					target.take_damage(dmg, _shooter_id)
-					already_damaged.append(target)
-
-	# Pass 2: Scene-tree scan for destructible walls in range
-	# (catches walls that the physics query might miss)
-	var structures := get_tree().current_scene.get_node_or_null("SeedWorld/Structures")
-	if structures == null:
-		structures = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld/Structures")
-	if structures:
-		for child in structures.get_children():
-			if child in already_damaged:
-				continue
-			if child.has_method("take_damage_at"):
-				# Check if any part of the wall is within blast radius
-				var dist := explosion_pos.distance_to(child.global_position)
-				# Use generous range: wall center + half its largest dimension
-				var wall_reach: float = 0.0
-				if "wall_size" in child:
-					wall_reach = child.wall_size.length() * 0.5
-				if dist <= EXPLOSION_RADIUS + wall_reach:
-					child.take_damage_at(explosion_pos, _damage, EXPLOSION_RADIUS, _shooter_id)
-					already_damaged.append(child)
+	# --- Shielded explosion damage (flat HP absorption + multi-point raycast) ---
+	ExplosionHelper.do_explosion(
+		get_world_3d(), get_tree().current_scene,
+		explosion_pos, _damage, EXPLOSION_RADIUS, _shooter_id, self
+	)
 
 	# --- Create terrain crater (server deforms, then tells clients) ---
 	var seed_world := get_tree().current_scene.get_node_or_null("SeedWorld")
@@ -220,23 +165,6 @@ func _scatter_ammo_projectiles(explosion_pos: Vector3) -> void:
 			_ammo_projectile_scene.resource_path, spawn_pos, scatter_dir,
 			_shooter_id, per_projectile_damage
 		)
-
-
-func _find_damageable(node: Node) -> Node:
-	## Walk up the tree from a collider to find the best damageable ancestor.
-	## Prefers take_damage_at (spatial/wall damage) over plain take_damage.
-	var current := node
-	var first_damageable: Node = null
-	for _i in 4:  # Max 4 levels up
-		if current == null:
-			break
-		# Prefer nodes with spatial damage (walls)
-		if current.has_method("take_damage_at"):
-			return current
-		if first_damageable == null and current.has_method("take_damage"):
-			first_damageable = current
-		current = current.get_parent()
-	return first_damageable
 
 
 @rpc("authority", "call_local", "reliable")

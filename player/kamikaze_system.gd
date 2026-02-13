@@ -259,56 +259,14 @@ func _explode() -> void:
 	print("Kamikaze explosion: speed=%.1f, speed_ratio=%.2f, alt_drop_at_cap=%.1f, total_drop=%.1f, effective_ratio=%.2f" % [
 		_speed, speed_ratio, _altitude_drop_at_cap, total_drop, effective_ratio])
 
-	# --- Pass 1: Physics sphere query for nearby bodies ---
-	var already_damaged: Array[Node] = []
-	var space_state := player.get_world_3d().direct_space_state
-	if space_state:
-		var query := PhysicsShapeQueryParameters3D.new()
-		var sphere := SphereShape3D.new()
-		sphere.radius = radius
-		query.shape = sphere
-		query.transform = Transform3D(Basis(), explosion_pos)
-		query.collision_mask = 0xFFFFFFFF
-		query.collide_with_bodies = true
-		query.collide_with_areas = true
-
-		var results := space_state.intersect_shape(query, 64)
-		for result in results:
-			var collider: Node = result["collider"]
-			if collider == player:
-				continue
-			var target := _find_damageable(collider)
-			if target and target not in already_damaged:
-				if target.has_method("take_damage_at"):
-					target.take_damage_at(explosion_pos, damage, radius, player.peer_id)
-					already_damaged.append(target)
-				elif target.has_method("take_damage"):
-					var dist := explosion_pos.distance_to(target.global_position)
-					var falloff := clampf(1.0 - (dist / radius), 0.0, 1.0)
-					var dmg := damage * falloff
-					if dmg > 0.5:
-						target.take_damage(dmg, player.peer_id)
-						already_damaged.append(target)
-
-	# --- Pass 2: Scene-tree scan for destructible walls ---
-	var cs := get_tree().current_scene
-	var structures: Node = cs.get_node_or_null("SeedWorld/Structures") if cs else null
-	if structures == null and cs:
-		structures = cs.get_node_or_null("BlockoutMap/SeedWorld/Structures")
-	if structures:
-		for child in structures.get_children():
-			if child in already_damaged:
-				continue
-			if child.has_method("take_damage_at"):
-				var dist := explosion_pos.distance_to(child.global_position)
-				var wall_reach: float = 0.0
-				if "wall_size" in child:
-					wall_reach = child.wall_size.length() * 0.5
-				if dist <= radius + wall_reach:
-					child.take_damage_at(explosion_pos, damage, radius, player.peer_id)
-					already_damaged.append(child)
+	# --- Shielded explosion damage (flat HP absorption + multi-point raycast) ---
+	ExplosionHelper.do_explosion(
+		player.get_world_3d(), get_tree().current_scene,
+		explosion_pos, damage, radius, player.peer_id, player
+	)
 
 	# --- Create terrain crater (scaled with speed) ---
+	var cs := get_tree().current_scene
 	var seed_world: Node = cs.get_node_or_null("SeedWorld") if cs else null
 	if seed_world == null and cs:
 		seed_world = cs.get_node_or_null("BlockoutMap/SeedWorld")
@@ -331,20 +289,6 @@ func _explode() -> void:
 	print("Player %d Kamikaze explosion! Speed: %.1f, Damage: %.1f, Radius: %.1f, Self-dmg: %.1f, HP left: %.1f" % [
 		player.peer_id, final_speed, damage, radius, self_damage, player.health])
 
-
-func _find_damageable(node: Node) -> Node:
-	## Walk up the tree to find the best damageable ancestor.
-	var current := node
-	var first_damageable: Node = null
-	for _i in 4:
-		if current == null:
-			break
-		if current.has_method("take_damage_at"):
-			return current
-		if first_damageable == null and current.has_method("take_damage"):
-			first_damageable = current
-		current = current.get_parent()
-	return first_damageable
 
 
 ## ======================================================================

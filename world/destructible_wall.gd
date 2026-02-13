@@ -22,10 +22,6 @@ const DEBRIS_IMPULSE := 3.5        ## Outward impulse on debris
 const DEBRIS_LIFETIME := 5.0       ## Seconds before debris auto-deletes
 const MAX_DEBRIS_TOTAL := 40       ## Cap total debris per explosion
 
-## How much damage each intact front block absorbs before passing through.
-## e.g. 0.35 means each layer of blocks in front absorbs 35% of incoming damage.
-const LAYER_ABSORPTION := 0.35
-
 ## Tier data: { color, health_per_block }
 const TIER_DATA := {
 	WallTier.WOOD:       { "color": Color(0.55, 0.35, 0.15), "block_hp": 15.0 },
@@ -174,15 +170,12 @@ func _sync_block_destroyed(key: Vector3i) -> void:
 
 func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attacker_id: int) -> void:
 	## Damage blocks within blast_radius of hit_pos. Only blocks in range take damage.
-	## For thick walls (num_z > 1), front blocks shield back blocks:
-	## damage is reduced by LAYER_ABSORPTION for each intact layer between
-	## the blast and the block being checked.
+	## Shielding uses flat HP absorption: each wall block or player between the
+	## explosion and a target block absorbs damage equal to its current HP.
 	if not multiplayer.is_server():
 		return
 
-	# Determine the blast direction in local space for layered shielding.
-	var local_blast: Vector3 = global_transform.affine_inverse() * hit_pos
-	var blast_from_high_z: bool = local_blast.z > 0.0
+	var space_state := get_world_3d().direct_space_state
 
 	var debris_spawned := 0
 	var destroyed_keys: Array[Vector3i] = []
@@ -203,11 +196,13 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		var falloff: float = clampf(1.0 - (dist / blast_radius), 0.0, 1.0)
 		var dmg: float = amount * falloff
 
-		# --- Layered shielding ---
-		if _num_z > 1:
-			var shields := _count_shielding_layers(key.x, key.y, key.z, blast_from_high_z)
-			if shields > 0:
-				dmg *= pow(1.0 - LAYER_ABSORPTION, shields)
+		# --- Flat HP shielding: raycast from explosion to this block ---
+		# Sum the HP of everything between the explosion and this block
+		if space_state and dist > 0.3:
+			var absorbed: float = ExplosionHelper.calc_ray_shielding(
+				space_state, hit_pos, block_world_pos, [block_body.get_rid()], block_body
+			)
+			dmg = maxf(dmg - absorbed, 0.0)
 
 		if dmg < 0.5:
 			continue
@@ -233,20 +228,6 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	# If all blocks gone, remove the wall node entirely
 	if _blocks.is_empty():
 		queue_free()
-
-
-func _count_shielding_layers(bx: int, by: int, bz: int, blast_from_high_z: bool) -> int:
-	## Count how many intact blocks in the same column are between bz and the blast.
-	var count := 0
-	if blast_from_high_z:
-		for z in range(bz + 1, _num_z):
-			if _blocks.has(Vector3i(bx, by, z)):
-				count += 1
-	else:
-		for z in range(0, bz):
-			if _blocks.has(Vector3i(bx, by, z)):
-				count += 1
-	return count
 
 
 func _spawn_debris(block_pos: Vector3, blast_center: Vector3, count: int) -> void:
