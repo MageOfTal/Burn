@@ -35,6 +35,7 @@ var action_shoot := false  ## Left-click: fire weapon
 var action_slide := false  ## Shift: slide/crouch
 var action_aim := false    ## Right-click: ADS
 var action_ctrl := false   ## Ctrl: suppress grapple release boost
+var action_forfeit := false  ## P: hold to forfeit (self-kill after 3s)
 
 ## Inventory UI state — when open, gameplay inputs are suppressed and mouse is freed.
 var inventory_open := false
@@ -118,6 +119,7 @@ func _physics_process(_delta: float) -> void:
 	if has_node("/root/PauseMenu") and get_node("/root/PauseMenu").is_open:
 		input_direction = Vector2.ZERO
 		action_shoot = false
+		action_forfeit = false
 		_mouse_delta = Vector2.ZERO
 		return
 
@@ -127,6 +129,7 @@ func _physics_process(_delta: float) -> void:
 		action_shoot = false
 		action_slide = false
 		action_aim = false
+		action_forfeit = false
 		_mouse_delta = Vector2.ZERO
 		return
 
@@ -144,6 +147,7 @@ func _physics_process(_delta: float) -> void:
 		action_shoot = false
 		action_slide = false
 		action_aim = false
+		action_forfeit = false
 		return
 
 	# Movement
@@ -154,6 +158,7 @@ func _physics_process(_delta: float) -> void:
 	action_slide = Input.is_action_pressed("slide")
 	action_aim = Input.is_action_pressed("aim")
 	action_ctrl = Input.is_key_pressed(KEY_CTRL)
+	action_forfeit = Input.is_action_pressed("forfeit")
 
 	# One-shot actions — increment counter on press (never reset to 0)
 	if Input.is_action_just_pressed("jump"):

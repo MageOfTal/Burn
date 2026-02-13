@@ -69,44 +69,45 @@ func _physics_process(delta: float) -> void:
 		return
 	if multiplayer.multiplayer_peer == null:
 		return
-	if not multiplayer.is_server():
-		return
-	if zone_phase < 0 or zone_phase >= ZONE_PHASES.size():
-		# All phases complete — zone stays at final size, keep damaging
+
+	# Zone shrink logic runs on ALL peers (deterministic, time-based).
+	# This keeps zone_radius in sync so the visual ring shrinks on clients too.
+	if zone_phase >= 0 and zone_phase < ZONE_PHASES.size():
+		# --- Wait phase: countdown to next shrink ---
+		if not is_shrinking:
+			next_shrink_time -= delta
+			if next_shrink_time <= 0.0:
+				# Start shrinking
+				var phase: Dictionary = ZONE_PHASES[zone_phase]
+				target_radius = _initial_radius * phase["target_pct"]
+				var shrink_time: float = phase["shrink_time"]
+				shrink_speed = (zone_radius - target_radius) / maxf(shrink_time, 0.1)
+				is_shrinking = true
+				if multiplayer.is_server():
+					print("[ZoneManager] Phase %d: shrinking %.0f → %.0f over %.0fs" % [
+						zone_phase, zone_radius, target_radius, shrink_time])
+
+		# --- Shrink phase: reduce radius ---
+		if is_shrinking:
+			zone_radius -= shrink_speed * delta
+			if zone_radius <= target_radius:
+				zone_radius = target_radius
+				is_shrinking = false
+				shrink_speed = 0.0
+				zone_phase += 1
+				# Start next phase wait timer
+				if zone_phase < ZONE_PHASES.size():
+					next_shrink_time = ZONE_PHASES[zone_phase]["wait"]
+					if multiplayer.is_server():
+						print("[ZoneManager] Phase %d complete. Next shrink in %.0fs" % [
+							zone_phase - 1, next_shrink_time])
+				else:
+					if multiplayer.is_server():
+						print("[ZoneManager] All phases complete. Zone at final radius: %.0f" % zone_radius)
+
+	# --- Damage players outside the zone (server-only) ---
+	if multiplayer.is_server():
 		_damage_outside_players(delta)
-		return
-
-	# --- Wait phase: countdown to next shrink ---
-	if not is_shrinking:
-		next_shrink_time -= delta
-		if next_shrink_time <= 0.0:
-			# Start shrinking
-			var phase: Dictionary = ZONE_PHASES[zone_phase]
-			target_radius = _initial_radius * phase["target_pct"]
-			var shrink_time: float = phase["shrink_time"]
-			shrink_speed = (zone_radius - target_radius) / maxf(shrink_time, 0.1)
-			is_shrinking = true
-			print("[ZoneManager] Phase %d: shrinking %.0f → %.0f over %.0fs" % [
-				zone_phase, zone_radius, target_radius, shrink_time])
-
-	# --- Shrink phase: reduce radius ---
-	if is_shrinking:
-		zone_radius -= shrink_speed * delta
-		if zone_radius <= target_radius:
-			zone_radius = target_radius
-			is_shrinking = false
-			shrink_speed = 0.0
-			zone_phase += 1
-			# Start next phase wait timer
-			if zone_phase < ZONE_PHASES.size():
-				next_shrink_time = ZONE_PHASES[zone_phase]["wait"]
-				print("[ZoneManager] Phase %d complete. Next shrink in %.0fs" % [
-					zone_phase - 1, next_shrink_time])
-			else:
-				print("[ZoneManager] All phases complete. Zone at final radius: %.0f" % zone_radius)
-
-	# --- Damage players outside the zone ---
-	_damage_outside_players(delta)
 
 
 func _damage_outside_players(delta: float) -> void:

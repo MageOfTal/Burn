@@ -137,6 +137,9 @@ properties/12/replication_mode = 1
 properties/13/path = NodePath("PlayerInput:slot_select")
 properties/13/spawn = true
 properties/13/replication_mode = 1
+properties/14/path = NodePath("PlayerInput:action_forfeit")
+properties/14/spawn = true
+properties/14/replication_mode = 1
 
 [node name="Player" type="CharacterBody3D"]
 collision_mask = 17

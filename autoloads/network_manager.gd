@@ -660,6 +660,11 @@ func _start_match() -> void:
 	GameManager.change_state(GameManager.GameState.PLAYING)
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
+	# Start zone on ALL peers (deterministic shrink runs on both server + client)
+	var map := get_tree().current_scene
+	if map and map.has_method("_start_zone"):
+		map._start_zone()
+
 	if multiplayer.is_server():
 		# Spawn all lobby players
 		for peer_id in _lobby_ready_peers:
@@ -674,15 +679,12 @@ func _start_match() -> void:
 		_spawn_bots()
 
 		# Spawn demo items
-		var map := get_tree().current_scene
 		if map and map.has_method("_spawn_demo_items"):
 			map._spawn_demo_items()
 		if map and map.has_method("spawn_lemon_shapes"):
 			map.spawn_lemon_shapes()
 
-		# Start zone and burn clock
-		if map and map.has_method("_start_zone"):
-			map._start_zone()
+		# Start burn clock
 		var burn_clock := get_node_or_null("/root/BurnClock")
 		if burn_clock and burn_clock.has_method("start"):
 			burn_clock.start()

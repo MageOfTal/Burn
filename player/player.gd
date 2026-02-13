@@ -62,6 +62,10 @@ var _last_slot := 0
 ## _server_process() and read by subsystems (slide_crouch_system, etc.)
 var _frame_jump := false
 
+## Forfeit (hold P to self-kill)
+var _forfeit_hold_time := 0.0
+const FORFEIT_DURATION := 3.0
+
 ## Synced weapon visual paths — clients use these to load 3D model + sound
 var equipped_gun_model_path: String = ""
 var equipped_fire_sound_path: String = ""
@@ -248,6 +252,16 @@ func _server_process(delta: float) -> void:
 			_do_respawn()
 		return
 
+	# --- Forfeit: hold P for 3 seconds to self-kill ---
+	if player_input.action_forfeit:
+		_forfeit_hold_time += delta
+		if _forfeit_hold_time >= FORFEIT_DURATION:
+			_forfeit_hold_time = 0.0
+			die(peer_id)
+			return
+	else:
+		_forfeit_hold_time = 0.0
+
 	# Fall-through-ground safety (skip in Toad Dimension at Y=-500)
 	if global_position.y < -50.0 and not in_toad_dimension:
 		_do_respawn()
@@ -359,6 +373,8 @@ func _server_process(delta: float) -> void:
 				if cons_data.consumable_effect == 0:  # KAMIKAZE_MISSILE
 					kamikaze_system.activate()
 					inventory.remove_item(inventory.equipped_index)
+				elif cons_data.consumable_effect == 1:  # MEDKIT
+					_process_medkit_heal()
 
 	# ADS state: server tracks whether the player is aiming
 	var w_data: WeaponData = current_weapon.weapon_data if current_weapon else null
@@ -367,6 +383,16 @@ func _server_process(delta: float) -> void:
 	# Combat: shooting (damage scaled by heat)
 	if player_input.action_shoot and current_weapon != null and current_weapon.can_fire():
 		_process_combat()
+
+
+func _process_medkit_heal() -> void:
+	## Server-only: heal 1 HP per frame, costing 5 fuel per frame.
+	var effective_max_hp: float = MAX_HEALTH + heat_system.get_health_bonus()
+	if health >= effective_max_hp:
+		return
+	if not inventory.spend_fuel_silent(5.0):
+		return
+	health = minf(health + 1.0, effective_max_hp)
 
 
 func _process_combat() -> void:
@@ -747,6 +773,9 @@ func die(killer_id: int) -> void:
 		if killer_id == -1:
 			# Zone kill
 			feed_text = "{P:%d} [color=orange]died to the zone[/color]" % peer_id
+		elif killer_id == peer_id:
+			# Self-kill (forfeit)
+			feed_text = "{P:%d} [color=gray]gave up[/color]" % peer_id
 		else:
 			var weapon_name := ""
 			if players_container:
@@ -818,6 +847,7 @@ func _do_respawn() -> void:
 	_last_extend = player_input.extend_count
 	_last_scrap = player_input.scrap_count
 	_last_slot = player_input.slot_count
+	_forfeit_hold_time = 0.0
 
 	print("Player %d respawned" % peer_id)
 

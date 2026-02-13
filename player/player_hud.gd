@@ -38,6 +38,16 @@ const KILL_FEED_FADE_TIME := 1.5
 ## Victory screen overlay
 var _victory_overlay: Control = null
 
+## Forfeit progress ring
+var _forfeit_ring: Control = null
+var _forfeit_label: Label = null
+var _forfeit_hold_time: float = 0.0
+const FORFEIT_DURATION := 3.0
+
+## Demon proximity red vignette
+var _demon_vignette: ColorRect = null
+var _demon_vignette_material: ShaderMaterial = null
+
 # ======================================================================
 #  Compass strip
 # ======================================================================
@@ -113,6 +123,12 @@ func setup(player: CharacterBody3D) -> void:
 	# Build kill feed container (left side, below stats)
 	_create_kill_feed()
 
+	# Forfeit progress ring (center of screen, hidden by default)
+	_create_forfeit_ring()
+
+	# Demon proximity vignette (behind all other HUD elements)
+	_create_demon_vignette()
+
 
 func _process(_delta: float) -> void:
 	if _player == null:
@@ -126,6 +142,8 @@ func _process(_delta: float) -> void:
 	_update_zone_display()
 	_update_compass()
 	_handle_marker_input()
+	_update_forfeit_ring()
+	_update_demon_vignette()
 
 
 func _update_health() -> void:
@@ -658,3 +676,128 @@ func _handle_marker_input() -> void:
 		_player_marker_pos = Vector3.INF
 	else:
 		_player_marker_pos = new_pos
+
+
+# ======================================================================
+#  Forfeit progress ring (hold P to self-kill)
+# ======================================================================
+
+func _create_forfeit_ring() -> void:
+	_forfeit_ring = Control.new()
+	_forfeit_ring.set_anchors_preset(Control.PRESET_CENTER)
+	_forfeit_ring.offset_left = -50
+	_forfeit_ring.offset_right = 50
+	_forfeit_ring.offset_top = -50
+	_forfeit_ring.offset_bottom = 50
+	_forfeit_ring.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_forfeit_ring.visible = false
+	_forfeit_ring.draw.connect(_draw_forfeit_ring)
+	add_child(_forfeit_ring)
+
+	_forfeit_label = Label.new()
+	_forfeit_label.text = "FORFEIT"
+	_forfeit_label.add_theme_font_size_override("font_size", 16)
+	_forfeit_label.add_theme_color_override("font_color", Color(1.0, 0.3, 0.2, 0.9))
+	_forfeit_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_forfeit_label.set_anchors_preset(Control.PRESET_CENTER)
+	_forfeit_label.offset_top = 55
+	_forfeit_label.offset_bottom = 75
+	_forfeit_label.offset_left = -50
+	_forfeit_label.offset_right = 50
+	_forfeit_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_forfeit_label.visible = false
+	add_child(_forfeit_label)
+
+
+func _update_forfeit_ring() -> void:
+	if _player == null or _forfeit_ring == null:
+		return
+	var pi: Node = _player.get_node_or_null("PlayerInput")
+	if pi == null:
+		return
+
+	if pi.action_forfeit and _player.is_alive:
+		_forfeit_hold_time += get_process_delta_time()
+		_forfeit_ring.visible = true
+		_forfeit_label.visible = true
+		_forfeit_ring.queue_redraw()
+	else:
+		if _forfeit_hold_time > 0.0:
+			_forfeit_hold_time = 0.0
+			_forfeit_ring.visible = false
+			_forfeit_label.visible = false
+
+
+func _draw_forfeit_ring() -> void:
+	if _forfeit_hold_time <= 0.0:
+		return
+	var center := _forfeit_ring.size / 2.0
+	var radius := 40.0
+	var width := 4.0
+	var progress := clampf(_forfeit_hold_time / FORFEIT_DURATION, 0.0, 1.0)
+
+	# Background ring (dark grey, full circle)
+	_forfeit_ring.draw_arc(center, radius, 0.0, TAU, 64, Color(0.3, 0.3, 0.3, 0.5), width)
+
+	# Progress arc (red, fills clockwise from top)
+	var start_angle := -PI / 2.0
+	var end_angle := start_angle + TAU * progress
+	var color := Color(1.0, 0.2, 0.1, 0.9)
+	if progress > 0.8:
+		color = Color(1.0, 0.0, 0.0, 1.0)
+	_forfeit_ring.draw_arc(center, radius, start_angle, end_angle, 64, color, width)
+
+
+# ======================================================================
+#  Demon proximity red vignette
+# ======================================================================
+
+func _create_demon_vignette() -> void:
+	_demon_vignette = ColorRect.new()
+	_demon_vignette.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_demon_vignette.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_demon_vignette.visible = false
+
+	var shader := Shader.new()
+	shader.code = "shader_type canvas_item;\n\nuniform float intensity : hint_range(0.0, 1.0) = 0.0;\n\nvoid fragment() {\n\tvec2 uv_centered = UV - vec2(0.5);\n\tfloat dist = length(uv_centered) * 2.0;\n\tfloat vignette = smoothstep(0.3, 1.2, dist);\n\tfloat alpha = vignette * intensity * 0.7;\n\tCOLOR = vec4(0.8, 0.0, 0.0, alpha);\n}\n"
+
+	_demon_vignette_material = ShaderMaterial.new()
+	_demon_vignette_material.shader = shader
+	_demon_vignette_material.set_shader_parameter("intensity", 0.0)
+	_demon_vignette.material = _demon_vignette_material
+
+	# Add as first child so it renders behind all other HUD elements
+	add_child(_demon_vignette)
+	move_child(_demon_vignette, 0)
+
+
+func _update_demon_vignette() -> void:
+	if _demon_vignette == null or _demon_vignette_material == null or _player == null:
+		return
+
+	var demon_sys: Node = _player.get_node_or_null("DemonSystem")
+	if demon_sys == null or not demon_sys.demon_active or demon_sys.is_eliminated:
+		_demon_vignette.visible = false
+		return
+
+	if not _player.is_alive:
+		_demon_vignette.visible = false
+		return
+
+	var distance: float = _player.global_position.distance_to(demon_sys.demon_position)
+	var speed: float = demon_sys.demon_speed
+
+	if speed <= 0.01:
+		_demon_vignette.visible = false
+		return
+
+	var time_to_reach: float = distance / speed
+	var threshold := 3.0
+
+	if time_to_reach >= threshold:
+		_demon_vignette.visible = false
+		return
+
+	var vignette_intensity: float = clampf(1.0 - (time_to_reach / threshold), 0.0, 1.0)
+	_demon_vignette_material.set_shader_parameter("intensity", vignette_intensity)
+	_demon_vignette.visible = true

@@ -22,6 +22,7 @@ const DEMO_SPAWN_TABLE: Array[Dictionary] = [
 	{ "path": "res://items/definitions/weapon_toad_staff.tres",           "offset": Vector3(0, 0, -3) },
 	{ "path": "res://items/definitions/consumable_kamikaze_missile.tres", "offset": Vector3(4, 0, 0) },
 	{ "path": "res://items/definitions/gadget_grappling_hook.tres",       "offset": Vector3(-4, 0, 0) },
+	{ "path": "res://items/definitions/consumable_medkit.tres",          "offset": Vector3(5, 0, 0) },
 ]
 
 ## Zone visual

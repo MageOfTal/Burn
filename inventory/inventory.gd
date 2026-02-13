@@ -208,6 +208,17 @@ func has_fuel(amount: float) -> bool:
 	return burn_fuel >= amount
 
 
+func spend_fuel_silent(amount: float) -> bool:
+	## Spend fuel without triggering full inventory sync RPC.
+	## Used for high-frequency fuel drains (medkit healing) since burn_fuel
+	## is already replicated via ServerSync.
+	if burn_fuel < amount:
+		return false
+	burn_fuel -= amount
+	fuel_changed.emit(burn_fuel)
+	return true
+
+
 # ======================================================================
 #  Utility
 # ======================================================================

@@ -1,0 +1,16 @@
+[gd_resource type="Resource" script_class="ConsumableData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/consumable_data.gd" id="1_script"]
+
+[resource]
+script = ExtResource("1_script")
+item_name = "Medkit"
+item_type = 1
+rarity = 2
+description = "Hold fire to heal. Costs 5 burn fuel per tick."
+base_burn_rate = 0.4
+initial_burn_time = 90.0
+burn_cost_to_extend = 1.5
+time_currency_value = 10.0
+mesh_color = Color(0.2, 1.0, 0.3, 1.0)
+consumable_effect = 1
