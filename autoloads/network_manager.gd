@@ -46,9 +46,14 @@ var _loading_hide_countdown: int = -1
 
 ## Lobby state
 var _lobby_ready_peers: Array[int] = []  ## Peers who loaded the map and are in the lobby
+var _waiting_peers: Array[int] = []      ## Peers waiting in lobby while a match is in progress
 var _lobby_screen: CanvasLayer = null
 var _lobby_player_list_label: Label = null
 var _lobby_start_button: Button = null
+var _lobby_match_status_label: Label = null  ## Shows in-game players + match timer
+var _match_status_timer: float = 0.0         ## Timer for periodic match status updates
+var _lobby_in_game_names: PackedStringArray = []  ## Names of players currently in-game (client)
+var _lobby_match_elapsed: float = 0.0             ## Match elapsed time (client, from server)
 
 
 func _ready() -> void:
@@ -66,6 +71,18 @@ func _process(delta: float) -> void:
 	elif _loading_hide_countdown == 0:
 		_loading_hide_countdown = -1
 		_hide_loading_screen()
+
+	# --- Server: send match status updates to waiting lobby peers every 2s ---
+	if is_server and GameManager.current_state == GameManager.GameState.PLAYING and _waiting_peers.size() > 0:
+		_match_status_timer += delta
+		if _match_status_timer >= 2.0:
+			_match_status_timer = 0.0
+			_send_match_status_to_waiting_peers()
+
+	# --- Client: update live match timer on lobby screen ---
+	if _lobby_match_status_label != null and _lobby_match_elapsed > 0.0:
+		_lobby_match_elapsed += delta
+		_update_match_status_display()
 
 	if not _is_connecting:
 		return
@@ -224,6 +241,9 @@ func disconnect_game() -> void:
 	is_server = false
 	players.clear()
 	_lobby_ready_peers.clear()
+	_waiting_peers.clear()
+	_lobby_in_game_names = PackedStringArray()
+	_lobby_match_elapsed = 0.0
 	GameManager.clear_usernames()
 
 	# Reset autoloads so they stop ticking without a multiplayer peer
@@ -384,8 +404,9 @@ func _on_peer_disconnected(peer_id: int) -> void:
 	print("[Net] ======== Peer disconnected: %d ========" % peer_id)
 	print("[Net]   was in players dict: %s" % str(players.has(peer_id)))
 	if is_server:
-		# Remove from lobby or despawn depending on game state
+		# Remove from lobby, waiting list, and usernames
 		_lobby_ready_peers.erase(peer_id)
+		_waiting_peers.erase(peer_id)
 		GameManager.player_usernames.erase(peer_id)
 		if GameManager.current_state == GameManager.GameState.LOBBY:
 			# In lobby — just update the player list (no player to despawn)
@@ -526,9 +547,18 @@ func _client_ready(client_version: String = "") -> void:
 		_update_lobby_player_list.rpc(_lobby_ready_peers.duplicate())
 		_refresh_lobby_player_list()
 	else:
-		# Game already running (late join) — spawn immediately
-		print("[Server] Game already running — spawning peer %d immediately" % sender_id)
-		_spawn_player(sender_id)
+		# Game in progress — put them in waiting lobby, don't spawn
+		if sender_id not in _lobby_ready_peers:
+			_lobby_ready_peers.append(sender_id)
+		if sender_id not in _waiting_peers:
+			_waiting_peers.append(sender_id)
+		print("[Server] Game in progress — peer %d added to waiting lobby" % sender_id)
+		# Tell the client they're in the waiting lobby
+		_rpc_enter_waiting_lobby.rpc_id(sender_id)
+		# Send them current match status immediately
+		_send_match_status_to_peer(sender_id)
+		# Broadcast updated username list so waiting peer sees everyone
+		_sync_all_usernames.rpc(_serialize_usernames())
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -566,6 +596,64 @@ func _rpc_server_version(server_version: String) -> void:
 		connection_failed.emit()
 	else:
 		print("[Client] Server version matches: %s" % server_version)
+
+
+# ======================================================================
+#  Waiting Lobby (mid-game join — spectate from lobby)
+# ======================================================================
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_enter_waiting_lobby() -> void:
+	## Client receives: game is in progress, you're in the waiting lobby.
+	print("[Client] Game in progress — entering waiting lobby")
+
+
+func _send_match_status_to_waiting_peers() -> void:
+	## Server-only: send match status to all waiting peers.
+	var in_game_names := PackedStringArray()
+	for peer_id in players:
+		if peer_id >= BOT_PEER_ID_START:
+			continue  # Skip bots in the display
+		in_game_names.append(GameManager.get_username(peer_id))
+	var elapsed := GameManager.match_time_elapsed
+	for peer_id in _waiting_peers:
+		_rpc_match_status.rpc_id(peer_id, in_game_names, elapsed)
+
+
+func _send_match_status_to_peer(peer_id: int) -> void:
+	## Server-only: send match status to a specific peer.
+	var in_game_names := PackedStringArray()
+	for pid in players:
+		if pid >= BOT_PEER_ID_START:
+			continue
+		in_game_names.append(GameManager.get_username(pid))
+	_rpc_match_status.rpc_id(peer_id, in_game_names, GameManager.match_time_elapsed)
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_match_status(in_game_names: PackedStringArray, elapsed: float) -> void:
+	## Client receives: current match status from server.
+	_lobby_in_game_names = in_game_names
+	_lobby_match_elapsed = elapsed
+	_update_match_status_display()
+
+
+func _update_match_status_display() -> void:
+	## Update the match status label on the lobby screen.
+	if _lobby_match_status_label == null:
+		return
+	var mins := int(_lobby_match_elapsed) / 60
+	var secs := int(_lobby_match_elapsed) % 60
+	var lines: PackedStringArray = []
+	lines.append("Match in progress — %d:%02d" % [mins, secs])
+	lines.append("")
+	if _lobby_in_game_names.size() > 0:
+		lines.append("In-Game Players:")
+		for pname in _lobby_in_game_names:
+			lines.append("  %s  (In Game)" % pname)
+	else:
+		lines.append("No players currently in-game")
+	_lobby_match_status_label.text = "\n".join(lines)
 
 
 # ======================================================================
@@ -630,19 +718,38 @@ func _show_lobby_ui() -> void:
 
 	# Spacer
 	var spacer := Control.new()
-	spacer.custom_minimum_size = Vector2(0, 20)
+	spacer.custom_minimum_size = Vector2(0, 10)
 	center.add_child(spacer)
+
+	# Match status section (shown when a game is in progress)
+	_lobby_match_status_label = Label.new()
+	_lobby_match_status_label.text = ""
+	_lobby_match_status_label.add_theme_font_size_override("font_size", 16)
+	_lobby_match_status_label.add_theme_color_override("font_color", Color(1.0, 0.5, 0.3))
+	_lobby_match_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD
+	center.add_child(_lobby_match_status_label)
+	# Initialize display if we already have match data
+	if _lobby_match_elapsed > 0.0:
+		_update_match_status_display()
 
 	center.add_child(HSeparator.new())
 
 	# Start button (host only) or waiting text (clients)
-	if is_server:
+	var is_match_in_progress := GameManager.current_state == GameManager.GameState.PLAYING
+	if is_server and not is_match_in_progress:
 		_lobby_start_button = Button.new()
 		_lobby_start_button.text = "Start Game"
 		_lobby_start_button.custom_minimum_size = Vector2(200, 50)
 		_lobby_start_button.add_theme_font_size_override("font_size", 20)
 		_lobby_start_button.pressed.connect(_on_lobby_start_pressed)
 		center.add_child(_lobby_start_button)
+	elif is_match_in_progress:
+		var waiting := Label.new()
+		waiting.text = "Waiting for current match to end..."
+		waiting.add_theme_font_size_override("font_size", 18)
+		waiting.add_theme_color_override("font_color", Color(1.0, 0.7, 0.3))
+		waiting.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		center.add_child(waiting)
 	else:
 		var waiting := Label.new()
 		waiting.text = "Waiting for host to start..."
@@ -665,6 +772,7 @@ func _hide_lobby_ui() -> void:
 		_lobby_screen = null
 		_lobby_player_list_label = null
 		_lobby_start_button = null
+		_lobby_match_status_label = null
 
 
 func _refresh_lobby_player_list() -> void:
@@ -819,18 +927,23 @@ func reset_game() -> void:
 		if peer_id >= BOT_PEER_ID_START:
 			GameManager.player_usernames.erase(peer_id)
 
-	# 9. Rebuild lobby peer list from currently connected peers
+	# 9. Rebuild lobby peer list from currently connected peers (includes former waiting peers)
 	_lobby_ready_peers.clear()
 	_lobby_ready_peers.append(1)  # Host
 	for peer_id in multiplayer.get_peers():
 		if peer_id not in _lobby_ready_peers:
 			_lobby_ready_peers.append(peer_id)
+	_waiting_peers.clear()
+	_lobby_in_game_names = PackedStringArray()
+	_lobby_match_elapsed = 0.0
 
 	# 10. Change state to LOBBY
 	GameManager.change_state(GameManager.GameState.LOBBY)
 
-	# 11. Show lobby on host
+	# 11. Show lobby on host + notify all clients to refresh their lobby
 	_show_lobby_ui()
+	_sync_all_usernames.rpc(_serialize_usernames())
+	_update_lobby_player_list.rpc(_lobby_ready_peers.duplicate())
 	print("[Server] Reset complete. Back in lobby with %d peers." % _lobby_ready_peers.size())
 
 
@@ -854,6 +967,10 @@ func _rpc_reset_to_lobby() -> void:
 		await seed_world.reset_world()
 		seed_world._spawn_heavy_structures()
 		# Don't block lobby UI on structure rebuilding — it happens in background
+
+	# Clear match status data (match is over)
+	_lobby_in_game_names = PackedStringArray()
+	_lobby_match_elapsed = 0.0
 
 	# Release mouse so lobby UI is interactive
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
