@@ -155,6 +155,17 @@ func _process(delta: float) -> void:
 	_update_prompt(delta)
 
 
+func reset_chest() -> void:
+	## Reset chest to closed + full state (used on game reset).
+	## Works on both server and client.
+	is_open = false
+	refill_timer = 0.0
+	_loot_items.clear()
+	if multiplayer.is_server():
+		_generate_loot()
+		_sync_state.rpc(false, 0.0)
+
+
 func _refill() -> void:
 	## Server-only: refill chest and close it.
 	_generate_loot()

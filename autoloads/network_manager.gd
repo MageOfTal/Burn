@@ -712,13 +712,16 @@ func reset_game() -> void:
 			player_node.queue_free()
 	players.clear()
 
-	# 3. Clear world items and projectiles
+	# 3. Clear world items (but not loot chests) and projectiles
 	var map := get_tree().current_scene
 	if map:
 		var world_items := map.get_node_or_null("WorldItems")
 		if world_items:
 			for child in world_items.get_children():
-				child.queue_free()
+				if child is LootChest:
+					child.reset_chest()
+				else:
+					child.queue_free()
 		var projectiles := map.get_node_or_null("Projectiles")
 		if projectiles:
 			for child in projectiles.get_children():
@@ -768,6 +771,14 @@ func reset_game() -> void:
 @rpc("authority", "call_remote", "reliable")
 func _rpc_reset_to_lobby() -> void:
 	## Client receives: game is being reset, clean up and show lobby.
+	# Reset chests on client side so they appear closed and full again
+	var map := get_tree().current_scene
+	if map:
+		var world_items := map.get_node_or_null("WorldItems")
+		if world_items:
+			for child in world_items.get_children():
+				if child is LootChest:
+					child.reset_chest()
 	# Release mouse so lobby UI is interactive
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	GameManager.change_state(GameManager.GameState.LOBBY)
