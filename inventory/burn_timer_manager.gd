@@ -32,8 +32,10 @@ func _physics_process(delta: float) -> void:
 	var global_mult: float = _burn_clock.get_burn_multiplier() if _burn_clock else 1.0
 	var heat_mult: float = heat_system.get_burn_rate_multiplier() if heat_system else 1.0
 
-	# Decrement all item timers
-	for stack: ItemStack in inventory.items:
+	# Decrement all item timers (skip null slots)
+	for stack in inventory.items:
+		if stack == null:
+			continue
 		stack.burn_time_remaining -= stack.item_data.base_burn_rate * global_mult * heat_mult * delta
 
 	# Remove expired items (this calls _notify_sync internally)

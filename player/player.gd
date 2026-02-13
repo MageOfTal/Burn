@@ -275,7 +275,7 @@ func _server_process(delta: float) -> void:
 	# --- Grapple: feed shoot input for fire/release toggle ---
 	# Must run BEFORE the grapple state machine so release is detected same frame
 	if current_weapon == null and inventory:
-		if inventory.equipped_index >= 0 and inventory.equipped_index < inventory.items.size():
+		if inventory.equipped_index >= 0 and inventory.equipped_index < inventory.items.size() and inventory.items[inventory.equipped_index] != null:
 			var eq_grapple: ItemStack = inventory.items[inventory.equipped_index]
 			if eq_grapple.item_data is GadgetData and (eq_grapple.item_data as GadgetData).gadget_type == 0:
 				grapple_system.handle_shoot_input(player_input.action_shoot)
@@ -338,7 +338,7 @@ func _server_process(delta: float) -> void:
 	# Weapon slot switching (1-6)
 	if wants_slot:
 		var slot_idx: int = player_input.slot_select - 1
-		if inventory and slot_idx < inventory.items.size():
+		if inventory and slot_idx < inventory.items.size() and inventory.items[slot_idx] != null:
 			inventory.equip_slot(slot_idx)
 			var stack: ItemStack = inventory.items[slot_idx]
 			if stack.item_data is WeaponData:
@@ -366,7 +366,7 @@ func _server_process(delta: float) -> void:
 
 	# --- Consumable activation: shoot while a consumable is equipped ---
 	if player_input.action_shoot and current_weapon == null and inventory:
-		if inventory.equipped_index >= 0 and inventory.equipped_index < inventory.items.size():
+		if inventory.equipped_index >= 0 and inventory.equipped_index < inventory.items.size() and inventory.items[inventory.equipped_index] != null:
 			var eq_stack: ItemStack = inventory.items[inventory.equipped_index]
 			if eq_stack.item_data is ConsumableData:
 				var cons_data: ConsumableData = eq_stack.item_data as ConsumableData
@@ -402,7 +402,7 @@ func _process_combat() -> void:
 	# Calculate fuel cost
 	var fuel_cost: float = current_weapon.weapon_data.burn_fuel_cost
 	var equipped_stack: ItemStack = null
-	if inventory and inventory.equipped_index >= 0 and inventory.equipped_index < inventory.items.size():
+	if inventory and inventory.equipped_index >= 0 and inventory.equipped_index < inventory.items.size() and inventory.items[inventory.equipped_index] != null:
 		equipped_stack = inventory.items[inventory.equipped_index]
 		if equipped_stack and equipped_stack.slotted_ammo:
 			fuel_cost += equipped_stack.slotted_ammo.ammo_burn_cost_per_shot
@@ -972,7 +972,7 @@ func rpc_equip_from_inventory(index: int) -> void:
 		return
 	if multiplayer.get_remote_sender_id() != peer_id:
 		return
-	if inventory and index >= 0 and index < inventory.items.size():
+	if inventory and index >= 0 and index < inventory.items.size() and inventory.items[index] != null:
 		var stack: ItemStack = inventory.items[index]
 		if stack.item_data is WeaponData:
 			inventory.equip_slot(index)
@@ -1000,6 +1000,8 @@ func rpc_slot_ammo(ammo_index: int, weapon_index: int) -> void:
 
 	var ammo_stack: ItemStack = inventory.items[ammo_index]
 	var weapon_stack: ItemStack = inventory.items[weapon_index]
+	if ammo_stack == null or weapon_stack == null:
+		return
 
 	var valid_ammo: bool = ammo_stack.item_data is WeaponData and ammo_stack.item_data.can_slot_as_ammo
 	if not valid_ammo:
@@ -1021,8 +1023,6 @@ func rpc_slot_ammo(ammo_index: int, weapon_index: int) -> void:
 
 	print("Player %d merged %s into %s (timer: %.0fs)" % [peer_id, ammo_stack.item_data.item_name, weapon_stack.item_data.item_name, merged_time])
 
-	if ammo_index < weapon_index:
-		weapon_index -= 1
 	inventory.remove_item(ammo_index)
 
 

@@ -2,12 +2,14 @@ extends Node
 class_name Inventory
 
 ## Manages 6 weapon slots for one player.
+## Slots use null for empty positions — items stay in their slot when others expire.
 ## All mutations happen on the server. Clients receive full-state sync via RPC.
 
 const MAX_SLOTS := 6
 const STARTING_FUEL := 1000.0
 
-var items: Array[ItemStack] = []
+## Fixed-size array: null = empty slot, ItemStack = occupied.
+var items: Array = []
 var time_currency: float = 0.0
 var equipped_index: int = -1
 var burn_fuel: float = STARTING_FUEL
@@ -28,15 +30,34 @@ signal shoe_changed
 signal fuel_changed(new_amount: float)
 
 
+## Returns the number of occupied (non-null) slots.
+func get_item_count() -> int:
+	var count := 0
+	for stack in items:
+		if stack != null:
+			count += 1
+	return count
+
+
 # ======================================================================
 #  Core item management
 # ======================================================================
 
 func add_item(item_data: ItemData) -> int:
 	## Add an item to inventory. Returns slot index, or -1 if full.
+	## Fills the first empty (null) slot, or appends if room.
+	# First, look for a null slot
+	for i in items.size():
+		if items[i] == null:
+			var stack := ItemStack.create(item_data)
+			items[i] = stack
+			item_added.emit(i, stack)
+			inventory_changed.emit()
+			_notify_sync()
+			return i
+	# No null slot — append if under max
 	if items.size() >= MAX_SLOTS:
 		return -1
-
 	var stack := ItemStack.create(item_data)
 	items.append(stack)
 	var idx := items.size() - 1
@@ -50,6 +71,8 @@ func equip_slot(index: int) -> void:
 	## Equip the weapon, consumable, or gadget in the given slot.
 	if index < 0 or index >= items.size():
 		return
+	if items[index] == null:
+		return
 	if items[index].item_data is WeaponData or items[index].item_data is ConsumableData or items[index].item_data is GadgetData:
 		equipped_index = index
 		weapon_equipped.emit(index)
@@ -57,13 +80,16 @@ func equip_slot(index: int) -> void:
 
 
 func remove_item(index: int) -> ItemStack:
-	## Remove and return the item at the given index.
+	## Remove the item at the given index (set to null). Returns the removed stack.
 	if index < 0 or index >= items.size():
 		return null
+	if items[index] == null:
+		return null
 
-	var stack := items[index]
-	items.remove_at(index)
-	_adjust_equipped_after_removal(index)
+	var stack: ItemStack = items[index]
+	items[index] = null
+	if equipped_index == index:
+		equipped_index = -1
 	item_removed.emit(index)
 	inventory_changed.emit()
 	_notify_sync()
@@ -78,15 +104,18 @@ func sacrifice_item(sacrifice_index: int, target_index: int) -> bool:
 		return false
 	if target_index < 0 or target_index >= items.size():
 		return false
+	if items[sacrifice_index] == null or items[target_index] == null:
+		return false
 
-	var sacrifice := items[sacrifice_index]
-	var target := items[target_index]
+	var sacrifice: ItemStack = items[sacrifice_index]
+	var target: ItemStack = items[target_index]
 
 	var time_added: float = sacrifice.item_data.time_currency_value / target.item_data.burn_cost_to_extend
 	target.burn_time_remaining += time_added
 
-	items.remove_at(sacrifice_index)
-	_adjust_equipped_after_removal(sacrifice_index)
+	items[sacrifice_index] = null
+	if equipped_index == sacrifice_index:
+		equipped_index = -1
 	item_removed.emit(sacrifice_index)
 	inventory_changed.emit()
 	_notify_sync()
@@ -97,13 +126,16 @@ func convert_to_time_currency(index: int) -> float:
 	## Destroy the item and add its value to the player's time currency.
 	if index < 0 or index >= items.size():
 		return 0.0
+	if items[index] == null:
+		return 0.0
 
-	var stack := items[index]
+	var stack: ItemStack = items[index]
 	var value := stack.item_data.time_currency_value
 	time_currency += value
 
-	items.remove_at(index)
-	_adjust_equipped_after_removal(index)
+	items[index] = null
+	if equipped_index == index:
+		equipped_index = -1
 	item_removed.emit(index)
 	inventory_changed.emit()
 	_notify_sync()
@@ -114,10 +146,12 @@ func spend_time_currency(amount: float, target_index: int) -> bool:
 	## Spend time currency to extend a specific item's burn timer.
 	if target_index < 0 or target_index >= items.size():
 		return false
+	if items[target_index] == null:
+		return false
 	if time_currency < amount:
 		return false
 
-	var target := items[target_index]
+	var target: ItemStack = items[target_index]
 	var time_added := amount / target.item_data.burn_cost_to_extend
 	target.burn_time_remaining += time_added
 	time_currency -= amount
@@ -127,25 +161,28 @@ func spend_time_currency(amount: float, target_index: int) -> bool:
 
 
 func remove_expired_items() -> Array[String]:
-	## Remove all items with burn_time_remaining <= 0. Returns names of removed items.
+	## Null out expired items (they stay in their slot). Returns names of removed items.
 	var expired_names: Array[String] = []
-	var i := items.size() - 1
-	while i >= 0:
-		if items[i].is_expired():
-			expired_names.append(items[i].item_data.item_name)
-			item_expired.emit(i, items[i].item_data.item_name)
+	for i in items.size():
+		if items[i] == null:
+			continue
+		var stack: ItemStack = items[i]
+		if stack.is_expired():
+			expired_names.append(stack.item_data.item_name)
+			item_expired.emit(i, stack.item_data.item_name)
 
 			# Clear ammo references pointing at this item
 			for j in items.size():
+				if items[j] == null:
+					continue
 				if items[j].slotted_ammo_source_index == i:
 					items[j].slotted_ammo = null
 					items[j].slotted_ammo_source_index = -1
-				elif items[j].slotted_ammo_source_index > i:
-					items[j].slotted_ammo_source_index -= 1
 
-			items.remove_at(i)
-			_adjust_equipped_after_removal(i)
-		i -= 1
+			# Null out the slot (items stay in place)
+			items[i] = null
+			if equipped_index == i:
+				equipped_index = -1
 
 	if expired_names.size() > 0:
 		inventory_changed.emit()
@@ -238,16 +275,11 @@ func clear_all() -> void:
 func get_serialized() -> Array:
 	var result: Array = []
 	for stack in items:
-		result.append(stack.serialize())
+		if stack != null:
+			result.append(stack.serialize())
+		else:
+			result.append(null)
 	return result
-
-
-func _adjust_equipped_after_removal(removed_index: int) -> void:
-	## Fix equipped_index after an item is removed from the array.
-	if equipped_index == removed_index:
-		equipped_index = -1
-	elif equipped_index > removed_index:
-		equipped_index -= 1
 
 
 # ======================================================================
@@ -269,16 +301,20 @@ func _notify_sync() -> void:
 
 func _serialize_full_state() -> Dictionary:
 	## Pack full inventory into a serializable Dictionary.
+	## Null slots are serialized with empty path so clients rebuild nulls correctly.
 	var item_list: Array = []
 	for stack in items:
-		item_list.append({
-			"path": stack.item_data.resource_path if stack.item_data else "",
-			"burn": stack.burn_time_remaining,
-			"qty": stack.quantity,
-			"fuel_spent": stack.fuel_spent_extending,
-			"ammo_path": stack.slotted_ammo.resource_path if stack.slotted_ammo else "",
-			"ammo_src": stack.slotted_ammo_source_index,
-		})
+		if stack == null:
+			item_list.append({"path": "", "burn": 0.0, "qty": 0, "fuel_spent": 0.0, "ammo_path": "", "ammo_src": -1})
+		else:
+			item_list.append({
+				"path": stack.item_data.resource_path if stack.item_data else "",
+				"burn": stack.burn_time_remaining,
+				"qty": stack.quantity,
+				"fuel_spent": stack.fuel_spent_extending,
+				"ammo_path": stack.slotted_ammo.resource_path if stack.slotted_ammo else "",
+				"ammo_src": stack.slotted_ammo_source_index,
+			})
 	return {
 		"items": item_list,
 		"equipped": equipped_index,
@@ -292,12 +328,15 @@ func _serialize_full_state() -> Dictionary:
 @rpc("authority", "call_remote", "reliable")
 func _rpc_sync_inventory(state: Dictionary) -> void:
 	## Client-side: rebuild local inventory from server state.
+	## Preserves null slots so items stay in their positions.
 	items.clear()
 	for entry: Dictionary in state["items"]:
 		if entry["path"] == "":
+			items.append(null)  # Empty slot
 			continue
 		var data: ItemData = load(entry["path"])
 		if data == null:
+			items.append(null)
 			continue
 		var stack := ItemStack.create(data)
 		stack.burn_time_remaining = entry["burn"]

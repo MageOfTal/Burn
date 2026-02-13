@@ -115,6 +115,8 @@ func _rebuild_ui() -> void:
 
 	# Draw weapon slots
 	for i in _inventory.items.size():
+		if _inventory.items[i] == null:
+			continue
 		var stack: ItemStack = _inventory.items[i]
 		if not stack.item_data is WeaponData:
 			continue
@@ -127,6 +129,8 @@ func _rebuild_ui() -> void:
 	var ammo_y := start_y
 	var ammo_count := 0
 	for i in _inventory.items.size():
+		if _inventory.items[i] == null:
+			continue
 		var stack: ItemStack = _inventory.items[i]
 		if not (stack.item_data is WeaponData and stack.item_data.can_slot_as_ammo):
 			continue
@@ -299,6 +303,8 @@ func _draw_ammo_item(index: int, stack: ItemStack, x: float, y: float) -> void:
 	# Check if this ammo is already slotted somewhere
 	var slotted_to := ""
 	for i in _inventory.items.size():
+		if _inventory.items[i] == null:
+			continue
 		var s: ItemStack = _inventory.items[i]
 		if s.slotted_ammo_source_index == index:
 			slotted_to = s.item_data.item_name

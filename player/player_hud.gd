@@ -220,7 +220,7 @@ func _update_inventory_display() -> void:
 		var slot_num := i + 1
 		var is_equipped: bool = (i == _inventory.equipped_index)
 
-		if i < _inventory.items.size():
+		if i < _inventory.items.size() and _inventory.items[i] != null:
 			var stack: ItemStack = _inventory.items[i]
 			var time_str := "%ds" % ceili(stack.burn_time_remaining)
 			var rarity_tag: String = RARITY_TAGS[stack.item_data.rarity] if stack.item_data else "?"

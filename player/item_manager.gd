@@ -137,7 +137,7 @@ func try_extend_equipped_item() -> void:
 		return
 
 	var stack: ItemStack = inventory.items[inventory.equipped_index]
-	if stack.item_data == null:
+	if stack == null or stack.item_data == null:
 		return
 
 	# Calculate scaling cost
@@ -176,7 +176,7 @@ func try_scrap_item() -> void:
 		return
 
 	var stack: ItemStack = inventory.items[inventory.equipped_index]
-	if stack.item_data == null:
+	if stack == null or stack.item_data == null:
 		return
 	# Fuel canisters cannot be scrapped
 	if stack.item_data.item_type == ItemData.ItemType.FUEL:
