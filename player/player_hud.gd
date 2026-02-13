@@ -131,7 +131,7 @@ func setup(player: CharacterBody3D) -> void:
 
 
 func _process(_delta: float) -> void:
-	if _player == null:
+	if _player == null or not is_instance_valid(_player):
 		return
 
 	_update_health()
@@ -729,6 +729,8 @@ func _update_forfeit_ring() -> void:
 
 
 func _draw_forfeit_ring() -> void:
+	if _forfeit_ring == null or not is_instance_valid(_forfeit_ring):
+		return
 	if _forfeit_hold_time <= 0.0:
 		return
 	var center := _forfeit_ring.size / 2.0
@@ -774,9 +776,11 @@ func _create_demon_vignette() -> void:
 func _update_demon_vignette() -> void:
 	if _demon_vignette == null or _demon_vignette_material == null or _player == null:
 		return
+	if not is_instance_valid(_player):
+		return
 
 	var demon_sys: Node = _player.get_node_or_null("DemonSystem")
-	if demon_sys == null or not demon_sys.demon_active or demon_sys.is_eliminated:
+	if demon_sys == null or not is_instance_valid(demon_sys) or not demon_sys.demon_active or demon_sys.is_eliminated:
 		_demon_vignette.visible = false
 		return
 

@@ -387,6 +387,8 @@ func _server_process(delta: float) -> void:
 
 func _process_medkit_heal() -> void:
 	## Server-only: heal 1 HP per frame, costing 5 fuel per frame.
+	if heat_system == null or inventory == null:
+		return
 	var effective_max_hp: float = MAX_HEALTH + heat_system.get_health_bonus()
 	if health >= effective_max_hp:
 		return
@@ -616,7 +618,10 @@ func _get_camera_aim_target(cam_origin: Vector3, cam_forward: Vector3) -> Vector
 
 func _push_nearby_bubbles() -> void:
 	## Server-only: push nearby bubbles away from the player using impulses.
-	var projectiles := get_tree().current_scene.get_node_or_null("Projectiles")
+	var scene := get_tree().current_scene
+	if scene == null:
+		return
+	var projectiles := scene.get_node_or_null("Projectiles")
 	if projectiles == null:
 		return
 
@@ -652,9 +657,12 @@ func _push_nearby_bubbles() -> void:
 func _try_open_nearby_chest() -> bool:
 	## Server-only: find the nearest closed LootChest within interact range and open it.
 	## Returns true if a chest was opened, false otherwise.
-	var world_items := get_tree().current_scene.get_node_or_null("WorldItems")
+	var scene := get_tree().current_scene
+	if scene == null:
+		return false
+	var world_items := scene.get_node_or_null("WorldItems")
 	if world_items == null:
-		world_items = get_tree().current_scene
+		world_items = scene
 
 	var best_chest: Node = null
 	var best_dist: float = INF

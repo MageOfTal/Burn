@@ -801,7 +801,10 @@ func broadcast_kill_feed(bbcode_text: String) -> void:
 @rpc("authority", "call_local", "reliable")
 func _rpc_kill_feed(bbcode_text: String) -> void:
 	## All peers: find the local player's HUD and add the entry.
-	var players_node := get_tree().current_scene.get_node_or_null("Players")
+	var scene := get_tree().current_scene
+	if scene == null:
+		return
+	var players_node := scene.get_node_or_null("Players")
 	if players_node == null:
 		return
 	var my_id := multiplayer.get_unique_id()
@@ -874,7 +877,10 @@ func _rpc_victory(winner_id: int, winner_name: String) -> void:
 	## All peers: show victory screen overlay on local player's HUD.
 	# Set game over state on clients too (prevents local damage processing)
 	GameManager.change_state(GameManager.GameState.GAME_OVER)
-	var players_node := get_tree().current_scene.get_node_or_null("Players")
+	var scene := get_tree().current_scene
+	if scene == null:
+		return
+	var players_node := scene.get_node_or_null("Players")
 	if players_node == null:
 		return
 	var my_id := multiplayer.get_unique_id()
