@@ -203,6 +203,62 @@ func _spawn_heavy_structures() -> void:
 	print("[SeedWorld] World generation complete — all structures placed")
 
 
+func reset_world() -> void:
+	## Reset the terrain (clear all crater deformations) and destroy all structures.
+	## Called by network_manager.reset_game() before re-spawning structures.
+	## After calling this, call _spawn_heavy_structures() to rebuild.
+	print("[SeedWorld] ======== RESETTING WORLD ========")
+
+	# --- 1. Clear terrain deformations by replacing VoxelStreamMemory ---
+	# VoxelStreamMemory stores all SDF edits (craters) in RAM. Replacing it
+	# with a fresh instance discards every edit, so the generator's pristine
+	# noise surface is used again when chunks reload.
+	if _voxel_terrain:
+		var fresh_stream := VoxelStreamMemory.new()
+		_voxel_terrain.stream = fresh_stream
+		# Re-acquire the VoxelTool — old one may reference stale data
+		_voxel_tool = _voxel_terrain.get_voxel_tool()
+		print("[SeedWorld] Terrain stream reset (craters cleared)")
+
+	# --- 2. Destroy all structures (walls, ramps, bars, donuts, tower) ---
+	var structures := get_node_or_null("Structures")
+	if structures:
+		# Clear tower reference BEFORE freeing (tower is a child of Structures)
+		_tower = null
+		structures.queue_free()
+		# Wait a frame so the node tree is actually cleaned up
+		await get_tree().process_frame
+		print("[SeedWorld] Structures removed")
+
+	# --- 3. Clean up any leftover topple bodies / chunks in the scene root ---
+	var scene_root := get_tree().current_scene
+	if scene_root:
+		for child in scene_root.get_children():
+			if child.name.begins_with("TowerToppleBody") or child.name.begins_with("TowerChunk"):
+				child.queue_free()
+
+	# --- 4. Reset the Dummies container ---
+	var dummies := get_parent().get_node_or_null("Dummies")
+	if dummies:
+		for child in dummies.get_children():
+			child.queue_free()
+
+	# --- 5. Reset state so _spawn_heavy_structures() works again ---
+	structures_complete = false
+	_tower = null
+	_tower_position = Vector3.INF
+
+	# Re-seed the RNG with the same seed so structures spawn identically
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 10293847
+	# Consume the same RNG calls as _ready() does for spawns/loot
+	_spawn_player_spawns(rng)
+	_spawn_loot_points(rng)
+	_structure_rng = rng
+
+	print("[SeedWorld] World reset complete — ready for _spawn_heavy_structures()")
+
+
 # ======================================================================
 #  Height query — raycast from above to find terrain surface
 # ======================================================================

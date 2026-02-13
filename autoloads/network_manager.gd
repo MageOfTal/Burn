@@ -750,22 +750,34 @@ func reset_game() -> void:
 	if toad_dim and "_sessions" in toad_dim:
 		toad_dim._sessions.clear()
 
-	# 7. Clear bot usernames (keep human usernames)
+	# 7. Reset terrain (clear craters) and rebuild structures (walls, tower, etc.)
+	var seed_world := map.get_node_or_null("SeedWorld") if map else null
+	if seed_world == null and map:
+		seed_world = map.get_node_or_null("BlockoutMap/SeedWorld")
+	if seed_world and seed_world.has_method("reset_world"):
+		await seed_world.reset_world()
+		# Rebuild structures in the background (walls, ramps, bars, donuts, tower)
+		seed_world._spawn_heavy_structures()
+		if not seed_world.structures_complete:
+			await seed_world.world_generation_complete
+		print("[Server] World reset and structures rebuilt")
+
+	# 8. Clear bot usernames (keep human usernames)
 	for peer_id in GameManager.player_usernames.keys():
 		if peer_id >= BOT_PEER_ID_START:
 			GameManager.player_usernames.erase(peer_id)
 
-	# 8. Rebuild lobby peer list from currently connected peers
+	# 9. Rebuild lobby peer list from currently connected peers
 	_lobby_ready_peers.clear()
 	_lobby_ready_peers.append(1)  # Host
 	for peer_id in multiplayer.get_peers():
 		if peer_id not in _lobby_ready_peers:
 			_lobby_ready_peers.append(peer_id)
 
-	# 9. Change state to LOBBY
+	# 10. Change state to LOBBY
 	GameManager.change_state(GameManager.GameState.LOBBY)
 
-	# 10. Show lobby on host
+	# 11. Show lobby on host
 	_show_lobby_ui()
 	print("[Server] Reset complete. Back in lobby with %d peers." % _lobby_ready_peers.size())
 
@@ -781,6 +793,16 @@ func _rpc_reset_to_lobby() -> void:
 			for child in world_items.get_children():
 				if child is LootChest:
 					child.reset_chest()
+
+	# Reset terrain (clear craters) and rebuild structures on client too
+	var seed_world := map.get_node_or_null("SeedWorld") if map else null
+	if seed_world == null and map:
+		seed_world = map.get_node_or_null("BlockoutMap/SeedWorld")
+	if seed_world and seed_world.has_method("reset_world"):
+		await seed_world.reset_world()
+		seed_world._spawn_heavy_structures()
+		# Don't block lobby UI on structure rebuilding — it happens in background
+
 	# Release mouse so lobby UI is interactive
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	GameManager.change_state(GameManager.GameState.LOBBY)
