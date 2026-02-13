@@ -61,7 +61,7 @@ const CLEARANCE_FORCE := 12.0
 
 ## Charge system — two grapples before cooldown.
 const MAX_CHARGES := 2
-const CHARGE_RECHARGE_TIME := 0.5   ## Seconds to regain one charge
+const CHARGE_RECHARGE_TIME := 1.0   ## Seconds to regain one charge
 
 ## Rope line-of-sight — cut if geometry obstructs the line.
 const ROPE_LOS_MARGIN := 3.0
@@ -949,7 +949,7 @@ func _apply_release_boost() -> bool:
 	## Returns true if the boost was actually applied.
 	## Boost is blocked if less than 0.5s since the last boost.
 	var now := Time.get_ticks_msec() / 1000.0
-	if _last_boost_time >= 0.0 and (now - _last_boost_time) < 0.5:
+	if _last_boost_time >= 0.0 and (now - _last_boost_time) < 1.0:
 		return false
 
 	var vel := player.velocity
