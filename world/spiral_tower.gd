@@ -49,6 +49,10 @@ const GROUND_Y_TOLERANCE := 2.0
 ## Tower cross-section is ~95 cells/layer * 40 layers ≈ 3800 cells total,
 ## so we need at least 5000 to fully traverse an intact tower.
 const BFS_MAX_ITERATIONS := 6000
+## SDF threshold for structural solidity. Values just below 0.0 (e.g. -0.05)
+## represent the very edge of the surface — too thin/weak to hold up a tower.
+## Only voxels with SDF well below zero are structurally load-bearing.
+const STRUCTURAL_SDF_THRESHOLD := -0.3
 
 # ======================================================================
 #  State
@@ -68,10 +72,18 @@ var _last_attacker_id: int = -1
 var _collapse_in_progress: bool = false
 ## Tracks the current effective tower top (lowered after each collapse)
 var _effective_tower_top: float = TOWER_HEIGHT
-## Pre-baked chunk fragment meshes (extracted from voxel data before erase)
-var _cached_chunk_meshes: Array[Mesh] = []
-## Pre-baked chunk mesh offsets (local offset from chunk center to mesh origin)
-var _cached_chunk_offsets: Array[Vector3] = []
+## Cached slab meshes baked at collapse time (before voxel erasure).
+## Each is a real voxel mesh of a horizontal slice of the collapsing section.
+var _cached_slab_meshes: Array[Mesh] = []
+## Offset of each slab's buffer origin relative to the topple body center (local space).
+var _cached_slab_offsets: Array[Vector3] = []
+## Pre-built collision shapes for each slab (centered BoxShape3D).
+var _cached_slab_shapes: Array[Shape3D] = []
+## AABB center of each slab mesh in buffer-local space. Used to offset
+## MeshInstance3D and CollisionShape3D so they're centered on the RigidBody3D.
+var _cached_slab_mesh_centers: Array[Vector3] = []
+## The body_center_local used when spawning the topple body.
+var _cached_body_center_local: Vector3 = Vector3.ZERO
 
 ## Signal emitted when tower generation is complete (awaited by seed_world)
 signal generation_complete
@@ -96,6 +108,12 @@ func _build_tower() -> void:
 	# --- Material ---
 	_tower_material = StandardMaterial3D.new()
 	_tower_material.albedo_color = Color(0.45, 0.42, 0.40)  # Stone gray
+	_tower_material.roughness = 0.85
+	_tower_material.metallic = 0.0
+	# Cull disabled = render both sides of every triangle. This prevents
+	# see-through holes at mesh boundaries where Transvoxel may not generate
+	# back-faces (e.g. top/bottom of slabs, carved surfaces, buffer edges).
+	_tower_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 
 	# --- VoxelTerrain ---
 	_voxel_terrain = VoxelTerrain.new()
@@ -145,53 +163,47 @@ func _build_tower() -> void:
 	# so the streaming system has nothing to target and loads zero blocks.
 	# We add a temporary VoxelViewer at the tower position during construction,
 	# then remove it after painting is complete.
+	#
+	# Position the viewer at the center of the tower bounds so it covers the
+	# full volume, and set view_distance large enough to reach every corner.
 	var _temp_viewer: Node3D = null
 	if ClassDB.class_exists(&"VoxelViewer"):
 		_temp_viewer = ClassDB.instantiate(&"VoxelViewer")
 		_temp_viewer.name = "TempBuildViewer"
+		# Center of tower volume: (0, TOWER_HEIGHT/2, 0) in local space
+		_temp_viewer.position = Vector3(0.0, TOWER_HEIGHT * 0.5, 0.0)
+		# View distance must cover from viewer to the farthest corner of the bounds.
+		# Bounds: -32 to +32 in XZ, -16 to +64 in Y. Viewer at (0, 20, 0).
+		# Farthest corner: (32, 64, 32) → distance ≈ 58. Use 80 for margin.
+		if _temp_viewer.has_method("set_view_distance"):
+			_temp_viewer.set_view_distance(80)
+		elif "view_distance" in _temp_viewer:
+			_temp_viewer.view_distance = 80
 		_voxel_terrain.add_child(_temp_viewer)
-		print("[SpiralTower] Added temporary VoxelViewer for block streaming")
+		print("[SpiralTower] Added temporary VoxelViewer at center for block streaming")
 
 	# Wait for the streaming system to load all blocks the tower needs.
-	# With the VoxelViewer present, blocks should start loading within a few frames.
-	# We wait until do_sphere would succeed by testing if a voxel read returns
-	# a valid SDF value (positive = air from our flat generator at Y=-100).
+	# We use is_area_editable() which checks the exact same code path that
+	# do_sphere() uses internally. This is reliable — unlike get_voxel_f()
+	# which has a generator fallback and returns valid data for unloaded blocks.
 	_voxel_tool = _voxel_terrain.get_voxel_tool()
 	var max_wait := 300  # Up to 5 seconds at 60fps
 	var blocks_ready := false
-	# Test positions at tower edges and corners — not just the center column.
-	# do_sphere() paints at ring offsets up to CORE_RADIUS and ramp positions
-	# up to OUTER_RADIUS, so we must ensure those block regions are loaded too.
-	var edge_r := OUTER_RADIUS + 1.0
-	var _test_positions: Array[Vector3] = [
-		Vector3(0, 0, 0),                        # Base center
-		Vector3(0, TOWER_HEIGHT * 0.5, 0),        # Mid center
-		Vector3(0, TOWER_HEIGHT, 0),              # Top center
-		Vector3(edge_r, 0, 0),                    # Base +X edge
-		Vector3(-edge_r, 0, 0),                   # Base -X edge
-		Vector3(0, 0, edge_r),                    # Base +Z edge
-		Vector3(0, 0, -edge_r),                   # Base -Z edge
-		Vector3(edge_r, TOWER_HEIGHT, 0),         # Top +X edge
-		Vector3(-edge_r, TOWER_HEIGHT, 0),        # Top -X edge
-		Vector3(0, TOWER_HEIGHT, edge_r),         # Top +Z edge
-		Vector3(0, TOWER_HEIGHT, -edge_r),        # Top -Z edge
-	]
+	# Build the AABB that covers the entire tower painting volume.
+	# do_sphere() at the farthest ramp point + radius must be within this box.
+	var paint_extent := OUTER_RADIUS + RAMP_PAINT_RADIUS + 1.0  # ~7.7m
+	var tower_aabb := AABB(
+		Vector3(-paint_extent, -CORE_PAINT_RADIUS - 1.0, -paint_extent),
+		Vector3(paint_extent * 2.0, TOWER_HEIGHT + CORE_PAINT_RADIUS + 2.0, paint_extent * 2.0)
+	)
 	for i in max_wait:
 		await get_tree().process_frame
 		_voxel_tool = _voxel_terrain.get_voxel_tool()
 		if _voxel_tool != null:
-			# Our flat generator at Y=-100 means all blocks should have positive SDF (air).
-			# Check ALL test positions — if any returns 0.0, that block isn't loaded yet.
-			var all_loaded := true
-			for test_pos in _test_positions:
-				var sdf: float = _voxel_tool.get_voxel_f(test_pos)
-				if sdf <= 0.0:
-					all_loaded = false
-					break
-			if all_loaded:
+			if _voxel_tool.is_area_editable(tower_aabb):
 				blocks_ready = true
-				print("[SpiralTower] All blocks ready after %d frames (%d test positions)" % [
-					i, _test_positions.size()])
+				print("[SpiralTower] All blocks editable after %d frames (AABB: %s)" % [
+					i, str(tower_aabb)])
 				break
 		if i > 0 and i % 60 == 0:
 			print("[SpiralTower] Still waiting for blocks to load... (frame %d)" % i)
@@ -226,25 +238,23 @@ func _paint_tower_shape() -> void:
 	## Paint the tower shape into the VoxelTerrain using do_sphere(MODE_ADD).
 	## This creates a blobby but solid spiral structure.
 	##
-	## COORDINATE NOTE: VoxelToolTerrain.do_sphere() operates in the VoxelTerrain's
-	## own voxel grid space. Since the VoxelTerrain is a child of SpiralTower,
-	## its world transform is offset by the tower's position. We must pass
-	## global_position + offset so the voxel data aligns with where the tower
-	## actually is in the world. The mesh renderer then applies the inverse of the
-	## VoxelTerrain's transform automatically.
-	##
-	## HOWEVER — Zylann's VoxelToolTerrain interprets positions in voxel-data space
+	## COORDINATE NOTE: VoxelToolTerrain interprets positions in voxel-data space
 	## which does NOT include the node's transform. The rendered mesh IS transformed
-	## by the node's global transform. So to paint at world (0,16,0) we must pass
-	## the position in voxel-data space — which is just the local offset from origin.
-	## Since the VoxelTerrain child is at local (0,0,0) relative to SpiralTower,
-	## painting at local (0, y, 0) ends up at world = SpiralTower.global_pos + (0, y, 0).
+	## by the node's global transform. So painting at local (0, y, 0) ends up at
+	## world = SpiralTower.global_pos + (0, y, 0).
+	##
+	## If a do_sphere() call hits an unloaded block, it silently fails. We collect
+	## failed positions and retry them once at the end after yielding to let
+	## the streaming system catch up.
 	if _voxel_tool == null:
 		return
 
 	_voxel_tool.mode = VoxelTool.MODE_ADD
 	var frames_since_yield := 0
 	var yield_interval := 20  # Yield every N sphere operations
+	var _failed_spheres: Array[Vector2] = []  # [x=radius, encoded pos index] — see retry below
+	var _failed_positions: Array[Vector3] = []
+	var _failed_radii: Array[float] = []
 
 	# --- Paint core column ---
 	# Place overlapping spheres along the Y axis to form a solid cylinder
@@ -261,11 +271,23 @@ func _paint_tower_shape() -> void:
 				y,
 				sin(angle) * ring_r
 			)
-			_voxel_tool.do_sphere(pos, CORE_PAINT_RADIUS)
+			# Check editability before painting — queue for retry if not editable
+			var sphere_aabb := AABB(pos - Vector3.ONE * CORE_PAINT_RADIUS, Vector3.ONE * CORE_PAINT_RADIUS * 2.0)
+			if _voxel_tool.is_area_editable(sphere_aabb):
+				_voxel_tool.do_sphere(pos, CORE_PAINT_RADIUS)
+			else:
+				_failed_positions.append(pos)
+				_failed_radii.append(CORE_PAINT_RADIUS)
 			frames_since_yield += 1
 
 		# Center sphere for solid core
-		_voxel_tool.do_sphere(Vector3(0, y, 0), CORE_PAINT_RADIUS)
+		var center_pos := Vector3(0, y, 0)
+		var center_aabb := AABB(center_pos - Vector3.ONE * CORE_PAINT_RADIUS, Vector3.ONE * CORE_PAINT_RADIUS * 2.0)
+		if _voxel_tool.is_area_editable(center_aabb):
+			_voxel_tool.do_sphere(center_pos, CORE_PAINT_RADIUS)
+		else:
+			_failed_positions.append(center_pos)
+			_failed_radii.append(CORE_PAINT_RADIUS)
 		frames_since_yield += 1
 
 		if frames_since_yield >= yield_interval:
@@ -301,7 +323,12 @@ func _paint_tower_shape() -> void:
 					y,
 					sin(angle) * r
 				)
-				_voxel_tool.do_sphere(pos, RAMP_PAINT_RADIUS)
+				var sphere_aabb := AABB(pos - Vector3.ONE * RAMP_PAINT_RADIUS, Vector3.ONE * RAMP_PAINT_RADIUS * 2.0)
+				if _voxel_tool.is_area_editable(sphere_aabb):
+					_voxel_tool.do_sphere(pos, RAMP_PAINT_RADIUS)
+				else:
+					_failed_positions.append(pos)
+					_failed_radii.append(RAMP_PAINT_RADIUS)
 				frames_since_yield += 1
 
 		if frames_since_yield >= yield_interval:
@@ -312,6 +339,39 @@ func _paint_tower_shape() -> void:
 			_voxel_tool.mode = VoxelTool.MODE_ADD
 
 		y += ramp_step
+
+	# --- Retry failed spheres ---
+	# Some blocks may not have been loaded during the main pass. After yielding
+	# a few frames the streaming system has had time to load them.
+	if _failed_positions.size() > 0:
+		print("[SpiralTower] Retrying %d failed sphere operations..." % _failed_positions.size())
+		# Yield several frames to give streaming time to catch up
+		for _retry_wait in 10:
+			await get_tree().process_frame
+		_voxel_tool = _voxel_terrain.get_voxel_tool()
+		_voxel_tool.mode = VoxelTool.MODE_ADD
+
+		var still_failed := 0
+		frames_since_yield = 0
+		for idx in _failed_positions.size():
+			var pos: Vector3 = _failed_positions[idx]
+			var radius: float = _failed_radii[idx]
+			var sphere_aabb := AABB(pos - Vector3.ONE * radius, Vector3.ONE * radius * 2.0)
+			if _voxel_tool.is_area_editable(sphere_aabb):
+				_voxel_tool.do_sphere(pos, radius)
+			else:
+				still_failed += 1
+			frames_since_yield += 1
+			if frames_since_yield >= yield_interval:
+				frames_since_yield = 0
+				await get_tree().process_frame
+				_voxel_tool = _voxel_terrain.get_voxel_tool()
+				_voxel_tool.mode = VoxelTool.MODE_ADD
+
+		if still_failed > 0:
+			push_warning("[SpiralTower] %d spheres still not editable after retry" % still_failed)
+		else:
+			print("[SpiralTower] All retried spheres painted successfully")
 
 	# Final yield to let mesh generation catch up
 	await get_tree().process_frame
@@ -422,6 +482,17 @@ func _check_structural_integrity() -> void:
 			sever_y, max_y_reached, _effective_tower_top])
 		if sever_y > 0.0 and sever_y < _effective_tower_top:
 			_trigger_collapse_at_height(sever_y)
+		return
+
+	# Step 4: Cross-section area check — even if BFS finds a path from ground
+	# to top, an angular/diagonal cut can leave a thin pillar that should not
+	# support the tower. Scan each Y layer and count solid cells. If any layer
+	# has too few solid cells, the tower is too weak at that height.
+	var weak_y := _find_weak_cross_section(visited, max_y_reached)
+	if weak_y >= 0.0:
+		print("[SpiralTower] Integrity: WEAK cross-section at y=%.1f — collapsing" % weak_y)
+		if weak_y > 0.0 and weak_y < _effective_tower_top:
+			_trigger_collapse_at_height(weak_y)
 	else:
 		print("[SpiralTower] Integrity: connected (max_y_grid=%d)" % max_y_reached)
 
@@ -446,7 +517,11 @@ func _grid_to_local(grid_pos: Vector3i) -> Vector3:
 
 
 func _is_solid_at_grid(grid_pos: Vector3i) -> bool:
-	## Check if the voxel at the given grid position is solid (SDF < 0).
+	## Check if the voxel at the given grid position is structurally solid.
+	## Uses STRUCTURAL_SDF_THRESHOLD (-0.3) rather than the surface boundary (0.0)
+	## so that thin bridges of barely-solid SDF data (common after diagonal cuts
+	## or overlapping explosions) are NOT treated as load-bearing structure.
+	## A voxel right at the surface edge (-0.05) should not hold up the tower.
 	var local_pos := _grid_to_local(grid_pos)
 	# Quick bounds check — skip if outside tower bounding box
 	if local_pos.y < -1.0 or local_pos.y > _effective_tower_top + 2.0:
@@ -456,7 +531,7 @@ func _is_solid_at_grid(grid_pos: Vector3i) -> bool:
 		return false
 	# get_voxel_f operates in voxel-data space (local to VoxelTerrain)
 	var sdf: float = _voxel_tool.get_voxel_f(local_pos)
-	return sdf < 0.0
+	return sdf < STRUCTURAL_SDF_THRESHOLD
 
 
 func _grid_key(pos: Vector3i) -> int:
@@ -474,7 +549,7 @@ const _NEIGHBORS := [
 
 
 func _find_ground_anchor() -> Vector3i:
-	## Find a solid voxel at ground level (within GROUND_Y_TOLERANCE of base).
+	## Find a structurally solid voxel at ground level (within GROUND_Y_TOLERANCE of base).
 	## Scans a grid at Y=0 within the core radius.
 	## All positions are in local tower space (0,0,0 = base center).
 	var step := INTEGRITY_SAMPLE_STEP
@@ -486,7 +561,7 @@ func _find_ground_anchor() -> Vector3i:
 			if x * x + z * z <= scan_radius * scan_radius:
 				var local_pos := Vector3(x, step * 0.5, z)
 				var sdf: float = _voxel_tool.get_voxel_f(local_pos)
-				if sdf < 0.0:
+				if sdf < STRUCTURAL_SDF_THRESHOLD:
 					return _local_to_grid(local_pos)
 			z += step
 		x += step
@@ -494,7 +569,7 @@ func _find_ground_anchor() -> Vector3i:
 
 
 func _find_any_solid_above(min_height: float) -> Vector3i:
-	## Find any solid voxel above min_height. Scans sparsely for speed.
+	## Find any structurally solid voxel above min_height. Scans sparsely for speed.
 	## All positions are in local tower space (0,0,0 = base center).
 	var step := INTEGRITY_SAMPLE_STEP * 2.0  # Coarse scan
 	var y := min_height
@@ -506,7 +581,7 @@ func _find_any_solid_above(min_height: float) -> Vector3i:
 				if x * x + z * z <= OUTER_RADIUS * OUTER_RADIUS:
 					var local_pos := Vector3(x, y, z)
 					var sdf: float = _voxel_tool.get_voxel_f(local_pos)
-					if sdf < 0.0:
+					if sdf < STRUCTURAL_SDF_THRESHOLD:
 						return _local_to_grid(local_pos)
 				z += step
 			x += step
@@ -545,6 +620,7 @@ func _bfs_flood_from_ground(ground_anchor: Vector3i) -> Array:
 func _find_disconnected_above(visited: Dictionary, max_y_reached: int) -> bool:
 	## Scan from top of tower downward for any solid voxel NOT in the visited set.
 	## If found, the tower is severed — that voxel is disconnected from ground.
+	## Uses the same structural SDF threshold as the BFS so both agree on what's solid.
 	var step := INTEGRITY_SAMPLE_STEP
 	var scan_y := _effective_tower_top
 	# Start scanning from top, stop just above the max Y the ground BFS reached
@@ -557,8 +633,8 @@ func _find_disconnected_above(visited: Dictionary, max_y_reached: int) -> bool:
 				if x * x + z * z <= OUTER_RADIUS * OUTER_RADIUS:
 					var local_pos := Vector3(x, scan_y, z)
 					var sdf: float = _voxel_tool.get_voxel_f(local_pos)
-					if sdf < 0.0:
-						# Found a solid voxel — check if it was reached by ground BFS
+					if sdf < STRUCTURAL_SDF_THRESHOLD:
+						# Found a structurally solid voxel — check if ground BFS reached it
 						var grid := _local_to_grid(local_pos)
 						var key := _grid_key(grid)
 						if not visited.has(key):
@@ -567,6 +643,54 @@ func _find_disconnected_above(visited: Dictionary, max_y_reached: int) -> bool:
 			x += step
 		scan_y -= step
 	return false  # Everything solid is connected to ground
+
+
+func _find_weak_cross_section(visited: Dictionary, max_y_reached: int) -> float:
+	## Scan each Y layer of the tower and count solid cells connected to ground.
+	## If any layer has fewer solid cells than the minimum required, the tower
+	## is structurally compromised — it can't support the weight above.
+	##
+	## Returns the Y height where the tower is weakest, or -1.0 if no weak point.
+	##
+	## The tower core is ~3.0m radius. At INTEGRITY_SAMPLE_STEP = 1.0m, a full
+	## cross-section of the core is roughly PI * 3^2 = ~28 cells. The ramp adds
+	## more, but it spirals so it's not present at all angles at a given height.
+	## A minimum of 4 cells (~14% of core area) means the tower is nearly cut through.
+	const MIN_SOLID_CELLS_PER_LAYER := 4
+	var step := INTEGRITY_SAMPLE_STEP
+	var weakest_y := -1.0
+	var weakest_count := 999
+
+	# Only check layers above ground level, up to the max Y the BFS reached.
+	# Below ground is the base — above max_y_reached is already handled by
+	# _find_disconnected_above.
+	var min_y := int(ceil(GROUND_Y_TOLERANCE / step)) + 1
+	var max_y := max_y_reached
+
+	for grid_y in range(min_y, max_y + 1):
+		var solid_count := 0
+		# Scan the XZ cross-section at this Y level
+		var x_grid := int(floor(-OUTER_RADIUS / step))
+		var x_max := int(ceil(OUTER_RADIUS / step))
+		var z_grid := int(floor(-OUTER_RADIUS / step))
+		var z_max := int(ceil(OUTER_RADIUS / step))
+
+		for gx in range(x_grid, x_max + 1):
+			for gz in range(z_grid, z_max + 1):
+				var key := _grid_key(Vector3i(gx, grid_y, gz))
+				if visited.has(key):
+					solid_count += 1
+
+		if solid_count < weakest_count:
+			weakest_count = solid_count
+			weakest_y = (float(grid_y) + 0.5) * step
+
+	if weakest_count < MIN_SOLID_CELLS_PER_LAYER:
+		print("[SpiralTower] Weak cross-section: %d cells at y=%.1f (min required: %d)" % [
+			weakest_count, weakest_y, MIN_SOLID_CELLS_PER_LAYER])
+		return weakest_y
+
+	return -1.0
 
 
 func _trigger_collapse_at_height(sever_y: float) -> void:
@@ -601,17 +725,22 @@ func _trigger_collapse_internal(sever_y: float) -> void:
 	# This extracts the actual voxel mesh so the topple body looks like the real tower.
 	var baked_mesh := _bake_upper_section_mesh(sever_y)
 
+	# Bake slab fragment meshes BEFORE erasing (SDF data will be destroyed on erase)
+	_bake_slab_meshes(sever_y)
+
 	# Compute the mesh offset: the baked mesh vertices are in buffer-local space,
 	# where (0,0,0) = the region_min corner we used for VoxelTool.copy().
-	# region_min was: (-extent - pad, sever_y - pad, -extent - pad)
+	# region_min was: (-extent - total_pad, sever_y - total_pad, -extent - total_pad)
 	# We need to offset the MeshInstance3D so the mesh aligns with the topple body center.
+	# Must match the total_min_pad used in _bake_upper_section_mesh (min_pad + EXTRA_PAD).
 	var mesher := VoxelMesherTransvoxel.new()
 	var min_pad: int = mesher.get_minimum_padding()
+	var total_pad: int = min_pad + 2  # Must match EXTRA_PAD in _bake_upper_section_mesh
 	var extent := OUTER_RADIUS + 2.0
 	var region_min_local := Vector3(
-		float(int(floor(-extent)) - min_pad),
-		float(int(floor(sever_y)) - min_pad),
-		float(int(floor(-extent)) - min_pad)
+		float(int(floor(-extent)) - total_pad),
+		float(int(floor(sever_y)) - total_pad),
+		float(int(floor(-extent)) - total_pad)
 	)
 
 	# The topple body will be positioned at the centroid of the severed section
@@ -623,10 +752,6 @@ func _trigger_collapse_internal(sever_y: float) -> void:
 	var body_center_local := Vector3(0.0, sever_y + section_height * 0.5, 0.0)
 	var mesh_offset := region_min_local - body_center_local
 
-	# Pre-bake chunk fragment meshes BEFORE erasing (so we have real voxel data)
-	var chunk_count := clampi(4 + int(section_height / 10.0), 4, 10)
-	_bake_chunk_meshes(sever_y, section_height, chunk_count)
-
 	# Erase the upper section from the voxel terrain
 	_erase_above(sever_y)
 	_effective_tower_top = sever_y  # Tower is now shorter
@@ -635,8 +760,8 @@ func _trigger_collapse_internal(sever_y: float) -> void:
 	var centroid := global_position + body_center_local
 	_spawn_topple_body(centroid, baked_mesh, mesh_offset, section_height, torque_dir)
 
-	# Sync to clients — send chunk_count so clients bake matching fragments
-	_sync_collapse_start.rpc(sever_y, torque_dir, chunk_count)
+	# Sync to clients
+	_sync_collapse_start.rpc(sever_y, torque_dir)
 
 	_collapse_in_progress = false
 
@@ -646,47 +771,52 @@ func _bake_upper_section_mesh(sever_y: float) -> Mesh:
 	## This copies the SDF data into a VoxelBuffer, then uses VoxelMesherTransvoxel
 	## to build the real mesh — so the topple body looks exactly like the tower.
 	##
-	## Returns the mesh with vertices centered around (0, section_height/2, 0)
-	## relative to the sever point.
+	## Key: after copying terrain data, we overwrite the padding border voxels
+	## with air (SDF = 1.0). VoxelTool.copy() fills the ENTIRE buffer from the
+	## terrain, overwriting any pre-filled values. The mesher treats the outer
+	## min_pad/max_pad layers as neighbor data — if those contain 0.0 instead of
+	## air, Transvoxel won't generate closing faces (the "see-through holes" bug).
 	if _voxel_tool == null:
 		return _bake_fallback_cylinder_mesh(sever_y)
 
 	var section_height: float = _effective_tower_top - sever_y
 
-	# The mesher needs padding around the data to produce correct surface normals
-	# at the edges. Get the padding requirements from the mesher.
 	var mesher := VoxelMesherTransvoxel.new()
 	var min_pad: int = mesher.get_minimum_padding()
 	var max_pad: int = mesher.get_maximum_padding()
+	# Extra air padding beyond the mesher's minimum so Transvoxel has a clean
+	# multi-voxel gradient at every boundary. Prevents see-through faces.
+	const EXTRA_PAD := 2
+	var total_min_pad: int = min_pad + EXTRA_PAD
+	var total_max_pad: int = max_pad + EXTRA_PAD
 
-	# Define the region to copy in voxel-data space (local to VoxelTerrain).
-	# The tower spans from roughly (-OUTER_RADIUS, 0, -OUTER_RADIUS) to
-	# (OUTER_RADIUS, TOWER_HEIGHT, OUTER_RADIUS) in local coords.
-	var extent := OUTER_RADIUS + 2.0  # Slight margin beyond tower radius
+	# Include padding in the copy region so the buffer is correctly sized for the mesher.
+	var extent := OUTER_RADIUS + 2.0
 	var region_min := Vector3i(
-		int(floor(-extent)) - min_pad,
-		int(floor(sever_y)) - min_pad,
-		int(floor(-extent)) - min_pad
+		int(floor(-extent)) - total_min_pad,
+		int(floor(sever_y)) - total_min_pad,
+		int(floor(-extent)) - total_min_pad
 	)
 	var region_max := Vector3i(
-		int(ceil(extent)) + max_pad,
-		int(ceil(sever_y + section_height)) + max_pad,
-		int(ceil(extent)) + max_pad
+		int(ceil(extent)) + total_max_pad,
+		int(ceil(sever_y + section_height)) + total_max_pad,
+		int(ceil(extent)) + total_max_pad
 	)
 
 	var buf_size: Vector3i = region_max - region_min
 	if buf_size.x <= 0 or buf_size.y <= 0 or buf_size.z <= 0:
 		return _bake_fallback_cylinder_mesh(sever_y)
 
-	# Create buffer and copy SDF data from the tower VoxelTerrain
+	# Copy terrain SDF data into the buffer (this fills the ENTIRE buffer).
 	var buffer := VoxelBuffer.new()
 	buffer.create(buf_size.x, buf_size.y, buf_size.z)
-
-	# Copy the SDF channel from the terrain into our buffer.
-	# VoxelTool.copy(src_pos, dst_buffer, channels_mask) copies a box of voxels
-	# starting at src_pos with the size of dst_buffer.
 	var sdf_channel_mask: int = 1 << VoxelBuffer.CHANNEL_SDF
 	_voxel_tool.copy(region_min, buffer, sdf_channel_mask)
+
+	# Overwrite the enlarged padding border with air AFTER the copy.
+	# The extra rows beyond the mesher's minimum ensure a multi-voxel gradient
+	# ramp from solid→air, so Transvoxel reliably generates closing faces.
+	_fill_buffer_padding_with_air(buffer, buf_size, total_min_pad, total_max_pad)
 
 	# Build the mesh using the same mesher type as the terrain
 	var materials: Array[Material] = [_tower_material]
@@ -695,19 +825,140 @@ func _bake_upper_section_mesh(sever_y: float) -> Mesh:
 		print("[SpiralTower] Mesh extraction failed — using fallback cylinder")
 		return _bake_fallback_cylinder_mesh(sever_y)
 
-	# The mesh vertices are in buffer-local space (0,0,0 = region_min corner).
-	# We need to offset them so the mesh is centered around (0, section_height/2, 0)
-	# for the topple body. The offset from buffer origin to tower local center is:
-	#   buffer_origin_in_local = region_min
-	#   tower_center_at_sever = (0, sever_y + section_height/2, 0)
-	# So vertex_world_local = vertex_buffer + region_min
-	# We want vertex_mesh = vertex_world_local - tower_center_at_sever
-	# = vertex_buffer + region_min - (0, sever_y + section_height/2, 0)
-	# We'll store this offset and apply it via MeshInstance3D position instead.
-	# (Stored as _mesh_offset on the topple body via metadata or as a child offset)
 	print("[SpiralTower] Baked real voxel mesh (surfaces: %d, buf_size: %s)" % [
 		built_mesh.get_surface_count(), str(buf_size)])
 	return built_mesh
+
+
+func _bake_slab_meshes(sever_y: float) -> void:
+	## Bake the upper tower section into horizontal slab meshes for impact fragments.
+	## Must be called BEFORE _erase_above() since it reads live SDF data.
+	## Populates _cached_slab_meshes, _cached_slab_offsets, _cached_slab_shapes,
+	## _cached_slab_mesh_centers.
+	##
+	## Same padding strategy as _bake_upper_section_mesh: copy terrain data first,
+	## then overwrite the padding border voxels with air so Transvoxel generates
+	## closed surfaces at all boundaries.
+	_cached_slab_meshes.clear()
+	_cached_slab_offsets.clear()
+	_cached_slab_shapes.clear()
+	_cached_slab_mesh_centers.clear()
+
+	if _voxel_tool == null:
+		return
+
+	var section_height: float = _effective_tower_top - sever_y
+	if section_height < 2.0:
+		return
+
+	var body_center_local := Vector3(0.0, sever_y + section_height * 0.5, 0.0)
+	_cached_body_center_local = body_center_local
+
+	# Aim for slabs ~6m tall. Minimum 2, maximum 6.
+	var slab_count := clampi(int(ceil(section_height / 6.0)), 2, 6)
+	var slab_height := section_height / float(slab_count)
+
+	var mesher := VoxelMesherTransvoxel.new()
+	var min_pad: int = mesher.get_minimum_padding()
+	var max_pad: int = mesher.get_maximum_padding()
+	# Extra voxels of air beyond the mesher's required padding. Transvoxel
+	# uses the padding rows for gradient computation; with only min_pad (typically 1)
+	# rows of air, the solid→air transition is right at the buffer edge and the
+	# mesher often fails to generate closing triangles there (the "see-through
+	# bottom face" bug). Adding 2 extra rows gives a clean gradient ramp so
+	# Transvoxel reliably produces closed geometry on all slab faces.
+	const EXTRA_PAD := 2
+	var total_min_pad: int = min_pad + EXTRA_PAD
+	var total_max_pad: int = max_pad + EXTRA_PAD
+	var extent := OUTER_RADIUS + 2.0
+	var sdf_channel_mask: int = 1 << VoxelBuffer.CHANNEL_SDF
+	var materials: Array[Material] = [_tower_material]
+
+	for slab_i in slab_count:
+		var slab_bottom: float = sever_y + slab_i * slab_height
+		var slab_top: float = slab_bottom + slab_height
+
+		# Include padding in the copy region — extra padding ensures clean
+		# solid→air transitions on all faces so Transvoxel generates closed geometry.
+		var region_min := Vector3i(
+			int(floor(-extent)) - total_min_pad,
+			int(floor(slab_bottom)) - total_min_pad,
+			int(floor(-extent)) - total_min_pad
+		)
+		var region_max := Vector3i(
+			int(ceil(extent)) + total_max_pad,
+			int(ceil(slab_top)) + total_max_pad,
+			int(ceil(extent)) + total_max_pad
+		)
+
+		var buf_size: Vector3i = region_max - region_min
+		if buf_size.x <= 0 or buf_size.y <= 0 or buf_size.z <= 0:
+			continue
+
+		# Copy terrain SDF, then overwrite the enlarged padding borders with air.
+		# We pass total_min_pad/total_max_pad so the full border (mesher padding +
+		# extra rows) is filled with air, creating a multi-voxel gradient ramp.
+		var buffer := VoxelBuffer.new()
+		buffer.create(buf_size.x, buf_size.y, buf_size.z)
+		_voxel_tool.copy(region_min, buffer, sdf_channel_mask)
+		_fill_buffer_padding_with_air(buffer, buf_size, total_min_pad, total_max_pad)
+
+		# Build mesh — Transvoxel sees air padding → closed surfaces
+		var slab_mesh: Mesh = mesher.build_mesh(buffer, materials)
+		if slab_mesh == null or slab_mesh.get_surface_count() == 0:
+			continue  # Skip empty slabs (can happen near the top)
+
+		# Offset of this slab's mesh origin relative to the topple body center.
+		# Mesh vertices are in buffer-local space (0,0,0 = region_min corner).
+		# At impact time: slab_world_pos = topple_body.global_transform * slab_offset
+		var slab_offset := Vector3(region_min) - body_center_local
+
+		_cached_slab_meshes.append(slab_mesh)
+		_cached_slab_offsets.append(slab_offset)
+
+		# Cache the mesh AABB center so _spawn_slab_fragments can re-center
+		# the MeshInstance3D and CollisionShape3D on the RigidBody3D origin.
+		var mesh_aabb := slab_mesh.get_aabb()
+		_cached_slab_mesh_centers.append(mesh_aabb.get_center())
+
+		# Collision shape: centered BoxShape3D matching the mesh AABB.
+		# Convex hulls from buffer-space vertices are offset from (0,0,0) and
+		# cause violent physics (player launched when walking on fragments).
+		# A centered box is stable and predictable.
+		var box := BoxShape3D.new()
+		box.size = mesh_aabb.size
+		_cached_slab_shapes.append(box)
+
+	print("[SpiralTower] Baked %d slab meshes (section: %.1fm, slab_h: %.1fm)" % [
+		_cached_slab_meshes.size(), section_height, slab_height])
+
+
+func _fill_buffer_padding_with_air(buffer: VoxelBuffer, buf_size: Vector3i,
+		min_pad: int, max_pad: int) -> void:
+	## Overwrite the padding border voxels of a VoxelBuffer with air (SDF = 1.0).
+	## VoxelMesherTransvoxel treats the outer min_pad layers (low side) and max_pad
+	## layers (high side) as neighbor data for gradient computation. If these contain
+	## 0.0 (from terrain data outside the tower), the mesher won't generate closing
+	## faces at boundaries. By writing air here AFTER VoxelTool.copy(), we ensure
+	## clean solid→air transitions that produce fully closed meshes.
+	##
+	## Uses fill_area_f for efficiency (single C++ call per slab instead of
+	## thousands of GDScript set_voxel_f calls).
+	var ch := VoxelBuffer.CHANNEL_SDF
+	var air := SDF_EMPTY_VALUE
+	var s := buf_size  # Alias for readability
+
+	# X axis: low side (0..min_pad) and high side (s.x-max_pad..s.x)
+	buffer.fill_area_f(air, Vector3i(0, 0, 0), Vector3i(min_pad, s.y, s.z), ch)
+	buffer.fill_area_f(air, Vector3i(s.x - max_pad, 0, 0), Vector3i(s.x, s.y, s.z), ch)
+
+	# Y axis: low side (0..min_pad) and high side (s.y-max_pad..s.y)
+	buffer.fill_area_f(air, Vector3i(0, 0, 0), Vector3i(s.x, min_pad, s.z), ch)
+	buffer.fill_area_f(air, Vector3i(0, s.y - max_pad, 0), Vector3i(s.x, s.y, s.z), ch)
+
+	# Z axis: low side (0..min_pad) and high side (s.z-max_pad..s.z)
+	buffer.fill_area_f(air, Vector3i(0, 0, 0), Vector3i(s.x, s.y, min_pad), ch)
+	buffer.fill_area_f(air, Vector3i(0, 0, s.z - max_pad), Vector3i(s.x, s.y, s.z), ch)
 
 
 func _bake_fallback_cylinder_mesh(sever_y: float) -> ArrayMesh:
@@ -760,111 +1011,6 @@ func _bake_fallback_cylinder_mesh(sever_y: float) -> ArrayMesh:
 	return mesh
 
 
-func _bake_chunk_meshes(sever_y: float, section_height: float, chunk_count: int) -> void:
-	## Pre-bake fragment meshes by subdividing the upper tower section into
-	## vertical slices (like pie slices) and extracting each as a real voxel mesh.
-	## Must be called BEFORE _erase_above() so the voxel data is still present.
-	_cached_chunk_meshes.clear()
-	_cached_chunk_offsets.clear()
-
-	if _voxel_tool == null:
-		return
-
-	var mesher := VoxelMesherTransvoxel.new()
-	var min_pad: int = mesher.get_minimum_padding()
-	var max_pad: int = mesher.get_maximum_padding()
-
-	# Divide the section into vertical slices (angular pie slices).
-	# Each chunk covers a portion of the tower's angular range and a vertical band.
-	@warning_ignore("integer_division")
-	var vertical_splits := maxi(1, chunk_count / 3)  # 1-3 vertical bands
-	@warning_ignore("integer_division")
-	var angular_splits := maxi(2, chunk_count / vertical_splits)  # 2-4 angular slices per band
-
-	var band_height := section_height / float(vertical_splits)
-	var slice_angle := TAU / float(angular_splits)
-	var extent := OUTER_RADIUS + 1.0  # Capture full tower width
-
-	for v_i in vertical_splits:
-		var band_bottom := sever_y + float(v_i) * band_height
-		var band_top := band_bottom + band_height
-
-		for a_i in angular_splits:
-			var angle_start := float(a_i) * slice_angle
-			var angle_end := angle_start + slice_angle
-			var angle_center := (angle_start + angle_end) * 0.5
-
-			# For each chunk, we copy a box region from voxel data and blank out
-			# the voxels outside this chunk's angular slice to isolate it.
-			# The box covers the full XZ extent but only this vertical band.
-			var region_min := Vector3i(
-				int(floor(-extent)) - min_pad,
-				int(floor(band_bottom)) - min_pad,
-				int(floor(-extent)) - min_pad
-			)
-			var region_max := Vector3i(
-				int(ceil(extent)) + max_pad,
-				int(ceil(band_top)) + max_pad,
-				int(ceil(extent)) + max_pad
-			)
-
-			var buf_size: Vector3i = region_max - region_min
-			if buf_size.x <= 0 or buf_size.y <= 0 or buf_size.z <= 0:
-				continue
-
-			# Copy SDF data from the tower
-			var buffer := VoxelBuffer.new()
-			buffer.create(buf_size.x, buf_size.y, buf_size.z)
-			var sdf_mask: int = 1 << VoxelBuffer.CHANNEL_SDF
-			_voxel_tool.copy(region_min, buffer, sdf_mask)
-
-			# Blank out voxels outside our angular slice by setting SDF to positive (air).
-			# We iterate through the buffer and check each voxel's angle.
-			for bx in buf_size.x:
-				for bz in buf_size.z:
-					# Convert buffer coords to local tower coords
-					var local_x: float = float(region_min.x + bx) + 0.5
-					var local_z: float = float(region_min.z + bz) + 0.5
-					var voxel_angle := atan2(local_z, local_x)  # -PI to PI
-					if voxel_angle < 0.0:
-						voxel_angle += TAU  # 0 to TAU
-
-					# Check if this voxel's angle falls within our slice
-					var in_slice := false
-					# Handle angle wrapping
-					if angle_end <= TAU:
-						in_slice = voxel_angle >= angle_start and voxel_angle < angle_end
-					else:
-						# Slice wraps around TAU
-						in_slice = voxel_angle >= angle_start or voxel_angle < fmod(angle_end, TAU)
-
-					if not in_slice:
-						# Blank this entire column in Y
-						for by in buf_size.y:
-							buffer.set_voxel_f(1.0, bx, by, bz, VoxelBuffer.CHANNEL_SDF)
-
-			# Build mesh from the isolated chunk data
-			var materials: Array[Material] = [_tower_material]
-			var chunk_mesh: Mesh = mesher.build_mesh(buffer, materials)
-			if chunk_mesh != null and chunk_mesh.get_surface_count() > 0:
-				_cached_chunk_meshes.append(chunk_mesh)
-				# Offset: mesh vertices are in buffer-local space (0,0,0 = region_min)
-				# Chunk center in local tower space:
-				var chunk_center_local := Vector3(
-					cos(angle_center) * CORE_RADIUS * 0.5,
-					(band_bottom + band_top) * 0.5,
-					sin(angle_center) * CORE_RADIUS * 0.5
-				)
-				var mesh_offset := Vector3(float(region_min.x), float(region_min.y), float(region_min.z)) - chunk_center_local
-				_cached_chunk_offsets.append(mesh_offset)
-
-	# If we got fewer meshes than expected (some slices had no solid data), fill with fallback
-	if _cached_chunk_meshes.size() == 0:
-		print("[SpiralTower] Chunk bake: no fragments extracted, will use rock fallback")
-	else:
-		print("[SpiralTower] Chunk bake: %d fragment meshes extracted" % _cached_chunk_meshes.size())
-
-
 func _erase_above(sever_y: float) -> void:
 	## Remove all voxel data above the sever height from the tower terrain.
 	## All positions in local voxel-data space (0,0,0 = tower base center).
@@ -908,13 +1054,18 @@ func _spawn_topple_body(centroid: Vector3, baked_mesh: Mesh, mesh_offset: Vector
 	mesh_inst.material_override = _tower_material
 	topple.add_child(mesh_inst)
 
-	# Physics properties
-	topple.mass = section_height * 200.0
+	# Physics properties — mass proportional to volume (cross-section area * height).
+	# Core cylinder area = PI * CORE_RADIUS^2 ≈ 28.3 m^2, plus spiral ramp adds ~30%.
+	# Density ~5.5 kg/m^3 gives reasonable feel for a stone tower.
+	var cross_section_area: float = PI * CORE_RADIUS * CORE_RADIUS * 1.3  # Core + ramp estimate
+	topple.mass = cross_section_area * section_height * 5.5
 	topple.continuous_cd = true
 	topple.contact_monitor = true
 	topple.max_contacts_reported = 4
 	topple.gravity_scale = 1.0
-	topple.collision_layer = 1
+	# Use dedicated collision layer 2 for tower debris so topple body and chunks
+	# don't collide with each other. Mask layer 1 (world/players) for ground impact.
+	topple.collision_layer = 2
 	topple.collision_mask = 1
 
 	# Set custom properties BEFORE adding to tree (these are simple vars, not transforms)
@@ -922,21 +1073,18 @@ func _spawn_topple_body(centroid: Vector3, baked_mesh: Mesh, mesh_offset: Vector
 	topple.attacker_id = _last_attacker_id
 	topple.tower_position = global_position
 
-	# FIX: Add to scene tree FIRST, then set global_position.
-	# Setting global_position requires is_inside_tree() == true.
+	# Set position BEFORE adding to tree so there's no 1-frame flash at (0,0,0).
+	# For a child of the scene root, position == global_position.
+	topple.position = centroid
 	var scene_root := get_tree().current_scene
 	if scene_root:
 		scene_root.add_child(topple)
-		topple.global_position = centroid
-	else:
-		topple.position = centroid  # Fallback (shouldn't happen)
 
-	# Apply strong torque for dramatic tipping — needs to overcome the mass
-	# (mass = section_height * 200, so torque must scale with mass)
+	# Apply torque for dramatic tipping — needs to overcome the mass
 	var torque_strength := topple.mass * section_height * 2.0
 	topple.apply_torque_impulse(torque_dir * torque_strength)
-	# Lateral push to get it moving sideways
-	var push_strength := topple.mass * 1.5
+	# Gentle lateral nudge — just enough to start the tip, not a visible jump
+	var push_strength := topple.mass * 0.3
 	topple.apply_central_impulse(torque_dir * push_strength)
 
 	print("[SpiralTower] Topple body spawned (mass: %.0f, height: %.1fm, torque: %.0f)" % [
@@ -1030,7 +1178,7 @@ func _generate_rock_mesh(size: float, seed_val: int) -> ArrayMesh:
 # ======================================================================
 
 @rpc("authority", "call_remote", "reliable")
-func _sync_collapse_start(sever_y: float, torque_dir: Vector3, chunk_count: int = 6) -> void:
+func _sync_collapse_start(sever_y: float, torque_dir: Vector3) -> void:
 	## Client-side: extract real mesh, erase upper section, spawn visual-only topple body.
 	var section_height: float = _effective_tower_top - sever_y
 	if section_height < 2.0:
@@ -1039,19 +1187,21 @@ func _sync_collapse_start(sever_y: float, torque_dir: Vector3, chunk_count: int 
 	# Bake visual mesh BEFORE erasing (so we capture the actual tower shape)
 	var baked_mesh := _bake_upper_section_mesh(sever_y)
 
-	# Pre-bake chunk fragment meshes BEFORE erasing (clients need them too)
-	_bake_chunk_meshes(sever_y, section_height, chunk_count)
+	# Bake slab fragment meshes BEFORE erasing (SDF data will be destroyed on erase)
+	_bake_slab_meshes(sever_y)
 
-	# Compute mesh offset (same logic as server)
+	var body_center_local := Vector3(0.0, sever_y + section_height * 0.5, 0.0)
+
+	# Compute mesh offset (same logic as server — must match EXTRA_PAD in _bake_upper_section_mesh)
 	var mesher := VoxelMesherTransvoxel.new()
 	var min_pad: int = mesher.get_minimum_padding()
+	var total_pad: int = min_pad + 2  # Must match EXTRA_PAD
 	var extent := OUTER_RADIUS + 2.0
 	var region_min_local := Vector3(
-		float(int(floor(-extent)) - min_pad),
-		float(int(floor(sever_y)) - min_pad),
-		float(int(floor(-extent)) - min_pad)
+		float(int(floor(-extent)) - total_pad),
+		float(int(floor(sever_y)) - total_pad),
+		float(int(floor(-extent)) - total_pad)
 	)
-	var body_center_local := Vector3(0.0, sever_y + section_height * 0.5, 0.0)
 	var mesh_offset := region_min_local - body_center_local
 
 	# Now erase the upper section visually
@@ -1078,22 +1228,24 @@ func _sync_collapse_start(sever_y: float, torque_dir: Vector3, chunk_count: int 
 	mesh_inst.material_override = _tower_material
 	topple.add_child(mesh_inst)
 
-	topple.mass = section_height * 200.0
+	var cross_section_area: float = PI * CORE_RADIUS * CORE_RADIUS * 1.3
+	topple.mass = cross_section_area * section_height * 5.5
 	topple.continuous_cd = true
 	topple.gravity_scale = 1.0
-	topple.collision_layer = 1
+	# Use dedicated collision layer 2 for tower debris (matches server topple body)
+	topple.collision_layer = 2
 	topple.collision_mask = 1
 
-	# FIX: Add to tree FIRST, then set global_position
+	# Set position BEFORE adding to tree so there's no 1-frame flash at (0,0,0)
+	topple.position = centroid
 	var scene_root := get_tree().current_scene
 	if scene_root:
 		scene_root.add_child(topple)
-		topple.global_position = centroid
 
 	# Match server-side forces for consistent visual
 	var torque_strength := topple.mass * section_height * 2.0
 	topple.apply_torque_impulse(torque_dir * torque_strength)
-	var push_strength := topple.mass * 1.5
+	var push_strength := topple.mass * 0.3
 	topple.apply_central_impulse(torque_dir * push_strength)
 
 	# Auto-cleanup after 15 seconds (client visual only)
@@ -1107,24 +1259,162 @@ func _sync_collapse_start(sever_y: float, torque_dir: Vector3, chunk_count: int 
 
 @rpc("authority", "call_local", "reliable")
 func _sync_collapse_impact(impact_pos: Vector3, _impact_velocity: Vector3,
-		chunk_count: int, chunk_sizes: Array, chunk_impulses: Array) -> void:
-	## All clients + server: spawn chunk debris at impact point.
-	## Uses pre-baked voxel fragment meshes when available, falls back to rock shapes.
-	## Server chunks have damage logic (via tower_chunk.gd).
-	## Client chunks are cosmetic RigidBody3Ds.
+		chunk_count: int, chunk_sizes: Array, chunk_impulses: Array,
+		body_transform: Transform3D = Transform3D.IDENTITY,
+		body_linear_vel: Vector3 = Vector3.ZERO,
+		body_angular_vel: Vector3 = Vector3.ZERO,
+		body_mass: float = 0.0) -> void:
+	## All clients + server: spawn slab fragments at the topple body's final pose.
+	## Fragments inherit the topple body's velocity so they continue falling
+	## naturally and each creates its own impact explosion when hitting the ground.
 	var is_server := multiplayer.is_server()
 	var scene_root := get_tree().current_scene
 	if scene_root == null:
 		return
 
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.45, 0.42, 0.40)
+	# Remove the topple body — it's being replaced by fragments.
+	# On server it's already queue_free'd by tower_topple_body, but on clients
+	# the visual copy (TowerToppleBody_Visual) is still around.
+	for child in scene_root.get_children():
+		if child is RigidBody3D and child.name.begins_with("TowerToppleBody"):
+			child.queue_free()
 
-	var has_real_fragments := _cached_chunk_meshes.size() > 0
+	if _cached_slab_meshes.size() > 0:
+		_spawn_slab_fragments(body_transform, is_server, scene_root,
+			body_linear_vel, body_angular_vel, body_mass)
+	else:
+		# Fallback: spawn random rock chunks if slab baking failed
+		print("[SpiralTower] No cached slab meshes — falling back to rock chunks")
+		_spawn_rock_chunks_legacy(impact_pos, chunk_count, chunk_sizes,
+			chunk_impulses, is_server, scene_root)
+
+
+
+func _spawn_slab_fragments(body_transform: Transform3D, is_server: bool,
+		scene_root: Node, body_linear_vel: Vector3 = Vector3.ZERO,
+		body_angular_vel: Vector3 = Vector3.ZERO,
+		body_mass: float = 0.0) -> void:
+	## Spawn cached slab meshes as RigidBody3D fragments at the topple body's
+	## final world-space position and rotation. Each slab is a real horizontal
+	## slice of the tower's voxel mesh, so it looks like an actual piece.
+	##
+	## Fragments inherit the topple body's velocity so they continue falling
+	## naturally. Mass is distributed equally (each slab is roughly the same
+	## height slice of the tower). Each fragment handles its own ground impact.
+	var spawned_slabs: Array[RigidBody3D] = []
+
+	# Deterministic RNG for slight scatter (seeded from body position so all peers match)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = int(body_transform.origin.x * 1000.0) ^ int(body_transform.origin.z * 7919.0)
+
+	var slab_count := _cached_slab_meshes.size()
+
+	# Distribute the topple body's total mass equally across all slabs.
+	# Each slab is roughly the same height slice so equal split is fair.
+	var mass_per_slab: float = body_mass / maxf(float(slab_count), 1.0) if body_mass > 0.0 else 200.0
+
+	for i in slab_count:
+		var slab_mesh: Mesh = _cached_slab_meshes[i]
+		var slab_offset: Vector3 = _cached_slab_offsets[i]
+		var slab_shape: Shape3D = _cached_slab_shapes[i]
+		var mesh_center: Vector3 = _cached_slab_mesh_centers[i] if i < _cached_slab_mesh_centers.size() else Vector3.ZERO
+
+		var slab := RigidBody3D.new()
+		slab.name = "TowerSlab_%d" % i
+
+		if is_server:
+			slab.set_script(TowerChunkScript)
+
+		# Collision shape — centered BoxShape3D matching the mesh AABB.
+		var col := CollisionShape3D.new()
+		col.shape = slab_shape
+		slab.add_child(col)
+
+		# Visual mesh — offset by -mesh_center so it's centered on the body origin.
+		var mesh_inst := MeshInstance3D.new()
+		mesh_inst.mesh = slab_mesh
+		mesh_inst.position = -mesh_center
+		if _tower_material:
+			mesh_inst.material_override = _tower_material
+		else:
+			var fallback := StandardMaterial3D.new()
+			fallback.albedo_color = Color(0.45, 0.42, 0.40)
+			fallback.roughness = 0.85
+			fallback.cull_mode = BaseMaterial3D.CULL_DISABLED
+			mesh_inst.material_override = fallback
+		mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		slab.add_child(mesh_inst)
+
+		# Physics — mass is the topple body's total mass split across fragments.
+		slab.mass = maxf(mass_per_slab, 50.0)
+		slab.gravity_scale = 1.0
+		slab.angular_damp = 1.5
+		slab.collision_layer = 2  # Tower debris layer
+		slab.collision_mask = 3   # Collide with world (1) AND other tower debris (2)
+
+		if is_server:
+			slab.contact_monitor = true
+			slab.max_contacts_reported = 4
+			slab.chunk_mass = slab.mass
+			slab.attacker_id = _last_attacker_id
+
+		# Position: place the body at the mesh center's world position,
+		# accounting for the topple body's rotation at breakup time.
+		var centered_offset: Vector3 = slab_offset + mesh_center
+		var slab_world_pos: Vector3 = body_transform * centered_offset
+
+		scene_root.add_child(slab)
+		var slab_xform := Transform3D(body_transform.basis, slab_world_pos)
+		slab.global_transform = slab_xform
+
+		spawned_slabs.append(slab)
+
+		# Inherit the topple body's velocity so fragments continue the fall
+		# naturally. For a rotating body, each point's velocity is:
+		#   v_point = v_center + angular_vel × (point - center)
+		# This gives outer/top fragments more speed than center ones.
+		var offset_from_center: Vector3 = slab_world_pos - body_transform.origin
+		var inherited_vel: Vector3 = body_linear_vel + body_angular_vel.cross(offset_from_center)
+		slab.linear_velocity = inherited_vel
+		slab.angular_velocity = body_angular_vel
+
+		# Small outward scatter so slabs separate slightly instead of stacking
+		var outward := offset_from_center
+		if outward.length_squared() < 0.01:
+			outward = Vector3(rng.randf_range(-1.0, 1.0), 0.2,
+				rng.randf_range(-1.0, 1.0))
+		outward.y = maxf(outward.y, 0.0)
+		outward = outward.normalized()
+		slab.apply_central_impulse(outward * rng.randf_range(1.0, 3.0))
+
+		# Small random spin so slabs tumble slightly differently
+		slab.apply_torque_impulse(Vector3(
+			rng.randf_range(-2.0, 2.0),
+			rng.randf_range(-1.0, 1.0),
+			rng.randf_range(-2.0, 2.0)
+		))
+
+	# Clear the cache
+	_cached_slab_meshes.clear()
+	_cached_slab_offsets.clear()
+	_cached_slab_shapes.clear()
+	_cached_slab_mesh_centers.clear()
+
+	print("[SpiralTower] Spawned %d slab fragments at topple body position" % spawned_slabs.size())
+
+
+func _spawn_rock_chunks_legacy(impact_pos: Vector3, chunk_count: int,
+		chunk_sizes: Array, chunk_impulses: Array,
+		is_server: bool, scene_root: Node) -> void:
+	## Fallback: spawn random rock-shaped chunks if slab baking failed.
+	var spawned_chunks: Array[RigidBody3D] = []
+
+	var rng := RandomNumberGenerator.new()
+	rng.seed = int(impact_pos.x * 1000.0) ^ int(impact_pos.z * 7919.0) ^ (chunk_count * 4391)
 
 	for i in chunk_count:
 		var chunk_size: float = chunk_sizes[i] if i < chunk_sizes.size() else 1.5
-		var chunk_impulse: Vector3 = chunk_impulses[i] if i < chunk_impulses.size() else Vector3.UP * 5.0
+		var chunk_impulse: Vector3 = chunk_impulses[i] if i < chunk_impulses.size() else Vector3.ZERO
 
 		var chunk := RigidBody3D.new()
 		chunk.name = "TowerChunk_%d" % i
@@ -1132,59 +1422,47 @@ func _sync_collapse_impact(impact_pos: Vector3, _impact_velocity: Vector3,
 		if is_server:
 			chunk.set_script(TowerChunkScript)
 
-		# Collision — use a convex hull approximation (sphere is cheapest)
 		var col := CollisionShape3D.new()
-		var sphere_shape := SphereShape3D.new()
-		sphere_shape.radius = chunk_size * 0.5
-		col.shape = sphere_shape
+		var rock_mesh: ArrayMesh = _generate_rock_mesh(chunk_size, i)
+		var convex := rock_mesh.create_convex_shape(true, false)
+		if convex and convex is ConvexPolygonShape3D and convex.points.size() >= 4:
+			col.shape = convex
+		else:
+			var box_shape := BoxShape3D.new()
+			var half := chunk_size * 0.45
+			box_shape.size = Vector3(half, half * 0.7, half)
+			col.shape = box_shape
 		chunk.add_child(col)
 
-		# Visual — use real voxel fragment if available, else fallback to rock shape
 		var mesh_inst := MeshInstance3D.new()
-		if has_real_fragments:
-			# Cycle through cached fragments (wrap index if more chunks than fragments)
-			var frag_idx := i % _cached_chunk_meshes.size()
-			mesh_inst.mesh = _cached_chunk_meshes[frag_idx]
-			mesh_inst.position = _cached_chunk_offsets[frag_idx]
-		else:
-			mesh_inst.mesh = _generate_rock_mesh(chunk_size, i)
-		mesh_inst.material_override = mat
+		mesh_inst.mesh = rock_mesh
+		mesh_inst.material_override = _tower_material
 		chunk.add_child(mesh_inst)
 
-		# Physics
-		chunk.mass = chunk_size * chunk_size * chunk_size * 50.0  # Volume-based mass
-		chunk.continuous_cd = true
+		chunk.mass = chunk_size * chunk_size * chunk_size * 50.0
 		chunk.gravity_scale = 1.0
-		chunk.collision_layer = 1
-		chunk.collision_mask = 1
+		chunk.angular_damp = 2.0
+		chunk.collision_layer = 2  # Tower debris layer
+		chunk.collision_mask = 3   # Collide with world (1) AND other tower debris (2)
 
 		if is_server:
 			chunk.contact_monitor = true
 			chunk.max_contacts_reported = 4
-			chunk.chunk_mass = chunk.mass / 200.0  # Normalized mass for damage calc
+			chunk.chunk_mass = chunk.mass / 200.0
 			chunk.attacker_id = _last_attacker_id
 
-		# FIX: Add to tree FIRST, then set global_position (requires is_inside_tree)
-		scene_root.add_child(chunk)
-		chunk.global_position = impact_pos + Vector3(
-			randf_range(-2.0, 2.0), chunk_size * 0.5, randf_range(-2.0, 2.0)
+		var spawn_pos: Vector3 = impact_pos + Vector3(
+			rng.randf_range(-2.0, 2.0), rng.randf_range(0.5, 2.0), rng.randf_range(-2.0, 2.0)
 		)
+
+		scene_root.add_child(chunk)
+		chunk.global_position = spawn_pos
+
+		spawned_chunks.append(chunk)
 
 		chunk.apply_central_impulse(chunk_impulse)
 		chunk.apply_torque_impulse(Vector3(
-			randf_range(-5.0, 5.0),
-			randf_range(-5.0, 5.0),
-			randf_range(-5.0, 5.0)
+			rng.randf_range(-3.0, 3.0),
+			rng.randf_range(-2.0, 2.0),
+			rng.randf_range(-3.0, 3.0)
 		))
-
-		# Auto-cleanup
-		var timer := Timer.new()
-		timer.wait_time = 12.0
-		timer.one_shot = true
-		timer.timeout.connect(chunk.queue_free)
-		chunk.add_child(timer)
-		timer.start()
-
-	# Clear cached meshes after use (free memory)
-	_cached_chunk_meshes.clear()
-	_cached_chunk_offsets.clear()

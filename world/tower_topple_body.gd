@@ -13,14 +13,14 @@ const TowerChunkScript := preload("res://world/tower_chunk.gd")
 #  Constants
 # ======================================================================
 
-const IMPACT_MIN_SPEED := 2.0          ## Minimum total speed to count as impact
-const MAX_TOPPLE_TIME := 10.0          ## Safety timeout — force breakup
-const IMMUNITY_TIME := 1.5             ## Ignore everything for this long after spawn
-const SETTLE_TIME := 4.0              ## After this long, break up even if slow (it settled)
+const IMPACT_MIN_SPEED := 6.0          ## Base minimum speed to count as impact (when upright)
+const IMPACT_MIN_SPEED_TILTED := 1.5   ## Minimum speed when fully horizontal (heavily tilted)
+const MAX_TOPPLE_TIME := 20.0          ## Safety timeout — force breakup
+const IMMUNITY_TIME := 3.0             ## Ignore everything for this long after spawn
+const SETTLE_TIME := 10.0              ## After this long, break up even if slow (it settled)
+const SHATTER_MIN_SPEED := 2.0         ## Below this speed at impact, no chunk breakup — just damage + stay whole
 const CHUNK_COUNT_MIN := 4
 const CHUNK_COUNT_MAX := 8
-const EXPLOSION_DAMAGE_MULT := 50.0    ## base_damage = speed * (section/40) * this
-const MAX_BLAST_RADIUS := 15.0
 
 # ======================================================================
 #  Properties (set by spiral_tower.gd before adding to scene)
@@ -77,31 +77,35 @@ func _physics_process(delta: float) -> void:
 
 	# Active impact detection: check if any part of the body is in contact
 	# with the ground terrain by raycasting from the body in multiple directions.
-	# A tipping tower hits ground at an angle, so we check downward from the
-	# centroid AND from the edges.
 	var speed := linear_velocity.length()
 	var angular_speed := angular_velocity.length()
 
-	# Method 1: If the body has contacts and decent speed, it's impacting.
-	# get_contact_count() works when contact_monitor is enabled.
+	# Tilt factor: 0.0 = upright, 1.0 = fully horizontal/inverted.
+	# The more tilted the tower is, the easier it should shatter on contact.
+	var tilt := _get_tilt_factor()
+	# Effective speed threshold decreases as the tower tilts further.
+	# Upright: need full IMPACT_MIN_SPEED. Horizontal: only need IMPACT_MIN_SPEED_TILTED.
+	var effective_min_speed := lerpf(IMPACT_MIN_SPEED, IMPACT_MIN_SPEED_TILTED, tilt)
+	# Angular threshold also scales — a heavily tilted tower rotating slowly is still impacting.
+	var effective_min_angular := lerpf(2.0, 0.5, tilt)
+
+	# Method 1: If the body has contacts and sufficient speed/rotation, it's impacting.
 	var contact_count := get_contact_count()
-	if contact_count > 0 and (speed > IMPACT_MIN_SPEED or angular_speed > 1.0):
+	if contact_count > 0 and (speed > effective_min_speed or angular_speed > effective_min_angular):
 		# Check if any contact is NOT the tower terrain
 		var has_ground_contact := false
-		for i in contact_count:
-			var collider := get_colliding_bodies()
-			for c in collider:
-				if c != _tower_terrain:
-					has_ground_contact = true
-					break
-			if has_ground_contact:
+		var colliders := get_colliding_bodies()
+		for c in colliders:
+			if c != _tower_terrain:
+				has_ground_contact = true
 				break
 		if has_ground_contact:
 			_contact_frames += 1
-			# Require a few frames of contact to avoid false positives
-			if _contact_frames >= 3:
-				print("[TowerToppleBody] Ground contact impact! speed=%.1f angular=%.1f contacts=%d timer=%.1f" % [
-					speed, angular_speed, contact_count, _topple_timer])
+			# Less frames needed when heavily tilted (impact is more obvious)
+			var frames_needed := int(lerpf(8.0, 3.0, tilt))
+			if _contact_frames >= frames_needed:
+				print("[TowerToppleBody] Ground contact impact! speed=%.1f angular=%.1f tilt=%.2f timer=%.1f" % [
+					speed, angular_speed, tilt, _topple_timer])
 				_do_impact(_find_impact_pos(), linear_velocity)
 				return
 	else:
@@ -115,12 +119,10 @@ func _physics_process(delta: float) -> void:
 		return
 
 	# Method 3: Raycast-based ground detection.
-	# Cast rays from the body downward and along its tilt direction to detect
-	# when the tower tip has reached ground level.
 	if _topple_timer > IMMUNITY_TIME + 0.5:
 		var hit_pos := _raycast_ground_check()
-		if hit_pos != Vector3.ZERO and (speed > IMPACT_MIN_SPEED or angular_speed > 1.0):
-			print("[TowerToppleBody] Raycast ground hit! speed=%.1f timer=%.1f" % [speed, _topple_timer])
+		if hit_pos != Vector3.ZERO and (speed > effective_min_speed or angular_speed > effective_min_angular):
+			print("[TowerToppleBody] Raycast ground hit! speed=%.1f tilt=%.2f timer=%.1f" % [speed, tilt, _topple_timer])
 			_do_impact(hit_pos, linear_velocity)
 			return
 
@@ -136,11 +138,14 @@ func _on_body_entered(body: Node) -> void:
 
 	var speed := linear_velocity.length()
 	var angular_speed := angular_velocity.length()
-	if speed < IMPACT_MIN_SPEED and angular_speed < 1.0:
+	var tilt := _get_tilt_factor()
+	var effective_min_speed := lerpf(IMPACT_MIN_SPEED, IMPACT_MIN_SPEED_TILTED, tilt)
+	var effective_min_angular := lerpf(2.0, 0.5, tilt)
+	if speed < effective_min_speed and angular_speed < effective_min_angular:
 		return
 
-	print("[TowerToppleBody] body_entered impact! speed=%.1f body=%s timer=%.1f" % [
-		speed, body.name, _topple_timer])
+	print("[TowerToppleBody] body_entered impact! speed=%.1f tilt=%.2f body=%s timer=%.1f" % [
+		speed, tilt, body.name, _topple_timer])
 	_do_impact(_find_impact_pos(), linear_velocity)
 
 
@@ -206,23 +211,21 @@ func _do_impact(impact_pos: Vector3, impact_velocity: Vector3) -> void:
 	_has_impacted = true
 
 	var impact_speed := impact_velocity.length()
-	var mass_factor: float = section_height / 40.0
 
-	print("[TowerToppleBody] Impact at %s (speed: %.1f, section: %.1fm)" % [
-		str(impact_pos), impact_speed, section_height])
+	print("[TowerToppleBody] Impact at %s (speed: %.1f, mass: %.0f, section: %.1fm)" % [
+		str(impact_pos), impact_speed, mass, section_height])
 
-	# --- 1. Main impact explosion damage ---
-	var base_damage: float = impact_speed * mass_factor * EXPLOSION_DAMAGE_MULT
-	var blast_radius: float = minf(3.0 + section_height * 0.3, MAX_BLAST_RADIUS)
+	# --- 1. Check if impact is forceful enough to shatter ---
+	# A gentle/slow fall should NOT break the tower into chunks. The topple body
+	# just stays as-is (a big piece of rubble). No explosion here — individual
+	# fragments create their own explosions when they hit the ground.
+	if impact_speed < SHATTER_MIN_SPEED:
+		print("[TowerToppleBody] Gentle impact (speed %.1f < %.1f) — no shatter, staying whole" % [
+			impact_speed, SHATTER_MIN_SPEED])
+		freeze = true
+		return
 
-	_do_explosion_damage(impact_pos, base_damage, blast_radius)
-
-	# --- 2. Terrain crater ---
-	var seed_world := _find_seed_world()
-	if seed_world and seed_world.has_method("create_crater"):
-		seed_world.create_crater(impact_pos, blast_radius * 0.5, 2.0, attacker_id)
-
-	# --- 3. Generate chunk data ---
+	# --- 2. Generate chunk data (for legacy rock fallback only) ---
 	var rng := RandomNumberGenerator.new()
 	rng.randomize()
 	var chunk_count := rng.randi_range(CHUNK_COUNT_MIN, CHUNK_COUNT_MAX)
@@ -237,88 +240,26 @@ func _do_impact(impact_pos: Vector3, impact_velocity: Vector3) -> void:
 
 		var scatter := Vector3(
 			rng.randf_range(-1.0, 1.0),
-			rng.randf_range(0.2, 0.8),
+			rng.randf_range(-0.1, 0.3),
 			rng.randf_range(-1.0, 1.0)
 		).normalized()
-		var impulse: Vector3 = impact_velocity * 0.3 + scatter * 8.0 + Vector3(0, 3.0, 0)
+		var impulse: Vector3 = scatter * rng.randf_range(3.0, 6.0)
 		chunk_impulses.append(impulse)
 
-	# --- 4. Tell tower to spawn chunks on all clients ---
+	# --- 3. Tell tower to spawn chunks on all clients ---
+	# Pass global_transform and current velocities so fragments inherit the
+	# topple body's inertia and continue falling naturally. Each fragment
+	# handles its own ground impact, explosion damage, and crater creation.
+	var body_xform: Transform3D = global_transform
 	var tower := _find_tower()
 	if tower and tower.has_method("_sync_collapse_impact"):
 		tower._sync_collapse_impact.rpc(
-			impact_pos, impact_velocity, chunk_count, chunk_sizes, chunk_impulses
+			impact_pos, impact_velocity, chunk_count, chunk_sizes, chunk_impulses,
+			body_xform, linear_velocity, angular_velocity, mass
 		)
 
-	# --- 5. Remove self ---
+	# --- 4. Remove self ---
 	queue_free()
-
-
-func _do_explosion_damage(pos: Vector3, damage: float, radius: float) -> void:
-	var space_state := get_world_3d().direct_space_state
-	var already_damaged: Array = []
-
-	var sphere_params := PhysicsShapeQueryParameters3D.new()
-	var sphere := SphereShape3D.new()
-	sphere.radius = radius
-	sphere_params.shape = sphere
-	sphere_params.transform = Transform3D(Basis.IDENTITY, pos)
-	sphere_params.collision_mask = 0xFFFFFFFF
-
-	var results := space_state.intersect_shape(sphere_params, 32)
-	for result in results:
-		var collider: Node = result["collider"]
-		if collider == self:
-			continue
-		var target := _find_damageable(collider)
-		if target and target not in already_damaged:
-			if target.has_method("take_damage_at"):
-				target.take_damage_at(pos, damage, radius, attacker_id)
-				already_damaged.append(target)
-			else:
-				var dist := pos.distance_to(target.global_position)
-				var falloff := clampf(1.0 - (dist / radius), 0.0, 1.0)
-				var dmg := damage * falloff
-				if dmg > 0.5:
-					target.take_damage(dmg, attacker_id)
-					already_damaged.append(target)
-
-	var structures := get_tree().current_scene.get_node_or_null("SeedWorld/Structures")
-	if structures == null:
-		structures = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld/Structures")
-	if structures:
-		for child in structures.get_children():
-			if child in already_damaged:
-				continue
-			if child.has_method("take_damage_at"):
-				var dist := pos.distance_to(child.global_position)
-				var wall_reach: float = 0.0
-				if "wall_size" in child:
-					wall_reach = child.wall_size.length() * 0.5
-				if dist <= radius + wall_reach:
-					child.take_damage_at(pos, damage, radius, attacker_id)
-					already_damaged.append(child)
-
-
-func _find_damageable(node: Node) -> Node:
-	var current := node
-	var first_damageable: Node = null
-	for _i in 4:
-		if current == null:
-			break
-		if current.has_method("take_damage_at"):
-			return current
-		if first_damageable == null and current.has_method("take_damage"):
-			first_damageable = current
-		current = current.get_parent()
-	return first_damageable
-
-
-func _find_seed_world() -> Node:
-	var sw := get_tree().current_scene.get_node_or_null("SeedWorld")
-	if sw == null:
-		sw = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld")
-	return sw
 
 
 func _find_tower() -> Node:
@@ -328,3 +269,12 @@ func _find_tower() -> Node:
 	if structures:
 		return structures.get_node_or_null("SpiralTower")
 	return null
+
+
+func _get_tilt_factor() -> float:
+	## Returns 0.0 when the tower is upright, 1.0 when fully horizontal or inverted.
+	## The local Y axis is the cylinder's long axis. When upright, basis.y ≈ Vector3.UP.
+	## dot(basis.y, UP) = 1.0 upright, 0.0 horizontal, -1.0 inverted.
+	var uprightness := global_transform.basis.y.dot(Vector3.UP)
+	# Remap: 1.0 (upright) → 0.0, 0.0 (horizontal) → 1.0, -1.0 (inverted) → 1.0
+	return clampf(1.0 - uprightness, 0.0, 1.0)

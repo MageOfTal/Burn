@@ -222,8 +222,8 @@ func process_ads_visuals(delta: float, is_aiming: bool, ads_fov: float, has_scop
 
 	# Smooth FOV transition
 	player.camera.fov = lerpf(player.camera.fov, target_fov, ADS_LERP_SPEED * delta)
-	# Smooth spring arm transition
-	player.spring_arm.spring_length = lerpf(player.spring_arm.spring_length, target_spring, ADS_LERP_SPEED * delta)
+	# Set target length on the camera script — it handles asymmetric smoothing
+	player.spring_arm.target_length = lerpf(player.spring_arm.target_length, target_spring, ADS_LERP_SPEED * delta)
 
 	# Scope overlay
 	update_scope_overlay(show_scope, delta)

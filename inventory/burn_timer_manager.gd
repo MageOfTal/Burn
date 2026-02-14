@@ -39,9 +39,17 @@ func _physics_process(delta: float) -> void:
 		stack.burn_time_remaining -= stack.item_data.base_burn_rate * global_mult * heat_mult * delta
 
 	# Remove expired items (this calls _notify_sync internally)
+	var prev_equipped := inventory.equipped_index
 	var expired := inventory.remove_expired_items()
 	for item_name in expired:
 		print("Item burned away: %s" % item_name)
+
+	# If the equipped weapon slot was cleared by expiry, tell the player to
+	# drop its current_weapon so a burned-out weapon can't keep firing.
+	if expired.size() > 0 and prev_equipped >= 0 and inventory.equipped_index == -1:
+		var player := get_parent()
+		if player and player.has_method("clear_equipped_weapon"):
+			player.clear_equipped_weapon()
 
 	# Decrement shoe burn timer
 	if inventory.equipped_shoe != null:

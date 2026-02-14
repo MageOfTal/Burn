@@ -246,6 +246,9 @@ func _spawn_debris(block_pos: Vector3, blast_center: Vector3, count: int) -> voi
 	for i in count:
 		var debris := RigidBody3D.new()
 		debris.name = "WallDebris"
+		debris.mass = 0.5  # Small stone/wood cube
+		debris.collision_layer = 32  # Layer 6: wall debris (no self-collision)
+		debris.collision_mask = 1    # World geometry only
 
 		var col := CollisionShape3D.new()
 		col.shape = debris_shape.duplicate()

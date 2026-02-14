@@ -17,7 +17,7 @@ const EXTEND_SCALE_RATE := 0.003     ## How fast cost ramps up per fuel spent (h
 ## --- Scrap Item (X key) ---
 ## Scrap a nearby ground item (priority) or the equipped weapon into burn fuel.
 ## Rarer items give significantly more fuel.
-const SCRAP_FUEL_BY_RARITY := [10.0, 25.0, 50.0, 100.0, 200.0]  # Common → Legendary (reduced)
+const SCRAP_FUEL_BY_RARITY := [10.0, 30.0, 65.0, 130.0, 250.0]  # Common → Legendary
 const SCRAP_PICKUP_RANGE := 4.0  ## Max distance to scrap a ground item
 
 ## Player reference
@@ -108,6 +108,7 @@ func on_item_pickup(world_item: Node) -> void:
 
 func drop_item_as_world_item(stack: ItemStack) -> void:
 	## Server-only: spawn a WorldItem on the ground with the remaining burn time.
+	## Preserves the item's current rarity (which may have been rolled at spawn).
 	# Drop slightly behind the player
 	var drop_pos := player.global_position - player.transform.basis.z * 1.5
 	drop_pos.y = player.global_position.y
@@ -118,7 +119,8 @@ func drop_item_as_world_item(stack: ItemStack) -> void:
 			stack.item_data.resource_path,
 			drop_pos,
 			stack.burn_time_remaining,
-			player.peer_id  # pickup immunity
+			player.peer_id,  # pickup immunity
+			stack.item_data.rarity  # preserve rolled rarity
 		)
 	else:
 		push_warning("ItemManager: map has no spawn_world_item method")

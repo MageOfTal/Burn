@@ -36,7 +36,11 @@ func spawn_random_item() -> void:
 		push_warning("LootSpawnPoint: map has no spawn_world_item method")
 		return
 
-	map.spawn_world_item(item_data.resource_path, global_position)
+	# Roll rarity only for weapons/consumables/gadgets — shoes and fuel keep their baked rarity
+	var rolled_rarity: int = -1
+	if item_data.item_type != ItemData.ItemType.SHOE and item_data.item_type != ItemData.ItemType.FUEL:
+		rolled_rarity = map.roll_rarity() if map.has_method("roll_rarity") else -1
+	map.spawn_world_item(item_data.resource_path, global_position, -1.0, -1, rolled_rarity)
 
 	# Grab the spawned node (last child of WorldItems) to track for respawn
 	var container := map.get_node_or_null("WorldItems")

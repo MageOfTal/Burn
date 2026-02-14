@@ -26,6 +26,8 @@ var _ground_pump_button: CheckButton = null
 var _reel_speed_input: LineEdit = null
 var _grapple_debug_visuals_button: CheckButton = null
 var _quit_btn: Button = null
+var _velocity_iter_slider: HSlider = null
+var _velocity_iter_label: Label = null
 
 ## Saved settings
 var _settings := {
@@ -90,8 +92,8 @@ func _build_ui() -> void:
 	# Center panel
 	_panel = PanelContainer.new()
 	_panel.set_anchors_preset(Control.PRESET_CENTER)
-	_panel.custom_minimum_size = Vector2(500, 750)
-	_panel.position = Vector2(-250, -375)
+	_panel.custom_minimum_size = Vector2(500, 850)
+	_panel.position = Vector2(-250, -425)
 	_overlay.add_child(_panel)
 
 	# Panel style
@@ -213,6 +215,22 @@ func _build_ui() -> void:
 
 	_grapple_debug_visuals_button = _add_check("Debug Visuals (pill, angles, spheres)", false, vbox)
 	_grapple_debug_visuals_button.toggled.connect(_on_grapple_debug_visuals_toggled)
+
+	# Separator
+	vbox.add_child(HSeparator.new())
+
+	# --- Physics Debug ---
+	var phys_title := Label.new()
+	phys_title.text = "Physics Debug"
+	phys_title.add_theme_font_size_override("font_size", 18)
+	phys_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	phys_title.add_theme_color_override("font_color", Color(1.0, 0.7, 0.3))
+	vbox.add_child(phys_title)
+
+	var vi_row := _add_slider_row("Velocity Iters", 1.0, 20.0, 10.0, 1.0, vbox)
+	_velocity_iter_slider = vi_row[0]
+	_velocity_iter_label = vi_row[1]
+	_velocity_iter_slider.value_changed.connect(_on_velocity_iter_changed)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -372,6 +390,16 @@ func _on_reel_speed_submitted(text: String) -> void:
 func _on_grapple_debug_visuals_toggled(pressed: bool) -> void:
 	GameManager.debug_grapple_visuals = pressed
 	print("[PauseMenu] Grapple debug visuals: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_velocity_iter_changed(value: float) -> void:
+	var iters := int(value)
+	_velocity_iter_label.text = "%d" % iters
+	GameManager.debug_velocity_iterations = iters
+	# Apply to the active physics space at runtime via PhysicsServer3D
+	var space_rid := get_viewport().world_3d.space
+	PhysicsServer3D.space_set_param(space_rid, PhysicsServer3D.SPACE_PARAM_SOLVER_ITERATIONS, iters)
+	print("[PauseMenu] Physics solver iterations: %d" % iters)
 
 
 func _update_quit_button() -> void:

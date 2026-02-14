@@ -11,6 +11,23 @@ var fuel_definitions: Array[ItemData] = []
 ## Number of loot chests to spawn (uses a subset of LootSpawnPoints)
 const CHEST_COUNT := 80
 
+## Rarity roll weights: every item spawned can be any rarity.
+## Higher rarities are progressively rarer. Weights are relative (don't need to sum to 1).
+const RARITY_WEIGHTS := [50.0, 25.0, 14.0, 8.0, 3.0]  # Common, Uncommon, Rare, Epic, Legendary
+
+func roll_rarity() -> int:
+	## Roll a random rarity (0-4) using weighted probabilities.
+	var total: float = 0.0
+	for w in RARITY_WEIGHTS:
+		total += w
+	var roll := randf() * total
+	var cumulative: float = 0.0
+	for i in RARITY_WEIGHTS.size():
+		cumulative += RARITY_WEIGHTS[i]
+		if roll <= cumulative:
+			return i
+	return 0  # Fallback: Common
+
 ## DEBUG: items to spawn near the host player at game start (permanent, no burn timer).
 ## These are "demo" pickups — the player can grab them at leisure.
 const DEMO_SPAWN_TABLE: Array[Dictionary] = [
@@ -45,6 +62,11 @@ func _enter_tree() -> void:
 
 
 func _ready() -> void:
+	# Centralized bubble separation manager (spatial hash grid, replaces O(n^2) per-bubble scan)
+	var bubble_mgr := BubbleSeparationManager.new()
+	bubble_mgr.name = "BubbleSeparationManager"
+	add_child(bubble_mgr)
+
 	# Zone visual is cosmetic — create on ALL peers so everyone sees the ring + fire
 	_create_zone_visual()
 
@@ -62,10 +84,27 @@ func _ready() -> void:
 #  World Item Spawning (via MultiplayerSpawner)
 # ======================================================================
 
+## Scrap/salvage fuel values by rarity tier. Higher rarity = more fuel when scrapped.
+const SCRAP_FUEL_BY_RARITY := [10.0, 30.0, 65.0, 130.0, 250.0]  # Common → Legendary
+## Rarity multipliers for time_currency_value (sacrifice/convert system).
+const RARITY_VALUE_MULT := [1.0, 2.0, 4.0, 8.0, 16.0]  # Exponential scaling
+
 func _on_spawn_world_item(data: Dictionary) -> Node:
 	## Spawn function called on ALL peers when server spawns a world item.
 	## The spawner automatically adds the returned node to WorldItems.
+	## If data has "rarity", the ItemData is duplicated with the overridden rarity.
+	## Only weapons/consumables/gadgets get rarity overrides — shoes and fuel keep
+	## their baked rarity (each .tres IS a rarity tier for those types).
 	var item_data: ItemData = load(data["path"])
+	if data.has("rarity"):
+		var rolled: int = data["rarity"]
+		var base_rarity: int = item_data.rarity
+		item_data = item_data.duplicate()
+		item_data.rarity = rolled
+		# Scale time_currency_value relative to the base definition's rarity
+		if base_rarity >= 0 and base_rarity < RARITY_VALUE_MULT.size() and rolled < RARITY_VALUE_MULT.size():
+			var ratio: float = RARITY_VALUE_MULT[rolled] / maxf(RARITY_VALUE_MULT[base_rarity], 0.01)
+			item_data.time_currency_value = item_data.time_currency_value * ratio
 	var world_item: WorldItem = preload("res://items/world_item.tscn").instantiate()
 	world_item.setup(item_data)
 	world_item.position = data["pos"]
@@ -76,9 +115,10 @@ func _on_spawn_world_item(data: Dictionary) -> Node:
 	return world_item
 
 
-func spawn_world_item(item_path: String, pos: Vector3, burn_time: float = -1.0, immune_peer: int = -1) -> void:
+func spawn_world_item(item_path: String, pos: Vector3, burn_time: float = -1.0, immune_peer: int = -1, rarity: int = -1) -> void:
 	## Server-only: spawn a world item via the ItemSpawner.
 	## The spawner replicates to all clients automatically.
+	## rarity: -1 = use definition default, 0-4 = override rarity.
 	if not multiplayer.is_server():
 		return
 	var data: Dictionary = {"path": item_path, "pos": pos}
@@ -86,6 +126,8 @@ func spawn_world_item(item_path: String, pos: Vector3, burn_time: float = -1.0, 
 		data["burn_time"] = burn_time
 	if immune_peer >= 0:
 		data["immune_peer"] = immune_peer
+	if rarity >= 0:
+		data["rarity"] = rarity
 	$ItemSpawner.spawn(data)
 
 
@@ -237,7 +279,11 @@ func _spawn_demo_items() -> void:
 
 		# Spawn via ItemSpawner — replicates to all clients automatically.
 		# burn_time 999999.0 = permanent (never expires).
-		spawn_world_item(entry["path"], host_pos + offset, 999999.0)
+		# Only roll rarity for weapons/consumables/gadgets (not shoes/fuel).
+		var rarity_roll: int = -1
+		if item_data.item_type != ItemData.ItemType.SHOE and item_data.item_type != ItemData.ItemType.FUEL:
+			rarity_roll = roll_rarity()
+		spawn_world_item(entry["path"], host_pos + offset, 999999.0, -1, rarity_roll)
 		count += 1
 
 	if count > 0:
@@ -644,4 +690,7 @@ func _process(delta: float) -> void:
 
 func _place_world_item(item_data: ItemData, pos: Vector3) -> void:
 	## Spawn a WorldItem via the ItemSpawner (replicates to all clients).
-	spawn_world_item(item_data.resource_path, pos)
+	var rarity_roll: int = -1
+	if item_data.item_type != ItemData.ItemType.SHOE and item_data.item_type != ItemData.ItemType.FUEL:
+		rarity_roll = roll_rarity()
+	spawn_world_item(item_data.resource_path, pos, -1.0, -1, rarity_roll)

@@ -1,4 +1,4 @@
-[gd_scene load_steps=19 format=3 uid="uid://player001"]
+[gd_scene load_steps=22 format=3 uid="uid://player001"]
 
 [ext_resource type="Script" path="res://player/player.gd" id="1_player"]
 [ext_resource type="Script" path="res://player/player_camera.gd" id="2_camera"]
@@ -14,6 +14,12 @@
 [ext_resource type="Script" path="res://player/item_manager.gd" id="12_item_mgr"]
 [ext_resource type="Script" path="res://player/grapple_system.gd" id="13_grapple"]
 [ext_resource type="Script" path="res://player/demon_system.gd" id="14_demon"]
+[ext_resource type="Shader" path="res://player/player_dissolve.gdshader" id="15_dissolve"]
+
+[sub_resource type="ShaderMaterial" id="DissolveMaterial_001"]
+shader = ExtResource("15_dissolve")
+shader_parameter/albedo_color = Color(0.5, 0.5, 0.5, 1.0)
+shader_parameter/alpha_fade = 1.0
 
 [sub_resource type="CapsuleShape3D" id="CapsuleShape3D_001"]
 radius = 0.4
@@ -142,7 +148,7 @@ properties/14/spawn = true
 properties/14/replication_mode = 1
 
 [node name="Player" type="CharacterBody3D"]
-collision_mask = 17
+collision_mask = 19
 floor_max_angle = 1.0472
 floor_snap_length = 0.3
 script = ExtResource("1_player")
@@ -154,6 +160,7 @@ shape = SubResource("CapsuleShape3D_001")
 [node name="BodyMesh" type="MeshInstance3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9, 0)
 mesh = SubResource("CapsuleMesh_001")
+material_override = SubResource("DissolveMaterial_001")
 
 [node name="CameraPivot" type="Node3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.5, 0)

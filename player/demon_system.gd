@@ -46,6 +46,15 @@ var _warning_label: Label = null
 var _game_over_overlay: Control = null
 var _was_eliminated: bool = false  ## Track transition for game over overlay
 
+## 3D arrowhead that points toward demon when within 10m (local player only)
+var _arrow_mesh: MeshInstance3D = null
+var _arrow_spin: float = 0.0         ## Current spin angle (radians, accumulated)
+var _arrow_flash_time: float = 0.0   ## Flash timer (accumulates, wraps)
+const ARROW_SHOW_DISTANCE := 10.0    ## Edge-to-edge distance at which arrow appears
+const ARROW_ORBIT_RADIUS := 1.2      ## Distance from player center the arrow floats
+const ARROW_HEIGHT_OFFSET := 1.0     ## Y offset above player feet
+const PLAYER_CAPSULE_RADIUS := 0.4   ## Player capsule radius for edge distance calc
+
 # ======================================================================
 #  Player reference
 # ======================================================================
@@ -186,7 +195,7 @@ func _eliminate_player() -> void:
 #  Client: demon visuals (LOCAL PLAYER ONLY)
 # ======================================================================
 
-func client_process_visuals(_delta: float) -> void:
+func client_process_visuals(delta: float) -> void:
 	## Client-side: only the local player renders the demon.
 	var is_local: bool = (player.peer_id == multiplayer.get_unique_id())
 	if not is_local:
@@ -198,6 +207,7 @@ func client_process_visuals(_delta: float) -> void:
 		_show_game_over_overlay()
 		_cleanup_demon_mesh()
 		_cleanup_warning_label()
+		_cleanup_arrow()
 		return
 	if is_eliminated:
 		return
@@ -205,6 +215,7 @@ func client_process_visuals(_delta: float) -> void:
 	if not demon_active:
 		_cleanup_demon_mesh()
 		_cleanup_warning_label()
+		_cleanup_arrow()
 		return
 
 	# Create demon mesh if needed
@@ -220,8 +231,12 @@ func client_process_visuals(_delta: float) -> void:
 	_demon_mesh.scale = Vector3(scale_val, scale_val, scale_val)
 
 	# Proximity warning on HUD
-	var dist: float = player.global_position.distance_to(demon_position)
-	_update_warning_label(dist < DEMON_WARNING_DISTANCE, dist)
+	var center_dist: float = player.global_position.distance_to(demon_position)
+	var edge_dist: float = maxf(center_dist - DEMON_CATCH_RADIUS - PLAYER_CAPSULE_RADIUS, 0.0)
+	_update_warning_label(center_dist < DEMON_WARNING_DISTANCE, center_dist)
+
+	# 3D arrowhead pointing toward demon when within 10m edge-to-edge
+	_update_demon_arrow(edge_dist, delta)
 
 
 # ======================================================================
@@ -335,6 +350,128 @@ func _cleanup_warning_label() -> void:
 
 
 # ======================================================================
+#  Client: 3D arrowhead pointing toward demon
+# ======================================================================
+
+func _update_demon_arrow(edge_dist: float, delta: float) -> void:
+	## Show/hide and position the 3D arrowhead that points toward the demon.
+	## Only visible within ARROW_SHOW_DISTANCE (10m edge-to-edge).
+	## Spins around its pointing axis and flashes (faster when closer).
+	if edge_dist >= ARROW_SHOW_DISTANCE or not player.is_alive:
+		_cleanup_arrow()
+		return
+
+	if _arrow_mesh == null or not is_instance_valid(_arrow_mesh):
+		_create_arrow_mesh()
+
+	# Direction from player to demon (XZ plane for horizontal pointing)
+	var to_demon: Vector3 = demon_position - player.global_position
+	var to_demon_xz := Vector3(to_demon.x, 0.0, to_demon.z)
+	if to_demon_xz.length() < 0.01:
+		_arrow_mesh.visible = false
+		return
+
+	var dir_xz: Vector3 = to_demon_xz.normalized()
+
+	# Proximity factor: 0 at 10m, 1 at 0m (touching)
+	var proximity: float = clampf(1.0 - (edge_dist / ARROW_SHOW_DISTANCE), 0.0, 1.0)
+
+	# Position the arrow orbiting around the player, toward the demon
+	var arrow_pos: Vector3 = player.global_position + dir_xz * ARROW_ORBIT_RADIUS
+	arrow_pos.y += ARROW_HEIGHT_OFFSET
+	_arrow_mesh.global_position = arrow_pos
+
+	# Point toward demon, then spin around the pointing axis
+	var look_target: Vector3 = arrow_pos + dir_xz
+	_arrow_mesh.look_at(look_target, Vector3.UP)
+	# Spin: speed ramps from 2 rad/s at far edge to 12 rad/s when very close
+	var spin_speed: float = lerpf(2.0, 12.0, proximity)
+	_arrow_spin += spin_speed * delta
+	# look_at resets rotation each frame, so apply total accumulated spin
+	_arrow_mesh.rotate_object_local(Vector3(0.0, 0.0, -1.0), _arrow_spin)
+	# Wrap to avoid float overflow over long sessions
+	if _arrow_spin > TAU * 10.0:
+		_arrow_spin = fmod(_arrow_spin, TAU)
+
+	# Flash: oscillate alpha. Frequency ramps from 1.5 Hz at far edge to 6 Hz when close
+	var flash_freq: float = lerpf(1.5, 6.0, proximity)
+	_arrow_flash_time += delta * flash_freq
+	var flash_wave: float = (sin(_arrow_flash_time * TAU) + 1.0) * 0.5  # 0..1
+	var base_alpha: float = lerpf(0.15, 0.85, proximity)
+	var alpha: float = lerpf(base_alpha * 0.3, base_alpha, flash_wave)
+
+	var mat: StandardMaterial3D = _arrow_mesh.material_override as StandardMaterial3D
+	if mat:
+		mat.albedo_color = Color(1.0, 0.1, 0.05, alpha)
+		var emission_strength: float = lerpf(0.3, 1.0, proximity) * lerpf(0.4, 1.0, flash_wave)
+		mat.emission = Color(0.8, 0.0, 0.0) * emission_strength
+
+	_arrow_mesh.visible = true
+
+
+func _create_arrow_mesh() -> void:
+	## Create a 3D arrowhead (chevron/pyramid pointing forward along -Z).
+	## No tail — just a pointed triangular arrowhead.
+	_arrow_mesh = MeshInstance3D.new()
+	_arrow_mesh.top_level = true
+	_arrow_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+
+	# Build arrowhead geometry: a flat chevron (4 triangles forming a pointed shape)
+	var mesh := ImmediateMesh.new()
+	_arrow_mesh.mesh = mesh
+
+	# Arrowhead dimensions
+	var tip_z := -0.4     # Tip of the arrow (forward, pointing at demon)
+	var back_z := 0.2     # Back of the arrowhead
+	var notch_z := 0.05   # Inner notch (V shape at rear)
+	var half_w := 0.25    # Half-width of the arrowhead wings
+	var y := 0.0
+
+	# Two triangles forming a chevron/arrowhead shape (double-sided)
+	mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+	# Left wing (front face)
+	mesh.surface_add_vertex(Vector3(0.0, y, tip_z))
+	mesh.surface_add_vertex(Vector3(-half_w, y, back_z))
+	mesh.surface_add_vertex(Vector3(0.0, y, notch_z))
+	# Right wing (front face)
+	mesh.surface_add_vertex(Vector3(0.0, y, tip_z))
+	mesh.surface_add_vertex(Vector3(0.0, y, notch_z))
+	mesh.surface_add_vertex(Vector3(half_w, y, back_z))
+	# Left wing (back face — reverse winding for double-sided)
+	mesh.surface_add_vertex(Vector3(0.0, y, tip_z))
+	mesh.surface_add_vertex(Vector3(0.0, y, notch_z))
+	mesh.surface_add_vertex(Vector3(-half_w, y, back_z))
+	# Right wing (back face)
+	mesh.surface_add_vertex(Vector3(0.0, y, tip_z))
+	mesh.surface_add_vertex(Vector3(half_w, y, back_z))
+	mesh.surface_add_vertex(Vector3(0.0, y, notch_z))
+	mesh.surface_end()
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(1.0, 0.1, 0.05, 0.7)
+	mat.emission_enabled = true
+	mat.emission = Color(0.8, 0.0, 0.0)
+	mat.emission_energy_multiplier = 2.0
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	mat.no_depth_test = true
+	_arrow_mesh.material_override = mat
+
+	var scene_root := get_tree().current_scene
+	if scene_root:
+		scene_root.add_child(_arrow_mesh)
+
+
+func _cleanup_arrow() -> void:
+	if _arrow_mesh and is_instance_valid(_arrow_mesh):
+		_arrow_mesh.queue_free()
+		_arrow_mesh = null
+	_arrow_spin = 0.0
+	_arrow_flash_time = 0.0
+
+
+# ======================================================================
 #  Client: game over overlay
 # ======================================================================
 
@@ -395,6 +532,7 @@ func _exit_tree() -> void:
 	## Clean up top-level nodes that survive player despawning (e.g. on game reset).
 	_cleanup_demon_mesh()
 	_cleanup_warning_label()
+	_cleanup_arrow()
 	if _game_over_overlay and is_instance_valid(_game_over_overlay):
 		_game_over_overlay.queue_free()
 		_game_over_overlay = null

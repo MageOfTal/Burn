@@ -138,7 +138,12 @@ func open(_peer_id: int) -> void:
 func _spawn_world_item(p_item_data: ItemData, pos: Vector3) -> void:
 	var map := get_tree().current_scene
 	if map.has_method("spawn_world_item"):
-		map.spawn_world_item(p_item_data.resource_path, pos)
+		# Roll rarity only for weapons/consumables/gadgets — shoes and fuel have
+		# rarity baked into their identity (each .tres IS a rarity tier).
+		var rolled_rarity: int = -1
+		if p_item_data.item_type != ItemData.ItemType.SHOE and p_item_data.item_type != ItemData.ItemType.FUEL:
+			rolled_rarity = map.roll_rarity() if map.has_method("roll_rarity") else -1
+		map.spawn_world_item(p_item_data.resource_path, pos, -1.0, -1, rolled_rarity)
 	else:
 		push_warning("LootChest: map has no spawn_world_item method")
 

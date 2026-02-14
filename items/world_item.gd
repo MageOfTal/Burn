@@ -16,7 +16,7 @@ var _immune_timer: float = 0.0
 const PICKUP_IMMUNITY_TIME := 2.0
 
 const SCRAP_POPUP_RANGE := 4.0
-const SCRAP_FUEL_BY_RARITY := [10.0, 25.0, 50.0, 100.0, 200.0]
+const SCRAP_FUEL_BY_RARITY := [10.0, 30.0, 65.0, 130.0, 250.0]
 
 ## Rarity colors for world item boxes
 const RARITY_COLORS := {
@@ -70,13 +70,17 @@ func set_pickup_immunity(peer_id: int) -> void:
 
 const PERMANENT_THRESHOLD := 999990.0  ## Items with burn_time >= this never expire
 
+const RARITY_NAMES := ["Common", "Uncommon", "Rare", "Epic", "Legendary"]
+
 func _process(delta: float) -> void:
-	# Update floating label
+	# Update floating label with rarity prefix
 	if label and item_data:
+		var rarity_tag: String = RARITY_NAMES[clampi(item_data.rarity, 0, 4)]
 		if burn_time_remaining >= PERMANENT_THRESHOLD:
-			label.text = item_data.item_name
+			label.text = "[%s] %s" % [rarity_tag, item_data.item_name]
 		else:
-			label.text = "%s [%ds]" % [item_data.item_name, ceili(burn_time_remaining)]
+			label.text = "[%s] %s [%ds]" % [rarity_tag, item_data.item_name, ceili(burn_time_remaining)]
+		label.modulate = RARITY_COLORS.get(item_data.rarity, Color.WHITE)
 
 	# Server: burn timer + immunity
 	if multiplayer.is_server():
@@ -99,14 +103,12 @@ func _update_visual() -> void:
 	if mesh == null or item_data == null:
 		return
 	var mat := StandardMaterial3D.new()
-	if item_data.mesh_color != Color.WHITE:
-		mat.albedo_color = item_data.mesh_color
-	else:
-		mat.albedo_color = RARITY_COLORS.get(item_data.rarity, Color.WHITE)
-	if item_data.rarity >= ItemData.Rarity.EPIC:
+	# Box color is determined exclusively by rarity
+	mat.albedo_color = RARITY_COLORS.get(item_data.rarity, Color.WHITE)
+	if item_data.rarity >= ItemData.Rarity.RARE:
 		mat.emission_enabled = true
 		mat.emission = mat.albedo_color
-		mat.emission_energy_multiplier = 1.5
+		mat.emission_energy_multiplier = 0.5 + item_data.rarity * 0.4  # Rare=1.3, Epic=1.7, Legendary=2.1
 	mesh.material_override = mat
 
 
@@ -198,11 +200,15 @@ func _find_local_player() -> Node:
 
 
 func _show_scrap_popup() -> void:
-	if _scrap_label != null:
-		return
+	var max_fuel: float = SCRAP_FUEL_BY_RARITY[clampi(item_data.rarity, 0, 4)]
+	var initial_time: float = maxf(item_data.initial_burn_time, 0.1)
+	var time_fraction: float = clampf(burn_time_remaining / initial_time, 0.0, 1.0)
+	var fuel: float = max_fuel * time_fraction
 
-	var fuel: float = SCRAP_FUEL_BY_RARITY[clampi(item_data.rarity, 0, 4)]
-	fuel += burn_time_remaining * 0.1
+	if _scrap_label != null:
+		# Update text each frame so the value stays accurate as the burn timer ticks
+		_scrap_label.text = "[X] SCRAP  +%.0f fuel" % fuel
+		return
 
 	_scrap_label = Label3D.new()
 	_scrap_label.text = "[X] SCRAP  +%.0f fuel" % fuel

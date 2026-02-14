@@ -763,7 +763,7 @@ func client_process_visuals(delta: float) -> void:
 		player.camera.fov = lerpf(player.camera.fov, target_fov, 6.0 * delta)
 		# Spring arm: pull camera BACK (further out) for better visibility
 		var target_spring := lerpf(CAMERA_BASE_SPRING, CAMERA_MAX_SPRING, speed_t)
-		player.spring_arm.spring_length = lerpf(player.spring_arm.spring_length, target_spring, 6.0 * delta)
+		player.spring_arm.target_length = lerpf(player.spring_arm.target_length, target_spring, 6.0 * delta)
 
 	# Weapon mount hidden during kamikaze
 	player.weapon_mount.visible = false

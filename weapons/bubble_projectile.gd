@@ -33,10 +33,6 @@ const POP_ENERGY_WALL := 0.8
 const POP_ENERGY_OBJECT := 2.0
 const POP_ENERGY_BUBBLE := 5.0
 
-## Soft bubble-on-bubble separation
-const BUBBLE_PUSH_STRENGTH := 4.0
-const BUBBLE_SEPARATION := 1.3
-
 ## Identity flag — used by _is_bubble() to distinguish from rubber balls.
 var is_bubble := true
 
@@ -74,15 +70,26 @@ func _ready() -> void:
 	phys_mat.friction = FRICTION
 	physics_material_override = phys_mat
 
-	collision_layer = 4  # Layer 3
-	collision_mask = 1   # World only
+	collision_layer = 4  # Layer 3: bubbles
+	collision_mask = 1   # World only (bubble-to-bubble handled by BubbleSeparationManager)
 
 	contact_monitor = true
 	max_contacts_reported = 4
 	if multiplayer.is_server():
 		body_entered.connect(_on_body_entered)
+		# Register with centralized spatial-hash separation manager
+		var manager := _find_separation_manager()
+		if manager:
+			manager.register(self)
 
 	_setup_visual()
+
+
+func _exit_tree() -> void:
+	if multiplayer.is_server():
+		var manager := _find_separation_manager()
+		if manager:
+			manager.unregister(self)
 
 
 func _setup_visual() -> void:
@@ -127,7 +134,6 @@ func _physics_process(delta: float) -> void:
 		_wind_dir = _wind_dir.rotated(Vector3.UP, randf_range(-0.2, 0.2))
 		_nudge_timer = NUDGE_INTERVAL
 
-	_push_apart_from_bubbles()
 	_check_player_overlap()
 
 
@@ -173,27 +179,11 @@ func _is_bubble(node: Node) -> bool:
 	return node is RigidBody3D and node != self and node.get("is_bubble") == true
 
 
-func _push_apart_from_bubbles() -> void:
-	## Soft separation forces between nearby bubbles.
-	var container := get_parent()
-	if container == null:
-		return
-
-	for child in container.get_children():
-		if child == self or not _is_bubble(child) or not is_instance_valid(child):
-			continue
-
-		var other: RigidBody3D = child as RigidBody3D
-		var to_other: Vector3 = other.global_position - global_position
-		var dist: float = to_other.length()
-
-		if dist < 0.001:
-			to_other = Vector3(randf_range(-1, 1), randf_range(-0.2, 0.2), randf_range(-1, 1)).normalized()
-			dist = 0.001
-
-		if dist < BUBBLE_SEPARATION:
-			var overlap := 1.0 - (dist / BUBBLE_SEPARATION)
-			apply_central_force(-to_other.normalized() * BUBBLE_PUSH_STRENGTH * overlap)
+func _find_separation_manager() -> BubbleSeparationManager:
+	var scene := get_tree().current_scene
+	if scene:
+		return scene.get_node_or_null("BubbleSeparationManager") as BubbleSeparationManager
+	return null
 
 
 func _check_player_overlap() -> void:

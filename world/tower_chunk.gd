@@ -13,16 +13,16 @@ class_name TowerChunk
 # ======================================================================
 
 const MIN_DAMAGE_SPEED := 3.0          ## Minimum impact speed to deal damage (m/s)
-const DAMAGE_PER_SPEED_PER_MASS := 8.0 ## Damage = speed * mass * this
+const DAMAGE_MULTIPLIER := 1.5         ## Damage = speed * sqrt(mass_kg) * this * angle_mult
 const CRATER_BASE_RADIUS := 0.5        ## Base crater radius on terrain hit
-const CRATER_MASS_SCALE := 0.3         ## Extra crater radius per unit mass
+const CRATER_MASS_SCALE := 0.003       ## Extra crater radius per kg of mass
 const MAX_DAMAGE_EVENTS := 3           ## Max separate damage events per chunk
 
 # ======================================================================
 #  Properties (set by spiral_tower.gd before adding to scene)
 # ======================================================================
 
-var chunk_mass: float = 1.0            ## Normalized mass for damage calculation
+var chunk_mass: float = 200.0          ## Mass in kg for damage calculation (set by spiral_tower.gd)
 var attacker_id: int = -1              ## Player who caused the collapse
 
 # ======================================================================
@@ -53,7 +53,15 @@ func _on_body_entered(body: Node) -> void:
 	var down_dot := absf(linear_velocity.normalized().dot(Vector3.DOWN))
 	var angle_mult := 1.0 + down_dot * 0.5  # 1.0 (horizontal) to 1.5 (vertical)
 
-	var base_damage: float = impact_speed * chunk_mass * DAMAGE_PER_SPEED_PER_MASS * angle_mult
+	# Damage scales with speed, sqrt(mass), and impact angle.
+	# Using sqrt(mass) so heavier slabs hit harder but not linearly —
+	# a 1000kg slab isn't 5x deadlier than a 200kg slab, just ~2.2x.
+	# Examples at vertical impact (angle_mult = 1.5):
+	#   200kg slab at 10 m/s: 10 * 14.1 * 1.5 * 1.5 ≈ 318 damage (lethal)
+	#   200kg slab at  5 m/s:  5 * 14.1 * 1.5 * 1.5 ≈ 159 damage (heavy hit)
+	#  1000kg slab at 10 m/s: 10 * 31.6 * 1.5 * 1.5 ≈ 711 damage (overkill)
+	var mass_factor: float = sqrt(chunk_mass)
+	var base_damage: float = impact_speed * mass_factor * DAMAGE_MULTIPLIER * angle_mult
 
 	# --- Damage player ---
 	if body.has_method("take_damage"):
@@ -68,7 +76,7 @@ func _on_body_entered(body: Node) -> void:
 	var target := _find_damageable(body)
 	if target:
 		if target.has_method("take_damage_at"):
-			var chunk_radius: float = 1.0 + chunk_mass * 0.5
+			var chunk_radius: float = 1.0 + mass_factor * 0.15
 			target.take_damage_at(global_position, base_damage, chunk_radius, attacker_id)
 		elif target.has_method("take_damage"):
 			target.take_damage(base_damage, attacker_id)

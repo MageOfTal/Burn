@@ -780,7 +780,7 @@ func _update_demon_vignette() -> void:
 	if not is_instance_valid(_player):
 		return
 
-	var demon_sys: Node = _player.get_node_or_null("DemonSystem")
+	var demon_sys: DemonSystem = _player.get_node_or_null("DemonSystem") as DemonSystem
 	if demon_sys == null or not is_instance_valid(demon_sys) or not demon_sys.demon_active or demon_sys.is_eliminated:
 		_demon_vignette.visible = false
 		return
@@ -789,20 +789,17 @@ func _update_demon_vignette() -> void:
 		_demon_vignette.visible = false
 		return
 
-	var distance: float = _player.global_position.distance_to(demon_sys.demon_position)
-	var speed: float = demon_sys.demon_speed
+	# Hitbox-to-hitbox distance: subtract player capsule radius and demon catch radius
+	var center_dist: float = _player.global_position.distance_to(demon_sys.demon_position)
+	var edge_dist: float = maxf(center_dist - DemonSystem.DEMON_CATCH_RADIUS - 0.4, 0.0)
 
-	if speed <= 0.01:
+	var threshold := 10.0  # Red frame starts appearing at 10m edge-to-edge
+
+	if edge_dist >= threshold:
 		_demon_vignette.visible = false
 		return
 
-	var time_to_reach: float = distance / speed
-	var threshold := 3.0
-
-	if time_to_reach >= threshold:
-		_demon_vignette.visible = false
-		return
-
-	var vignette_intensity: float = clampf(1.0 - (time_to_reach / threshold), 0.0, 1.0)
+	# Intensity ramps from 0 at 10m to 1 at 0m (touching)
+	var vignette_intensity: float = clampf(1.0 - (edge_dist / threshold), 0.0, 1.0)
 	_demon_vignette_material.set_shader_parameter("intensity", vignette_intensity)
 	_demon_vignette.visible = true

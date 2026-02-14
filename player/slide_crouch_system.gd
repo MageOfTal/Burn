@@ -44,6 +44,7 @@ var _slide_on_land_grace: float = 0.0              ## Grace window after landing
 var _was_on_floor: bool = true                     ## Track floor state for landing detection
 var _pre_land_velocity_y: float = 0.0              ## Vertical speed right before landing
 var _crouch_airborne_timer: float = 0.0            ## Crouch airborne grace (like slide)
+var _slide_was_on_floor: bool = true                ## Track floor→air transition for ramp launch
 
 ## --- Post-slide jump window ---
 const POST_SLIDE_WINDOW := 0.125         ## Seconds after slide ends where jump preserves speed
@@ -105,6 +106,7 @@ func start_slide() -> void:
 	is_crouching = false
 	_slide_airborne_timer = 0.0
 	_slide_low_speed_timer = 0.0
+	_slide_was_on_floor = player.is_on_floor()
 	_slide_smoothed_normal = player.get_floor_normal() if player.is_on_floor() else Vector3.UP
 	# Lock slide direction to current movement direction — NO speed boost.
 	var horiz := Vector2(player.velocity.x, player.velocity.z)
@@ -125,36 +127,77 @@ func start_slide() -> void:
 func process_slide(delta: float) -> void:
 	## Server-only: physics-based slide.
 	## Uses real inclined-plane physics: a = g * (sin(angle)*alignment - friction*cos(angle))
-
-	# --- Jump out of slide: keep all horizontal momentum ---
-	if player._frame_jump and player.is_on_floor():
-		var saved_hx: float = _slide_velocity.x
-		var saved_hz: float = _slide_velocity.z
-		# End slide state (may try to transition to crouch, which we override)
-		is_sliding = false
-		_slide_cooldown_timer = SLIDE_COOLDOWN
-		_slide_low_speed_timer = 0.0
-		_slide_velocity = Vector3.ZERO
-		_slide_forward_dir = Vector3.ZERO
-		is_crouching = false
-		apply_standing_pose()
-		# Set velocity AFTER end_slide so nothing overwrites it
-		player.velocity.x = saved_hx
-		player.velocity.z = saved_hz
-		player.velocity.y = player.JUMP_VELOCITY
-		return
+	## Sliding posture is retained while airborne — the player keeps the lowered capsule
+	## and resumes ground-slide physics automatically on landing.
 
 	var on_floor := player.is_on_floor()
 	var gravity: float = player.gravity
 
-	# --- Airborne grace ---
-	if on_floor:
-		_slide_airborne_timer = 0.0
-	else:
+	# --- Jump out of slide: keep all horizontal momentum, keep slide posture airborne ---
+	if player._frame_jump and on_floor:
+		var saved_hx: float = _slide_velocity.x
+		var saved_hz: float = _slide_velocity.z
+		player.velocity.x = saved_hx
+		player.velocity.z = saved_hz
+		player.velocity.y = player.JUMP_VELOCITY
+		# Stay in slide state — posture is retained in the air
+		_slide_was_on_floor = false
+		return
+
+	# --- Airborne: retain slide posture, apply gravity, skip ground physics ---
+	if not on_floor:
 		_slide_airborne_timer += delta
+		# Ramp launch: first frame leaving ground during slide
+		if _slide_was_on_floor:
+			var slope_steepness := sqrt(1.0 - _slide_smoothed_normal.y * _slide_smoothed_normal.y)
+			var slide_speed := _slide_velocity.length()
+			var launch_vy := slide_speed * slope_steepness * 0.7
+			if launch_vy > 0.5:
+				player.velocity.y = launch_vy
+			else:
+				player.velocity.y = 0.0
+		else:
+			player.velocity.y -= gravity * delta
+
+		# Keep horizontal slide velocity (no friction in air)
+		player.velocity.x = _slide_velocity.x
+		player.velocity.z = _slide_velocity.z
+		_slide_was_on_floor = false
+
+		# Only end slide in air if the player released shift
+		if not player.player_input.action_slide:
+			end_slide()
+		return
+
+	# --- Just landed: reset airborne state, refresh floor normal ---
+	# Project full 3D velocity onto the ground plane to get the real along-surface
+	# speed. Someone falling straight into a slope has most velocity absorbed by
+	# the ground — only the tangential component carries into the slide.
+	if _slide_airborne_timer > 0.0:
+		_slide_airborne_timer = 0.0
+		var floor_n := player.get_floor_normal()
+		_slide_smoothed_normal = floor_n
+		# Project full velocity onto ground plane: v_tangent = v - (v·n)*n
+		var full_vel := player.velocity
+		var into_surface := full_vel.dot(floor_n)
+		var tangent_vel := full_vel - floor_n * into_surface
+		# Extract horizontal component of the tangent velocity
+		var tangent_horiz := Vector3(tangent_vel.x, 0.0, tangent_vel.z)
+		var tangent_speed := tangent_horiz.length()
+		if tangent_speed > SLIDE_MIN_ENTRY_SPEED:
+			_slide_velocity = tangent_horiz
+			_slide_forward_dir = tangent_horiz.normalized()
+		elif tangent_speed > 0.5:
+			# Some speed but below entry threshold — let ground physics bleed it out
+			_slide_velocity = tangent_horiz
+			_slide_forward_dir = tangent_horiz.normalized()
+		else:
+			# Almost no along-surface speed — end the slide
+			end_slide()
+			return
 
 	# --- Smooth the floor normal to prevent jitter on procedural terrain ---
-	var raw_normal := player.get_floor_normal() if on_floor else _slide_smoothed_normal
+	var raw_normal := player.get_floor_normal()
 	var smooth_rate := 6.0 * delta
 	_slide_smoothed_normal = _slide_smoothed_normal.lerp(raw_normal, clampf(smooth_rate, 0.0, 1.0)).normalized()
 
@@ -172,7 +215,7 @@ func process_slide(delta: float) -> void:
 	var alignment := slide_dir.dot(downhill_horiz) if downhill_horiz.length() > 0.001 else 0.0
 
 	# --- On downhill slopes, gently redirect slide toward downhill ---
-	if on_floor and slope_steepness > 0.1 and alignment > 0.0:
+	if slope_steepness > 0.1 and alignment > 0.0:
 		var redirect_strength := slope_steepness * 2.5 * delta
 		redirect_strength = minf(redirect_strength, 0.5)
 		var redirect_spd := _slide_velocity.length()
@@ -218,7 +261,7 @@ func process_slide(delta: float) -> void:
 
 	# --- Unified physics-based slope force ---
 	var slope_force: float = 0.0
-	if on_floor and slope_steepness > 0.01:
+	if slope_steepness > 0.01:
 		var sin_angle := slope_steepness
 		var cos_angle := _slide_smoothed_normal.y
 		slope_force = gravity * (sin_angle * alignment - SLIDE_FRICTION_COEFF * cos_angle)
@@ -250,14 +293,12 @@ func process_slide(delta: float) -> void:
 	player.velocity.x = _slide_velocity.x
 	player.velocity.z = _slide_velocity.z
 
-	if on_floor:
-		var speed_factor := _slide_velocity.length() / SLIDE_INITIAL_SPEED
-		var snap_force := SLIDE_SNAP_DOWN + gravity * slope_steepness * speed_factor
-		player.velocity.y = -snap_force * maxf(slope_steepness, 0.08)
-	else:
-		player.velocity.y -= gravity * delta
+	var speed_factor := _slide_velocity.length() / SLIDE_INITIAL_SPEED
+	var snap_force := SLIDE_SNAP_DOWN + gravity * slope_steepness * speed_factor
+	player.velocity.y = -snap_force * maxf(slope_steepness, 0.08)
+	_slide_was_on_floor = true
 
-	# --- End conditions ---
+	# --- End conditions (ground only) ---
 	if _slide_velocity.length() < SLIDE_MIN_SPEED:
 		_slide_low_speed_timer += delta
 	else:
@@ -265,8 +306,6 @@ func process_slide(delta: float) -> void:
 
 	var should_end := false
 	if not player.player_input.action_slide:
-		should_end = true
-	if not on_floor and _slide_airborne_timer > SLIDE_AIRBORNE_GRACE:
 		should_end = true
 	if _slide_low_speed_timer > SLIDE_TO_CROUCH_DELAY:
 		should_end = true
@@ -431,15 +470,25 @@ func process_landing(delta: float) -> void:
 	_was_on_floor = player.is_on_floor()
 
 	if was_airborne and player.is_on_floor() and _wants_slide_on_land:
-		# Convert downward velocity into horizontal speed on landing
-		var land_speed_bonus := maxf(-_pre_land_velocity_y, 0.0) * 0.5
-		if land_speed_bonus > 0.1:
-			var horiz_dir := Vector3(player.velocity.x, 0.0, player.velocity.z)
-			if horiz_dir.length() < 0.1:
-				horiz_dir = -player.transform.basis.z
-			horiz_dir = horiz_dir.normalized()
-			player.velocity.x += horiz_dir.x * land_speed_bonus
-			player.velocity.z += horiz_dir.z * land_speed_bonus
+		# Project the pre-landing velocity onto the ground plane to get the real
+		# along-surface speed. Only the tangential component becomes slide momentum.
+		var floor_n := player.get_floor_normal()
+		# Reconstruct the pre-land velocity (horizontal from current + vertical from tracked)
+		var pre_land_vel := Vector3(player.velocity.x, _pre_land_velocity_y, player.velocity.z)
+		var into_surface := pre_land_vel.dot(floor_n)
+		var tangent_vel := pre_land_vel - floor_n * into_surface
+		var tangent_horiz := Vector3(tangent_vel.x, 0.0, tangent_vel.z)
+		var tangent_speed := tangent_horiz.length()
+		# Apply the tangential speed as a velocity boost in that direction
+		if tangent_speed > SLIDE_MIN_ENTRY_SPEED:
+			# The surface projection already accounts for the angle — no extra scaling needed.
+			# But we do add a fraction of excess beyond current horizontal speed as bonus.
+			var current_horiz := Vector2(player.velocity.x, player.velocity.z).length()
+			var bonus := maxf(tangent_speed - current_horiz, 0.0) * 0.6
+			if bonus > 0.1:
+				var bonus_dir := tangent_horiz.normalized()
+				player.velocity.x += bonus_dir.x * bonus
+				player.velocity.z += bonus_dir.z * bonus
 		# Start grace window
 		_slide_on_land_grace = 0.15
 

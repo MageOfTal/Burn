@@ -79,6 +79,12 @@ const HALF_CAPSULE_HEMI_STEPS := 3    ## Latitude steps for the hemisphere cap
 ## the area the rope swept through between LOS checks.  Uses ConvexPolygonShape3D
 ## with 3 coplanar vertices — the physics engine treats this as a triangle.
 
+## Binary search — find the interpolation t where the rope first contacts
+## each obstacle within the swept triangle.
+const BISECT_ITERATIONS := 4          ## 4 iterations → ~6% precision (~0.01m at 240Hz)
+const ROPE_PROXIMITY_MAX := 0.05      ## Max distance from rope line for collide_shape contacts to count (rope width)
+const ARC_SWEEP_RADIUS := 0.01        ## Tiny pill radius for arc-sweep fallback (thin-object localization)
+
 
 # ======================================================================
 #  Synced state (replicated via ServerSync)
@@ -104,11 +110,9 @@ var _fresh_grapple: bool = false      ## True until player first exceeds angular
 var _charges: int = MAX_CHARGES
 var _recharge_timer: float = 0.0      ## Time until next charge is restored
 
-## Boost cooldown — prevents spamming grapple for repeated boosts.
-var _last_boost_time: float = -1.0    ## Engine time of last release boost (-1 = never)
-## Grapple start time — boost only allowed after 2s of grappling.
-var _grapple_start_time: float = 0.0
-const MIN_GRAPPLE_TIME_FOR_BOOST := 2.0
+## Boost gate — must grapple for this long before release boost is allowed.
+var _grapple_time: float = 0.0        ## Seconds spent in current grapple
+const MIN_GRAPPLE_TIME_FOR_BOOST := 1.0
 
 
 ## Debug timing — spike detection
@@ -158,6 +162,12 @@ var _right_half_query: PhysicsShapeQueryParameters3D = null
 ## covering the area the rope swept through between LOS checks.  Rebuilt each check.
 var _center_sweep_shape: ConvexPolygonShape3D = null
 var _center_sweep_query: PhysicsShapeQueryParameters3D = null
+
+## Arc-sweep pill — tiny capsule (0.01m radius) swept through the rope's arc
+## to localize thin objects that rays miss.  Same geometry as the go-around pill
+## but with a much smaller radius.  Used in _localize_obstacle() fallback.
+var _arc_sweep_shape: ConvexPolygonShape3D = null
+var _arc_sweep_query: PhysicsShapeQueryParameters3D = null
 
 ## Debug: center-ray contact point (where the rope hits geometry).
 var _center_contact_point: Vector3 = Vector3.ZERO
@@ -237,6 +247,14 @@ func setup(p: CharacterBody3D) -> void:
 	_center_sweep_query.collide_with_bodies = true
 	_center_sweep_query.collide_with_areas = false
 
+	# Pre-create arc-sweep pill shape (tiny capsule for thin-object localization)
+	_arc_sweep_shape = ConvexPolygonShape3D.new()
+	_arc_sweep_query = PhysicsShapeQueryParameters3D.new()
+	_arc_sweep_query.shape = _arc_sweep_shape
+	_arc_sweep_query.collision_mask = 1
+	_arc_sweep_query.collide_with_bodies = true
+	_arc_sweep_query.collide_with_areas = false
+
 	# Debug HUD label — shows bend angle, wrap count, rope state on screen
 	_debug_label = Label.new()
 	_debug_label.add_theme_font_size_override("font_size", 20)
@@ -283,6 +301,8 @@ func _get_proximity_factor() -> float:
 
 func tick_charges(delta: float) -> void:
 	## Recharge grapple charges over time. Call every frame (even when not grappling).
+	if is_grappling:
+		_grapple_time += delta
 	if _charges < MAX_CHARGES:
 		_recharge_timer -= delta
 		if _recharge_timer <= 0.0:
@@ -356,7 +376,7 @@ func try_fire() -> void:
 	_low_momentum_timer = 0.0
 	_fresh_grapple = true
 	is_grappling = true
-	_grapple_start_time = Time.get_ticks_msec() / 1000.0
+	_grapple_time = 0.0
 	_shoot_was_held = true
 	_last_los_chest = hand_origin
 
@@ -630,14 +650,23 @@ func process(delta: float) -> void:
 
 
 func _is_rope_obstructed() -> bool:
-	## Rope obstruction check — pill-based.
+	## Rope obstruction check — interpolated multi-obstacle, pill-based.
 	##
-	## 1. Center check — detect obstruction:
-	##    a. Swept prism (prev_chest, current_chest, anchor).
-	##    b. Player-to-anchor ray.
-	##    c. Anchor-to-player ray (catches backface hits).
-	## 2. If blocked, pill check — left/right half-capsules test if there's
-	##    a way around.  At least one half clear -> don't cut.  Both blocked -> CUT.
+	## Overview:
+	## 1. Swept prism (prev_chest → current_chest → anchor) detects ALL obstacles
+	##    the rope swept through between ticks — including thin objects that rays miss.
+	## 2. For each obstacle, binary-search to find the interpolation t (0→1) where
+	##    the rope first contacts it.  Uses rays first (fast path), falls back to
+	##    collide_shape for thin objects that rays miss.
+	## 3. Sort obstacles by t (earliest contact first).
+	## 4. Walk through in order: at each obstacle's interpolated chest position,
+	##    run the pill go-around check.  If both halves blocked → CUT.
+	##    If at least one half clear → continue to next obstacle.
+	## 5. If all obstacles have a clear go-around → no cut.
+	##
+	## Fallback: when the player barely moved (sweep_len < 0.05), skip the swept
+	## prism and use traditional bidirectional rope rays instead.
+
 	var _los_t0 := Time.get_ticks_usec()
 	var space_state := player.get_world_3d().direct_space_state
 	var player_chest: Vector3 = player.global_position + Vector3(0, 1.2, 0)
@@ -673,8 +702,7 @@ func _is_rope_obstructed() -> bool:
 
 	_pill_swing_normal = swing_normal
 
-	var _los_t_center := Time.get_ticks_usec()
-	# --- Step 1: Center rope check with swept-triangle detection ---
+	# Reset debug state
 	_has_center_contact = false
 	_center_contact_cloud = []
 	_center_contact_rid = RID()
@@ -684,11 +712,12 @@ func _is_rope_obstructed() -> bool:
 	_prev_los_chest = prev_chest
 	_last_los_chest = player_chest
 
-	var center_hit_result: Dictionary = {}
-
-	# A) Swept-triangle check — thin prism (prev_chest, current_chest, anchor)
+	# =================================================================
+	#  PATH A: Player moved significantly — swept prism multi-obstacle
+	# =================================================================
 	var sweep_vec: Vector3 = player_chest - prev_chest
 	var sweep_len: float = sweep_vec.length()
+
 	if sweep_len > 0.05:
 		var edge_a: Vector3 = player_chest - prev_chest
 		var edge_b: Vector3 = anchor_point - prev_chest
@@ -705,46 +734,179 @@ func _is_rope_obstructed() -> bool:
 		_center_sweep_query.transform = Transform3D.IDENTITY
 		_center_sweep_query.exclude = excludes
 		var sweep_overlaps := space_state.intersect_shape(_center_sweep_query, 8)
-		if not sweep_overlaps.is_empty():
-			var confirm_query := PhysicsRayQueryParameters3D.create(prev_chest, anchor_point)
-			confirm_query.exclude = excludes
-			confirm_query.collision_mask = 1
-			var confirm_result := space_state.intersect_ray(confirm_query)
-			if not confirm_result.is_empty():
-				if confirm_result.position.distance_to(anchor_point) >= ROPE_LOS_MARGIN:
-					center_hit_result = confirm_result
 
-	# B) Current rope ray — player chest to anchor
-	if center_hit_result.is_empty():
-		var rope_query := PhysicsRayQueryParameters3D.create(player_chest, anchor_point)
-		rope_query.exclude = excludes
-		rope_query.collision_mask = 1
-		var rope_result := space_state.intersect_ray(rope_query)
-		if not rope_result.is_empty():
-			if rope_result.position.distance_to(anchor_point) >= ROPE_LOS_MARGIN:
-				center_hit_result = rope_result
+		if sweep_overlaps.is_empty():
+			# Also check current-frame rope rays (catches stationary obstacles
+			# that the razor-thin prism might miss due to float precision)
+			var fallback_result := _check_rope_rays(space_state, player_chest, excludes)
+			if fallback_result.is_empty():
+				_pill_half_blocked = [0, 0]
+				return false
+			# Single obstacle from ray — run pill at current position
+			return _run_pill_check_at(space_state, player_chest, rope_dir, rope_len,
+				swing_normal, fallback_result, excludes)
 
-	# C) Anchor to player ray — catches obstacles the player-side ray misses
-	var anchor_ray_query := PhysicsRayQueryParameters3D.create(anchor_point, player_chest)
-	anchor_ray_query.exclude = excludes
-	anchor_ray_query.collision_mask = 1
-	var anchor_ray_result := space_state.intersect_ray(anchor_ray_query)
-	if not anchor_ray_result.is_empty():
-		if anchor_ray_result.position.distance_to(player_chest) >= ROPE_LOS_MARGIN:
-			if center_hit_result.is_empty():
-				center_hit_result = anchor_ray_result
+		# --- Collect unique obstacle RIDs from the swept prism ---
+		var obstacle_rids: Array[RID] = []
+		for overlap in sweep_overlaps:
+			var rid: RID = overlap.get("rid", RID())
+			if not rid.is_valid():
+				continue
+			# Skip if it's in our exclude list
+			var dominated := false
+			for ex in excludes:
+				if rid == ex:
+					dominated = true
+					break
+			if dominated:
+				continue
+			# Deduplicate
+			var already := false
+			for existing_rid in obstacle_rids:
+				if rid == existing_rid:
+					already = true
+					break
+			if not already:
+				obstacle_rids.append(rid)
 
-	# --- Clear path: no obstruction ---
+		if obstacle_rids.is_empty():
+			_pill_half_blocked = [0, 0]
+			return false
+
+		# --- For each obstacle, find interpolation t and contact point ---
+		# Each entry: { "t": float, "rid": RID, "contact": Vector3 }
+		var obstacle_data: Array[Dictionary] = []
+
+		for obs_rid in obstacle_rids:
+			var result := _localize_obstacle(space_state, prev_chest, player_chest,
+				obs_rid, excludes, obstacle_rids)
+			if not result.is_empty():
+				obstacle_data.append(result)
+
+		if obstacle_data.is_empty():
+			# Swept prism flagged objects but none could be localized on the rope.
+			# Fall back to current-frame rope rays.
+			var fallback_result := _check_rope_rays(space_state, player_chest, excludes)
+			if fallback_result.is_empty():
+				_pill_half_blocked = [0, 0]
+				return false
+			return _run_pill_check_at(space_state, player_chest, rope_dir, rope_len,
+				swing_normal, fallback_result, excludes)
+
+		# --- Sort by t (earliest contact first) ---
+		obstacle_data.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+			return a["t"] < b["t"])
+
+		# --- Walk through obstacles, pill-check each one ---
+		for obs in obstacle_data:
+			var obs_t: float = obs["t"]
+			var obs_rid: RID = obs["rid"]
+			var obs_contact: Vector3 = obs["contact"]
+
+			# Interpolated chest position at this t
+			var interp_chest: Vector3 = prev_chest.lerp(player_chest, obs_t)
+
+			# Rope geometry from the interpolated position
+			var interp_rope_vec: Vector3 = anchor_point - interp_chest
+			var interp_rope_len: float = interp_rope_vec.length()
+			if interp_rope_len < 0.1:
+				continue
+			var interp_rope_dir: Vector3 = interp_rope_vec / interp_rope_len
+
+			# Build swing normal at this interpolated position
+			var interp_swing_normal := _compute_swing_normal(interp_rope_dir)
+
+			# Set debug state for this obstacle (last one evaluated wins for visuals)
+			_center_contact_point = obs_contact
+			_center_contact_rid = obs_rid
+			_has_center_contact = true
+			_pill_swing_normal = interp_swing_normal
+
+			# Run pill check at the interpolated position
+			var pill_xform := _build_pill_transform(interp_chest, interp_rope_dir,
+				interp_swing_normal, interp_rope_len)
+
+			var left_pts := _build_half_capsule_points(interp_rope_len, PILL_RADIUS, 1.0)
+			_left_half_shape.points = left_pts
+			_left_half_query.transform = pill_xform
+			_left_half_query.exclude = excludes
+
+			var right_pts := _build_half_capsule_points(interp_rope_len, PILL_RADIUS, -1.0)
+			_right_half_shape.points = right_pts
+			_right_half_query.transform = pill_xform
+			_right_half_query.exclude = excludes
+
+			var left_contacts: Array[Vector3] = []
+			var left_blocked := _check_pill_half_blocked(space_state, _left_half_query, left_contacts)
+
+			var right_contacts: Array[Vector3] = []
+			var right_blocked := _check_pill_half_blocked(space_state, _right_half_query, right_contacts)
+
+			_pill_half_blocked = [1 if left_blocked else 0, 1 if right_blocked else 0]
+			_arc_contacts = [left_contacts, right_contacts]
+
+			if left_blocked and right_blocked:
+				return true  # Both halves blocked — CUT
+
+			# At least one half clear — can go around this obstacle, check next
+
+		# All obstacles had a way around
+		_pill_half_blocked = [0, 0]
+		return false
+
+	# =================================================================
+	#  PATH B: Player barely moved — traditional rope ray check
+	# =================================================================
+	var center_hit_result := _check_rope_rays(space_state, player_chest, excludes)
+
 	if center_hit_result.is_empty():
 		_pill_half_blocked = [0, 0]
 		return false
 
-	# --- Blocked: run pill check ---
-	_center_contact_point = center_hit_result.position
-	_center_contact_rid = center_hit_result.get("rid", RID())
+	# Single obstacle from rays — run pill at current position
+	return _run_pill_check_at(space_state, player_chest, rope_dir, rope_len,
+		swing_normal, center_hit_result, excludes)
+
+
+func _check_rope_rays(space_state: PhysicsDirectSpaceState3D,
+		player_chest: Vector3, excludes: Array[RID]) -> Dictionary:
+	## Bidirectional rope rays: player→anchor and anchor→player.
+	## Returns the hit result Dictionary, or empty if no obstruction.
+	var result: Dictionary = {}
+
+	# Player chest to anchor
+	var rope_query := PhysicsRayQueryParameters3D.create(player_chest, anchor_point)
+	rope_query.exclude = excludes
+	rope_query.collision_mask = 1
+	var rope_result := space_state.intersect_ray(rope_query)
+	if not rope_result.is_empty():
+		if rope_result.position.distance_to(anchor_point) >= ROPE_LOS_MARGIN:
+			result = rope_result
+
+	# Anchor to player chest (catches backface hits)
+	var anchor_query := PhysicsRayQueryParameters3D.create(anchor_point, player_chest)
+	anchor_query.exclude = excludes
+	anchor_query.collision_mask = 1
+	var anchor_result := space_state.intersect_ray(anchor_query)
+	if not anchor_result.is_empty():
+		if anchor_result.position.distance_to(player_chest) >= ROPE_LOS_MARGIN:
+			if result.is_empty():
+				result = anchor_result
+
+	return result
+
+
+func _run_pill_check_at(space_state: PhysicsDirectSpaceState3D,
+		chest: Vector3, rope_dir: Vector3, rope_len: float,
+		swing_normal: Vector3, hit_result: Dictionary,
+		excludes: Array[RID]) -> bool:
+	## Run a single pill go-around check at the given chest position.
+	## Sets debug state and returns true if both halves blocked (= CUT).
+	_center_contact_point = hit_result.position
+	_center_contact_rid = hit_result.get("rid", RID())
 	_has_center_contact = true
 
-	var pill_xform := _build_pill_transform(player_chest, rope_dir, swing_normal, rope_len)
+	var pill_xform := _build_pill_transform(chest, rope_dir, swing_normal, rope_len)
 
 	var left_pts := _build_half_capsule_points(rope_len, PILL_RADIUS, 1.0)
 	_left_half_shape.points = left_pts
@@ -765,9 +927,205 @@ func _is_rope_obstructed() -> bool:
 	_pill_half_blocked = [1 if left_blocked else 0, 1 if right_blocked else 0]
 	_arc_contacts = [left_contacts, right_contacts]
 
-	if not left_blocked or not right_blocked:
-		return false  # Way around — don't cut
-	return true  # Both halves blocked — CUT
+	return left_blocked and right_blocked
+
+
+func _localize_obstacle(space_state: PhysicsDirectSpaceState3D,
+		prev_chest: Vector3, cur_chest: Vector3,
+		target_rid: RID, excludes: Array[RID],
+		all_obstacle_rids: Array[RID]) -> Dictionary:
+	## Find the interpolation t (0→1) where the rope from lerp(prev, cur, t) → anchor
+	## first intersects the obstacle identified by target_rid.
+	## Returns { "t": float, "rid": RID, "contact": Vector3 } or empty dict.
+	##
+	## Strategy:
+	## 1. Binary search using raycasts (fast, works for most objects).
+	## 2. If all rays miss (thin object), fall back to sweeping a tiny pill
+	##    (0.01m radius) through the rope's arc using cast_motion, with the
+	##    exclude list set to block everything except target_rid so only that
+	##    object can be hit.  get_rest_info then gives the contact point.
+
+	# --- Fast path: binary search with rays ---
+	var best_t: float = -1.0
+	var best_contact: Vector3 = Vector3.ZERO
+	var t_lo: float = 0.0
+	var t_hi: float = 1.0
+
+	# First check: does any ray from this range hit the target?
+	# Probe at 5 evenly spaced t values to seed the binary search.
+	# More probes = better chance of catching narrow-window obstacles.
+	for probe_i in 5:
+		var probe_t: float = float(probe_i) / 4.0  # 0.0, 0.25, 0.5, 0.75, 1.0
+		var probe_chest: Vector3 = prev_chest.lerp(cur_chest, probe_t)
+		var hit := _ray_hits_rid(space_state, probe_chest, target_rid, excludes)
+		if not hit.is_empty():
+			best_t = probe_t
+			best_contact = hit.position
+			t_hi = probe_t
+			break
+
+	if best_t >= 0.0:
+		# Binary search to narrow down the earliest t
+		for _i in BISECT_ITERATIONS:
+			var t_mid: float = (t_lo + t_hi) * 0.5
+			var mid_chest: Vector3 = prev_chest.lerp(cur_chest, t_mid)
+			var hit := _ray_hits_rid(space_state, mid_chest, target_rid, excludes)
+			if not hit.is_empty():
+				t_hi = t_mid
+				best_t = t_mid
+				best_contact = hit.position
+			else:
+				t_lo = t_mid
+
+		# Verify the contact is not in a safe zone
+		if best_contact.distance_to(anchor_point) < ROPE_LOS_MARGIN:
+			return {}
+		if best_contact.distance_to(prev_chest.lerp(cur_chest, best_t)) < ROPE_LOS_MARGIN:
+			return {}
+
+		return { "t": best_t, "rid": target_rid, "contact": best_contact }
+
+	# --- Fallback: rays missed — arc-sweep a tiny pill to localize thin objects ---
+	# Build an exclude list that blocks everything EXCEPT target_rid.
+	# This turns the physics query into an "include-only" filter for the target.
+	var arc_excludes: Array[RID] = excludes.duplicate()
+	for other_rid in all_obstacle_rids:
+		if other_rid != target_rid:
+			# Deduplicate — don't add if already in excludes
+			var already := false
+			for ex in arc_excludes:
+				if other_rid == ex:
+					already = true
+					break
+			if not already:
+				arc_excludes.append(other_rid)
+
+	# Build the tiny pill (same geometry as go-around pill, but 0.01m radius)
+	# aligned along the rope at t=0 (prev_chest → anchor).
+	var prev_rope_vec: Vector3 = anchor_point - prev_chest
+	var prev_rope_len: float = prev_rope_vec.length()
+	if prev_rope_len < 0.1:
+		return {}
+	var prev_rope_dir: Vector3 = prev_rope_vec / prev_rope_len
+
+	# Build a full capsule (both halves combined) at ARC_SWEEP_RADIUS
+	# We use side_sign=+1 and side_sign=-1 points merged into one shape so the
+	# pill covers the full rope circumference (thin 0.01m tube around the rope).
+	var left_pts := _build_half_capsule_points(prev_rope_len, ARC_SWEEP_RADIUS, 1.0)
+	var right_pts := _build_half_capsule_points(prev_rope_len, ARC_SWEEP_RADIUS, -1.0)
+	var full_pts := PackedVector3Array()
+	full_pts.append_array(left_pts)
+	full_pts.append_array(right_pts)
+	_arc_sweep_shape.points = full_pts
+
+	# Build the pill transform at t=0 position
+	var prev_swing_normal := _compute_swing_normal(prev_rope_dir)
+	var pill_xform := _build_pill_transform(prev_chest, prev_rope_dir,
+		prev_swing_normal, prev_rope_len)
+	_arc_sweep_query.transform = pill_xform
+	_arc_sweep_query.exclude = arc_excludes
+
+	# Sweep motion = how the player chest moved this frame (the arc).
+	# cast_motion returns [safe, unsafe] fractions along this motion vector.
+	var sweep_motion: Vector3 = cur_chest - prev_chest
+	_arc_sweep_query.motion = sweep_motion
+
+	var motion_result := space_state.cast_motion(_arc_sweep_query)
+	# motion_result = [safe_fraction, unsafe_fraction]
+	# safe = furthest fraction with no penetration, unsafe = first fraction with penetration
+	if motion_result[1] >= 1.0:
+		# No collision found along the arc — target wasn't hit
+		return {}
+
+	# The unsafe fraction IS our t value (0→1 along prev_chest → cur_chest)
+	var hit_t: float = motion_result[1]
+
+	# Move the pill to the unsafe position and use get_rest_info to get contact point + RID.
+	# Since our exclude list blocks everything except target_rid, this is guaranteed
+	# to return the target's contact info (if anything).
+	var hit_chest: Vector3 = prev_chest + sweep_motion * hit_t
+	var hit_rope_vec: Vector3 = anchor_point - hit_chest
+	var hit_rope_len: float = hit_rope_vec.length()
+	if hit_rope_len < 0.1:
+		return {}
+	var hit_rope_dir: Vector3 = hit_rope_vec / hit_rope_len
+	var hit_swing_normal := _compute_swing_normal(hit_rope_dir)
+
+	# Rebuild pill geometry at the hit position for get_rest_info
+	var hit_left := _build_half_capsule_points(hit_rope_len, ARC_SWEEP_RADIUS, 1.0)
+	var hit_right := _build_half_capsule_points(hit_rope_len, ARC_SWEEP_RADIUS, -1.0)
+	var hit_full := PackedVector3Array()
+	hit_full.append_array(hit_left)
+	hit_full.append_array(hit_right)
+	_arc_sweep_shape.points = hit_full
+
+	var hit_pill_xform := _build_pill_transform(hit_chest, hit_rope_dir,
+		hit_swing_normal, hit_rope_len)
+	_arc_sweep_query.transform = hit_pill_xform
+	_arc_sweep_query.motion = Vector3.ZERO  # No motion for rest info query
+
+	var rest_info := space_state.get_rest_info(_arc_sweep_query)
+	if rest_info.is_empty():
+		return {}
+
+	var rest_rid: RID = rest_info.get("rid", RID())
+	var rest_point: Vector3 = rest_info.get("point", Vector3.ZERO)
+
+	# Verify RID matches (should always match since everything else is excluded,
+	# but sanity check anyway)
+	if rest_rid != target_rid:
+		return {}
+
+	# Verify safe zones
+	if rest_point.distance_to(anchor_point) < ROPE_LOS_MARGIN:
+		return {}
+	if rest_point.distance_to(hit_chest) < ROPE_LOS_MARGIN:
+		return {}
+
+	return { "t": hit_t, "rid": target_rid, "contact": rest_point }
+
+
+func _ray_hits_rid(space_state: PhysicsDirectSpaceState3D,
+		chest: Vector3, target_rid: RID, excludes: Array[RID]) -> Dictionary:
+	## Fire bidirectional rays from chest↔anchor.  Returns the hit result
+	## Dictionary if either ray hits an object with the target_rid (and the
+	## hit is outside the safe margin).  Returns empty dict otherwise.
+
+	# Chest → anchor
+	var fwd_query := PhysicsRayQueryParameters3D.create(chest, anchor_point)
+	fwd_query.exclude = excludes
+	fwd_query.collision_mask = 1
+	var fwd_result := space_state.intersect_ray(fwd_query)
+	if not fwd_result.is_empty():
+		var hit_rid: RID = fwd_result.get("rid", RID())
+		if hit_rid == target_rid:
+			if fwd_result.position.distance_to(anchor_point) >= ROPE_LOS_MARGIN:
+				return fwd_result
+
+	# Anchor → chest (catches backface hits)
+	var rev_query := PhysicsRayQueryParameters3D.create(anchor_point, chest)
+	rev_query.exclude = excludes
+	rev_query.collision_mask = 1
+	var rev_result := space_state.intersect_ray(rev_query)
+	if not rev_result.is_empty():
+		var hit_rid: RID = rev_result.get("rid", RID())
+		if hit_rid == target_rid:
+			if rev_result.position.distance_to(chest) >= ROPE_LOS_MARGIN:
+				return rev_result
+
+	return {}
+
+
+func _compute_swing_normal(rope_dir: Vector3) -> Vector3:
+	## Compute a swing-perpendicular normal for the pill orientation.
+	## Uses current velocity if available, otherwise falls back to world up.
+	var rad_spd: float = player.velocity.dot(rope_dir)
+	var tang_v: Vector3 = player.velocity - rope_dir * rad_spd
+	if tang_v.length() > 0.5:
+		return rope_dir.cross(tang_v).normalized()
+	if absf(rope_dir.y) < 0.9:
+		return rope_dir.cross(Vector3.UP).normalized()
+	return rope_dir.cross(Vector3.RIGHT).normalized()
 
 
 func _log_los_timing(t0: int, t_center: int, t_fan: int, t_pill: int, outcome: String) -> void:
@@ -951,12 +1309,8 @@ func _apply_release_boost() -> bool:
 	## Tilt velocity upward by 25° (capped at 30° above horizontal),
 	## then add a speed boost that scales with current speed.
 	## Returns true if the boost was actually applied.
-	## Boost is blocked if less than 0.5s since the last boost or if
-	## grapple has been active for less than 2 seconds.
-	var now := Time.get_ticks_msec() / 1000.0
-	if _last_boost_time >= 0.0 and (now - _last_boost_time) < 1.0:
-		return false
-	if (now - _grapple_start_time) < MIN_GRAPPLE_TIME_FOR_BOOST:
+	## Boost is blocked if grapple hasn't been active for at least 1 second.
+	if _grapple_time < MIN_GRAPPLE_TIME_FOR_BOOST:
 		return false
 
 	var vel := player.velocity
@@ -989,7 +1343,6 @@ func _apply_release_boost() -> bool:
 	var boost_dir := player.velocity.normalized()
 	player.velocity += boost_dir * boost
 
-	_last_boost_time = now
 	return true
 
 
@@ -1006,8 +1359,7 @@ func reset_state() -> void:
 	_fresh_grapple = false
 	_charges = MAX_CHARGES
 	_recharge_timer = 0.0
-	_last_boost_time = -1.0
-	_grapple_start_time = 0.0
+	_grapple_time = 0.0
 	_pill_half_blocked = [0, 0]
 	_pill_swing_normal = Vector3.ZERO
 	_prev_los_chest = Vector3.ZERO

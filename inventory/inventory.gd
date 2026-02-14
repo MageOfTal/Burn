@@ -302,10 +302,11 @@ func _notify_sync() -> void:
 func _serialize_full_state() -> Dictionary:
 	## Pack full inventory into a serializable Dictionary.
 	## Null slots are serialized with empty path so clients rebuild nulls correctly.
+	## Rarity is included so clients can duplicate + override (items spawn at random rarity).
 	var item_list: Array = []
 	for stack in items:
 		if stack == null:
-			item_list.append({"path": "", "burn": 0.0, "qty": 0, "fuel_spent": 0.0, "ammo_path": "", "ammo_src": -1})
+			item_list.append({"path": "", "burn": 0.0, "qty": 0, "fuel_spent": 0.0, "ammo_path": "", "ammo_src": -1, "rarity": 0})
 		else:
 			item_list.append({
 				"path": stack.item_data.resource_path if stack.item_data else "",
@@ -314,6 +315,7 @@ func _serialize_full_state() -> Dictionary:
 				"fuel_spent": stack.fuel_spent_extending,
 				"ammo_path": stack.slotted_ammo.resource_path if stack.slotted_ammo else "",
 				"ammo_src": stack.slotted_ammo_source_index,
+				"rarity": stack.item_data.rarity if stack.item_data else 0,
 			})
 	return {
 		"items": item_list,
@@ -322,6 +324,7 @@ func _serialize_full_state() -> Dictionary:
 		"fuel": burn_fuel,
 		"shoe_path": equipped_shoe.item_data.resource_path if equipped_shoe and equipped_shoe.item_data else "",
 		"shoe_burn": equipped_shoe.burn_time_remaining if equipped_shoe else 0.0,
+		"shoe_rarity": equipped_shoe.item_data.rarity if equipped_shoe and equipped_shoe.item_data else 0,
 	}
 
 
@@ -329,6 +332,7 @@ func _serialize_full_state() -> Dictionary:
 func _rpc_sync_inventory(state: Dictionary) -> void:
 	## Client-side: rebuild local inventory from server state.
 	## Preserves null slots so items stay in their positions.
+	## Rarity is applied by duplicating the base ItemData if it differs from the .tres default.
 	items.clear()
 	for entry: Dictionary in state["items"]:
 		if entry["path"] == "":
@@ -338,6 +342,10 @@ func _rpc_sync_inventory(state: Dictionary) -> void:
 		if data == null:
 			items.append(null)
 			continue
+		# Apply rarity override if the synced rarity differs from the .tres default
+		if entry.has("rarity") and data.rarity != entry["rarity"]:
+			data = data.duplicate()
+			data.rarity = entry["rarity"]
 		var stack := ItemStack.create(data)
 		stack.burn_time_remaining = entry["burn"]
 		stack.quantity = entry["qty"]
@@ -354,6 +362,11 @@ func _rpc_sync_inventory(state: Dictionary) -> void:
 	if state["shoe_path"] != "":
 		var shoe_data: ItemData = load(state["shoe_path"])
 		if shoe_data:
+			# Apply shoe rarity override
+			var shoe_rarity: int = state.get("shoe_rarity", shoe_data.rarity)
+			if shoe_data.rarity != shoe_rarity:
+				shoe_data = shoe_data.duplicate()
+				shoe_data.rarity = shoe_rarity
 			equipped_shoe = ItemStack.create(shoe_data)
 			equipped_shoe.burn_time_remaining = state["shoe_burn"]
 		else:
