@@ -505,7 +505,9 @@ func _process_combat() -> void:
 			if collider != null and collider.has_method("take_damage"):
 				var final_damage: float = base_damage_per_pellet * heat_system.get_damage_multiplier() * rarity_mult
 				collider.take_damage(final_damage, peer_id)
-				total_damage_dealt += base_damage_per_pellet
+				# Only generate heat from hitting players, not structures
+				if collider is CharacterBody3D:
+					total_damage_dealt += base_damage_per_pellet
 
 		if total_damage_dealt > 0.0:
 			heat_system.on_damage_dealt(total_damage_dealt)
@@ -520,7 +522,9 @@ func _process_combat() -> void:
 			var rarity_mult: float = 1.0 + current_weapon.weapon_data.rarity * RARITY_DAMAGE_BONUS
 			var final_damage: float = base_damage * heat_system.get_damage_multiplier() * rarity_mult
 			collider.take_damage(final_damage, peer_id)
-			heat_system.on_damage_dealt(base_damage)
+			# Only generate heat from hitting players, not structures
+			if collider is CharacterBody3D:
+				heat_system.on_damage_dealt(base_damage)
 
 
 func _process_normal_movement(delta: float) -> void:

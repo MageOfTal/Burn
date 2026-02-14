@@ -159,20 +159,39 @@ func _build_tower() -> void:
 	_voxel_tool = _voxel_terrain.get_voxel_tool()
 	var max_wait := 300  # Up to 5 seconds at 60fps
 	var blocks_ready := false
+	# Test positions at tower edges and corners — not just the center column.
+	# do_sphere() paints at ring offsets up to CORE_RADIUS and ramp positions
+	# up to OUTER_RADIUS, so we must ensure those block regions are loaded too.
+	var edge_r := OUTER_RADIUS + 1.0
+	var _test_positions: Array[Vector3] = [
+		Vector3(0, 0, 0),                        # Base center
+		Vector3(0, TOWER_HEIGHT * 0.5, 0),        # Mid center
+		Vector3(0, TOWER_HEIGHT, 0),              # Top center
+		Vector3(edge_r, 0, 0),                    # Base +X edge
+		Vector3(-edge_r, 0, 0),                   # Base -X edge
+		Vector3(0, 0, edge_r),                    # Base +Z edge
+		Vector3(0, 0, -edge_r),                   # Base -Z edge
+		Vector3(edge_r, TOWER_HEIGHT, 0),         # Top +X edge
+		Vector3(-edge_r, TOWER_HEIGHT, 0),        # Top -X edge
+		Vector3(0, TOWER_HEIGHT, edge_r),         # Top +Z edge
+		Vector3(0, TOWER_HEIGHT, -edge_r),        # Top -Z edge
+	]
 	for i in max_wait:
 		await get_tree().process_frame
 		_voxel_tool = _voxel_terrain.get_voxel_tool()
 		if _voxel_tool != null:
-			# Test multiple positions across the tower volume to ensure all blocks loaded
-			var test_base := _voxel_tool.get_voxel_f(Vector3(0, 0, 0))
-			var test_mid := _voxel_tool.get_voxel_f(Vector3(0, TOWER_HEIGHT * 0.5, 0))
-			var test_top := _voxel_tool.get_voxel_f(Vector3(0, TOWER_HEIGHT, 0))
 			# Our flat generator at Y=-100 means all blocks should have positive SDF (air).
-			# If all three test points return positive values, blocks are loaded.
-			if test_base > 0.0 and test_mid > 0.0 and test_top > 0.0:
+			# Check ALL test positions — if any returns 0.0, that block isn't loaded yet.
+			var all_loaded := true
+			for test_pos in _test_positions:
+				var sdf: float = _voxel_tool.get_voxel_f(test_pos)
+				if sdf <= 0.0:
+					all_loaded = false
+					break
+			if all_loaded:
 				blocks_ready = true
-				print("[SpiralTower] Blocks ready after %d frames (SDF: base=%.2f mid=%.2f top=%.2f)" % [
-					i, test_base, test_mid, test_top])
+				print("[SpiralTower] All blocks ready after %d frames (%d test positions)" % [
+					i, _test_positions.size()])
 				break
 		if i > 0 and i % 60 == 0:
 			print("[SpiralTower] Still waiting for blocks to load... (frame %d)" % i)

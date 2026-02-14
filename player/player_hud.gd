@@ -564,6 +564,7 @@ func add_kill_feed_entry(bbcode_text: String) -> void:
 	# Remove oldest if over limit
 	while _kill_feed_container.get_child_count() > KILL_FEED_MAX:
 		var oldest := _kill_feed_container.get_child(_kill_feed_container.get_child_count() - 1)
+		_kill_feed_container.remove_child(oldest)
 		oldest.queue_free()
 
 	# Auto-fade after display time

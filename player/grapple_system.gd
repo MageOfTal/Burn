@@ -106,6 +106,9 @@ var _recharge_timer: float = 0.0      ## Time until next charge is restored
 
 ## Boost cooldown — prevents spamming grapple for repeated boosts.
 var _last_boost_time: float = -1.0    ## Engine time of last release boost (-1 = never)
+## Grapple start time — boost only allowed after 2s of grappling.
+var _grapple_start_time: float = 0.0
+const MIN_GRAPPLE_TIME_FOR_BOOST := 2.0
 
 
 ## Debug timing — spike detection
@@ -353,6 +356,7 @@ func try_fire() -> void:
 	_low_momentum_timer = 0.0
 	_fresh_grapple = true
 	is_grappling = true
+	_grapple_start_time = Time.get_ticks_msec() / 1000.0
 	_shoot_was_held = true
 	_last_los_chest = hand_origin
 
@@ -947,9 +951,12 @@ func _apply_release_boost() -> bool:
 	## Tilt velocity upward by 25° (capped at 30° above horizontal),
 	## then add a speed boost that scales with current speed.
 	## Returns true if the boost was actually applied.
-	## Boost is blocked if less than 0.5s since the last boost.
+	## Boost is blocked if less than 0.5s since the last boost or if
+	## grapple has been active for less than 2 seconds.
 	var now := Time.get_ticks_msec() / 1000.0
 	if _last_boost_time >= 0.0 and (now - _last_boost_time) < 1.0:
+		return false
+	if (now - _grapple_start_time) < MIN_GRAPPLE_TIME_FOR_BOOST:
 		return false
 
 	var vel := player.velocity
@@ -1000,6 +1007,7 @@ func reset_state() -> void:
 	_charges = MAX_CHARGES
 	_recharge_timer = 0.0
 	_last_boost_time = -1.0
+	_grapple_start_time = 0.0
 	_pill_half_blocked = [0, 0]
 	_pill_swing_normal = Vector3.ZERO
 	_prev_los_chest = Vector3.ZERO
