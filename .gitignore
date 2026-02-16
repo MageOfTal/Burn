@@ -16,3 +16,6 @@ desktop.ini
 .vscode/
 *.swp
 *.swo
+
+# Windows NUL device artifact
+nul
