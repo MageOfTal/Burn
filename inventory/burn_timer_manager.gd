@@ -57,15 +57,44 @@ func _physics_process(delta: float) -> void:
 		inventory.equipped_shoe.burn_time_remaining -= shoe_rate * delta
 		if inventory.equipped_shoe.is_expired():
 			var shoe_name: String = inventory.equipped_shoe.item_data.item_name
+			# Eject attached trinkets back to bag (or drop to world)
+			_eject_shoe_trinkets()
 			inventory.equipped_shoe = null
 			inventory.shoe_changed.emit()
 			inventory.inventory_changed.emit()
 			print("Shoes burned away: %s" % shoe_name)
+
+	# Trinkets never burn — they persist until the player dies.
 
 	# Periodic sync: push current burn timers to the owning client every SYNC_INTERVAL
 	# so their HUD shows live countdowns, not stale values from the last mutation.
 	_sync_timer += delta
 	if _sync_timer >= SYNC_INTERVAL:
 		_sync_timer = 0.0
-		if inventory.items.size() > 0 or inventory.equipped_shoe != null:
+		if inventory.items.size() > 0 or inventory.equipped_shoe != null or inventory.trinket_bag.size() > 0:
 			inventory._notify_sync()
+
+
+func _eject_shoe_trinkets() -> void:
+	## Move all trinkets from the expired shoe back to the trinket bag.
+	## If the bag is full, drop them to the world.
+	if inventory.equipped_shoe == null:
+		return
+	for trinket_data in inventory.equipped_shoe.slotted_trinkets:
+		if trinket_data == null:
+			continue
+		if inventory.trinket_bag.size() < Inventory.MAX_TRINKETS:
+			var stack := ItemStack.create(trinket_data)
+			inventory.trinket_bag.append(stack)
+			print("Trinket %s returned to bag" % trinket_data.item_name)
+		else:
+			# Bag full — drop to world
+			var player_node := get_parent()
+			if player_node:
+				var item_mgr := player_node.get_node_or_null("ItemManager")
+				if item_mgr:
+					var stack := ItemStack.create(trinket_data)
+					item_mgr.drop_item_as_world_item(stack)
+					print("Trinket %s dropped to world (bag full)" % trinket_data.item_name)
+	inventory.equipped_shoe.slotted_trinkets.clear()
+	inventory.trinket_bag_changed.emit()

@@ -19,6 +19,10 @@ var slotted_ammo_source_index: int = -1
 ## Used for scaling cost: the more you extend, the more it costs (up to 2.5x base cost).
 var fuel_spent_extending: float = 0.0
 
+## Trinkets attached to this item (shoes only). Array of TrinketData references.
+## Trinkets are removable — unlike ammo, they can be detached and returned to the bag.
+var slotted_trinkets: Array = []
+
 
 static func create(data: ItemData) -> ItemStack:
 	var stack := ItemStack.new()
@@ -44,4 +48,6 @@ func serialize() -> Dictionary:
 		"damage": item_data.damage if item_data is WeaponData else 0.0,
 		"has_ammo": slotted_ammo != null,
 		"ammo_name": slotted_ammo.item_name if slotted_ammo else "",
+		"trinket_count": slotted_trinkets.size(),
+		"trinket_names": slotted_trinkets.map(func(t): return t.item_name if t else ""),
 	}

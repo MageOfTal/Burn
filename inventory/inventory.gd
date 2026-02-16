@@ -13,9 +13,14 @@ var items: Array = []
 var time_currency: float = 0.0
 var equipped_index: int = -1
 var burn_fuel: float = STARTING_FUEL
+var kill_currency: float = 0.0
 
 ## Shoe equipment slot (separate from the 6 item slots)
 var equipped_shoe: ItemStack = null
+
+## Trinket bag — separate storage for trinket items.
+const MAX_TRINKETS := 4
+var trinket_bag: Array = []  # Array of ItemStack (TrinketData items)
 
 ## Networking: peer_id of the owning player (set by player.gd).
 ## Server sends inventory RPCs to this peer when state changes.
@@ -27,6 +32,7 @@ signal item_expired(index: int, item_name: String)
 signal inventory_changed
 signal weapon_equipped(index: int)
 signal shoe_changed
+signal trinket_bag_changed
 signal fuel_changed(new_amount: float)
 
 
@@ -49,9 +55,9 @@ func add_item(item_data: ItemData) -> int:
 	# First, look for a null slot
 	for i in items.size():
 		if items[i] == null:
-			var stack := ItemStack.create(item_data)
-			items[i] = stack
-			item_added.emit(i, stack)
+			var new_stack := ItemStack.create(item_data)
+			items[i] = new_stack
+			item_added.emit(i, new_stack)
 			inventory_changed.emit()
 			_notify_sync()
 			return i
@@ -222,6 +228,49 @@ func get_shoe_speed_bonus() -> float:
 	return 0.0
 
 
+func get_shoe_extra_jumps() -> int:
+	## Returns total extra jumps from trinkets attached to the equipped shoe.
+	if equipped_shoe == null:
+		return 0
+	var total := 0
+	for trinket in equipped_shoe.slotted_trinkets:
+		if trinket is TrinketData:
+			total += trinket.extra_jumps
+	return total
+
+
+# ======================================================================
+#  Trinket bag
+# ======================================================================
+
+func add_trinket(trinket_data: ItemData) -> int:
+	## Add a trinket to the trinket bag. Returns index, or -1 if full.
+	if trinket_bag.size() >= MAX_TRINKETS:
+		return -1
+	var stack := ItemStack.create(trinket_data)
+	trinket_bag.append(stack)
+	trinket_bag_changed.emit()
+	inventory_changed.emit()
+	_notify_sync()
+	return trinket_bag.size() - 1
+
+
+func remove_trinket(index: int) -> ItemStack:
+	## Remove a trinket from the bag by index. Returns the removed stack.
+	if index < 0 or index >= trinket_bag.size():
+		return null
+	var stack: ItemStack = trinket_bag[index]
+	trinket_bag.remove_at(index)
+	trinket_bag_changed.emit()
+	inventory_changed.emit()
+	_notify_sync()
+	return stack
+
+
+func get_trinket_count() -> int:
+	return trinket_bag.size()
+
+
 # ======================================================================
 #  Fuel
 # ======================================================================
@@ -262,14 +311,34 @@ func spend_fuel_silent(amount: float) -> bool:
 
 func clear_all() -> void:
 	## Remove all items (used on death/respawn).
+	## NOTE: kill_currency is intentionally NOT cleared — it persists after death.
 	items.clear()
 	equipped_index = -1
 	equipped_shoe = null
+	trinket_bag.clear()
 	burn_fuel = STARTING_FUEL
 	shoe_changed.emit()
+	trinket_bag_changed.emit()
 	inventory_changed.emit()
 	fuel_changed.emit(burn_fuel)
 	_notify_sync()
+
+
+func add_kill_currency(amount: float) -> void:
+	kill_currency += amount
+	_notify_sync()
+
+
+func spend_kill_currency(amount: float) -> bool:
+	if kill_currency < amount:
+		return false
+	kill_currency -= amount
+	_notify_sync()
+	return true
+
+
+func has_kill_currency(amount: float) -> bool:
+	return kill_currency >= amount
 
 
 func get_serialized() -> Array:
@@ -309,22 +378,43 @@ func _serialize_full_state() -> Dictionary:
 			item_list.append({"path": "", "burn": 0.0, "qty": 0, "fuel_spent": 0.0, "ammo_path": "", "ammo_src": -1, "rarity": 0})
 		else:
 			item_list.append({
-				"path": stack.item_data.resource_path if stack.item_data else "",
+				"path": stack.item_data.get_source_path() if stack.item_data else "",
 				"burn": stack.burn_time_remaining,
 				"qty": stack.quantity,
 				"fuel_spent": stack.fuel_spent_extending,
-				"ammo_path": stack.slotted_ammo.resource_path if stack.slotted_ammo else "",
+				"ammo_path": stack.slotted_ammo.get_source_path() if stack.slotted_ammo else "",
 				"ammo_src": stack.slotted_ammo_source_index,
 				"rarity": stack.item_data.rarity if stack.item_data else 0,
 			})
+	# Serialize trinket bag
+	var trinket_list: Array = []
+	for t_stack in trinket_bag:
+		if t_stack == null or t_stack.item_data == null:
+			trinket_list.append({"path": "", "burn": 0.0, "rarity": 0})
+		else:
+			trinket_list.append({
+				"path": t_stack.item_data.get_source_path(),
+				"burn": t_stack.burn_time_remaining,
+				"rarity": t_stack.item_data.rarity,
+			})
+
+	# Serialize trinkets slotted on shoe
+	var shoe_trinket_paths: Array = []
+	if equipped_shoe and equipped_shoe.slotted_trinkets.size() > 0:
+		for trinket in equipped_shoe.slotted_trinkets:
+			shoe_trinket_paths.append(trinket.get_source_path() if trinket else "")
+
 	return {
 		"items": item_list,
 		"equipped": equipped_index,
 		"tc": time_currency,
 		"fuel": burn_fuel,
-		"shoe_path": equipped_shoe.item_data.resource_path if equipped_shoe and equipped_shoe.item_data else "",
+		"kc": kill_currency,
+		"shoe_path": equipped_shoe.item_data.get_source_path() if equipped_shoe and equipped_shoe.item_data else "",
 		"shoe_burn": equipped_shoe.burn_time_remaining if equipped_shoe else 0.0,
 		"shoe_rarity": equipped_shoe.item_data.rarity if equipped_shoe and equipped_shoe.item_data else 0,
+		"trinkets": trinket_list,
+		"shoe_trinkets": shoe_trinket_paths,
 	}
 
 
@@ -344,8 +434,10 @@ func _rpc_sync_inventory(state: Dictionary) -> void:
 			continue
 		# Apply rarity override if the synced rarity differs from the .tres default
 		if entry.has("rarity") and data.rarity != entry["rarity"]:
+			var orig_path: String = data.resource_path
 			data = data.duplicate()
-			data.rarity = entry["rarity"]
+			data._original_resource_path = orig_path
+			data.rarity = entry["rarity"] as ItemData.Rarity
 		var stack := ItemStack.create(data)
 		stack.burn_time_remaining = entry["burn"]
 		stack.quantity = entry["qty"]
@@ -358,6 +450,7 @@ func _rpc_sync_inventory(state: Dictionary) -> void:
 	equipped_index = state["equipped"]
 	time_currency = state["tc"]
 	burn_fuel = state["fuel"]
+	kill_currency = state.get("kc", 0.0)
 
 	if state["shoe_path"] != "":
 		var shoe_data: ItemData = load(state["shoe_path"])
@@ -365,15 +458,44 @@ func _rpc_sync_inventory(state: Dictionary) -> void:
 			# Apply shoe rarity override
 			var shoe_rarity: int = state.get("shoe_rarity", shoe_data.rarity)
 			if shoe_data.rarity != shoe_rarity:
+				var orig_shoe_path: String = shoe_data.resource_path
 				shoe_data = shoe_data.duplicate()
-				shoe_data.rarity = shoe_rarity
+				shoe_data._original_resource_path = orig_shoe_path
+				shoe_data.rarity = shoe_rarity as ItemData.Rarity
 			equipped_shoe = ItemStack.create(shoe_data)
 			equipped_shoe.burn_time_remaining = state["shoe_burn"]
+			# Rebuild trinkets slotted on shoe
+			var shoe_trinket_paths: Array = state.get("shoe_trinkets", [])
+			for t_path in shoe_trinket_paths:
+				if t_path != "":
+					var t_data: ItemData = load(t_path)
+					if t_data:
+						equipped_shoe.slotted_trinkets.append(t_data)
 		else:
 			equipped_shoe = null
 	else:
 		equipped_shoe = null
 
+	# Rebuild trinket bag
+	trinket_bag.clear()
+	var trinket_entries: Array = state.get("trinkets", [])
+	for t_entry: Dictionary in trinket_entries:
+		if t_entry["path"] == "":
+			continue
+		var t_data: ItemData = load(t_entry["path"])
+		if t_data == null:
+			continue
+		# Apply rarity override
+		if t_entry.has("rarity") and t_data.rarity != t_entry["rarity"]:
+			var orig_t_path: String = t_data.resource_path
+			t_data = t_data.duplicate()
+			t_data._original_resource_path = orig_t_path
+			t_data.rarity = t_entry["rarity"] as ItemData.Rarity
+		var t_stack := ItemStack.create(t_data)
+		t_stack.burn_time_remaining = t_entry["burn"]
+		trinket_bag.append(t_stack)
+
 	inventory_changed.emit()
 	shoe_changed.emit()
+	trinket_bag_changed.emit()
 	fuel_changed.emit(burn_fuel)

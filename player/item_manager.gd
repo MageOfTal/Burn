@@ -1,8 +1,9 @@
-extends Node
+extends PlayerSubsystem
 class_name ItemManager
 
 ## Item management subsystem.
-## Owns item pickup, drop, extend lifespan (F key), and scrap (X key) logic.
+## Owns item pickup, drop, extend lifespan (F key), scrap ground item (X key),
+## and scrap equipped item (O key) logic.
 ## Attached as a child of Player in player.tscn.
 
 ## --- Extend Item Lifespan (F key) ---
@@ -14,18 +15,16 @@ const EXTEND_TIME_ADDED := 30.0      ## Seconds added per extension press
 const EXTEND_MAX_COST_MULT := 2.5    ## Maximum cost multiplier after many extensions
 const EXTEND_SCALE_RATE := 0.003     ## How fast cost ramps up per fuel spent (higher = faster)
 
-## --- Scrap Item (X key) ---
-## Scrap a nearby ground item (priority) or the equipped weapon into burn fuel.
+## --- Scrap Ground Item (X key) ---
+## Scrap a nearby ground item into burn fuel.
+## --- Scrap Equipped Item (O key) ---
+## Scrap the equipped weapon/item from inventory into burn fuel.
 ## Rarer items give significantly more fuel.
 const SCRAP_FUEL_BY_RARITY := [10.0, 30.0, 65.0, 130.0, 250.0]  # Common → Legendary
 const SCRAP_PICKUP_RANGE := 4.0  ## Max distance to scrap a ground item
 
-## Player reference
-var player: CharacterBody3D
-
-
 func setup(p: CharacterBody3D) -> void:
-	player = p
+	super.setup(p)
 
 
 ## ======================================================================
@@ -87,9 +86,31 @@ func on_item_pickup(world_item: Node) -> void:
 		print("Player %d picked up %s (+%.0f fuel)" % [player.peer_id, item_data.item_name, item_data.fuel_amount])
 		return
 
+	# Trinkets go into the trinket bag
+	if item_data.item_type == ItemData.ItemType.TRINKET:
+		var t_idx := inventory.add_trinket(item_data)
+		if t_idx < 0:
+			return  # Trinket bag full
+		# Preserve world item's remaining burn time
+		var t_stack: ItemStack = inventory.trinket_bag[t_idx]
+		if t_stack and world_item.burn_time_remaining < WorldItem.PERMANENT_THRESHOLD:
+			t_stack.burn_time_remaining = world_item.burn_time_remaining
+		world_item.queue_free()
+		print("Player %d picked up trinket %s" % [player.peer_id, item_data.item_name])
+		return
+
 	# Shoes go into the dedicated shoe slot
 	if item_data.item_type == ItemData.ItemType.SHOE:
+		# Eject trinkets from old shoe before swapping
+		_eject_shoe_trinkets()
 		var old_shoe: ItemStack = inventory.equip_shoe(item_data)
+		# Preserve the world item's remaining burn time instead of resetting
+		# (skip permanent items — they use 999999 as a marker, not a real timer)
+		if inventory.equipped_shoe and world_item.burn_time_remaining < WorldItem.PERMANENT_THRESHOLD:
+			inventory.equipped_shoe.burn_time_remaining = world_item.burn_time_remaining
+		# Extended Mags bonus: +40% burn timer on shoe pickup
+		if 7 in player.active_bonuses and inventory.equipped_shoe:
+			inventory.equipped_shoe.burn_time_remaining *= 1.4
 		# Drop old shoe back into the world with its remaining burn time
 		if old_shoe != null and old_shoe.item_data != null:
 			drop_item_as_world_item(old_shoe)
@@ -100,6 +121,17 @@ func on_item_pickup(world_item: Node) -> void:
 	var idx := inventory.add_item(item_data)
 	if idx < 0:
 		return  # Inventory full
+
+	# Preserve the world item's remaining burn time instead of resetting
+	# (skip permanent items — they use 999999 as a marker, not a real timer)
+	var stack: ItemStack = inventory.items[idx]
+	if stack and world_item.burn_time_remaining < WorldItem.PERMANENT_THRESHOLD:
+		stack.burn_time_remaining = world_item.burn_time_remaining
+
+	# Extended Mags bonus: +40% burn timer on item pickup
+	if 7 in player.active_bonuses and idx >= 0:
+		if stack:
+			stack.burn_time_remaining *= 1.4
 
 	# Remove the world item
 	world_item.queue_free()
@@ -113,10 +145,15 @@ func drop_item_as_world_item(stack: ItemStack) -> void:
 	var drop_pos := player.global_position - player.transform.basis.z * 1.5
 	drop_pos.y = player.global_position.y
 
+	var item_path: String = stack.item_data.get_source_path()
+	if item_path == "":
+		push_warning("ItemManager: cannot drop %s — no resource path" % stack.item_data.item_name)
+		return
+
 	var map := get_tree().current_scene
 	if map.has_method("spawn_world_item"):
 		map.spawn_world_item(
-			stack.item_data.resource_path,
+			item_path,
 			drop_pos,
 			stack.burn_time_remaining,
 			player.peer_id,  # pickup immunity
@@ -124,6 +161,27 @@ func drop_item_as_world_item(stack: ItemStack) -> void:
 		)
 	else:
 		push_warning("ItemManager: map has no spawn_world_item method")
+
+
+func _eject_shoe_trinkets() -> void:
+	## Server-only: move all trinkets from the equipped shoe back to trinket bag.
+	## If bag is full, drop to world. Called before shoe swap or on death.
+	var inventory: Inventory = player.inventory
+	if inventory == null or inventory.equipped_shoe == null:
+		return
+	for trinket_data in inventory.equipped_shoe.slotted_trinkets:
+		if trinket_data == null:
+			continue
+		if inventory.trinket_bag.size() < Inventory.MAX_TRINKETS:
+			var stack := ItemStack.create(trinket_data)
+			inventory.trinket_bag.append(stack)
+			print("Trinket %s returned to bag (shoe swap)" % trinket_data.item_name)
+		else:
+			var stack := ItemStack.create(trinket_data)
+			drop_item_as_world_item(stack)
+			print("Trinket %s dropped to world (bag full, shoe swap)" % trinket_data.item_name)
+	inventory.equipped_shoe.slotted_trinkets.clear()
+	inventory.trinket_bag_changed.emit()
 
 
 ## ======================================================================
@@ -158,21 +216,65 @@ func try_extend_equipped_item() -> void:
 
 
 ## ======================================================================
-##  Scrap item (X key)
+##  Scrap ground item (X key)
 ## ======================================================================
 
-func try_scrap_item() -> void:
-	## Server-only: look for a nearby ground item to scrap first, then fall back
-	## to scrapping the equipped weapon.
+func try_scrap_ground_item() -> void:
+	## Server-only: scrap the nearest ground WorldItem within range for fuel.
 	if not multiplayer.is_server():
 		return
 
-	# Priority 1: scrap a nearby WorldItem on the ground
-	var scrapped_ground := _try_scrap_ground_item()
-	if scrapped_ground:
+	var world_items := get_tree().current_scene.get_node_or_null("WorldItems")
+	if world_items == null:
 		return
 
-	# Priority 2: scrap the equipped weapon
+	var player_pos := player.global_position
+	var best_item: Node = null
+	var best_dist := SCRAP_PICKUP_RANGE
+
+	for child in world_items.get_children():
+		if not child is Area3D or not child.has_method("setup"):
+			continue
+		if not "item_data" in child or child.item_data == null:
+			continue
+		var dist: float = player_pos.distance_to(child.global_position)
+		if dist < best_dist:
+			best_dist = dist
+			best_item = child
+
+	if best_item == null:
+		return
+
+	var item_data: ItemData = best_item.item_data
+	# Fuel canisters cannot be scrapped
+	if item_data.item_type == ItemData.ItemType.FUEL:
+		return
+	var rarity: int = item_data.rarity
+	var max_fuel: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
+	# Fuel scales linearly with time remaining: full timer = full fuel, expired = nothing
+	var initial_time: float = maxf(item_data.initial_burn_time, 0.1)
+	var time_fraction: float = 1.0
+	if "burn_time_remaining" in best_item:
+		time_fraction = clampf(best_item.burn_time_remaining / initial_time, 0.0, 1.0)
+	var fuel_gained: float = max_fuel * time_fraction
+	# Scavenger bonus: +50% scrap fuel
+	if 3 in player.active_bonuses:
+		fuel_gained *= 1.5
+
+	player.inventory.add_fuel(fuel_gained)
+	print("Player %d scrapped ground item %s for %.0f fuel" % [player.peer_id, item_data.item_name, fuel_gained])
+	best_item.queue_free()
+
+
+## ======================================================================
+##  Scrap equipped item (O key)
+## ======================================================================
+
+func try_scrap_equipped_item() -> void:
+	## Server-only: scrap the currently equipped weapon/item from inventory for fuel.
+	if not multiplayer.is_server():
+		return
+
 	var inventory: Inventory = player.inventory
 	if inventory.equipped_index < 0 or inventory.equipped_index >= inventory.items.size():
 		return
@@ -190,6 +292,9 @@ func try_scrap_item() -> void:
 	var initial_time: float = maxf(stack.item_data.initial_burn_time, 0.1)
 	var time_fraction: float = clampf(stack.burn_time_remaining / initial_time, 0.0, 1.0)
 	var fuel_gained: float = max_fuel * time_fraction
+	# Scavenger bonus: +50% scrap fuel
+	if 3 in player.active_bonuses:
+		fuel_gained *= 1.5
 
 	var item_name: String = stack.item_data.item_name
 	var idx := inventory.equipped_index
@@ -200,45 +305,3 @@ func try_scrap_item() -> void:
 	inventory.remove_item(idx)
 	inventory.add_fuel(fuel_gained)
 	print("Player %d scrapped %s for %.0f fuel" % [player.peer_id, item_name, fuel_gained])
-
-
-func _try_scrap_ground_item() -> bool:
-	## Look for the nearest WorldItem within range and scrap it for fuel.
-	var world_items := get_tree().current_scene.get_node_or_null("WorldItems")
-	if world_items == null:
-		return false
-
-	var player_pos := player.global_position
-	var best_item: Node = null
-	var best_dist := SCRAP_PICKUP_RANGE
-
-	for child in world_items.get_children():
-		if not child is Area3D or not child.has_method("setup"):
-			continue
-		if not "item_data" in child or child.item_data == null:
-			continue
-		var dist: float = player_pos.distance_to(child.global_position)
-		if dist < best_dist:
-			best_dist = dist
-			best_item = child
-
-	if best_item == null:
-		return false
-
-	var item_data: ItemData = best_item.item_data
-	# Fuel canisters cannot be scrapped
-	if item_data.item_type == ItemData.ItemType.FUEL:
-		return false
-	var rarity: int = item_data.rarity
-	var max_fuel: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
-	# Fuel scales linearly with time remaining: full timer = full fuel, expired = nothing
-	var initial_time: float = maxf(item_data.initial_burn_time, 0.1)
-	var time_fraction: float = 1.0
-	if "burn_time_remaining" in best_item:
-		time_fraction = clampf(best_item.burn_time_remaining / initial_time, 0.0, 1.0)
-	var fuel_gained: float = max_fuel * time_fraction
-
-	player.inventory.add_fuel(fuel_gained)
-	print("Player %d scrapped ground item %s for %.0f fuel" % [player.peer_id, item_data.item_name, fuel_gained])
-	best_item.queue_free()
-	return true
