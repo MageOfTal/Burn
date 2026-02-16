@@ -917,17 +917,34 @@ func _bake_slab_meshes(sever_y: float) -> void:
 		_cached_slab_offsets.append(slab_offset)
 
 		# Cache the mesh AABB center so _spawn_slab_fragments can re-center
-		# the MeshInstance3D and CollisionShape3D on the RigidBody3D origin.
+		# the MeshInstance3D on the RigidBody3D origin.
 		var mesh_aabb := slab_mesh.get_aabb()
 		_cached_slab_mesh_centers.append(mesh_aabb.get_center())
 
-		# Collision shape: centered BoxShape3D matching the mesh AABB.
-		# Convex hulls from buffer-space vertices are offset from (0,0,0) and
-		# cause violent physics (player launched when walking on fragments).
-		# A centered box is stable and predictable.
-		var box := BoxShape3D.new()
-		box.size = mesh_aabb.size
-		_cached_slab_shapes.append(box)
+		# Collision shape: convex hull from the actual mesh, re-centered so the
+		# hull's origin matches the RigidBody3D origin. The raw hull points are
+		# in buffer-local space (origin at region_min corner), but the
+		# MeshInstance3D sits at -mesh_center — so we shift hull points by
+		# -mesh_center to keep them aligned.
+		var slab_shape: Shape3D = null
+		var raw_convex := slab_mesh.create_convex_shape(true, false)
+		if raw_convex and raw_convex.points.size() >= 4:
+			var raw_pts: PackedVector3Array = raw_convex.points
+			var shifted_pts := PackedVector3Array()
+			shifted_pts.resize(raw_pts.size())
+			for pt_i in raw_pts.size():
+				shifted_pts[pt_i] = raw_pts[pt_i] - mesh_aabb.get_center()
+			var centered_convex := ConvexPolygonShape3D.new()
+			centered_convex.points = shifted_pts
+			slab_shape = centered_convex
+		else:
+			# Fallback: cylinder matching the tower's known radius
+			var cyl := CylinderShape3D.new()
+			cyl.radius = OUTER_RADIUS
+			cyl.height = slab_height
+			slab_shape = cyl
+			print("[SpiralTower] Convex hull failed for slab %d, using cylinder fallback" % _cached_slab_meshes.size())
+		_cached_slab_shapes.append(slab_shape)
 
 	print("[SpiralTower] Baked %d slab meshes (section: %.1fm, slab_h: %.1fm)" % [
 		_cached_slab_meshes.size(), section_height, slab_height])
@@ -1064,9 +1081,9 @@ func _spawn_topple_body(centroid: Vector3, baked_mesh: Mesh, mesh_offset: Vector
 	topple.max_contacts_reported = 4
 	topple.gravity_scale = 1.0
 	# Use dedicated collision layer 2 for tower debris so topple body and chunks
-	# don't collide with each other. Mask layer 1 (world/players) for ground impact.
+	# don't collide with each other. Mask world(1) + players(128) for impact.
 	topple.collision_layer = 2
-	topple.collision_mask = 1
+	topple.collision_mask = 1 | 128
 
 	# Set custom properties BEFORE adding to tree (these are simple vars, not transforms)
 	topple.section_height = section_height
@@ -1234,7 +1251,7 @@ func _sync_collapse_start(sever_y: float, torque_dir: Vector3) -> void:
 	topple.gravity_scale = 1.0
 	# Use dedicated collision layer 2 for tower debris (matches server topple body)
 	topple.collision_layer = 2
-	topple.collision_mask = 1
+	topple.collision_mask = 1 | 128
 
 	# Set position BEFORE adding to tree so there's no 1-frame flash at (0,0,0)
 	topple.position = centroid
@@ -1322,10 +1339,12 @@ func _spawn_slab_fragments(body_transform: Transform3D, is_server: bool,
 		var slab := RigidBody3D.new()
 		slab.name = "TowerSlab_%d" % i
 
-		if is_server:
-			slab.set_script(TowerChunkScript)
+		# All peers get the TowerChunk script so RPCs (debug spheres,
+		# destruction debris) work on clients. The script's _ready() and
+		# damage logic only run on the server (guarded by is_server checks).
+		slab.set_script(TowerChunkScript)
 
-		# Collision shape — centered BoxShape3D matching the mesh AABB.
+		# Collision shape — re-centered convex hull matching the actual slab mesh.
 		var col := CollisionShape3D.new()
 		col.shape = slab_shape
 		slab.add_child(col)
@@ -1350,7 +1369,7 @@ func _spawn_slab_fragments(body_transform: Transform3D, is_server: bool,
 		slab.gravity_scale = 1.0
 		slab.angular_damp = 1.5
 		slab.collision_layer = 2  # Tower debris layer
-		slab.collision_mask = 3   # Collide with world (1) AND other tower debris (2)
+		slab.collision_mask = 15 | 128  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + players(128)
 
 		if is_server:
 			slab.contact_monitor = true
@@ -1443,7 +1462,7 @@ func _spawn_rock_chunks_legacy(impact_pos: Vector3, chunk_count: int,
 		chunk.gravity_scale = 1.0
 		chunk.angular_damp = 2.0
 		chunk.collision_layer = 2  # Tower debris layer
-		chunk.collision_mask = 3   # Collide with world (1) AND other tower debris (2)
+		chunk.collision_mask = 15 | 128  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + players(128)
 
 		if is_server:
 			chunk.contact_monitor = true

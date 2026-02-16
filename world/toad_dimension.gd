@@ -1,67 +1,88 @@
 extends Node
 
-## The Toad Dimension — a shared pocket arena far below the map.
-## All players sent here occupy the SAME space — multiple pairs can fight
-## simultaneously amid a shared downpour of toads.
+## The Toad Dimension — a shared pocket arena at Y=-500 in the main World3D.
+## Players are teleported down, not reparented (reparenting breaks the
+## MultiplayerSpawner). Physics isolation is achieved via collision layer
+## swapping so overworld hitscan/physics queries don't interact with toad
+## dimension players and vice versa.
 ##
-## Visual design:
-##   - Endless dark grey ground plane with scattered rocks/bumps
-##   - Broad grey foggy skybox — whitewashed, eerie atmosphere
-##   - Giant toad models looming in all 4 cardinal directions
-##   - Massive toad rain shared across all active sessions
+## Visual isolation is handled by environment swapping (fog, sky, ambient light)
+## — 500m underground, the overworld is not visible.
+##
+## Each player gets their own independent exit timer. Multiple pairs can fight
+## simultaneously in the same space amid a shared toad rain.
 ##
 ## Server-authoritative: only the server teleports players and manages sessions.
+##
+## Toad bodies are full RigidBody3D physics objects (toad_body.tscn).
+## Each toad bounces once off the floor, then phases through the ground
+## and despawns when it falls far enough below. Toads push players on
+## contact via PhysicsBodyBase (mass = 4 kg, 1/20th of player mass).
 
-const DIMENSION_Y := -500.0        ## Base Y for the arena floor
-const FLOOR_SIZE := 500.0          ## Massive floor to look endless
-const CEILING_HEIGHT := 60.0       ## Invisible ceiling height
-const SESSION_DURATION := 10.0     ## Seconds trapped in the dimension
-const GIANT_TOAD_Y_OFFSET := 30.0  ## Raise toad so it sits on the floor
-const GIANT_TOAD_DISTANCE := 350.0 ## Far enough players can't reach it
-const TOAD_RAIN_INTERVAL := 0.03   ## Seconds between toad spawns (massive downpour)
-const TOAD_RAIN_AREA := 35.0       ## Radius of toad rain spread
-const TOADS_PER_TICK := 3          ## Toads spawned per rain tick
-const TOAD_SCATTER_SPEED := 8.0    ## How fast toads scatter on landing
-const TOAD_DESPAWN_DELAY := 3.0    ## Seconds after session ends before toads fade
+const DIMENSION_Y: float = -500.0        ## Arena floor Y
+const FLOOR_SIZE: float = 500.0          ## Massive floor to look endless
+const CEILING_HEIGHT: float = 60.0       ## Invisible ceiling height
+const SESSION_DURATION: float = 10.0     ## Seconds trapped in the dimension
+const GIANT_TOAD_Y_OFFSET: float = 30.0  ## Raise toad so it sits on the floor
+const GIANT_TOAD_DISTANCE: float = 350.0 ## Far enough players can't reach it
+const TOAD_RAIN_INTERVAL: float = 0.03   ## Seconds between toad spawns (massive downpour)
+const TOAD_RAIN_AREA: float = 52.5       ## Radius of toad rain spread (50% larger)
+var toads_per_tick: int = 400             ## Toads spawned per rain tick (adjustable via pause menu)
+const TOAD_SCATTER_SPEED: float = 8.0    ## How fast toads scatter on session end
+const TOAD_DESPAWN_DELAY: float = 3.0    ## Seconds after session ends before remaining toads are freed
+const TOAD_MAX: int = 1000000              ## Maximum toad bodies alive at once
+
+## Collision layers saved/restored during dimension transition.
+## Toad dimension players move to layer 9 (bit 256) — an unused layer
+## that no overworld weapon mask includes. Their mask hits world geometry
+## (toad floor/ceiling), toad walls, toad rain, and other toad players.
+## Overworld hitscan masks (1|2|4|8|16|128) don't include 256, so
+## toad players are completely invisible to overworld weapons.
+const TOAD_COLLISION_LAYER: int = 256        ## Layer 9 (toad dimension players)
+const TOAD_COLLISION_MASK: int = 1 | 16 | 64 | 256  ## World + toad walls + toad rain + toad players
+
+## Pre-loaded toad body scene
+var _toad_body_scene: PackedScene = null
 
 ## Fixed arena center — all sessions share the same space
-var _arena_center := Vector3(0, DIMENSION_Y + 1.0, 0)
+var _arena_center: Vector3 = Vector3(0, DIMENSION_Y + 1.0, 0)
 
-## Track active sessions: {session_id: SessionData}
-var _sessions: Dictionary = {}
-var _next_session_id: int = 0
 var _arena_built: bool = false
 var _arena_node: Node3D = null
 
 ## Shared materials (created once)
 var _floor_mat: StandardMaterial3D = null
-var _toad_body_mat: StandardMaterial3D = null
-var _toad_eye_mat: StandardMaterial3D = null
-var _toad_pupil_mat: StandardMaterial3D = null
 
 ## Client-side environment swap
 var _toad_env: Environment = null
 var _overworld_env: Environment = null
 var _is_showing_toad_env: bool = false
 
-## Shared toad rain container (toads pile up across all sessions)
+## Container node for spawned toad RigidBody3D instances
 var _shared_toads_container: Node3D = null
 var _toad_rain_timer: float = 0.0
 var _toads_despawning: bool = false  ## True while scatter/despawn is in progress
 
+## Per-player tracking: {peer_id: PlayerToadData}
+## Each player has their own timer and saved position. Leaving is independent.
+var _players: Dictionary = {}
 
-class SessionData:
-	var session_id: int
-	var attacker: CharacterBody3D
-	var victim: CharacterBody3D
-	var attacker_saved_pos: Vector3
-	var victim_saved_pos: Vector3
+## Shared rain timer — reset (not stacked) when new players enter.
+var _rain_duration: float = 0.0
+
+
+class PlayerToadData:
+	var player: CharacterBody3D
+	var saved_pos: Vector3
+	var saved_collision_layer: int
+	var saved_collision_mask: int
 	var timer: float
-	var ended: bool = false
 
 
 func enter(attacker: CharacterBody3D, victim: CharacterBody3D) -> void:
-	## Server-only: begin a toad dimension session for two players.
+	## Server-only: send two players to the toad dimension.
+	## Each player gets their own independent exit timer.
+	## The shared rain timer is reset (not stacked) on each new entry.
 	if not multiplayer.is_server():
 		return
 
@@ -73,91 +94,110 @@ func enter(attacker: CharacterBody3D, victim: CharacterBody3D) -> void:
 	if not _arena_built:
 		_build_arena()
 
-	var session := SessionData.new()
-	session.session_id = _next_session_id
-	_next_session_id += 1
+	# Save positions before teleport
+	var attacker_saved_pos := attacker.global_position
+	var victim_saved_pos := victim.global_position
 
-	# Save positions
-	session.attacker = attacker
-	session.victim = victim
-	session.attacker_saved_pos = attacker.global_position
-	session.victim_saved_pos = victim.global_position
-	session.timer = SESSION_DURATION
+	# Register both players with independent timers
+	_register_player(attacker, attacker_saved_pos)
+	_register_player(victim, victim_saved_pos)
 
 	# Cancel any active movement abilities before teleporting
 	attacker.reset_movement_states()
 	victim.reset_movement_states()
 
-	# Teleport players — spread them out a bit so multiple pairs don't stack
-	var pair_offset := Vector3(randf_range(-8, 8), 0, randf_range(-8, 8))
+	# Mark as in toad dimension so the flag is synced
 	attacker.in_toad_dimension = true
 	victim.in_toad_dimension = true
+
+	# Swap collision layers for physics isolation
+	_apply_toad_collision(attacker)
+	_apply_toad_collision(victim)
+
+	# Disable VoxelViewers (no voxel terrain at Y=-500)
+	_set_voxel_viewer_enabled(attacker, false)
+	_set_voxel_viewer_enabled(victim, false)
+
+	# Teleport players to the toad arena — spread them out per pair
+	var pair_offset := Vector3(randf_range(-8, 8), 0, randf_range(-8, 8))
 	var attacker_pos := _arena_center + pair_offset + Vector3(-3, 0, 0)
 	var victim_pos := _arena_center + pair_offset + Vector3(3, 0, 0)
 	attacker.global_position = attacker_pos
 	victim.global_position = victim_pos
+
+	# Zero velocity to prevent carrying momentum from overworld
+	attacker.velocity = Vector3.ZERO
+	victim.velocity = Vector3.ZERO
 
 	# Face players toward each other
 	var to_victim := victim_pos - attacker_pos
 	attacker.rotation.y = atan2(to_victim.x, to_victim.z)
 	victim.rotation.y = atan2(-to_victim.x, -to_victim.z)
 
-	# Notify clients for VFX / environment swap
-	_on_enter_toad_dimension.rpc(attacker.peer_id, victim.peer_id, session.session_id)
+	# Reset (not stack) the shared rain timer
+	_rain_duration = SESSION_DURATION
 
-	_sessions[session.session_id] = session
-	print("[ToadDimension] Session %d started: Player %d vs Player %d (%d active sessions)" % [
-		session.session_id, attacker.peer_id, victim.peer_id, _sessions.size()
+	# Notify clients for VFX / environment swap
+	_on_enter_toad_dimension.rpc(attacker.peer_id, victim.peer_id)
+
+	print("[ToadDimension] Players %d and %d entered (%d players in dimension)" % [
+		attacker.peer_id, victim.peer_id, _players.size()
 	])
+
+
+func _register_player(player: CharacterBody3D, overworld_pos: Vector3) -> void:
+	## Add a player to the dimension with their own exit timer.
+	## If already inside, reset their timer.
+	var data := PlayerToadData.new()
+	data.player = player
+	data.saved_pos = overworld_pos
+	data.saved_collision_layer = player.collision_layer
+	data.saved_collision_mask = player.collision_mask
+	data.timer = SESSION_DURATION
+	_players[player.peer_id] = data
 
 
 func _physics_process(delta: float) -> void:
 	if not multiplayer.is_server():
 		return
 
-	var finished_sessions: Array[int] = []
-	var any_active := false
+	# Tick each player's individual exit timer
+	var exiting_peers: Array[int] = []
+	for peer_id in _players:
+		var data: PlayerToadData = _players[peer_id]
 
-	for session_id in _sessions:
-		var session: SessionData = _sessions[session_id]
-
-		if session.ended:
-			finished_sessions.append(session_id)
+		if not is_instance_valid(data.player) or not data.player.is_alive:
+			exiting_peers.append(peer_id)
 			continue
 
-		any_active = true
-		session.timer -= delta
+		data.timer -= delta
+		if data.timer <= 0.0:
+			exiting_peers.append(peer_id)
 
-		# Check for dead players — if either died, end early
-		var attacker_dead: bool = not is_instance_valid(session.attacker) or not session.attacker.is_alive
-		var victim_dead: bool = not is_instance_valid(session.victim) or not session.victim.is_alive
+	# Return players whose timers expired or who died
+	for peer_id in exiting_peers:
+		_exit_player(peer_id)
 
-		if session.timer <= 0.0 or attacker_dead or victim_dead:
-			_end_session(session)
+	var anyone_inside: bool = _players.size() > 0
 
-	for sid in finished_sessions:
-		_sessions.erase(sid)
+	# Shared toad rain — single rain source, ticking down independently
+	if anyone_inside and is_instance_valid(_shared_toads_container):
+		_rain_duration -= delta
+		if _rain_duration > 0.0:
+			_toad_rain_timer -= delta
+			if _toad_rain_timer <= 0.0:
+				_toad_rain_timer = TOAD_RAIN_INTERVAL
+				for _i in range(toads_per_tick):
+					_spawn_toad()
 
-	# Shared toad rain — runs as long as ANY session is active
-	if any_active and is_instance_valid(_shared_toads_container):
-		_toad_rain_timer -= delta
-		if _toad_rain_timer <= 0.0:
-			_toad_rain_timer = TOAD_RAIN_INTERVAL
-			for _i in range(TOADS_PER_TICK):
-				_spawn_falling_toad()
-
-		# Cap total toad count to prevent performance issues
+		# Cap total toad count by removing oldest
 		var toad_count := _shared_toads_container.get_child_count()
-		if toad_count > 500:
-			# Remove oldest toads
-			for _i in range(toad_count - 500):
-				var oldest := _shared_toads_container.get_child(0)
-				oldest.queue_free()
+		if toad_count > TOAD_MAX:
+			_remove_oldest_toads(toad_count - TOAD_MAX)
 
-	# If no sessions active, clear remaining rain toads immediately
-	if not any_active and not _toads_despawning and is_instance_valid(_shared_toads_container):
-		if _shared_toads_container.get_child_count() > 0:
-			_scatter_and_despawn_toads()
+	# If nobody is in the dimension, despawn all toads immediately
+	if not anyone_inside and not _toads_despawning and _shared_toads_container and _shared_toads_container.get_child_count() > 0:
+		_clear_all_toads()
 
 
 func _process(_delta: float) -> void:
@@ -165,28 +205,31 @@ func _process(_delta: float) -> void:
 	_update_client_environment()
 
 
-func _end_session(session: SessionData) -> void:
-	session.ended = true
+func _exit_player(peer_id: int) -> void:
+	## Remove a single player from the toad dimension and return them.
+	var data: PlayerToadData = _players.get(peer_id)
+	if data == null:
+		return
 
-	# Cancel active abilities and teleport survivors back — place on terrain
-	# surface so they don't end up underground if it was cratered.
-	if is_instance_valid(session.attacker) and session.attacker.is_alive:
-		session.attacker.reset_movement_states()
-		session.attacker.in_toad_dimension = false
-		session.attacker.global_position = _get_safe_return_pos(session.attacker_saved_pos)
+	_players.erase(peer_id)
 
-	if is_instance_valid(session.victim) and session.victim.is_alive:
-		session.victim.reset_movement_states()
-		session.victim.in_toad_dimension = false
-		session.victim.global_position = _get_safe_return_pos(session.victim_saved_pos)
+	if is_instance_valid(data.player):
+		data.player.reset_movement_states()
+		data.player.in_toad_dimension = false
 
-	_on_exit_toad_dimension.rpc(
-		session.attacker.peer_id if is_instance_valid(session.attacker) else -1,
-		session.victim.peer_id if is_instance_valid(session.victim) else -1,
-		session.session_id
-	)
-	print("[ToadDimension] Session %d ended (%d sessions remain)" % [
-		session.session_id, _sessions.size() - 1
+		# Restore original collision layers
+		_restore_collision(data)
+
+		# Re-enable VoxelViewer for terrain streaming
+		_set_voxel_viewer_enabled(data.player, true)
+
+		if data.player.is_alive:
+			data.player.global_position = _get_safe_return_pos(data.saved_pos)
+			data.player.velocity = Vector3.ZERO
+
+	_on_exit_toad_dimension_player.rpc(peer_id)
+	print("[ToadDimension] Player %d exited (%d players remain)" % [
+		peer_id, _players.size()
 	])
 
 
@@ -201,29 +244,32 @@ func _get_safe_return_pos(saved_pos: Vector3) -> Vector3:
 	return saved_pos
 
 
-func _scatter_and_despawn_toads() -> void:
-	## Scatter all rain toads outward then queue them for cleanup.
-	## Great toads and the arena are NOT affected — they live in _arena_node, not here.
-	if not is_instance_valid(_shared_toads_container):
-		return
-	_toads_despawning = true
-	for child in _shared_toads_container.get_children():
-		if child is RigidBody3D:
-			var scatter_dir := Vector3(
-				randf_range(-1, 1), randf_range(0.3, 1.0), randf_range(-1, 1)
-			).normalized()
-			child.apply_impulse(scatter_dir * TOAD_SCATTER_SPEED)
-			child.angular_velocity = Vector3(
-				randf_range(-8, 8), randf_range(-8, 8), randf_range(-8, 8)
-			)
-	# Despawn after brief scatter animation
-	get_tree().create_timer(TOAD_DESPAWN_DELAY).timeout.connect(
-		func() -> void:
-			if is_instance_valid(_shared_toads_container):
-				for child in _shared_toads_container.get_children():
-					child.queue_free()
-			_toads_despawning = false
-	)
+# ======================================================================
+#  Collision layer isolation
+# ======================================================================
+
+func _apply_toad_collision(player: CharacterBody3D) -> void:
+	## Swap the player's collision layers so they only interact with
+	## toad arena geometry and other players — not overworld objects.
+	player.collision_layer = TOAD_COLLISION_LAYER
+	player.collision_mask = TOAD_COLLISION_MASK
+
+
+func _restore_collision(data: PlayerToadData) -> void:
+	## Restore the player's original collision layers.
+	if is_instance_valid(data.player):
+		data.player.collision_layer = data.saved_collision_layer
+		data.player.collision_mask = data.saved_collision_mask
+
+
+func _set_voxel_viewer_enabled(player: CharacterBody3D, enabled: bool) -> void:
+	## Enable/disable the VoxelViewer child to prevent streaming at Y=-500.
+	var viewer := player.get_node_or_null("VoxelViewer")
+	if viewer:
+		viewer.set_process(enabled)
+		viewer.set_physics_process(enabled)
+		if viewer.has_method("set_enabled"):
+			viewer.set_enabled(enabled)
 
 
 # ======================================================================
@@ -337,6 +383,169 @@ func _get_local_player() -> CharacterBody3D:
 
 
 # ======================================================================
+#  Toad spawning — RigidBody3D scene instances
+# ======================================================================
+
+func _spawn_toad() -> void:
+	## Instantiate a toad_body.tscn and add it to the toads container.
+	## Each toad is a full RigidBody3D with physics, collision, and visuals.
+	## The toad body script handles bounce detection, floor pass-through,
+	## and self-despawn automatically.
+	if _toad_body_scene == null:
+		_toad_body_scene = load("res://world/toad_body.tscn")
+
+	var toad: RigidBody3D = _toad_body_scene.instantiate()
+
+	# Random size (collision radius and visual scale)
+	var body_scale: float = randf_range(0.2, 0.4)
+
+	# Set collision shape radius to match visual scale
+	var col_shape: CollisionShape3D = toad.get_node("CollisionShape3D")
+	if col_shape and col_shape.shape is SphereShape3D:
+		col_shape.shape = col_shape.shape.duplicate()
+		col_shape.shape.radius = body_scale
+
+	# Scale the body mesh (squished sphere — 0.65 height ratio like original)
+	var body_mesh: MeshInstance3D = toad.get_node("Body")
+	if body_mesh:
+		body_mesh.scale = Vector3(body_scale, body_scale * 0.65, body_scale)
+
+	# Position eyes and pupils relative to body size
+	_setup_toad_eyes(toad, body_scale)
+
+	# Random spawn position in rain area
+	var rng_x: float = randf_range(-TOAD_RAIN_AREA, TOAD_RAIN_AREA)
+	var rng_z: float = randf_range(-TOAD_RAIN_AREA, TOAD_RAIN_AREA)
+	toad.position = _arena_center + Vector3(rng_x, CEILING_HEIGHT - 5.0 + randf() * 3.0, rng_z)
+
+	# Give a small random angular velocity so they tumble
+	toad.angular_velocity = Vector3(randf_range(-4, 4), randf_range(-4, 4), randf_range(-4, 4))
+
+	# Tell the toad body where the floor is for despawn detection
+	toad._floor_y = DIMENSION_Y
+
+	# Apply current toggle states before adding to scene
+	if GameManager.debug_toad_no_physics:
+		toad.start_physics_disabled()
+
+	if GameManager.debug_toad_no_shadows:
+		toad.set_shadows_enabled(false)
+
+	_shared_toads_container.add_child(toad)
+
+
+func _setup_toad_eyes(toad: RigidBody3D, radius: float) -> void:
+	## Position and scale eye + pupil meshes relative to the toad body size.
+	var eye_offset: float = radius * 0.55
+	var eye_size: float = radius * 0.25
+	var pupil_size: float = eye_size * 0.45
+
+	var eye_l: MeshInstance3D = toad.get_node_or_null("EyeL")
+	var eye_r: MeshInstance3D = toad.get_node_or_null("EyeR")
+	var pupil_l: MeshInstance3D = toad.get_node_or_null("PupilL")
+	var pupil_r: MeshInstance3D = toad.get_node_or_null("PupilR")
+
+	if eye_l:
+		eye_l.scale = Vector3(eye_size, eye_size * 0.75, eye_size)
+		eye_l.position = Vector3(eye_offset * 0.7, radius * 0.5, -radius * 0.6)
+	if eye_r:
+		eye_r.scale = Vector3(eye_size, eye_size * 0.75, eye_size)
+		eye_r.position = Vector3(-eye_offset * 0.7, radius * 0.5, -radius * 0.6)
+
+	var pupil_z_offset: float = -eye_size * 0.4
+	if pupil_l:
+		pupil_l.scale = Vector3(pupil_size, pupil_size * 0.78, pupil_size)
+		pupil_l.position = Vector3(eye_offset * 0.7, radius * 0.5, -radius * 0.6 + pupil_z_offset)
+	if pupil_r:
+		pupil_r.scale = Vector3(pupil_size, pupil_size * 0.78, pupil_size)
+		pupil_r.position = Vector3(-eye_offset * 0.7, radius * 0.5, -radius * 0.6 + pupil_z_offset)
+
+
+func _remove_oldest_toads(count: int) -> void:
+	## Free the oldest `count` toad nodes from the container.
+	var children := _shared_toads_container.get_children()
+	var to_remove: int = mini(count, children.size())
+	for i in range(to_remove):
+		if is_instance_valid(children[i]):
+			children[i].queue_free()
+
+
+func _clear_all_toads() -> void:
+	## Immediately free all toad bodies.
+	if _shared_toads_container == null:
+		return
+	for child in _shared_toads_container.get_children():
+		if is_instance_valid(child):
+			child.queue_free()
+
+
+# ======================================================================
+#  Live toggle application (called from pause menu)
+# ======================================================================
+
+func apply_toad_physics_toggle(physics_enabled: bool) -> void:
+	## Apply physics toggle to all existing toad bodies.
+	if _shared_toads_container == null:
+		return
+	for child in _shared_toads_container.get_children():
+		if not is_instance_valid(child) or not child is RigidBody3D:
+			continue
+		if physics_enabled:
+			child.restore_physics()
+		else:
+			child.start_physics_disabled()
+
+
+func apply_toad_shadow_toggle(shadows_enabled: bool) -> void:
+	## Apply shadow toggle to all existing toad bodies.
+	if _shared_toads_container == null:
+		return
+	for child in _shared_toads_container.get_children():
+		if not is_instance_valid(child) or not child is RigidBody3D:
+			continue
+		child.set_shadows_enabled(shadows_enabled)
+
+
+# ======================================================================
+#  Scatter & despawn
+# ======================================================================
+
+func _scatter_and_despawn_toads() -> void:
+	## Give all toads a random outward impulse, then clear after a delay.
+	## Handles both live (pre-bounce) and frozen (post-bounce) toads.
+	if _shared_toads_container == null or _shared_toads_container.get_child_count() == 0:
+		return
+	_toads_despawning = true
+
+	# Apply scatter impulse to all living toads
+	for child in _shared_toads_container.get_children():
+		if not is_instance_valid(child) or not child is RigidBody3D:
+			continue
+		var scatter_dir := Vector3(
+			randf_range(-1, 1), randf_range(0.3, 1.0), randf_range(-1, 1)
+		).normalized()
+		var scatter_angular := Vector3(
+			randf_range(-8, 8), randf_range(-8, 8), randf_range(-8, 8)
+		)
+
+		if child.freeze:
+			# Post-bounce toad: already out of Jolt, set manual velocity directly
+			child._manual_velocity = scatter_dir * TOAD_SCATTER_SPEED
+			child._manual_angular_vel = scatter_angular
+		else:
+			# Pre-bounce toad: still in Jolt, use physics impulse
+			child.apply_central_impulse(scatter_dir * TOAD_SCATTER_SPEED * child.mass)
+			child.angular_velocity = scatter_angular
+
+	# Despawn after brief scatter animation
+	get_tree().create_timer(TOAD_DESPAWN_DELAY).timeout.connect(
+		func() -> void:
+			_clear_all_toads()
+			_toads_despawning = false
+	)
+
+
+# ======================================================================
 #  Arena construction (built once, shared by all sessions)
 # ======================================================================
 
@@ -352,7 +561,19 @@ func _build_arena() -> void:
 	_shared_toads_container.name = "SharedToadRain"
 	_arena_node.add_child(_shared_toads_container)
 
-	# --- Endless floor ---
+	# --- Build arena geometry ---
+	_build_floor()
+	_build_ceiling()
+	_build_cylindrical_barrier()
+	_build_giant_toads()
+	_build_arena_lighting()
+	_spawn_ground_details()
+
+	_arena_built = true
+	print("[ToadDimension] Shared arena built at Y=%.0f (max_toads=%d)" % [DIMENSION_Y, TOAD_MAX])
+
+
+func _build_floor() -> void:
 	var floor_body := StaticBody3D.new()
 	floor_body.name = "ToadFloor"
 	floor_body.position = Vector3(0, DIMENSION_Y, 0)
@@ -375,7 +596,8 @@ func _build_arena() -> void:
 	floor_mesh.material_override = _floor_mat
 	floor_body.add_child(floor_mesh)
 
-	# --- Invisible ceiling ---
+
+func _build_ceiling() -> void:
 	var ceil_body := StaticBody3D.new()
 	ceil_body.position = Vector3(0, DIMENSION_Y + CEILING_HEIGHT, 0)
 	ceil_body.collision_layer = 1
@@ -387,7 +609,8 @@ func _build_arena() -> void:
 	ceil_col.shape = ceil_shape
 	ceil_body.add_child(ceil_col)
 
-	# --- Invisible cylindrical barrier (non-grappleable, layer 5) ---
+
+func _build_cylindrical_barrier() -> void:
 	var barrier_radius := 150.0
 	var barrier_segments := 32  # Number of flat panels forming the cylinder
 	var wall_h := CEILING_HEIGHT
@@ -413,7 +636,8 @@ func _build_arena() -> void:
 		wall_col.shape = wall_shape
 		wall.add_child(wall_col)
 
-	# --- Giant toads in all 4 cardinal directions ---
+
+func _build_giant_toads() -> void:
 	var toad_dirs: Array[Dictionary] = [
 		{"offset": Vector3(0, 0, -1), "rot": 0.0},
 		{"offset": Vector3(0, 0, 1), "rot": PI},
@@ -433,7 +657,8 @@ func _build_arena() -> void:
 		toad_light.position = toad_pos + Vector3(0, 30, 0) + dir_offset * -20.0
 		_arena_node.add_child(toad_light)
 
-	# --- Arena lighting ---
+
+func _build_arena_lighting() -> void:
 	var light1 := OmniLight3D.new()
 	light1.light_color = Color(0.3, 0.8, 0.35)
 	light1.light_energy = 4.0
@@ -448,28 +673,12 @@ func _build_arena() -> void:
 	light2.position = _arena_center + Vector3(10, 10, -10)
 	_arena_node.add_child(light2)
 
-	# --- Ground detail ---
-	_spawn_ground_details()
-
-	_arena_built = true
-	print("[ToadDimension] Shared arena built at Y=%.0f" % DIMENSION_Y)
-
 
 func _create_shared_materials() -> void:
 	_floor_mat = StandardMaterial3D.new()
 	_floor_mat.albedo_color = Color(0.12, 0.12, 0.12)
 	_floor_mat.roughness = 0.95
 	_floor_mat.metallic = 0.05
-
-	_toad_body_mat = StandardMaterial3D.new()
-	_toad_body_mat.albedo_color = Color(0.15, 0.55, 0.1)
-	_toad_body_mat.roughness = 0.7
-
-	_toad_eye_mat = StandardMaterial3D.new()
-	_toad_eye_mat.albedo_color = Color(0.95, 0.95, 0.8)
-
-	_toad_pupil_mat = StandardMaterial3D.new()
-	_toad_pupil_mat.albedo_color = Color(0.05, 0.05, 0.0)
 
 
 func _spawn_ground_details() -> void:
@@ -508,73 +717,6 @@ func _spawn_ground_details() -> void:
 		mound.position = _arena_center + Vector3(mx, -0.5, mz)
 		mound.material_override = bump_mat
 		_arena_node.add_child(mound)
-
-
-# ======================================================================
-#  Toad spawning (shared rain)
-# ======================================================================
-
-func _spawn_falling_toad() -> void:
-	var toad := RigidBody3D.new()
-	toad.gravity_scale = 2.0
-	toad.collision_layer = 0
-	toad.collision_mask = 1
-	toad.mass = 0.8
-	toad.physics_material_override = _get_toad_physics_mat()
-
-	var body_mesh := MeshInstance3D.new()
-	var sphere := SphereMesh.new()
-	var body_scale := randf_range(0.2, 0.4)
-	sphere.radius = body_scale
-	sphere.height = body_scale * 1.3
-	body_mesh.mesh = sphere
-	body_mesh.material_override = _toad_body_mat
-	toad.add_child(body_mesh)
-
-	var eye_offset := body_scale * 0.55
-	var eye_size := body_scale * 0.25
-	for eye_x in [-eye_offset, eye_offset]:
-		var eye := MeshInstance3D.new()
-		var eye_sphere := SphereMesh.new()
-		eye_sphere.radius = eye_size
-		eye_sphere.height = eye_size * 1.5
-		eye.mesh = eye_sphere
-		eye.position = Vector3(eye_x * 0.7, body_scale * 0.5, -body_scale * 0.6)
-		eye.material_override = _toad_eye_mat
-		toad.add_child(eye)
-
-		var pupil := MeshInstance3D.new()
-		var pupil_sphere := SphereMesh.new()
-		pupil_sphere.radius = eye_size * 0.45
-		pupil_sphere.height = eye_size * 0.7
-		pupil.mesh = pupil_sphere
-		pupil.position = eye.position + Vector3(0, 0, -eye_size * 0.4)
-		pupil.material_override = _toad_pupil_mat
-		toad.add_child(pupil)
-
-	var col := CollisionShape3D.new()
-	var col_shape := SphereShape3D.new()
-	col_shape.radius = body_scale
-	col.shape = col_shape
-	toad.add_child(col)
-
-	var rng_x := randf_range(-TOAD_RAIN_AREA, TOAD_RAIN_AREA)
-	var rng_z := randf_range(-TOAD_RAIN_AREA, TOAD_RAIN_AREA)
-	toad.position = _arena_center + Vector3(rng_x, CEILING_HEIGHT - 5.0 + randf() * 3.0, rng_z)
-
-	toad.angular_velocity = Vector3(randf_range(-4, 4), randf_range(-4, 4), randf_range(-4, 4))
-
-	_shared_toads_container.add_child(toad)
-
-
-var _toad_phys_mat: PhysicsMaterial = null
-
-func _get_toad_physics_mat() -> PhysicsMaterial:
-	if _toad_phys_mat == null:
-		_toad_phys_mat = PhysicsMaterial.new()
-		_toad_phys_mat.bounce = 0.3
-		_toad_phys_mat.friction = 0.6
-	return _toad_phys_mat
 
 
 # ======================================================================
@@ -625,16 +767,16 @@ func _create_giant_toad(center: Vector3, y_rotation: float = 0.0) -> Node3D:
 # ======================================================================
 
 @rpc("authority", "call_remote", "reliable")
-func _on_enter_toad_dimension(attacker_peer: int, victim_peer: int, _session_id: int) -> void:
+func _on_enter_toad_dimension(attacker_peer: int, victim_peer: int) -> void:
 	var local_id := multiplayer.get_unique_id()
 	if local_id == attacker_peer or local_id == victim_peer:
 		print("[ToadDimension] You have entered the Toad Dimension!")
 
 
 @rpc("authority", "call_remote", "reliable")
-func _on_exit_toad_dimension(attacker_peer: int, victim_peer: int, _session_id: int) -> void:
+func _on_exit_toad_dimension_player(peer_id: int) -> void:
 	var local_id := multiplayer.get_unique_id()
-	if local_id == attacker_peer or local_id == victim_peer:
+	if local_id == peer_id:
 		print("[ToadDimension] You have returned from the Toad Dimension.")
 
 
@@ -644,3 +786,52 @@ func _on_exit_toad_dimension(attacker_peer: int, victim_peer: int, _session_id: 
 
 func is_in_toad_dimension(player: CharacterBody3D) -> bool:
 	return player.get("in_toad_dimension") == true
+
+
+func find_player_anywhere(peer_id: int) -> CharacterBody3D:
+	## Find a player node by peer_id. Players always remain in the
+	## Players container (no reparenting), so this is a simple lookup.
+	var scene := get_tree().current_scene
+	if scene:
+		var players := scene.get_node_or_null("Players")
+		if players:
+			var p: Node = players.get_node_or_null(str(peer_id))
+			if p is CharacterBody3D:
+				return p
+	return null
+
+
+func get_all_player_nodes() -> Array[CharacterBody3D]:
+	## Returns all player nodes. Players always remain in the Players
+	## container (no reparenting), so this iterates that container.
+	var result: Array[CharacterBody3D] = []
+	var scene := get_tree().current_scene
+	if scene:
+		var players := scene.get_node_or_null("Players")
+		if players:
+			for child in players.get_children():
+				if child is CharacterBody3D:
+					result.append(child)
+	return result
+
+
+# ======================================================================
+#  Game reset (called by NetworkManager)
+# ======================================================================
+
+func reset() -> void:
+	## Full cleanup: return all players to overworld, clear toads, reset state.
+	for peer_id in _players.keys():
+		var data: PlayerToadData = _players[peer_id]
+		if is_instance_valid(data.player):
+			data.player.in_toad_dimension = false
+			_restore_collision(data)
+			_set_voxel_viewer_enabled(data.player, true)
+
+	_players.clear()
+	_rain_duration = 0.0
+	_toad_rain_timer = 0.0
+	_toads_despawning = false
+
+	_clear_all_toads()
+	_restore_overworld_env()

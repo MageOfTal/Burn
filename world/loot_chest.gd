@@ -15,6 +15,7 @@ const CHEST_POPUP_RANGE := 5.0        ## Distance to show prompt label
 var weapon_pool: Array[ItemData] = []
 var shoe_pool: Array[ItemData] = []
 var fuel_pool: Array[ItemData] = []
+var trinket_pool: Array[ItemData] = []
 
 ## Server state
 var is_open: bool = false
@@ -25,10 +26,7 @@ var _loot_items: Array[ItemData] = []
 var _lid_mesh: MeshInstance3D = null
 var _body_mesh: MeshInstance3D = null
 var _glow_light: OmniLight3D = null
-var _prompt_label: Label3D = null
-var _cached_local_player: Node = null
-var _player_cache_timer: float = 0.0
-const PLAYER_CACHE_INTERVAL := 1.0
+var _prompt_proximity: ProximityLabel = null
 
 
 func _ready() -> void:
@@ -82,15 +80,14 @@ func _build_visuals() -> void:
 	col.position.y = 0.375
 	add_child(col)
 
-	# Prompt label
-	_prompt_label = Label3D.new()
-	_prompt_label.font_size = 48
-	_prompt_label.outline_size = 6
-	_prompt_label.outline_modulate = Color(0, 0, 0)
-	_prompt_label.position = Vector3(0, 1.5, 0)
-	_prompt_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	_prompt_label.visible = false
-	add_child(_prompt_label)
+	# Prompt label (proximity-based)
+	_prompt_proximity = ProximityLabel.new()
+	_prompt_proximity.popup_range = CHEST_POPUP_RANGE
+	_prompt_proximity.label_offset = Vector3(0, 1.5, 0)
+	_prompt_proximity.label_color = Color(1.0, 0.85, 0.3)
+	_prompt_proximity.use_visibility_toggle = true
+	_prompt_proximity.update_callback = _on_prompt_label_update
+	add_child(_prompt_proximity)
 
 
 func _generate_loot() -> void:
@@ -101,11 +98,12 @@ func _generate_loot() -> void:
 	if not fuel_pool.is_empty():
 		_loot_items.append(fuel_pool[randi() % fuel_pool.size()])
 
-	# 2-3 random items (weapons, shoes, gadgets, consumables)
+	# 2-3 random items (weapons, shoes, gadgets, consumables, trinkets)
 	var item_count := randi_range(CHEST_ITEM_COUNT_MIN, CHEST_ITEM_COUNT_MAX)
 	var combined_pool: Array[ItemData] = []
 	combined_pool.append_array(weapon_pool)
 	combined_pool.append_array(shoe_pool)
+	combined_pool.append_array(trinket_pool)
 	if not combined_pool.is_empty():
 		for _i in item_count:
 			_loot_items.append(combined_pool[randi() % combined_pool.size()])
@@ -138,10 +136,10 @@ func open(_peer_id: int) -> void:
 func _spawn_world_item(p_item_data: ItemData, pos: Vector3) -> void:
 	var map := get_tree().current_scene
 	if map.has_method("spawn_world_item"):
-		# Roll rarity only for weapons/consumables/gadgets — shoes and fuel have
-		# rarity baked into their identity (each .tres IS a rarity tier).
+		# Roll rarity only for weapons/consumables/gadgets — shoes, fuel, and trinkets
+		# have rarity baked into their identity (each .tres IS a rarity tier).
 		var rolled_rarity: int = -1
-		if p_item_data.item_type != ItemData.ItemType.SHOE and p_item_data.item_type != ItemData.ItemType.FUEL:
+		if p_item_data.item_type != ItemData.ItemType.SHOE and p_item_data.item_type != ItemData.ItemType.FUEL and p_item_data.item_type != ItemData.ItemType.TRINKET:
 			rolled_rarity = map.roll_rarity() if map.has_method("roll_rarity") else -1
 		map.spawn_world_item(p_item_data.resource_path, pos, -1.0, -1, rolled_rarity)
 	else:
@@ -157,7 +155,6 @@ func _process(delta: float) -> void:
 
 	# Client: update visuals
 	_update_visuals(delta)
-	_update_prompt(delta)
 
 
 func reset_chest() -> void:
@@ -200,39 +197,14 @@ func _update_visuals(_delta: float) -> void:
 			_glow_light.light_energy = lerpf(_glow_light.light_energy, 1.5, 0.15)
 
 
-func _update_prompt(delta: float) -> void:
-	if _prompt_label == null:
-		return
-
-	# Cache local player lookup
-	_player_cache_timer -= delta
-	if _player_cache_timer <= 0.0 or not is_instance_valid(_cached_local_player):
-		_player_cache_timer = PLAYER_CACHE_INTERVAL
-		_cached_local_player = _find_local_player()
-
-	if _cached_local_player == null or not _cached_local_player.is_inside_tree():
-		_prompt_label.visible = false
-		return
-
-	var dist: float = global_position.distance_to(_cached_local_player.global_position)
-
-	if dist < CHEST_POPUP_RANGE:
-		_prompt_label.visible = true
-		if is_open:
-			_prompt_label.text = "EMPTY (%.0fs)" % maxf(refill_timer, 0.0)
-			_prompt_label.modulate = Color(0.6, 0.6, 0.6)
-		else:
-			_prompt_label.text = "[E] OPEN"
-			_prompt_label.modulate = Color(1.0, 0.85, 0.3)
+func _on_prompt_label_update(lbl: Label3D, _player: Node, _dist: float) -> void:
+	## Called every frame the prompt label is visible (player in range).
+	if is_open:
+		lbl.text = "EMPTY (%.0fs)" % maxf(refill_timer, 0.0)
+		lbl.modulate = Color(0.6, 0.6, 0.6)
 	else:
-		_prompt_label.visible = false
-
-
-func _find_local_player() -> Node:
-	var players := get_tree().current_scene.get_node_or_null("Players")
-	if players == null:
-		return null
-	return players.get_node_or_null(str(multiplayer.get_unique_id()))
+		lbl.text = "[E] OPEN"
+		lbl.modulate = Color(1.0, 0.85, 0.3)
 
 
 @rpc("authority", "call_remote", "reliable")

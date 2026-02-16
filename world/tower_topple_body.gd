@@ -1,9 +1,10 @@
-extends RigidBody3D
+extends PhysicsBodyBase
 class_name TowerToppleBody
 
 ## The rigid body representing the toppling upper section of a spiral tower.
 ## Server-authoritative: detects ground impact, triggers chunk breakup and
-## explosion damage at the impact point.
+## explosion damage at the impact point. Pushes nearby characters via
+## mass-weighted physics (inherited from PhysicsBodyBase).
 ##
 ## Created by spiral_tower.gd when structural integrity fails.
 
@@ -18,7 +19,6 @@ const IMPACT_MIN_SPEED_TILTED := 1.5   ## Minimum speed when fully horizontal (h
 const MAX_TOPPLE_TIME := 20.0          ## Safety timeout — force breakup
 const IMMUNITY_TIME := 3.0             ## Ignore everything for this long after spawn
 const SETTLE_TIME := 10.0              ## After this long, break up even if slow (it settled)
-const SHATTER_MIN_SPEED := 2.0         ## Below this speed at impact, no chunk breakup — just damage + stay whole
 const CHUNK_COUNT_MIN := 4
 const CHUNK_COUNT_MAX := 8
 
@@ -60,6 +60,7 @@ func _ready() -> void:
 
 
 func _physics_process(delta: float) -> void:
+	super._physics_process(delta)  # PhysicsBodyBase: mass-weighted character push
 	if not multiplayer.is_server() or _has_impacted:
 		return
 
@@ -164,7 +165,7 @@ func _find_impact_pos() -> Vector3:
 		var ray := PhysicsRayQueryParameters3D.create(
 			origin,
 			origin + Vector3(0, -section_height * 1.5, 0),
-			0xFFFFFFFF,
+			1,  # World geometry only
 			[get_rid()]
 		)
 		var result := space_state.intersect_ray(ray)
@@ -192,7 +193,7 @@ func _raycast_ground_check() -> Vector3:
 		var ray := PhysicsRayQueryParameters3D.create(
 			tip,
 			tip + Vector3(0, -2.5, 0),
-			0xFFFFFFFF,
+			1,  # World geometry only
 			[get_rid()]
 		)
 		var result := space_state.intersect_ray(ray)
@@ -216,12 +217,11 @@ func _do_impact(impact_pos: Vector3, impact_velocity: Vector3) -> void:
 		str(impact_pos), impact_speed, mass, section_height])
 
 	# --- 1. Check if impact is forceful enough to shatter ---
-	# A gentle/slow fall should NOT break the tower into chunks. The topple body
-	# just stays as-is (a big piece of rubble). No explosion here — individual
-	# fragments create their own explosions when they hit the ground.
-	if impact_speed < SHATTER_MIN_SPEED:
-		print("[TowerToppleBody] Gentle impact (speed %.1f < %.1f) — no shatter, staying whole" % [
-			impact_speed, SHATTER_MIN_SPEED])
+	# A toppled tower should always break up. The speed check is only a safeguard
+	# for extremely gentle nudges, but settle/timeout paths may report near-zero
+	# velocity even though the tower clearly fell. Use a very low threshold.
+	if impact_speed < 0.5 and _topple_timer < SETTLE_TIME:
+		print("[TowerToppleBody] Extremely gentle nudge (speed %.1f) — staying whole" % impact_speed)
 		freeze = true
 		return
 

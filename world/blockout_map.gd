@@ -7,9 +7,11 @@ extends Node3D
 var weapon_definitions: Array[ItemData] = []
 var shoe_definitions: Array[ItemData] = []
 var fuel_definitions: Array[ItemData] = []
+var trinket_definitions: Array[ItemData] = []
 
 ## Number of loot chests to spawn (uses a subset of LootSpawnPoints)
 const CHEST_COUNT := 80
+const STORE_COUNT := 8
 
 ## Rarity roll weights: every item spawned can be any rarity.
 ## Higher rarities are progressively rarer. Weights are relative (don't need to sum to 1).
@@ -40,6 +42,7 @@ const DEMO_SPAWN_TABLE: Array[Dictionary] = [
 	{ "path": "res://items/definitions/consumable_kamikaze_missile.tres", "offset": Vector3(4, 0, 0) },
 	{ "path": "res://items/definitions/gadget_grappling_hook.tres",       "offset": Vector3(-4, 0, 0) },
 	{ "path": "res://items/definitions/consumable_medkit.tres",          "offset": Vector3(5, 0, 0) },
+	{ "path": "res://items/definitions/gun_jeg_double_barrel_shotgun.tres", "offset": Vector3(-5, 0, 0) },
 ]
 
 ## Zone visual
@@ -62,11 +65,6 @@ func _enter_tree() -> void:
 
 
 func _ready() -> void:
-	# Centralized bubble separation manager (spatial hash grid, replaces O(n^2) per-bubble scan)
-	var bubble_mgr := BubbleSeparationManager.new()
-	bubble_mgr.name = "BubbleSeparationManager"
-	add_child(bubble_mgr)
-
 	# Zone visual is cosmetic — create on ALL peers so everyone sees the ring + fire
 	_create_zone_visual()
 
@@ -74,6 +72,7 @@ func _ready() -> void:
 	# Chest gameplay logic (loot generation, opening) is server-only via is_server() guards.
 	_load_item_definitions()
 	_spawn_loot_chests()
+	_spawn_kill_stores()
 
 	# NOTE: BurnClock.start(), _start_zone(), and _spawn_demo_items() are now
 	# called from NetworkManager._start_match() when the host starts the game
@@ -99,8 +98,10 @@ func _on_spawn_world_item(data: Dictionary) -> Node:
 	if data.has("rarity"):
 		var rolled: int = data["rarity"]
 		var base_rarity: int = item_data.rarity
+		var original_path: String = item_data.resource_path
 		item_data = item_data.duplicate()
-		item_data.rarity = rolled
+		item_data._original_resource_path = original_path
+		item_data.rarity = rolled as ItemData.Rarity
 		# Scale time_currency_value relative to the base definition's rarity
 		if base_rarity >= 0 and base_rarity < RARITY_VALUE_MULT.size() and rolled < RARITY_VALUE_MULT.size():
 			var ratio: float = RARITY_VALUE_MULT[rolled] / maxf(RARITY_VALUE_MULT[base_rarity], 0.01)
@@ -192,13 +193,15 @@ func _load_item_definitions() -> void:
 						shoe_definitions.append(res)
 					ItemData.ItemType.FUEL:
 						fuel_definitions.append(res)
+					ItemData.ItemType.TRINKET:
+						trinket_definitions.append(res)
 					_:
 						weapon_definitions.append(res)
 		file_name = dir.get_next()
 	dir.list_dir_end()
-	print("Loaded %d weapons, %d shoes, %d fuel" % [
+	print("Loaded %d weapons, %d shoes, %d fuel, %d trinkets" % [
 		weapon_definitions.size(), shoe_definitions.size(),
-		fuel_definitions.size()])
+		fuel_definitions.size(), trinket_definitions.size()])
 
 
 # ======================================================================
@@ -241,11 +244,70 @@ func _spawn_loot_chests() -> void:
 		chest.weapon_pool = weapon_definitions
 		chest.shoe_pool = shoe_definitions
 		chest.fuel_pool = fuel_definitions
+		chest.trinket_pool = trinket_definitions
 		chest.position = points[i].global_position
 		container.add_child(chest, true)
 
-	print("[Chests] Spawned %d loot chests (weapons=%d shoes=%d fuel=%d)" % [
-		count, weapon_definitions.size(), shoe_definitions.size(), fuel_definitions.size()])
+	print("[Chests] Spawned %d loot chests (weapons=%d shoes=%d fuel=%d trinkets=%d)" % [
+		count, weapon_definitions.size(), shoe_definitions.size(), fuel_definitions.size(), trinket_definitions.size()])
+
+
+# ======================================================================
+#  Kill Stores (kill-currency shops)
+# ======================================================================
+
+func _spawn_kill_stores() -> void:
+	## Spawn kill-currency stores at a subset of LootSpawnPoints.
+	## Uses the same deterministic shuffle as chests (seed 55555) to identify
+	## which points are already taken, then a different seed (77777) for stores.
+	var loot_spawn_points := get_node_or_null("LootSpawnPoints")
+	if loot_spawn_points == null:
+		return
+
+	var points: Array[Node] = []
+	for child in loot_spawn_points.get_children():
+		if child is Marker3D:
+			points.append(child)
+
+	# Reproduce the same shuffle as _spawn_loot_chests() to identify used points
+	var chest_rng := RandomNumberGenerator.new()
+	chest_rng.seed = 55555
+	for i in range(points.size() - 1, 0, -1):
+		var j := chest_rng.randi_range(0, i)
+		var tmp: Node = points[i]
+		points[i] = points[j]
+		points[j] = tmp
+
+	# The first CHEST_COUNT points are used by chests. Take the remainder.
+	var remaining: Array[Node] = []
+	for i in range(mini(CHEST_COUNT, points.size()), points.size()):
+		remaining.append(points[i])
+
+	if remaining.is_empty():
+		push_warning("[Stores] Not enough spawn points for stores (all used by chests)")
+		return
+
+	# Shuffle remaining points with a different seed for stores
+	var store_rng := RandomNumberGenerator.new()
+	store_rng.seed = 77777
+	for i in range(remaining.size() - 1, 0, -1):
+		var j := store_rng.randi_range(0, i)
+		var tmp: Node = remaining[i]
+		remaining[i] = remaining[j]
+		remaining[j] = tmp
+
+	var count := mini(STORE_COUNT, remaining.size())
+	var store_scene := preload("res://world/kill_store.tscn")
+	var container := get_node_or_null("WorldItems")
+	if container == null:
+		container = self
+
+	for i in count:
+		var store: KillStore = store_scene.instantiate()
+		store.position = remaining[i].global_position
+		container.add_child(store, true)
+
+	print("[Stores] Spawned %d kill stores" % count)
 
 
 # ======================================================================
@@ -677,8 +739,8 @@ func _process(delta: float) -> void:
 					var ez: float = zm.zone_center.y + sin(angle) * r
 					# Get terrain height at emitter position
 					var ey := 0.0
-					if seed_world and seed_world.has_method("get_height_at"):
-						ey = seed_world.get_height_at(ex, ez)
+					if seed_world and seed_world.has_method("get_height_from_noise"):
+						ey = seed_world.get_height_from_noise(ex, ez)
 					emitter.global_position = Vector3(ex, ey, ez)
 					# Only emit if radius is reasonable
 					emitter.emitting = r > 5.0
@@ -694,3 +756,186 @@ func _place_world_item(item_data: ItemData, pos: Vector3) -> void:
 	if item_data.item_type != ItemData.ItemType.SHOE and item_data.item_type != ItemData.ItemType.FUEL:
 		rarity_roll = roll_rarity()
 	spawn_world_item(item_data.resource_path, pos, -1.0, -1, rarity_roll)
+
+
+# ======================================================================
+#  Toad Rail Cannon (debug — fires toads at a target platform)
+# ======================================================================
+
+func spawn_toad_rail_cannon() -> void:
+	## Build a toad rail cannon near the host player with two platforms:
+	## a cannon platform (with the cannon on it) and a target platform
+	## big enough for the player to stand on and get pelted by toads.
+	var players_node := get_node_or_null("Players")
+	if players_node == null:
+		return
+	var host_player := players_node.get_node_or_null("1")
+	if host_player == null:
+		return
+
+	var host_pos: Vector3 = host_player.global_position
+
+	# Layout: cannon platform 12m to the right (+X) and 8m up from host,
+	# target platform 50m further in +Z direction from the cannon.
+	var cannon_base: Vector3 = host_pos + Vector3(12.0, 8.0, 0.0)
+	var fire_dir := Vector3.FORWARD  # +Z direction (Godot forward = -Z, but we want a clear line)
+	fire_dir = Vector3(0, 0, 1)  # Shoot in +Z
+	var target_distance: float = 10.0
+	var target_base: Vector3 = cannon_base + fire_dir * target_distance
+
+	var plat_mat := StandardMaterial3D.new()
+	plat_mat.albedo_color = Color(0.3, 0.3, 0.35)
+
+	var cannon_mat := StandardMaterial3D.new()
+	cannon_mat.albedo_color = Color(0.15, 0.5, 0.1)  # Green toad-themed
+
+	var target_mat := StandardMaterial3D.new()
+	target_mat.albedo_color = Color(0.5, 0.15, 0.1)  # Red target
+
+	# --- Cannon Platform (small, holds the cannon) ---
+	_build_static_platform(cannon_base, Vector3(4.0, 0.5, 4.0), plat_mat)
+
+	# --- Ramp from ground to cannon platform ---
+	_build_ramp(host_pos, cannon_base, 3.0, plat_mat)
+
+	# --- Target Platform (big, for the player to stand on) ---
+	_build_static_platform(target_base, Vector3(8.0, 0.5, 8.0), target_mat)
+
+	# --- Ramp from ground to target platform ---
+	# Ramp approaches target from -X side (toward host). 16m horizontal run for
+	# a gentler slope that clearly extends below the platform to ground level.
+	var target_ramp_ground := Vector3(target_base.x - 16.0, host_pos.y, target_base.z)
+	_build_ramp(target_ramp_ground, target_base, 3.0, target_mat)
+
+	# --- Cannon body (visual barrel) ---
+	var barrel := MeshInstance3D.new()
+	var barrel_mesh := CylinderMesh.new()
+	barrel_mesh.top_radius = 0.3
+	barrel_mesh.bottom_radius = 0.4
+	barrel_mesh.height = 3.0
+	barrel.mesh = barrel_mesh
+	barrel.material_override = cannon_mat
+	barrel.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Rotate barrel to point in fire direction (+Z) — cylinder default is Y-up
+	barrel.rotation.x = PI / 2.0
+	barrel.position = cannon_base + Vector3(0, 1.5, 1.5)
+	add_child(barrel)
+
+	# Cannon base pedestal
+	var pedestal := MeshInstance3D.new()
+	var ped_mesh := BoxMesh.new()
+	ped_mesh.size = Vector3(1.2, 1.0, 1.2)
+	pedestal.mesh = ped_mesh
+	pedestal.material_override = cannon_mat
+	pedestal.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	pedestal.position = cannon_base + Vector3(0, 0.5, 0)
+	add_child(pedestal)
+
+	# --- Cannon script node ---
+	var cannon := Node3D.new()
+	cannon.name = "ToadRailCannon"
+	cannon.set_script(load("res://world/toad_rail_cannon.gd"))
+	add_child(cannon)
+	cannon.global_position = cannon_base + Vector3(0, 1.0, 3.0)  # Muzzle at front of barrel, raised 1m
+	cannon.set_fire_direction(fire_dir)
+
+	# --- Labels ---
+	var cannon_label := Label3D.new()
+	cannon_label.text = "TOAD RAIL CANNON"
+	cannon_label.font_size = 48
+	cannon_label.modulate = Color(0.2, 0.8, 0.2)
+	cannon_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	cannon_label.position = cannon_base + Vector3(0, 4.0, 0)
+	add_child(cannon_label)
+
+	var target_label := Label3D.new()
+	target_label.text = "TARGET PLATFORM"
+	target_label.font_size = 48
+	target_label.modulate = Color(0.9, 0.3, 0.2)
+	target_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	target_label.position = target_base + Vector3(0, 4.0, 0)
+	add_child(target_label)
+
+	print("DEMO: Spawned toad rail cannon (speed=%d m/s, distance=%dm)" % [
+		int(100), int(target_distance)
+	])
+
+
+func _build_static_platform(center: Vector3, size: Vector3, mat: StandardMaterial3D) -> void:
+	## Build a walkable static platform (mesh + collision).
+	var mesh_inst := MeshInstance3D.new()
+	var box := BoxMesh.new()
+	box.size = size
+	mesh_inst.mesh = box
+	mesh_inst.material_override = mat
+	mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	mesh_inst.position = center + Vector3(0, -size.y * 0.5, 0)
+	add_child(mesh_inst)
+
+	var body := StaticBody3D.new()
+	body.collision_layer = 1  # World geometry
+	body.collision_mask = 0
+	body.position = mesh_inst.position
+	var col := CollisionShape3D.new()
+	var shape := BoxShape3D.new()
+	shape.size = size
+	col.shape = shape
+	body.add_child(col)
+	add_child(body)
+
+
+func _build_ramp(ground_pos: Vector3, platform_pos: Vector3, width: float, mat: StandardMaterial3D) -> void:
+	## Build a ramp from ground level up to a platform.
+	## The run is derived from the actual XZ distance between ground_pos and
+	## platform_pos so the ramp bottom always reaches the ground position.
+	var rise: float = platform_pos.y - ground_pos.y
+
+	# Direction from ground toward the platform (XZ only)
+	var xz_dir := Vector3(platform_pos.x - ground_pos.x, 0, platform_pos.z - ground_pos.z)
+	var run: float = xz_dir.length()
+	if run < 0.5:
+		run = 16.0  # Fallback: default horizontal run if positions are stacked
+		xz_dir = Vector3(1, 0, 0)
+	else:
+		xz_dir = xz_dir / run  # Normalize
+
+	var ramp_angle := atan2(rise, run)
+	var ramp_len := sqrt(rise * rise + run * run)
+	var ramp_thickness := 0.3
+
+	# Extend the ramp 2m past the bottom so it dips into the terrain,
+	# guaranteeing a solid connection to the ground.
+	var extra := 2.0
+	var total_len := ramp_len + extra
+
+	# Ramp center: midpoint of the extended ramp
+	var ramp_center := Vector3(
+		platform_pos.x - xz_dir.x * (run + extra * cos(ramp_angle)) * 0.5,
+		ground_pos.y + (rise - extra * sin(ramp_angle)) * 0.5,
+		platform_pos.z - xz_dir.z * (run + extra * cos(ramp_angle)) * 0.5
+	)
+
+	# Y rotation to face the ramp toward the platform
+	var y_rot := atan2(xz_dir.x, xz_dir.z)
+
+	var ramp_mesh := MeshInstance3D.new()
+	var ramp_box := BoxMesh.new()
+	ramp_box.size = Vector3(width, ramp_thickness, total_len)
+	ramp_mesh.mesh = ramp_box
+	ramp_mesh.material_override = mat
+	ramp_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	ramp_mesh.position = ramp_center
+	ramp_mesh.rotation = Vector3(ramp_angle, y_rot, 0)
+	add_child(ramp_mesh)
+
+	var ramp_body := StaticBody3D.new()
+	ramp_body.collision_layer = 1
+	ramp_body.collision_mask = 0
+	ramp_body.position = ramp_center
+	ramp_body.rotation = Vector3(ramp_angle, y_rot, 0)
+	var ramp_col := CollisionShape3D.new()
+	var ramp_shape := BoxShape3D.new()
+	ramp_shape.size = ramp_box.size
+	ramp_col.shape = ramp_shape
+	ramp_body.add_child(ramp_col)
+	add_child(ramp_body)

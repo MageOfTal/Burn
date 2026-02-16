@@ -28,8 +28,6 @@ extends Node3D
 @export var num_player_spawns: int = 40
 @export var num_loot_spawns: int = 500
 @export var num_dummies: int = 0
-@export var num_bars: int = 50
-@export var num_donuts: int = 100
 @export var structure_margin: float = 25.0  ## Keep structures this far from edges
 
 ## Signals
@@ -111,6 +109,24 @@ func _ready() -> void:
 
 	add_child(_voxel_terrain)
 
+	# --- Server-side VoxelViewer: load ALL terrain chunks permanently ---
+	# Without this, chunks only load around player VoxelViewers, which means
+	# terrain may not have collision meshes when a player spawns (causing them
+	# to fall through the ground). A single viewer at map center with a view
+	# distance covering the full map ensures all chunks are always loaded.
+	if multiplayer.is_server() and ClassDB.class_exists(&"VoxelViewer"):
+		var server_viewer: Node3D = ClassDB.instantiate(&"VoxelViewer")
+		server_viewer.name = "ServerVoxelViewer"
+		server_viewer.position = Vector3(0.0, 0.0, 0.0)
+		if server_viewer.has_method("set_view_distance"):
+			server_viewer.set_view_distance(512)
+		elif "view_distance" in server_viewer:
+			server_viewer.view_distance = 512
+		# Require collisions so physics meshes are generated for all chunks
+		if "requires_collisions" in server_viewer:
+			server_viewer.requires_collisions = true
+		_voxel_terrain.add_child(server_viewer)
+
 	# Get the VoxelTool for editing (digging, craters)
 	_voxel_tool = _voxel_terrain.get_voxel_tool()
 
@@ -156,6 +172,7 @@ func _ready() -> void:
 		world_env.name = "WorldEnvironment"
 		world_env.environment = env
 		get_parent().add_child.call_deferred(world_env)
+		VideoSettings.call_deferred("apply_all")
 
 	_terrain_ready = true
 
@@ -190,11 +207,9 @@ func _spawn_heavy_structures() -> void:
 	if not GameManager.debug_skip_structures:
 		await _spawn_walls_batched(rng, structures_node)
 		await _spawn_ramps_batched(rng, structures_node)
-		await _spawn_bars_batched(rng, structures_node)
-		await _spawn_donuts_batched(rng, structures_node)
 		await _spawn_tower(rng, structures_node)
 	else:
-		print("[SeedWorld] Skipping walls/ramps/tower (debug toggle)")
+		print("[SeedWorld] Skipping structures (debug toggle)")
 		await get_tree().process_frame  # Yield once so signal timing stays consistent
 	_spawn_dummies(rng)
 
@@ -220,7 +235,7 @@ func reset_world() -> void:
 		_voxel_tool = _voxel_terrain.get_voxel_tool()
 		print("[SeedWorld] Terrain stream reset (craters cleared)")
 
-	# --- 2. Destroy all structures (walls, ramps, bars, donuts, tower) ---
+	# --- 2. Destroy all structures (walls, ramps, tower) ---
 	var structures := get_node_or_null("Structures")
 	if structures:
 		# Clear tower reference BEFORE freeing (tower is a child of Structures)
@@ -427,17 +442,31 @@ func _spawn_walls_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 
 
 func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn ramp structures, yielding every batch to spread load.
-	var ramp_size := Vector3(4, 0.3, 8)
-	var ramp_mat := StandardMaterial3D.new()
-	ramp_mat.albedo_color = Color(0.5, 0.6, 0.5, 1)
-
+	## Spawn destructible ramps, yielding every batch to spread load.
+	var ramp_scene := preload("res://world/destructible_ramp.tscn")
+	var ramp_sizes := [
+		Vector3(4, 0.5, 8),
+		Vector3(3, 0.5, 6),
+		Vector3(5, 0.5, 10),
+		Vector3(3, 0.5, 5),
+	]
 	var angles_deg := [15.0, 20.0, 25.0, 30.0]
+	var tier_weights := [0.35, 0.35, 0.20, 0.10]
 	var spawned := 0
 
 	for i in num_ramps:
+		var ramp_size: Vector3 = ramp_sizes[rng.randi() % ramp_sizes.size()]
 		var ramp_angle: float = angles_deg[rng.randi() % angles_deg.size()]
 		var y_rot := rng.randf_range(0, TAU)
+
+		var roll := rng.randf()
+		var tier: int = 0
+		var cumulative := 0.0
+		for t in tier_weights.size():
+			cumulative += tier_weights[t]
+			if roll <= cumulative:
+				tier = t
+				break
 
 		var pos := _get_random_ground_pos(rng, 0.3, 25.0)
 		if pos == Vector3.INF:
@@ -449,142 +478,21 @@ func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
 				continue
 
-		var ramp := StaticBody3D.new()
+		var ramp: Node3D = ramp_scene.instantiate()
 		ramp.name = "Ramp_%d" % spawned
+		ramp.ramp_size = ramp_size
+		ramp.ramp_tier = tier
 		ramp.position = pos
 		ramp.rotation.y = y_rot
 		ramp.rotation.x = deg_to_rad(ramp_angle)
 		parent.add_child(ramp)
-
-		var col := CollisionShape3D.new()
-		var box_shape := BoxShape3D.new()
-		box_shape.size = ramp_size
-		col.shape = box_shape
-		ramp.add_child(col)
-
-		var mesh_inst := MeshInstance3D.new()
-		var box_mesh := BoxMesh.new()
-		box_mesh.size = ramp_size
-		mesh_inst.mesh = box_mesh
-		mesh_inst.material_override = ramp_mat
-		ramp.add_child(mesh_inst)
 		spawned += 1
 
-		# Yield every 20 ramps (each is just 3 nodes, much lighter than walls)
-		if spawned % 20 == 0:
-			await get_tree().process_frame
-
-
-func _spawn_bars_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn skinny vertical bars (0.1m wide, 20m tall) across the map.
-	## Great for testing grapple rope obstruction with narrow obstacles.
-	var bar_width := 0.1
-	var bar_height := 20.0
-	var bar_mat := StandardMaterial3D.new()
-	bar_mat.albedo_color = Color(0.6, 0.55, 0.5)
-	var spawned := 0
-
-	for i in num_bars:
-		var pos := _get_random_ground_pos(rng, bar_height * 0.5, 30.0)
-		if pos == Vector3.INF:
-			continue
-
-		# Skip if inside tower exclusion zone
-		if _tower_position != Vector3.INF:
-			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
-			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
-				continue
-
-		var bar := StaticBody3D.new()
-		bar.name = "Bar_%d" % spawned
-		bar.position = pos
-		parent.add_child(bar)
-
-		var col := CollisionShape3D.new()
-		var box_shape := BoxShape3D.new()
-		box_shape.size = Vector3(bar_width, bar_height, bar_width)
-		col.shape = box_shape
-		bar.add_child(col)
-
-		var mesh_inst := MeshInstance3D.new()
-		var box_mesh := BoxMesh.new()
-		box_mesh.size = Vector3(bar_width, bar_height, bar_width)
-		mesh_inst.mesh = box_mesh
-		mesh_inst.material_override = bar_mat
-		bar.add_child(mesh_inst)
-		spawned += 1
-
-		if spawned % 20 == 0:
-			await get_tree().process_frame
-
-	print("[SeedWorld] Spawned %d bars" % spawned)
-
-
-func _spawn_donuts_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn thin vertical torus rings (~7.2m diameter, 0.1m tube thickness).
-	## Collision is a trimesh (ConcavePolygonShape3D) built from the TorusMesh
-	## — perfectly solid, no gaps.
-	var donut_major_radius := 3.5   ## Center of tube circle (half of ~7m diameter)
-	var donut_tube_radius := 0.1    ## Tube thickness (thin)
-	var donut_mat := StandardMaterial3D.new()
-	donut_mat.albedo_color = Color(0.65, 0.5, 0.35)
-	var spawned := 0
-
-	# Build the torus mesh once and reuse for all donuts (visual + collision).
-	var torus := TorusMesh.new()
-	torus.inner_radius = donut_major_radius - donut_tube_radius
-	torus.outer_radius = donut_major_radius + donut_tube_radius
-	torus.rings = 32
-	torus.ring_segments = 12
-
-	# Build a rotated trimesh shape that matches the upright visual.
-	# TorusMesh lies flat by default; we rotate faces 90° around X so the
-	# collision matches the visual (standing upright, hole faces sideways).
-	var raw_faces: PackedVector3Array = torus.get_faces()
-	var rot_basis := Basis(Vector3.RIGHT, deg_to_rad(90.0))
-	var rotated_faces := PackedVector3Array()
-	rotated_faces.resize(raw_faces.size())
-	for fi in raw_faces.size():
-		rotated_faces[fi] = rot_basis * raw_faces[fi]
-	var trimesh_shape := ConcavePolygonShape3D.new()
-	trimesh_shape.set_faces(rotated_faces)
-
-	for i in num_donuts:
-		var y_rot := rng.randf_range(0, TAU)
-		var pos := _get_random_ground_pos(rng, donut_major_radius + donut_tube_radius, 30.0)
-		if pos == Vector3.INF:
-			continue
-
-		# Skip if inside tower exclusion zone
-		if _tower_position != Vector3.INF:
-			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
-			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
-				continue
-
-		var donut := StaticBody3D.new()
-		donut.name = "Donut_%d" % spawned
-		donut.position = pos
-		donut.rotation.y = y_rot
-		parent.add_child(donut)
-
-		# Visual — TorusMesh standing upright (rotated so the hole faces sideways)
-		var mesh_inst := MeshInstance3D.new()
-		mesh_inst.mesh = torus
-		mesh_inst.material_override = donut_mat
-		mesh_inst.rotation.x = deg_to_rad(90.0)
-		donut.add_child(mesh_inst)
-
-		# Collision — trimesh from the torus mesh, already rotated to match visual
-		var col := CollisionShape3D.new()
-		col.shape = trimesh_shape
-		donut.add_child(col)
-
-		spawned += 1
-
+		# Yield every 5 ramps (each builds a block grid like walls)
 		if spawned % 5 == 0:
 			await get_tree().process_frame
 
-	print("[SeedWorld] Spawned %d donuts" % spawned)
+	print("[SeedWorld] Spawned %d destructible ramps" % spawned)
 
 
 func _spawn_player_spawns(rng: RandomNumberGenerator) -> void:

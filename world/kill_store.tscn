@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://killstore001"]
+
+[ext_resource type="Script" path="res://world/kill_store.gd" id="1_store"]
+
+[node name="KillStore" type="StaticBody3D"]
+script = ExtResource("1_store")

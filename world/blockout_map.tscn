@@ -28,6 +28,6 @@ spawn_path = NodePath("../WorldItems")
 
 [node name="ProjectileSpawner" type="MultiplayerSpawner" parent="."]
 spawn_path = NodePath("../Projectiles")
-spawn_limit = 200
+spawn_limit = 500
 
 [node name="Projectiles" type="Node3D" parent="."]
