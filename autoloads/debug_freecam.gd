@@ -167,6 +167,11 @@ func _deactivate() -> void:
 
 
 func _find_local_player() -> CharacterBody3D:
+	var toad_dim := get_node_or_null("/root/ToadDimension")
+	if toad_dim and toad_dim.has_method("find_player_anywhere"):
+		var p: CharacterBody3D = toad_dim.find_player_anywhere(multiplayer.get_unique_id())
+		if p:
+			return p
 	var scene := get_tree().current_scene
 	if scene == null:
 		return null

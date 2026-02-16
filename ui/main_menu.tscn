@@ -96,6 +96,14 @@ text = "Disable Zone Damage"
 layout_mode = 2
 text = "Skip Walls & Ramps"
 
+[node name="FreeFiring" type="CheckBox" parent="CenterContainer/VBoxContainer" unique_id=1940657801]
+layout_mode = 2
+text = "Free Firing (No Fuel Cost)"
+
+[node name="ShotgunBoost" type="CheckBox" parent="CenterContainer/VBoxContainer" unique_id=2044159603]
+layout_mode = 2
+text = "Shotgun Boost (2x Pellets, 2x Fire Rate)"
+
 [node name="Spacer3" type="Control" parent="CenterContainer/VBoxContainer" unique_id=1324201565]
 custom_minimum_size = Vector2(0, 10)
 layout_mode = 2
@@ -118,4 +126,6 @@ autowrap_mode = 2
 [connection signal="toggled" from="CenterContainer/VBoxContainer/DisableDemon" to="." method="_on_demon_toggled"]
 [connection signal="toggled" from="CenterContainer/VBoxContainer/DisableZoneDamage" to="." method="_on_zone_damage_toggled"]
 [connection signal="toggled" from="CenterContainer/VBoxContainer/SkipStructures" to="." method="_on_skip_structures_toggled"]
+[connection signal="toggled" from="CenterContainer/VBoxContainer/FreeFiring" to="." method="_on_free_firing_toggled"]
+[connection signal="toggled" from="CenterContainer/VBoxContainer/ShotgunBoost" to="." method="_on_shotgun_boost_toggled"]
 [connection signal="pressed" from="CenterContainer/VBoxContainer/QuitButton" to="." method="_on_quit_pressed"]

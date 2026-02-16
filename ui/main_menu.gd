@@ -92,3 +92,9 @@ func _on_zone_damage_toggled(enabled: bool) -> void:
 
 func _on_skip_structures_toggled(enabled: bool) -> void:
 	GameManager.debug_skip_structures = enabled
+
+func _on_free_firing_toggled(enabled: bool) -> void:
+	GameManager.debug_free_firing = enabled
+
+func _on_shotgun_boost_toggled(enabled: bool) -> void:
+	GameManager.debug_shotgun_boost = enabled

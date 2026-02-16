@@ -308,10 +308,12 @@ func _spawn_player(peer_id: int) -> void:
 	var spawn_points: Array[Node] = spawn_container.get_children() if spawn_container else []
 	if spawn_points.size() > 0:
 		var spawn_idx := players.size() % spawn_points.size()
-		player_node.position = spawn_points[spawn_idx].position
+		player_node.position = spawn_points[spawn_idx].global_position
+		player_node.sync_position = player_node.position
 		print("[Server]   Using spawn point %d/%d at %s" % [spawn_idx, spawn_points.size(), str(player_node.position)])
 	else:
 		player_node.position = Vector3(0, 20, 0)
+		player_node.sync_position = player_node.position
 		push_warning("[Server] No spawn points available — spawning at fallback position")
 
 	print("[Server]   Adding to player_container (current children: %d)..." % player_container.get_child_count())
@@ -334,6 +336,10 @@ func _despawn_player(peer_id: int) -> void:
 		# Kill feed: announce human players leaving (not bots)
 		if peer_id < BOT_PEER_ID_START:
 			broadcast_kill_feed("[color=teal]{P:%d} disconnected[/color]" % peer_id)
+		# If player is in toad dimension, clean up their tracking there
+		var toad_dim := get_node_or_null("/root/ToadDimension")
+		if toad_dim and toad_dim._players.has(peer_id):
+			toad_dim._exit_player(peer_id)
 		var player_node: Node = players[peer_id]
 		player_node.queue_free()
 		players.erase(peer_id)
@@ -349,9 +355,11 @@ func _reposition_to_spawn_point(peer_id: int) -> void:
 	var map := get_tree().current_scene
 	var spawn_container := map.get_node_or_null("PlayerSpawnPoints") if map else null
 	if spawn_container and spawn_container.get_child_count() > 0:
-		var sp: Node = spawn_container.get_child(0)
-		player_node.global_position = sp.position
-		print("[Server] Repositioned player %d to spawn point at %s" % [peer_id, str(sp.position)])
+		var spawn_idx := players.size() % spawn_container.get_child_count()
+		var sp: Node = spawn_container.get_child(spawn_idx)
+		player_node.global_position = sp.global_position
+		player_node.sync_position = player_node.global_position
+		print("[Server] Repositioned player %d to spawn point %d at %s" % [peer_id, spawn_idx, str(sp.global_position)])
 
 
 func _spawn_bots() -> void:
@@ -652,8 +660,9 @@ func _update_match_status_display() -> void:
 	## Update the match status label on the lobby screen.
 	if _lobby_match_status_label == null:
 		return
-	var mins := int(_lobby_match_elapsed) / 60
-	var secs := int(_lobby_match_elapsed) % 60
+	var elapsed_int: int = int(_lobby_match_elapsed)
+	var mins: int = elapsed_int / 60
+	var secs: int = elapsed_int % 60
 	var lines: PackedStringArray = []
 	lines.append("Match in progress — %d:%02d" % [mins, secs])
 	lines.append("")
@@ -841,6 +850,13 @@ func _start_match() -> void:
 			_spawn_player(peer_id)
 			_reposition_to_spawn_point(peer_id)
 
+		# Clear kill currency and bonuses for a fresh match
+		for pid in players:
+			if is_instance_valid(players[pid]):
+				players[pid].active_bonuses.clear()
+				if players[pid].has_node("Inventory"):
+					players[pid].get_node("Inventory").kill_currency = 0.0
+
 		# Debug: spawn demon near ALL players for testing
 		for pid in players:
 			players[pid].demon_system.debug_spawn_nearby()
@@ -853,6 +869,8 @@ func _start_match() -> void:
 			map._spawn_demo_items()
 		if map and map.has_method("spawn_lemon_shapes"):
 			map.spawn_lemon_shapes()
+		if map and map.has_method("spawn_toad_rail_cannon"):
+			map.spawn_toad_rail_cannon()
 
 		# Start burn clock
 		var burn_clock := get_node_or_null("/root/BurnClock")
@@ -877,7 +895,12 @@ func reset_game() -> void:
 	# 1. Notify clients FIRST so they can clean up before nodes are freed
 	_rpc_reset_to_lobby.rpc()
 
-	# 2. Despawn all players and bots
+	# 2. Reset toad dimension (restore collision layers, flags) BEFORE despawning
+	var toad_dim := get_node_or_null("/root/ToadDimension")
+	if toad_dim and toad_dim.has_method("reset"):
+		toad_dim.reset()
+
+	# 3. Despawn all players and bots
 	for peer_id in players.keys():
 		var player_node: Node = players[peer_id]
 		if is_instance_valid(player_node):
@@ -915,10 +938,7 @@ func reset_game() -> void:
 		zone_mgr.reset()
 	GameManager.match_time_elapsed = 0.0
 
-	# 6. Reset ToadDimension
-	var toad_dim := get_node_or_null("/root/ToadDimension")
-	if toad_dim and "_sessions" in toad_dim:
-		toad_dim._sessions.clear()
+	# 6. (ToadDimension already reset in step 2, before player despawn)
 
 	# 7. Reset terrain (clear craters) and rebuild structures (walls, tower, etc.)
 	var seed_world := map.get_node_or_null("SeedWorld") if map else null
@@ -1002,19 +1022,17 @@ func broadcast_kill_feed(bbcode_text: String) -> void:
 @rpc("authority", "call_local", "reliable")
 func _rpc_kill_feed(bbcode_text: String) -> void:
 	## All peers: find the local player's HUD and add the entry.
-	var scene := get_tree().current_scene
-	if scene == null:
-		return
-	var players_node := scene.get_node_or_null("Players")
-	if players_node == null:
-		return
+	# Find local player in either overworld or toad dimension container
 	var my_id := multiplayer.get_unique_id()
-	for child in players_node.get_children():
-		if child.name.to_int() == my_id:
-			var hud := child.get_node_or_null("HUDLayer/PlayerHUD")
-			if hud and hud.has_method("add_kill_feed_entry"):
-				hud.add_kill_feed_entry(bbcode_text)
-			break
+	var local_player: Node = players.get(my_id)
+	if local_player == null:
+		var toad_dim := get_node_or_null("/root/ToadDimension")
+		if toad_dim and toad_dim.has_method("find_player_anywhere"):
+			local_player = toad_dim.find_player_anywhere(my_id)
+	if local_player:
+		var hud := local_player.get_node_or_null("HUDLayer/PlayerHUD")
+		if hud and hud.has_method("add_kill_feed_entry"):
+			hud.add_kill_feed_entry(bbcode_text)
 
 
 # ======================================================================
@@ -1078,19 +1096,17 @@ func _rpc_victory(winner_id: int, winner_name: String) -> void:
 	## All peers: show victory screen overlay on local player's HUD.
 	# Set game over state on clients too (prevents local damage processing)
 	GameManager.change_state(GameManager.GameState.GAME_OVER)
-	var scene := get_tree().current_scene
-	if scene == null:
-		return
-	var players_node := scene.get_node_or_null("Players")
-	if players_node == null:
-		return
+	# Find local player in either overworld or toad dimension container
 	var my_id := multiplayer.get_unique_id()
-	for child in players_node.get_children():
-		if child.name.to_int() == my_id:
-			var hud := child.get_node_or_null("HUDLayer/PlayerHUD")
-			if hud and hud.has_method("show_victory_screen"):
-				hud.show_victory_screen(winner_id, winner_name, my_id)
-			break
+	var local_player: Node = players.get(my_id)
+	if local_player == null:
+		var toad_dim := get_node_or_null("/root/ToadDimension")
+		if toad_dim and toad_dim.has_method("find_player_anywhere"):
+			local_player = toad_dim.find_player_anywhere(my_id)
+	if local_player:
+		var hud := local_player.get_node_or_null("HUDLayer/PlayerHUD")
+		if hud and hud.has_method("show_victory_screen"):
+			hud.show_victory_screen(winner_id, winner_name, my_id)
 
 
 # ======================================================================

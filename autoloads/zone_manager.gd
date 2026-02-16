@@ -171,6 +171,8 @@ func _damage_outside_players(delta: float) -> void:
 			continue
 		if not player_node.get("is_alive"):
 			continue
+		if player_node.get("in_toad_dimension"):
+			continue
 		var player_xz := Vector2(player_node.global_position.x, player_node.global_position.z)
 		var dist := player_xz.distance_to(zone_center)
 		if dist > zone_radius:

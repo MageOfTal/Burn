@@ -1,53 +1,73 @@
 extends CanvasLayer
 
-## Pause menu with graphics settings.
+## Pause menu with debug toggles and a dedicated Video Settings sub-page.
 ## Toggled by Escape key. Pauses gameplay input while open.
 ## Autoloaded so it works from any scene.
+##
+## Graphics/video settings are delegated to the VideoSettings autoload.
+## This script handles only the UI construction and signal wiring.
 
 var is_open := false
 
-# UI refs (created in _ready)
+# ── Main panel UI refs ───────────────────────────────────────────────────
 var _overlay: ColorRect = null
-var _panel: PanelContainer = null
+var _main_panel: PanelContainer = null
+var _fps_label: Label = null
+var _fps_timer: float = 0.0
+var _reel_speed_input: LineEdit = null
+var _grapple_debug_visuals_button: CheckButton = null
+var _grapple_horiz_nudge_button: CheckButton = null
+var _velocity_iter_slider: HSlider = null
+var _velocity_iter_label: Label = null
+var _bubble_no_ccd_button: CheckButton = null
+var _bubble_no_push_query_button: CheckButton = null
+var _bubble_one_contact_button: CheckButton = null
+var _bubble_freeze_settled_button: CheckButton = null
+var _bubble_no_contact_monitor_button: CheckButton = null
+var _bubble_no_collision_button: CheckButton = null
+var _bubble_no_separation_button: CheckButton = null
+var _hide_bubbles_button: CheckButton = null
+var _toad_density_input: LineEdit = null
+var _toad_no_physics_button: CheckButton = null
+var _toad_no_shadows_button: CheckButton = null
+var _quit_btn: Button = null
+
+# ── Video Settings panel UI refs ─────────────────────────────────────────
+var _video_panel: PanelContainer = null
+var _video_fps_label: Label = null
 var _vsync_button: CheckButton = null
 var _fullscreen_button: CheckButton = null
 var _fov_slider: HSlider = null
 var _fov_label: Label = null
-var _msaa_option: OptionButton = null
-var _shadow_option: OptionButton = null
 var _render_scale_slider: HSlider = null
 var _render_scale_label: Label = null
 var _brightness_slider: HSlider = null
 var _brightness_label: Label = null
+var _msaa_option: OptionButton = null
+var _fxaa_button: CheckButton = null
+var _taa_button: CheckButton = null
+var _shadow_option: OptionButton = null
+var _shadow_filter_option: OptionButton = null
+var _ssao_button: CheckButton = null
+var _ssao_quality_option: OptionButton = null
+var _ssil_button: CheckButton = null
+var _ssil_quality_option: OptionButton = null
+var _ssr_button: CheckButton = null
+var _ssr_quality_option: OptionButton = null
+var _glow_button: CheckButton = null
+var _glow_slider: HSlider = null
+var _glow_label: Label = null
+var _gi_option: OptionButton = null
 var _fog_button: CheckButton = null
-var _fps_label: Label = null
-var _fps_timer: float = 0.0
-var _ground_pump_button: CheckButton = null
-var _reel_speed_input: LineEdit = null
-var _grapple_debug_visuals_button: CheckButton = null
-var _quit_btn: Button = null
-var _velocity_iter_slider: HSlider = null
-var _velocity_iter_label: Label = null
-
-## Saved settings
-var _settings := {
-	"vsync": true,
-	"fullscreen": true,
-	"fov": 70.0,
-	"msaa": 0,
-	"shadow_quality": 2,
-	"render_scale": 1.0,
-	"brightness": 1.0,
-	"fog_enabled": true,
-}
+var _volumetric_fog_button: CheckButton = null
+var _fps_hud_button: CheckButton = null
 
 
 func _ready() -> void:
 	layer = 100  # On top of everything
-	_build_ui()
+	_build_main_panel()
+	_build_video_panel()
 	_overlay.visible = false
-	# Apply default settings
-	_apply_vsync(true)
 
 
 func _input(event: InputEvent) -> void:
@@ -68,7 +88,10 @@ func _process(delta: float) -> void:
 	_fps_timer += delta
 	if _fps_timer >= 0.25:
 		_fps_timer = 0.0
-		_fps_label.text = "FPS: %d" % Engine.get_frames_per_second()
+		var fps_text := "FPS: %d" % Engine.get_frames_per_second()
+		_fps_label.text = fps_text
+		if _video_fps_label:
+			_video_fps_label.text = fps_text
 
 
 func _toggle_menu() -> void:
@@ -79,9 +102,18 @@ func _toggle_menu() -> void:
 		_update_quit_button()
 	else:
 		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+		# Save settings when closing menu (batch save)
+		VideoSettings.save_settings()
+		# Always return to main panel when closing
+		_main_panel.visible = true
+		_video_panel.visible = false
 
 
-func _build_ui() -> void:
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN PANEL (debug toggles + video settings button)
+# ══════════════════════════════════════════════════════════════════════════
+
+func _build_main_panel() -> void:
 	# Background overlay
 	_overlay = ColorRect.new()
 	_overlay.color = Color(0, 0, 0, 0.5)
@@ -89,25 +121,18 @@ func _build_ui() -> void:
 	_overlay.mouse_filter = Control.MOUSE_FILTER_STOP
 	add_child(_overlay)
 
-	# Center panel
-	_panel = PanelContainer.new()
-	_panel.set_anchors_preset(Control.PRESET_CENTER)
-	_panel.custom_minimum_size = Vector2(500, 850)
-	_panel.position = Vector2(-250, -425)
-	_overlay.add_child(_panel)
+	# Center panel — shorter now without graphics settings
+	_main_panel = PanelContainer.new()
+	_main_panel.set_anchors_preset(Control.PRESET_CENTER)
+	_main_panel.custom_minimum_size = Vector2(500, 900)
+	_main_panel.position = Vector2(-250, -450)
+	_overlay.add_child(_main_panel)
 
-	# Panel style
-	var style := StyleBoxFlat.new()
-	style.bg_color = Color(0.1, 0.1, 0.15, 0.95)
-	style.border_color = Color(0.3, 0.4, 0.6)
-	style.set_border_width_all(2)
-	style.set_corner_radius_all(8)
-	style.set_content_margin_all(20)
-	_panel.add_theme_stylebox_override("panel", style)
+	_main_panel.add_theme_stylebox_override("panel", _make_panel_style())
 
 	var vbox := VBoxContainer.new()
 	vbox.add_theme_constant_override("separation", 12)
-	_panel.add_child(vbox)
+	_main_panel.add_child(vbox)
 
 	# Title
 	var title := Label.new()
@@ -127,67 +152,12 @@ func _build_ui() -> void:
 	# Separator
 	vbox.add_child(HSeparator.new())
 
-	# --- VSync ---
-	_vsync_button = _add_check("V-Sync", true, vbox)
-	_vsync_button.toggled.connect(_on_vsync_toggled)
-
-	# --- Fullscreen ---
-	_fullscreen_button = _add_check("Fullscreen", true, vbox)
-	_fullscreen_button.toggled.connect(_on_fullscreen_toggled)
-
-	# --- FOV ---
-	var fov_row := _add_slider_row("FOV", 50.0, 120.0, 70.0, 1.0, vbox)
-	_fov_slider = fov_row[0]
-	_fov_label = fov_row[1]
-	_fov_slider.value_changed.connect(_on_fov_changed)
-
-	# --- Render Scale ---
-	var rs_row := _add_slider_row("Render Scale", 0.5, 1.0, 1.0, 0.05, vbox)
-	_render_scale_slider = rs_row[0]
-	_render_scale_label = rs_row[1]
-	_render_scale_slider.value_changed.connect(_on_render_scale_changed)
-
-	# --- Brightness ---
-	var br_row := _add_slider_row("Brightness", 0.5, 2.0, 1.0, 0.05, vbox)
-	_brightness_slider = br_row[0]
-	_brightness_label = br_row[1]
-	_brightness_slider.value_changed.connect(_on_brightness_changed)
-
-	# --- MSAA ---
-	var msaa_hbox := HBoxContainer.new()
-	var msaa_label := Label.new()
-	msaa_label.text = "Anti-Aliasing (MSAA)"
-	msaa_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	msaa_hbox.add_child(msaa_label)
-	_msaa_option = OptionButton.new()
-	_msaa_option.add_item("Off", 0)
-	_msaa_option.add_item("2x", 1)
-	_msaa_option.add_item("4x", 2)
-	_msaa_option.add_item("8x", 3)
-	_msaa_option.selected = 0
-	_msaa_option.item_selected.connect(_on_msaa_changed)
-	msaa_hbox.add_child(_msaa_option)
-	vbox.add_child(msaa_hbox)
-
-	# --- Shadow Quality ---
-	var shadow_hbox := HBoxContainer.new()
-	var shadow_label := Label.new()
-	shadow_label.text = "Shadow Quality"
-	shadow_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	shadow_hbox.add_child(shadow_label)
-	_shadow_option = OptionButton.new()
-	_shadow_option.add_item("Off", 0)
-	_shadow_option.add_item("Low", 1)
-	_shadow_option.add_item("Medium", 2)
-	_shadow_option.add_item("High", 3)
-	_shadow_option.selected = 2
-	_shadow_option.item_selected.connect(_on_shadow_changed)
-	shadow_hbox.add_child(_shadow_option)
-	vbox.add_child(shadow_hbox)
-
-	# --- Fog ---
-	_fog_button = _add_check("Fog", true, vbox)
-	_fog_button.toggled.connect(_on_fog_toggled)
+	# --- Video Settings button ---
+	var video_btn := Button.new()
+	video_btn.text = "Video Settings"
+	video_btn.custom_minimum_size = Vector2(0, 40)
+	video_btn.pressed.connect(_on_video_settings_pressed)
+	vbox.add_child(video_btn)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -206,7 +176,7 @@ func _build_ui() -> void:
 	reel_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	reel_hbox.add_child(reel_label)
 	_reel_speed_input = LineEdit.new()
-	_reel_speed_input.text = "3.0"
+	_reel_speed_input.text = "%.1f" % GameManager.debug_grapple_reel_speed
 	_reel_speed_input.custom_minimum_size = Vector2(80, 0)
 	_reel_speed_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_reel_speed_input.text_submitted.connect(_on_reel_speed_submitted)
@@ -215,6 +185,9 @@ func _build_ui() -> void:
 
 	_grapple_debug_visuals_button = _add_check("Debug Visuals (pill, angles, spheres)", false, vbox)
 	_grapple_debug_visuals_button.toggled.connect(_on_grapple_debug_visuals_toggled)
+
+	_grapple_horiz_nudge_button = _add_check("Launch Nudge: Include Horizontal", true, vbox)
+	_grapple_horiz_nudge_button.toggled.connect(_on_grapple_horiz_nudge_toggled)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -231,6 +204,70 @@ func _build_ui() -> void:
 	_velocity_iter_slider = vi_row[0]
 	_velocity_iter_label = vi_row[1]
 	_velocity_iter_slider.value_changed.connect(_on_velocity_iter_changed)
+
+	_hide_bubbles_button = _add_check("Hide Bubble Visuals", false, vbox)
+	_hide_bubbles_button.toggled.connect(_on_hide_bubbles_toggled)
+
+	# --- Bubble Physics Toggles ---
+	var bubble_title := Label.new()
+	bubble_title.text = "Bubble Physics"
+	bubble_title.add_theme_font_size_override("font_size", 16)
+	bubble_title.add_theme_color_override("font_color", Color(0.6, 0.85, 1.0))
+	vbox.add_child(bubble_title)
+
+	_bubble_no_ccd_button = _add_check("Disable Bubble CCD", false, vbox)
+	_bubble_no_ccd_button.toggled.connect(_on_bubble_no_ccd_toggled)
+
+	_bubble_no_push_query_button = _add_check("Disable Bubble Push Query", false, vbox)
+	_bubble_no_push_query_button.toggled.connect(_on_bubble_no_push_query_toggled)
+
+	_bubble_one_contact_button = _add_check("Bubble 1-Contact Limit", false, vbox)
+	_bubble_one_contact_button.toggled.connect(_on_bubble_one_contact_toggled)
+
+	_bubble_freeze_settled_button = _add_check("Freeze Settled Bubbles", false, vbox)
+	_bubble_freeze_settled_button.toggled.connect(_on_bubble_freeze_settled_toggled)
+
+	_bubble_no_contact_monitor_button = _add_check("Disable Bubble Contact Monitor", false, vbox)
+	_bubble_no_contact_monitor_button.toggled.connect(_on_bubble_no_contact_monitor_toggled)
+
+	_bubble_no_collision_button = _add_check("Disable ALL Bubble Collision", false, vbox)
+	_bubble_no_collision_button.toggled.connect(_on_bubble_no_collision_toggled)
+
+	_bubble_no_separation_button = _add_check("Disable Bubble Separation Manager", false, vbox)
+	_bubble_no_separation_button.toggled.connect(_on_bubble_no_separation_toggled)
+
+	var no_processing_button := _add_check("Disable ALL Bubble Processing", false, vbox)
+	no_processing_button.toggled.connect(_on_bubble_no_processing_toggled)
+
+	# Separator
+	vbox.add_child(HSeparator.new())
+
+	# --- Toad Dimension ---
+	var toad_title := Label.new()
+	toad_title.text = "Toad Dimension"
+	toad_title.add_theme_font_size_override("font_size", 18)
+	toad_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	toad_title.add_theme_color_override("font_color", Color(0.3, 0.8, 0.3))
+	vbox.add_child(toad_title)
+
+	var toad_hbox := HBoxContainer.new()
+	var toad_label := Label.new()
+	toad_label.text = "Rain Density (toads/tick)"
+	toad_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	toad_hbox.add_child(toad_label)
+	_toad_density_input = LineEdit.new()
+	_toad_density_input.custom_minimum_size = Vector2(80, 0)
+	_toad_density_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_toad_density_input.text_submitted.connect(_on_toad_density_submitted)
+	toad_hbox.add_child(_toad_density_input)
+	vbox.add_child(toad_hbox)
+	_refresh_toad_density_text()
+
+	_toad_no_physics_button = _add_check("Disable Toad Physics", GameManager.debug_toad_no_physics, vbox)
+	_toad_no_physics_button.toggled.connect(_on_toad_no_physics_toggled)
+
+	_toad_no_shadows_button = _add_check("Disable Toad Shadows", GameManager.debug_toad_no_shadows, vbox)
+	_toad_no_shadows_button.toggled.connect(_on_toad_no_shadows_toggled)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -255,7 +292,208 @@ func _build_ui() -> void:
 	vbox.add_child(btn_row)
 
 
-## --- Helpers ---
+# ══════════════════════════════════════════════════════════════════════════
+# VIDEO SETTINGS PANEL
+# ══════════════════════════════════════════════════════════════════════════
+
+func _build_video_panel() -> void:
+	_video_panel = PanelContainer.new()
+	_video_panel.set_anchors_preset(Control.PRESET_CENTER)
+	_video_panel.custom_minimum_size = Vector2(550, 800)
+	_video_panel.position = Vector2(-275, -400)
+	_video_panel.visible = false
+	_overlay.add_child(_video_panel)
+
+	_video_panel.add_theme_stylebox_override("panel", _make_panel_style())
+
+	# ScrollContainer so the long list of settings can scroll
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_video_panel.add_child(scroll)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 10)
+	vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(vbox)
+
+	# Title
+	var title := Label.new()
+	title.text = "VIDEO SETTINGS"
+	title.add_theme_font_size_override("font_size", 28)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vbox.add_child(title)
+
+	# FPS counter
+	_video_fps_label = Label.new()
+	_video_fps_label.text = "FPS: --"
+	_video_fps_label.add_theme_font_size_override("font_size", 14)
+	_video_fps_label.add_theme_color_override("font_color", Color(0.7, 0.9, 0.7))
+	_video_fps_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vbox.add_child(_video_fps_label)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Presets ──────────────────────────────────────────────────────────
+	var preset_label := Label.new()
+	preset_label.text = "Quality Presets"
+	preset_label.add_theme_font_size_override("font_size", 16)
+	preset_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vbox.add_child(preset_label)
+
+	var preset_row := HBoxContainer.new()
+	preset_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	preset_row.add_theme_constant_override("separation", 8)
+	for preset_name in ["Low", "Medium", "High", "Ultra"]:
+		var btn := Button.new()
+		btn.text = preset_name
+		btn.custom_minimum_size = Vector2(90, 32)
+		btn.pressed.connect(_on_preset_pressed.bind(preset_name.to_lower()))
+		preset_row.add_child(btn)
+	vbox.add_child(preset_row)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Display ──────────────────────────────────────────────────────────
+	_add_section_header("Display", vbox)
+
+	_vsync_button = _add_check("V-Sync", VideoSettings.settings["vsync"], vbox)
+	_vsync_button.toggled.connect(_on_vsync_toggled)
+
+	_fullscreen_button = _add_check("Fullscreen", VideoSettings.settings["fullscreen"], vbox)
+	_fullscreen_button.toggled.connect(_on_fullscreen_toggled)
+
+	var fov_row := _add_slider_row("FOV", 50.0, 120.0, VideoSettings.settings["fov"], 1.0, vbox)
+	_fov_slider = fov_row[0]
+	_fov_label = fov_row[1]
+	_fov_label.text = "%.0f" % VideoSettings.settings["fov"]
+	_fov_slider.value_changed.connect(_on_fov_changed)
+
+	var rs_row := _add_slider_row("Render Scale", 0.5, 1.0, VideoSettings.settings["render_scale"], 0.05, vbox)
+	_render_scale_slider = rs_row[0]
+	_render_scale_label = rs_row[1]
+	_render_scale_label.text = "%.0f%%" % (VideoSettings.settings["render_scale"] * 100.0)
+	_render_scale_slider.value_changed.connect(_on_render_scale_changed)
+
+	var br_row := _add_slider_row("Brightness", 0.5, 2.0, VideoSettings.settings["brightness"], 0.05, vbox)
+	_brightness_slider = br_row[0]
+	_brightness_label = br_row[1]
+	_brightness_label.text = "%.2f" % VideoSettings.settings["brightness"]
+	_brightness_slider.value_changed.connect(_on_brightness_changed)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Anti-Aliasing ────────────────────────────────────────────────────
+	_add_section_header("Anti-Aliasing", vbox)
+
+	_msaa_option = _add_option_row("MSAA", ["Off", "2x", "4x", "8x"], VideoSettings.settings["msaa"], vbox)
+	_msaa_option.item_selected.connect(_on_msaa_changed)
+
+	_fxaa_button = _add_check("FXAA", VideoSettings.settings["fxaa"], vbox)
+	_fxaa_button.toggled.connect(_on_fxaa_toggled)
+
+	_taa_button = _add_check("TAA", VideoSettings.settings["taa"], vbox)
+	_taa_button.toggled.connect(_on_taa_toggled)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Shadows ──────────────────────────────────────────────────────────
+	_add_section_header("Shadows", vbox)
+
+	_shadow_option = _add_option_row("Shadow Quality", ["Off", "Low", "Medium", "High"], VideoSettings.settings["shadow_quality"], vbox)
+	_shadow_option.item_selected.connect(_on_shadow_changed)
+
+	_shadow_filter_option = _add_option_row("Shadow Softness", ["Hard", "Soft Low", "Soft Medium", "Soft High"], VideoSettings.settings["shadow_filter"], vbox)
+	_shadow_filter_option.item_selected.connect(_on_shadow_filter_changed)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Lighting & Effects ───────────────────────────────────────────────
+	_add_section_header("Lighting & Effects", vbox)
+
+	_ssao_button = _add_check("SSAO", VideoSettings.settings["ssao_enabled"], vbox)
+	_ssao_button.toggled.connect(_on_ssao_toggled)
+
+	_ssao_quality_option = _add_option_row("SSAO Quality", ["Low", "Medium", "High"], VideoSettings.settings["ssao_quality"], vbox)
+	_ssao_quality_option.item_selected.connect(_on_ssao_quality_changed)
+
+	_ssil_button = _add_check("SSIL", VideoSettings.settings["ssil_enabled"], vbox)
+	_ssil_button.toggled.connect(_on_ssil_toggled)
+
+	_ssil_quality_option = _add_option_row("SSIL Quality", ["Low", "Medium", "High"], VideoSettings.settings["ssil_quality"], vbox)
+	_ssil_quality_option.item_selected.connect(_on_ssil_quality_changed)
+
+	_ssr_button = _add_check("SSR", VideoSettings.settings["ssr_enabled"], vbox)
+	_ssr_button.toggled.connect(_on_ssr_toggled)
+
+	_ssr_quality_option = _add_option_row("SSR Quality", ["Low", "Medium", "High"], VideoSettings.settings["ssr_quality"], vbox)
+	_ssr_quality_option.item_selected.connect(_on_ssr_quality_changed)
+
+	_glow_button = _add_check("Glow / Bloom", VideoSettings.settings["glow_enabled"], vbox)
+	_glow_button.toggled.connect(_on_glow_toggled)
+
+	var glow_row := _add_slider_row("Glow Intensity", 0.0, 2.0, VideoSettings.settings["glow_intensity"], 0.05, vbox)
+	_glow_slider = glow_row[0]
+	_glow_label = glow_row[1]
+	_glow_label.text = "%.2f" % VideoSettings.settings["glow_intensity"]
+	_glow_slider.value_changed.connect(_on_glow_intensity_changed)
+
+	_gi_option = _add_option_row("Global Illumination", ["None", "SDFGI"], VideoSettings.settings["gi_mode"], vbox)
+	_gi_option.item_selected.connect(_on_gi_changed)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Fog ──────────────────────────────────────────────────────────────
+	_add_section_header("Fog", vbox)
+
+	_fog_button = _add_check("Fog", VideoSettings.settings["fog_enabled"], vbox)
+	_fog_button.toggled.connect(_on_fog_toggled)
+
+	_volumetric_fog_button = _add_check("Volumetric Fog", VideoSettings.settings["volumetric_fog"], vbox)
+	_volumetric_fog_button.toggled.connect(_on_volumetric_fog_toggled)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Performance ──────────────────────────────────────────────────────
+	_add_section_header("Performance", vbox)
+
+	_fps_hud_button = _add_check("Show FPS", false, vbox)
+	_fps_hud_button.toggled.connect(_on_fps_hud_toggled)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Back button ──────────────────────────────────────────────────────
+	var back_btn := Button.new()
+	back_btn.text = "Back"
+	back_btn.custom_minimum_size = Vector2(120, 40)
+	back_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	back_btn.pressed.connect(_on_video_back_pressed)
+	vbox.add_child(back_btn)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# UI HELPERS
+# ══════════════════════════════════════════════════════════════════════════
+
+func _make_panel_style() -> StyleBoxFlat:
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(0.1, 0.1, 0.15, 0.95)
+	style.border_color = Color(0.3, 0.4, 0.6)
+	style.set_border_width_all(2)
+	style.set_corner_radius_all(8)
+	style.set_content_margin_all(20)
+	return style
+
+
+func _add_section_header(text: String, parent: Node) -> void:
+	var label := Label.new()
+	label.text = text
+	label.add_theme_font_size_override("font_size", 18)
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	label.add_theme_color_override("font_color", Color(0.6, 0.75, 1.0))
+	parent.add_child(label)
+
 
 func _add_check(label_text: String, default: bool, parent: Node) -> CheckButton:
 	var hbox := HBoxContainer.new()
@@ -293,90 +531,233 @@ func _add_slider_row(label_text: String, min_val: float, max_val: float, default
 	return [slider, val_label]
 
 
-## --- Setting callbacks ---
+func _add_option_row(label_text: String, items: Array, default_index: int, parent: Node) -> OptionButton:
+	var hbox := HBoxContainer.new()
+	var label := Label.new()
+	label.text = label_text
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hbox.add_child(label)
+	var option := OptionButton.new()
+	for i in items.size():
+		option.add_item(items[i], i)
+	option.selected = default_index
+	hbox.add_child(option)
+	parent.add_child(hbox)
+	return option
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NAVIGATION
+# ══════════════════════════════════════════════════════════════════════════
+
+func _on_video_settings_pressed() -> void:
+	_main_panel.visible = false
+	_video_panel.visible = true
+
+
+func _on_video_back_pressed() -> void:
+	VideoSettings.save_settings()
+	_video_panel.visible = false
+	_main_panel.visible = true
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# VIDEO SETTINGS CALLBACKS
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── Presets ──────────────────────────────────────────────────────────────
+
+func _on_preset_pressed(preset_name: String) -> void:
+	VideoSettings.apply_preset(preset_name)
+	_refresh_all_video_controls()
+
+
+# ── Display ──────────────────────────────────────────────────────────────
 
 func _on_vsync_toggled(pressed: bool) -> void:
-	_apply_vsync(pressed)
-	_settings["vsync"] = pressed
-
-
-func _apply_vsync(enabled: bool) -> void:
-	if enabled:
-		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_ENABLED)
-	else:
-		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	VideoSettings.settings["vsync"] = pressed
+	VideoSettings.apply_display()
 
 
 func _on_fullscreen_toggled(pressed: bool) -> void:
-	if pressed:
-		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
-	else:
-		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
-	_settings["fullscreen"] = pressed
+	VideoSettings.settings["fullscreen"] = pressed
+	VideoSettings.apply_display()
 
 
 func _on_fov_changed(value: float) -> void:
 	_fov_label.text = "%.0f" % value
-	_settings["fov"] = value
-	# Apply to local player's camera
-	var camera := _find_local_camera()
-	if camera:
-		camera.fov = value
+	VideoSettings.settings["fov"] = value
+	VideoSettings.apply_fov()
 
 
 func _on_render_scale_changed(value: float) -> void:
 	_render_scale_label.text = "%.0f%%" % (value * 100.0)
-	_settings["render_scale"] = value
-	get_viewport().scaling_3d_scale = value
+	VideoSettings.settings["render_scale"] = value
+	VideoSettings.apply_display()
 
 
 func _on_brightness_changed(value: float) -> void:
 	_brightness_label.text = "%.2f" % value
-	_settings["brightness"] = value
-	# Apply to environment
-	var env := _find_environment()
-	if env:
-		env.tonemap_exposure = value * 0.9  # 0.9 is our baseline
+	VideoSettings.settings["brightness"] = value
+	VideoSettings.apply_display()
 
+
+# ── Anti-Aliasing ────────────────────────────────────────────────────────
 
 func _on_msaa_changed(index: int) -> void:
-	_settings["msaa"] = index
-	match index:
-		0: get_viewport().msaa_3d = Viewport.MSAA_DISABLED
-		1: get_viewport().msaa_3d = Viewport.MSAA_2X
-		2: get_viewport().msaa_3d = Viewport.MSAA_4X
-		3: get_viewport().msaa_3d = Viewport.MSAA_8X
+	VideoSettings.settings["msaa"] = index
+	VideoSettings.apply_anti_aliasing()
 
+
+func _on_fxaa_toggled(pressed: bool) -> void:
+	VideoSettings.settings["fxaa"] = pressed
+	VideoSettings.apply_anti_aliasing()
+
+
+func _on_taa_toggled(pressed: bool) -> void:
+	VideoSettings.settings["taa"] = pressed
+	VideoSettings.apply_anti_aliasing()
+
+
+# ── Shadows ──────────────────────────────────────────────────────────────
 
 func _on_shadow_changed(index: int) -> void:
-	_settings["shadow_quality"] = index
-	# Find the sun directional light and adjust quality
-	var sun := _find_sun()
-	if sun == null:
-		return
-	match index:
-		0:
-			sun.shadow_enabled = false
-		1:
-			sun.shadow_enabled = true
-			sun.directional_shadow_max_distance = 80.0
-			RenderingServer.directional_shadow_atlas_set_size(1024, true)
-		2:
-			sun.shadow_enabled = true
-			sun.directional_shadow_max_distance = 200.0
-			RenderingServer.directional_shadow_atlas_set_size(2048, true)
-		3:
-			sun.shadow_enabled = true
-			sun.directional_shadow_max_distance = 400.0
-			RenderingServer.directional_shadow_atlas_set_size(4096, true)
+	VideoSettings.settings["shadow_quality"] = index
+	VideoSettings.apply_shadows()
 
+
+func _on_shadow_filter_changed(index: int) -> void:
+	VideoSettings.settings["shadow_filter"] = index
+	VideoSettings.apply_shadows()
+
+
+# ── Post-Processing ─────────────────────────────────────────────────────
+
+func _on_ssao_toggled(pressed: bool) -> void:
+	VideoSettings.settings["ssao_enabled"] = pressed
+	VideoSettings.apply_post_processing()
+
+
+func _on_ssao_quality_changed(index: int) -> void:
+	VideoSettings.settings["ssao_quality"] = index
+	VideoSettings.apply_post_processing()
+
+
+func _on_ssil_toggled(pressed: bool) -> void:
+	VideoSettings.settings["ssil_enabled"] = pressed
+	VideoSettings.apply_post_processing()
+
+
+func _on_ssil_quality_changed(index: int) -> void:
+	VideoSettings.settings["ssil_quality"] = index
+	VideoSettings.apply_post_processing()
+
+
+func _on_ssr_toggled(pressed: bool) -> void:
+	VideoSettings.settings["ssr_enabled"] = pressed
+	VideoSettings.apply_post_processing()
+
+
+func _on_ssr_quality_changed(index: int) -> void:
+	VideoSettings.settings["ssr_quality"] = index
+	VideoSettings.apply_post_processing()
+
+
+func _on_glow_toggled(pressed: bool) -> void:
+	VideoSettings.settings["glow_enabled"] = pressed
+	VideoSettings.apply_post_processing()
+
+
+func _on_glow_intensity_changed(value: float) -> void:
+	_glow_label.text = "%.2f" % value
+	VideoSettings.settings["glow_intensity"] = value
+	VideoSettings.apply_post_processing()
+
+
+func _on_gi_changed(index: int) -> void:
+	VideoSettings.settings["gi_mode"] = index
+	VideoSettings.apply_gi()
+
+
+# ── Fog ──────────────────────────────────────────────────────────────────
 
 func _on_fog_toggled(pressed: bool) -> void:
-	_settings["fog_enabled"] = pressed
-	var env := _find_environment()
-	if env:
-		env.fog_enabled = pressed
+	VideoSettings.settings["fog_enabled"] = pressed
+	VideoSettings.apply_fog()
 
+
+func _on_volumetric_fog_toggled(pressed: bool) -> void:
+	VideoSettings.settings["volumetric_fog"] = pressed
+	VideoSettings.apply_fog()
+
+
+# ── Performance ──────────────────────────────────────────────────────────
+
+func _on_fps_hud_toggled(pressed: bool) -> void:
+	GameManager.show_fps_hud = pressed
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PRESET UI REFRESH
+# ══════════════════════════════════════════════════════════════════════════
+
+func _refresh_all_video_controls() -> void:
+	## Update every video settings UI control to match VideoSettings.settings
+	## without triggering signal callbacks (block signals during update).
+	var s := VideoSettings.settings
+
+	_set_check_silent(_vsync_button, s["vsync"])
+	_set_check_silent(_fullscreen_button, s["fullscreen"])
+	_set_slider_silent(_fov_slider, s["fov"])
+	_fov_label.text = "%.0f" % s["fov"]
+	_set_slider_silent(_render_scale_slider, s["render_scale"])
+	_render_scale_label.text = "%.0f%%" % (s["render_scale"] * 100.0)
+	_set_slider_silent(_brightness_slider, s["brightness"])
+	_brightness_label.text = "%.2f" % s["brightness"]
+
+	_set_option_silent(_msaa_option, s["msaa"])
+	_set_check_silent(_fxaa_button, s["fxaa"])
+	_set_check_silent(_taa_button, s["taa"])
+
+	_set_option_silent(_shadow_option, s["shadow_quality"])
+	_set_option_silent(_shadow_filter_option, s["shadow_filter"])
+
+	_set_check_silent(_ssao_button, s["ssao_enabled"])
+	_set_option_silent(_ssao_quality_option, s["ssao_quality"])
+	_set_check_silent(_ssil_button, s["ssil_enabled"])
+	_set_option_silent(_ssil_quality_option, s["ssil_quality"])
+	_set_check_silent(_ssr_button, s["ssr_enabled"])
+	_set_option_silent(_ssr_quality_option, s["ssr_quality"])
+	_set_check_silent(_glow_button, s["glow_enabled"])
+	_set_slider_silent(_glow_slider, s["glow_intensity"])
+	_glow_label.text = "%.2f" % s["glow_intensity"]
+	_set_option_silent(_gi_option, s["gi_mode"])
+
+	_set_check_silent(_fog_button, s["fog_enabled"])
+	_set_check_silent(_volumetric_fog_button, s["volumetric_fog"])
+
+
+func _set_check_silent(btn: CheckButton, value: bool) -> void:
+	btn.set_block_signals(true)
+	btn.button_pressed = value
+	btn.set_block_signals(false)
+
+
+func _set_slider_silent(slider: HSlider, value: float) -> void:
+	slider.set_block_signals(true)
+	slider.value = value
+	slider.set_block_signals(false)
+
+
+func _set_option_silent(option: OptionButton, index: int) -> void:
+	option.set_block_signals(true)
+	option.selected = index
+	option.set_block_signals(false)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# DEBUG CALLBACKS (unchanged from original)
+# ══════════════════════════════════════════════════════════════════════════
 
 func _on_reel_speed_submitted(text: String) -> void:
 	var val := text.to_float()
@@ -392,14 +773,126 @@ func _on_grapple_debug_visuals_toggled(pressed: bool) -> void:
 	print("[PauseMenu] Grapple debug visuals: %s" % ("ON" if pressed else "OFF"))
 
 
+func _on_grapple_horiz_nudge_toggled(pressed: bool) -> void:
+	GameManager.debug_grapple_horiz_nudge = pressed
+	print("[PauseMenu] Grapple horizontal nudge: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_hide_bubbles_toggled(pressed: bool) -> void:
+	GameManager.debug_hide_bubbles = pressed
+	for node in get_tree().get_nodes_in_group("bubbles"):
+		var mesh := node.get_node_or_null("MeshInstance3D")
+		if mesh:
+			mesh.visible = not pressed
+	print("[PauseMenu] Hide bubble visuals: %s" % ("ON" if pressed else "OFF"))
+
+
 func _on_velocity_iter_changed(value: float) -> void:
 	var iters := int(value)
 	_velocity_iter_label.text = "%d" % iters
 	GameManager.debug_velocity_iterations = iters
-	# Apply to the active physics space at runtime via PhysicsServer3D
 	var space_rid := get_viewport().world_3d.space
 	PhysicsServer3D.space_set_param(space_rid, PhysicsServer3D.SPACE_PARAM_SOLVER_ITERATIONS, iters)
 	print("[PauseMenu] Physics solver iterations: %d" % iters)
+
+
+func _on_bubble_no_ccd_toggled(pressed: bool) -> void:
+	GameManager.debug_bubble_no_ccd = pressed
+	for node in get_tree().get_nodes_in_group("bubbles"):
+		if node is RigidBody3D:
+			node.continuous_cd = not pressed
+	print("[PauseMenu] Bubble CCD disabled: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_bubble_no_push_query_toggled(pressed: bool) -> void:
+	GameManager.debug_bubble_no_push_query = pressed
+	print("[PauseMenu] Bubble push query disabled: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_bubble_no_collision_toggled(pressed: bool) -> void:
+	GameManager.debug_bubble_no_collision = pressed
+	for node in get_tree().get_nodes_in_group("bubbles"):
+		if node is RigidBody3D:
+			if pressed:
+				node.collision_layer = 4
+				node.collision_mask = 0
+			else:
+				node.collision_layer = 4
+				node.collision_mask = 1
+	print("[PauseMenu] Bubble ALL collision disabled: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_bubble_one_contact_toggled(pressed: bool) -> void:
+	GameManager.debug_bubble_one_contact = pressed
+	for node in get_tree().get_nodes_in_group("bubbles"):
+		if node is RigidBody3D:
+			node.max_contacts_reported = 1 if pressed else 4
+	print("[PauseMenu] Bubble 1-contact limit: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_bubble_freeze_settled_toggled(pressed: bool) -> void:
+	GameManager.debug_bubble_freeze_settled = pressed
+	if not pressed:
+		for node in get_tree().get_nodes_in_group("bubbles"):
+			if node is RigidBody3D and node.freeze:
+				node.freeze = false
+	print("[PauseMenu] Freeze settled bubbles: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_bubble_no_contact_monitor_toggled(pressed: bool) -> void:
+	GameManager.debug_bubble_no_contact_monitor = pressed
+	for node in get_tree().get_nodes_in_group("bubbles"):
+		if node is RigidBody3D:
+			node.contact_monitor = not pressed
+	print("[PauseMenu] Bubble contact monitor disabled: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_bubble_no_separation_toggled(pressed: bool) -> void:
+	GameManager.debug_bubble_no_separation = pressed
+	print("[PauseMenu] Bubble separation manager disabled: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_bubble_no_processing_toggled(pressed: bool) -> void:
+	GameManager.debug_bubble_no_processing = pressed
+	print("[PauseMenu] Bubble ALL processing disabled: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_toad_density_submitted(text: String) -> void:
+	var val := int(text.to_float())
+	if val >= 1:
+		var toad_dim := get_node_or_null("/root/ToadDimension")
+		if toad_dim:
+			toad_dim.toads_per_tick = val
+			print("[PauseMenu] Toad rain density set to %d toads/tick" % val)
+	_refresh_toad_density_text()
+
+
+func _on_toad_no_physics_toggled(pressed: bool) -> void:
+	GameManager.debug_toad_no_physics = pressed
+	# Apply to all existing toad bodies
+	var toad_dim := get_node_or_null("/root/ToadDimension")
+	if toad_dim:
+		toad_dim.apply_toad_physics_toggle(not pressed)
+	print("[PauseMenu] Toad physics disabled: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_toad_no_shadows_toggled(pressed: bool) -> void:
+	GameManager.debug_toad_no_shadows = pressed
+	# Apply to all existing toad bodies
+	var toad_dim := get_node_or_null("/root/ToadDimension")
+	if toad_dim:
+		toad_dim.apply_toad_shadow_toggle(not pressed)
+	print("[PauseMenu] Toad shadows disabled: %s" % ("ON" if pressed else "OFF"))
+
+
+func _refresh_toad_density_text() -> void:
+	if _toad_density_input == null:
+		return
+	var toad_dim := get_node_or_null("/root/ToadDimension")
+	if toad_dim:
+		_toad_density_input.text = "%d" % toad_dim.toads_per_tick
+	else:
+		_toad_density_input.text = "45"
 
 
 func _update_quit_button() -> void:
@@ -427,43 +920,3 @@ func _on_reset_pressed() -> void:
 func _on_quit_pressed() -> void:
 	_toggle_menu()
 	NetworkManager.disconnect_game()
-
-
-## --- Scene lookups ---
-
-func _find_local_camera() -> Camera3D:
-	var vp := get_viewport()
-	if vp:
-		return vp.get_camera_3d()
-	return null
-
-
-func _find_sun() -> DirectionalLight3D:
-	var scene := get_tree().current_scene
-	if scene == null:
-		return null
-	# SeedWorld adds the Sun as a child
-	var seed_world := scene.get_node_or_null("SeedWorld")
-	if seed_world:
-		for child in seed_world.get_children():
-			if child is DirectionalLight3D:
-				return child
-	# Fallback: search root
-	for child in scene.get_children():
-		if child is DirectionalLight3D:
-			return child
-	return null
-
-
-func _find_environment() -> Environment:
-	var scene := get_tree().current_scene
-	if scene == null:
-		return null
-	var world_env := scene.get_node_or_null("WorldEnvironment")
-	if world_env and world_env is WorldEnvironment:
-		return world_env.environment
-	# Search parent too
-	for child in scene.get_children():
-		if child is WorldEnvironment:
-			return child.environment
-	return null

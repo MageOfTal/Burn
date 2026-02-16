@@ -16,11 +16,30 @@ var debug_disable_burn_timers: bool = false
 var debug_disable_demon: bool = false
 var debug_disable_zone_damage: bool = false
 var debug_skip_structures: bool = false
+var debug_free_firing: bool = false          # No burn fuel cost when firing weapons
+var debug_shotgun_boost: bool = false        # Double barrel: halved fire rate, doubled pellets
 var debug_grapple_ground_pump: bool = false
-var debug_grapple_reel_speed: float = 3.0  # Matches GrappleSystem.ROPE_REEL_SPEED default
+var debug_grapple_reel_speed: float = 1.2  # Default reel speed (m/s)
 var debug_grapple_visuals: bool = false     # Show pill, angle display, spheres, raycasts
+var debug_grapple_horiz_nudge: bool = true # Launch nudge includes horizontal component toward anchor
+var show_fps_hud: bool = false               # Show FPS counter on gameplay HUD
 var debug_freecam_active: bool = false      # Set by DebugFreecam autoload
-var debug_velocity_iterations: int = 10    # Jolt solver velocity iterations (default 10)
+
+# Bubble / physics debug toggles (set from pause menu)
+var debug_hide_bubbles: bool = false
+var debug_bubble_no_ccd: bool = false
+var debug_bubble_no_push_query: bool = false
+var debug_bubble_one_contact: bool = false
+var debug_bubble_freeze_settled: bool = false
+var debug_bubble_no_contact_monitor: bool = false
+var debug_bubble_no_collision: bool = false
+var debug_bubble_no_separation: bool = false  # Disable bubble overlap repulsion
+var debug_bubble_no_processing: bool = false  # Skip ALL bubble GDScript (wind, drift, overlap, damage)
+var debug_velocity_iterations: int = 10
+
+# Toad dimension debug toggles (set from pause menu)
+var debug_toad_no_physics: bool = false   # Disable all physics for toad rain bodies
+var debug_toad_no_shadows: bool = false   # Disable shadow casting on toad rain bodies
 
 signal game_state_changed(new_state: GameState)
 signal match_started
