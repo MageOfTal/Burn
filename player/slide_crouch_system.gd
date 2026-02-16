@@ -1,4 +1,4 @@
-extends Node
+extends PlayerSubsystem
 class_name SlideCrouchSystem
 
 ## Slide and crouch physics subsystem.
@@ -59,12 +59,8 @@ var _original_camera_y: float = 1.5
 var _original_mesh_y: float = 0.9
 var _original_mesh_scale_y: float = 1.0
 
-## Player reference (set during setup)
-var player: CharacterBody3D
-
-
 func setup(p: CharacterBody3D) -> void:
-	player = p
+	super.setup(p)
 	_original_capsule_height = p._original_capsule_height
 	_original_camera_y = p._original_camera_y
 	_original_mesh_y = p._original_mesh_y
@@ -127,21 +123,28 @@ func start_slide() -> void:
 func process_slide(delta: float) -> void:
 	## Server-only: physics-based slide.
 	## Uses real inclined-plane physics: a = g * (sin(angle)*alignment - friction*cos(angle))
-	## Sliding posture is retained while airborne — the player keeps the lowered capsule
-	## and resumes ground-slide physics automatically on landing.
+	## Sliding posture is retained when going airborne passively (ramps, ledges).
+	## Jumping out of a slide ends it — the player stands up in the air.
 
 	var on_floor := player.is_on_floor()
 	var gravity: float = player.gravity
 
-	# --- Jump out of slide: keep all horizontal momentum, keep slide posture airborne ---
+	# --- Jump out of slide: keep all horizontal momentum, end slide, stand up ---
 	if player._frame_jump and on_floor:
-		var saved_hx: float = _slide_velocity.x
-		var saved_hz: float = _slide_velocity.z
-		player.velocity.x = saved_hx
-		player.velocity.z = saved_hz
+		player.velocity.x = _slide_velocity.x
+		player.velocity.z = _slide_velocity.z
 		player.velocity.y = player.JUMP_VELOCITY
-		# Stay in slide state — posture is retained in the air
-		_slide_was_on_floor = false
+		# End slide directly — bypass end_slide() which would transition to crouch
+		# since we're still on_floor and holding shift
+		is_sliding = false
+		_slide_cooldown_timer = SLIDE_COOLDOWN
+		_slide_low_speed_timer = 0.0
+		_slide_velocity = Vector3.ZERO
+		_slide_forward_dir = Vector3.ZERO
+		apply_standing_pose()
+		# Queue slide-on-land so holding shift will re-enter slide/crouch on landing
+		if player.player_input.action_slide:
+			queue_slide_on_land()
 		return
 
 	# --- Airborne: retain slide posture, apply gravity, skip ground physics ---
@@ -149,9 +152,9 @@ func process_slide(delta: float) -> void:
 		_slide_airborne_timer += delta
 		# Ramp launch: first frame leaving ground during slide
 		if _slide_was_on_floor:
-			var slope_steepness := sqrt(1.0 - _slide_smoothed_normal.y * _slide_smoothed_normal.y)
+			var launch_steepness := sqrt(1.0 - _slide_smoothed_normal.y * _slide_smoothed_normal.y)
 			var slide_speed := _slide_velocity.length()
-			var launch_vy := slide_speed * slope_steepness * 0.7
+			var launch_vy := slide_speed * launch_steepness * 0.7
 			if launch_vy > 0.5:
 				player.velocity.y = launch_vy
 			else:
@@ -243,7 +246,7 @@ func process_slide(delta: float) -> void:
 		var cam_side: float = cam_right.dot(slide_perp)
 		turn_angle *= signf(cam_side) if absf(cam_side) > 0.01 else 1.0
 		# Rotate velocity around Y axis
-		var spd := _slide_velocity.length()
+		var steer_spd := _slide_velocity.length()
 		var cos_a := cos(turn_angle)
 		var sin_a := sin(turn_angle)
 		_slide_velocity = Vector3(
@@ -252,7 +255,7 @@ func process_slide(delta: float) -> void:
 			_slide_velocity.x * sin_a + _slide_velocity.z * cos_a
 		)
 		# Preserve exact speed (no gain, no loss)
-		_slide_velocity = _slide_velocity.normalized() * spd
+		_slide_velocity = _slide_velocity.normalized() * steer_spd
 		# Update reference direction
 		_slide_forward_dir = _slide_velocity.normalized()
 		# Recalculate slide_dir after steering

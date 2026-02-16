@@ -1,4 +1,4 @@
-extends Node
+extends PlayerSubsystem
 class_name GrappleSystem
 
 ## Grappling Hook — position-based constraint pendulum.
@@ -23,12 +23,13 @@ class_name GrappleSystem
 const MAX_GRAPPLE_RANGE := 60.0       ## Raycast distance for finding anchor
 const SWING_GRAVITY := 17.5           ## Same as player gravity
 ## Release boost — tilts velocity upward and adds speed on release.
-const RELEASE_PITCH_UP := deg_to_rad(25.0)   ## Tilt velocity 25° upward on release
-const RELEASE_PITCH_MAX := deg_to_rad(30.0)  ## Never tilt above 30° upward
+const RELEASE_PITCH_UP := deg_to_rad(20.0)   ## Tilt velocity 20° upward on release
+const RELEASE_PITCH_MAX := deg_to_rad(25.0)  ## Never tilt above 25° upward
 const RELEASE_BOOST_MIN_SPEED := 2.0         ## No boost below this speed (m/s)
-const RELEASE_BOOST_MAX_SPEED := 50.0        ## Full boost at this speed (m/s)
+const RELEASE_BOOST_MAX_SPEED := 43.0        ## Full boost at this speed (m/s)
 const RELEASE_BOOST_MIN := 1.0               ## Boost at min speed (m/s)
-const RELEASE_BOOST_MAX := 10.0              ## Boost at max speed (m/s)
+const RELEASE_BOOST_MAX := 7.0               ## Boost at max speed (m/s)
+const RELEASE_BOOST_SPEED_CAP := 50.0        ## Boost can't push total speed past this (m/s)
 const MIN_ROPE_LENGTH := 3.0          ## Stop reeling at this distance
 const ROPE_REEL_SPEED := 3.0          ## Rope shortens this many m/s (creates pull)
 
@@ -37,8 +38,8 @@ const STEER_RATE := 1.8               ## A/D rotation rate (rad/s at full input)
 const SWING_PUMP_STRENGTH := 8.0      ## W pumps along swing velocity (air only)
 
 ## Launch nudge — small upward kick on fire to unstick from the floor.
-const LAUNCH_NUDGE_SPEED := 4.0       ## Max upward speed added on fire (m/s)
-const LAUNCH_MAX_ANGLE := 60.0        ## No nudge above this angle (too vertical)
+const LAUNCH_NUDGE_SPEED := 8.0       ## Max directional speed added on fire (m/s)
+
 
 ## Low-momentum inward pull — lets you scale buildings when nearly stationary.
 const CLIMB_PULL_SPEED := 6.0         ## Inward pull speed when climbing (m/s)
@@ -112,7 +113,7 @@ var _recharge_timer: float = 0.0      ## Time until next charge is restored
 
 ## Boost gate — must grapple for this long before release boost is allowed.
 var _grapple_time: float = 0.0        ## Seconds spent in current grapple
-const MIN_GRAPPLE_TIME_FOR_BOOST := 1.0
+const MIN_GRAPPLE_TIME_FOR_BOOST := 1.4
 
 
 ## Debug timing — spike detection
@@ -183,15 +184,8 @@ var _arc_contacts: Array[Array] = [[], []]
 ## Debug: on-screen label showing bend angle, wrap count, rope state.
 var _debug_label: Label = null
 
-# ======================================================================
-#  Player reference
-# ======================================================================
-
-var player: CharacterBody3D
-
-
 func setup(p: CharacterBody3D) -> void:
-	player = p
+	super.setup(p)
 	_rope_material = StandardMaterial3D.new()
 	_rope_material.albedo_color = Color(0.3, 0.6, 1.0, 1.0)
 	_rope_material.emission_enabled = true
@@ -390,12 +384,49 @@ func try_fire() -> void:
 	if slide_crouch.is_crouching:
 		slide_crouch.end_crouch()
 
-	# Launch nudge — small upward kick scaled by rope angle
-	var to_anchor_dir: Vector3 = (anchor_point - player.global_position).normalized()
-	var anchor_up: float = clampf(to_anchor_dir.y, 0.0, 1.0)
-	var anchor_angle_deg: float = rad_to_deg(asin(clampf(to_anchor_dir.y, -1.0, 1.0)))
-	if anchor_up > 0.05 and anchor_angle_deg < LAUNCH_MAX_ANGLE:
-		player.velocity.y += LAUNCH_NUDGE_SPEED * anchor_up
+	# Launch nudge — kick toward anchor to unstick from the floor
+	var anchor_dist: float = player.global_position.distance_to(anchor_point)
+	var dist_factor: float = clampf((anchor_dist - 2.0) / (7.0 - 2.0), 0.0, 1.0)
+	if dist_factor > 0.0:
+		var to_anchor: Vector3 = anchor_point - player.global_position
+		var nudge_dir: Vector3 = to_anchor.normalized()
+		var full_nudge: float = LAUNCH_NUDGE_SPEED * dist_factor
+
+		if GameManager.debug_grapple_horiz_nudge:
+			# Directional nudge toward anchor (vertical + horizontal)
+			var nudge: Vector3 = nudge_dir * full_nudge
+
+			# Cap vertical component so it doesn't push past 8.5 m/s upward
+			if nudge.y > 0.0 and player.velocity.y + nudge.y > 8.5:
+				nudge.y = maxf(8.5 - player.velocity.y, 0.0)
+
+			# Cap horizontal component along the toward-anchor direction
+			var horiz_dir := Vector3(to_anchor.x, 0.0, to_anchor.z)
+			var horiz_len: float = horiz_dir.length()
+			if horiz_len > 0.001:
+				horiz_dir /= horiz_len
+				var nudge_horiz: float = nudge.x * horiz_dir.x + nudge.z * horiz_dir.z
+				var vel_horiz: float = player.velocity.x * horiz_dir.x + player.velocity.z * horiz_dir.z
+				if nudge_horiz > 0.0 and vel_horiz + nudge_horiz > 8.5:
+					var allowed: float = maxf(8.5 - vel_horiz, 0.0)
+					var scale: float = allowed / nudge_horiz
+					nudge.x *= scale
+					nudge.z *= scale
+
+			player.velocity += nudge
+		else:
+			# Vertical-only nudge
+			var nudge_y: float = nudge_dir.y * full_nudge
+			if nudge_y > 0.0 and player.velocity.y + nudge_y > 8.5:
+				nudge_y = maxf(8.5 - player.velocity.y, 0.0)
+			player.velocity.y += nudge_y
+
+		# Ensure minimum vertical lift (tapered by distance)
+		var lift: float = 7.0 * dist_factor
+		if player.velocity.y < 0.0:
+			player.velocity.y += lift
+		elif player.velocity.y < lift:
+			player.velocity.y = lift
 
 	var hand_pos: Vector3 = player.global_position + Vector3(0, 1.2, 0)
 	_show_grapple_fire.rpc(hand_pos, anchor_point)
@@ -641,7 +672,7 @@ func process(delta: float) -> void:
 	var _t_total := Time.get_ticks_usec()
 	var total_us: float = _t_total - _t0
 	var move_us: float = _t_move_end - _t_move
-	var los_us: float = (_t_los_end - _t_los) if _t_los > 0 else 0.0
+	var los_us: float = float(_t_los_end - _t_los) if _t_los > 0 else 0.0
 	var now_sec: float = Time.get_ticks_msec() / 1000.0
 	if total_us > DEBUG_SPIKE_THRESHOLD_US and (now_sec - _debug_last_print_time) > 1.0:
 		_debug_last_print_time = now_sec
@@ -1136,8 +1167,8 @@ func _log_los_timing(t0: int, t_center: int, t_fan: int, t_pill: int, outcome: S
 	if total_us > DEBUG_SPIKE_THRESHOLD_US and (now_sec - _debug_last_print_time) > 0.5:
 		_debug_last_print_time = now_sec
 		var center_us: float = (t_fan - t_center) if t_fan > 0 else (t_end - t_center)
-		var fan_us: float = (t_pill - t_fan) if (t_fan > 0 and t_pill > 0) else 0.0
-		var pill_us: float = (t_end - t_pill) if t_pill > 0 else 0.0
+		var fan_us: float = float(t_pill - t_fan) if (t_fan > 0 and t_pill > 0) else 0.0
+		var pill_us: float = float(t_end - t_pill) if t_pill > 0 else 0.0
 		var setup_us: float = t_center - t0
 		print("[LOS SPIKE] total=%.0fµs  setup=%.0fµs  center=%.0fµs  fan=%.0fµs  pill=%.0fµs  outcome=%s" % [
 			total_us, setup_us, center_us, fan_us, pill_us, outcome])
@@ -1218,7 +1249,7 @@ func _build_half_capsule_points(rope_len: float, radius: float,
 
 
 func _build_pill_transform(player_chest: Vector3, rope_dir: Vector3,
-		swing_normal: Vector3, rope_len: float) -> Transform3D:
+		swing_normal: Vector3, _rope_len: float) -> Transform3D:
 	## Build a Transform3D that places the pill centered on the rope.
 	## Local Y = rope direction, local X = swing_normal (split direction).
 	## Origin = player_chest (the Y=0 of local space is at the player end).
@@ -1302,7 +1333,7 @@ func _do_release(with_boost: bool) -> void:
 	if boosted:
 		_play_release_woosh.rpc(release_pos)
 	print("Player %d released grapple (speed: %.1f, boost: %s)" % [
-		player.peer_id, player.velocity.length(), str(with_boost)])
+		player.peer_id, player.velocity.length(), str(boosted)])
 
 
 func _apply_release_boost() -> bool:
@@ -1318,12 +1349,12 @@ func _apply_release_boost() -> bool:
 	if speed < RELEASE_BOOST_MIN_SPEED:
 		return false
 
-	# --- Pitch tilt: rotate velocity upward by 10°, capped at 15° ---
+	# --- Pitch tilt: rotate velocity upward by 20°, capped at 25° ---
 	var horiz_speed := Vector2(vel.x, vel.z).length()
 	if horiz_speed > 0.1:
 		# Current pitch angle (negative = downward, positive = upward)
 		var current_pitch := atan2(vel.y, horiz_speed)
-		# Target pitch after adding 10°, capped at 15° upward
+		# Target pitch after adding 20°, capped at 25° upward
 		var new_pitch := minf(current_pitch + RELEASE_PITCH_UP, RELEASE_PITCH_MAX)
 		# Only apply if we're actually tilting upward from current
 		if new_pitch > current_pitch:
@@ -1335,11 +1366,13 @@ func _apply_release_boost() -> bool:
 			player.velocity.z = horiz_dir.y * new_horiz
 			player.velocity.y = new_vert
 
-	# --- Speed boost: 1 m/s at 2 m/s, scaling to 10 m/s at 50 m/s ---
+	# --- Speed boost: 1 m/s at 2 m/s, scaling to 7 m/s at 43 m/s, capped at 50 m/s ---
 	speed = player.velocity.length()  # Re-read after pitch change
 	var t := clampf((speed - RELEASE_BOOST_MIN_SPEED) /
 		(RELEASE_BOOST_MAX_SPEED - RELEASE_BOOST_MIN_SPEED), 0.0, 1.0)
 	var boost := lerpf(RELEASE_BOOST_MIN, RELEASE_BOOST_MAX, t)
+	var headroom := maxf(RELEASE_BOOST_SPEED_CAP - speed, 0.0)
+	boost = minf(boost, headroom)
 	var boost_dir := player.velocity.normalized()
 	player.velocity += boost_dir * boost
 
@@ -1376,38 +1409,46 @@ func reset_state() -> void:
 # ======================================================================
 
 func client_process_visuals(_delta: float) -> void:
-	cleanup()
 	if not is_grappling:
+		cleanup()
 		if _debug_label:
 			_debug_label.visible = false
 		return
 
-	var player_hand: Vector3 = player.global_position + Vector3(0, 1.2, 0)
+	# Use the interpolated transform so the rope attaches to where the player
+	# is visually rendered, not the last physics-tick position.
+	var interp_pos: Vector3 = player.get_global_transform_interpolated().origin
+	var player_hand: Vector3 = interp_pos + Vector3(0, 1.2, 0)
 	var cam_pos: Vector3 = player.camera.global_position if player.camera else player_hand
 	var scene_root := get_tree().current_scene
 
-	# --- Red rope — always visible ---
-	var im := ImmediateMesh.new()
-	_rope_mesh_instance = MeshInstance3D.new()
-	_rope_mesh_instance.mesh = im
-	_rope_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	_rope_mesh_instance.top_level = true
-	_rope_mesh_instance.material_override = _rope_material
+	# --- Rope — reuse existing MeshInstance3D, only rebuild geometry ---
+	if not _rope_mesh_instance or not is_instance_valid(_rope_mesh_instance):
+		var im := ImmediateMesh.new()
+		_rope_mesh_instance = MeshInstance3D.new()
+		_rope_mesh_instance.mesh = im
+		_rope_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_rope_mesh_instance.top_level = true
+		_rope_mesh_instance.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+		_rope_mesh_instance.material_override = _rope_material
+		if scene_root:
+			scene_root.add_child(_rope_mesh_instance)
 
+	var im: ImmediateMesh = _rope_mesh_instance.mesh as ImmediateMesh
+	im.clear_surfaces()
 	_build_rope_ribbon(im, player_hand, anchor_point, cam_pos)
 
-	if scene_root:
-		scene_root.add_child(_rope_mesh_instance)
-
-	# --- Anchor light ---
-	_anchor_light = OmniLight3D.new()
-	_anchor_light.light_color = Color(0.3, 0.6, 1.0)
-	_anchor_light.light_energy = 2.5
-	_anchor_light.omni_range = 4.0
-	_anchor_light.omni_attenuation = 1.5
+	# --- Anchor light — reuse, just update position ---
+	if not _anchor_light or not is_instance_valid(_anchor_light):
+		_anchor_light = OmniLight3D.new()
+		_anchor_light.light_color = Color(0.3, 0.6, 1.0)
+		_anchor_light.light_energy = 2.5
+		_anchor_light.omni_range = 4.0
+		_anchor_light.omni_attenuation = 1.5
+		_anchor_light.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+		if scene_root:
+			scene_root.add_child(_anchor_light)
 	_anchor_light.position = anchor_point
-	if scene_root:
-		scene_root.add_child(_anchor_light)
 
 	var show_debug: bool = GameManager.debug_grapple_visuals
 
@@ -1425,11 +1466,13 @@ func client_process_visuals(_delta: float) -> void:
 	elif _debug_label:
 		_debug_label.visible = false
 
+	# --- Debug visuals (these are rebuilt each frame, acceptable for debug) ---
+	_free_visual(_pill_mesh_instance)
+	_pill_mesh_instance = null
+	_free_visual(_contact_mesh_instance)
+	_contact_mesh_instance = null
 	if show_debug:
-		# --- Pill debug visualization ---
 		_build_pill_visual(player_hand)
-
-		# --- Contact point + sphere debug visualization ---
 		_build_contact_debug_visual()
 
 
@@ -1457,19 +1500,23 @@ func _build_rope_ribbon(im: ImmediateMesh, from: Vector3, to: Vector3, cam_pos: 
 	im.surface_end()
 
 
+func _free_visual(node: Node) -> void:
+	if node and is_instance_valid(node):
+		var p := node.get_parent()
+		if p:
+			p.remove_child(node)
+		node.queue_free()
+
+
 func cleanup() -> void:
-	if _rope_mesh_instance and is_instance_valid(_rope_mesh_instance):
-		_rope_mesh_instance.queue_free()
-		_rope_mesh_instance = null
-	if _anchor_light and is_instance_valid(_anchor_light):
-		_anchor_light.queue_free()
-		_anchor_light = null
-	if _pill_mesh_instance and is_instance_valid(_pill_mesh_instance):
-		_pill_mesh_instance.queue_free()
-		_pill_mesh_instance = null
-	if _contact_mesh_instance and is_instance_valid(_contact_mesh_instance):
-		_contact_mesh_instance.queue_free()
-		_contact_mesh_instance = null
+	_free_visual(_rope_mesh_instance)
+	_rope_mesh_instance = null
+	_free_visual(_anchor_light)
+	_anchor_light = null
+	_free_visual(_pill_mesh_instance)
+	_pill_mesh_instance = null
+	_free_visual(_contact_mesh_instance)
+	_contact_mesh_instance = null
 
 
 # ======================================================================
@@ -1504,6 +1551,7 @@ func _build_pill_visual(player_chest: Vector3) -> void:
 	_pill_mesh_instance.mesh = im
 	_pill_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	_pill_mesh_instance.top_level = true
+	_pill_mesh_instance.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
 	# Pick cached materials per half (full opacity for first subdivision, dim for rest)
 	var all_fracs: Array[float] = [1.0, 0.5, 0.25, 0.75]
@@ -1642,6 +1690,7 @@ func _build_contact_debug_visual() -> void:
 	_contact_mesh_instance.mesh = im
 	_contact_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	_contact_mesh_instance.top_level = true
+	_contact_mesh_instance.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
 	# All materials are pre-cached in setup() — no per-frame allocation.
 
@@ -1726,6 +1775,7 @@ func _show_grapple_fire(from: Vector3, to: Vector3) -> void:
 	flash.light_energy = 8.0
 	flash.omni_range = 4.0
 	flash.top_level = true
+	flash.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	scene_root.add_child(flash)
 	flash.global_position = to
 	var tween := get_tree().create_tween()
@@ -1744,6 +1794,7 @@ func _show_grapple_fire(from: Vector3, to: Vector3) -> void:
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	spark.material_override = mat
 	spark.top_level = true
+	spark.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	scene_root.add_child(spark)
 	spark.global_position = to
 	var spark_tween := get_tree().create_tween()
@@ -1761,6 +1812,7 @@ func _show_grapple_release(pos: Vector3) -> void:
 	flash.light_energy = 4.0
 	flash.omni_range = 3.0
 	flash.top_level = true
+	flash.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	scene_root.add_child(flash)
 	flash.global_position = pos
 	var tween := get_tree().create_tween()
@@ -1797,9 +1849,8 @@ func _play_release_woosh(pos: Vector3) -> void:
 	var playback: AudioStreamGeneratorPlayback = sfx.get_stream_playback()
 	var rng := RandomNumberGenerator.new()
 	rng.randomize()
-	# Simple biquad low-pass state
+	# Simple low-pass state
 	var lp_prev := 0.0
-	var lp_prev2 := 0.0
 	for i in num_samples:
 		var t := float(i) / float(num_samples)
 		# Volume envelope: quick attack, smooth decay

@@ -1,4 +1,4 @@
-extends Node
+extends PlayerSubsystem
 class_name CombatVFX
 
 ## Weapon visual effects subsystem.
@@ -11,22 +11,33 @@ const ADS_LERP_SPEED := 12.0         ## How fast FOV/spring transitions
 const ADS_SPRING_LENGTH := 1.0       ## Camera pulls closer when aiming
 const DEFAULT_SPRING_LENGTH := 2.2
 
+## Bullet sound constants
+const BULLET_WHIZ_DISTANCE := 3.0  ## Max distance from bullet ray to trigger close-miss sound
+const BULLET_WHIZ_PITCH_MIN := 0.85
+const BULLET_WHIZ_PITCH_MAX := 1.15
+const BULLET_HIT_PITCH_MIN := 0.9
+const BULLET_HIT_PITCH_MAX := 1.1
+
+## Preloaded bullet sounds
+var _bullet_hit_stream: AudioStream = null
+var _bullet_close_streams: Array[AudioStream] = []
+
 ## State
 var _scope_overlay: ColorRect = null
 
-## Player reference
-var player: CharacterBody3D
-
-
 func setup(p: CharacterBody3D) -> void:
-	player = p
+	super.setup(p)
+	# Preload bullet sounds
+	_bullet_hit_stream = load("res://assets/audio/sfx/bullet/hit.ogg")
+	for i in range(1, 6):
+		_bullet_close_streams.append(load("res://assets/audio/sfx/bullet/close%d.ogg" % i))
 
 
 ## ======================================================================
 ##  RPCs: weapon visual effects (run on all clients)
 ## ======================================================================
 
-@rpc("authority", "call_local", "unreliable")
+@rpc("authority", "call_local", "reliable")
 func show_melee_swing_fx(from_pos: Vector3, swing_dir: Vector3) -> void:
 	## Visual effect: wide green arc sweep for melee weapons.
 	var im := ImmediateMesh.new()
@@ -83,7 +94,7 @@ func show_melee_swing_fx(from_pos: Vector3, swing_dir: Vector3) -> void:
 	tween.tween_callback(mesh_inst.queue_free)
 
 
-@rpc("authority", "call_local", "unreliable")
+@rpc("authority", "call_local", "reliable")
 func show_shot_fx(from_pos: Vector3, to_pos: Vector3) -> void:
 	## Visual effect: tracer line + muzzle flash + fire sound.
 	_play_fire_sound()
@@ -108,6 +119,7 @@ func show_shot_fx(from_pos: Vector3, to_pos: Vector3) -> void:
 	im.surface_end()
 
 	tracer.top_level = true
+	tracer.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	player.add_child(tracer)
 
 	# Muzzle flash light
@@ -116,6 +128,7 @@ func show_shot_fx(from_pos: Vector3, to_pos: Vector3) -> void:
 	flash.light_energy = 5.0
 	flash.omni_range = 3.0
 	flash.top_level = true
+	flash.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	player.add_child(flash)
 	flash.global_position = from_pos
 
@@ -126,7 +139,7 @@ func show_shot_fx(from_pos: Vector3, to_pos: Vector3) -> void:
 	tween.tween_callback(flash.queue_free)
 
 
-@rpc("authority", "call_local", "unreliable")
+@rpc("authority", "call_local", "reliable")
 func show_shotgun_fx(from_pos: Vector3, shot_ends: Array[Vector3]) -> void:
 	## Visual effect for multi-pellet weapons: multiple tracer lines + muzzle flash + fire sound.
 	_play_fire_sound()
@@ -152,6 +165,7 @@ func show_shotgun_fx(from_pos: Vector3, shot_ends: Array[Vector3]) -> void:
 	im.surface_end()
 
 	tracer.top_level = true
+	tracer.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	player.add_child(tracer)
 
 	# Muzzle flash light (brighter for shotguns)
@@ -160,6 +174,7 @@ func show_shotgun_fx(from_pos: Vector3, shot_ends: Array[Vector3]) -> void:
 	flash.light_energy = 8.0
 	flash.omni_range = 4.0
 	flash.top_level = true
+	flash.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	player.add_child(flash)
 	flash.global_position = from_pos
 
@@ -192,12 +207,55 @@ func _play_fire_sound() -> void:
 		one_shot.max_distance = 60.0
 		one_shot.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
 		one_shot.top_level = true
+		one_shot.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 		player.add_child(one_shot)
-		one_shot.global_position = player.global_position
+		one_shot.global_position = player.get_global_transform_interpolated().origin
 		one_shot.play()
 		one_shot.finished.connect(one_shot.queue_free)
 	else:
 		player.fire_sound_player.play()
+
+
+## ======================================================================
+##  Bullet impact & whiz-by sounds
+## ======================================================================
+
+@rpc("authority", "call_local", "reliable")
+func play_bullet_hit_sound(hit_pos: Vector3) -> void:
+	## Play bullet hit sound at the impact position with random pitch.
+	if _bullet_hit_stream == null:
+		return
+	var snd := AudioStreamPlayer3D.new()
+	snd.stream = _bullet_hit_stream
+	snd.pitch_scale = randf_range(BULLET_HIT_PITCH_MIN, BULLET_HIT_PITCH_MAX)
+	snd.max_distance = 40.0
+	snd.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+	snd.top_level = true
+	snd.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+	get_tree().current_scene.add_child(snd)
+	snd.global_position = hit_pos
+	snd.play()
+	snd.finished.connect(snd.queue_free)
+
+
+@rpc("authority", "call_local", "reliable")
+func play_bullet_whiz_sound(closest_pos: Vector3) -> void:
+	## Play a random bullet close-miss sound at the nearest point on the ray
+	## to this player. Sent only to the player who nearly got hit.
+	if _bullet_close_streams.is_empty():
+		return
+	var stream: AudioStream = _bullet_close_streams[randi() % _bullet_close_streams.size()]
+	var snd := AudioStreamPlayer3D.new()
+	snd.stream = stream
+	snd.pitch_scale = randf_range(BULLET_WHIZ_PITCH_MIN, BULLET_WHIZ_PITCH_MAX)
+	snd.max_distance = 30.0
+	snd.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+	snd.top_level = true
+	snd.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+	get_tree().current_scene.add_child(snd)
+	snd.global_position = closest_pos
+	snd.play()
+	snd.finished.connect(snd.queue_free)
 
 
 ## ======================================================================
@@ -209,8 +267,8 @@ func process_ads_visuals(delta: float, is_aiming: bool, ads_fov: float, has_scop
 	## Uses synced properties (ads_fov, has_scope) instead of weapon node data,
 	## because the weapon node only exists on the server.
 	var base_fov := DEFAULT_FOV
-	if player.has_node("/root/PauseMenu"):
-		base_fov = player.get_node("/root/PauseMenu")._settings.get("fov", DEFAULT_FOV)
+	if player.has_node("/root/VideoSettings"):
+		base_fov = player.get_node("/root/VideoSettings").settings.get("fov", DEFAULT_FOV)
 	var target_fov := base_fov
 	var target_spring := DEFAULT_SPRING_LENGTH
 	var show_scope := false

@@ -1,4 +1,4 @@
-extends Node
+extends PlayerSubsystem
 class_name HeatSystem
 
 ## Tracks heat accumulation from combat. Server-authoritative.
@@ -43,7 +43,10 @@ func _physics_process(delta: float) -> void:
 
 	# Decay heat when out of combat
 	if _time_since_combat >= combat_timeout and heat_level > 0.0:
-		heat_level = maxf(heat_level - heat_decay_rate * delta, 0.0)
+		var effective_decay: float = heat_decay_rate
+		if player and 8 in player.active_bonuses:  # Heat Sink: 50% slower decay
+			effective_decay *= 0.5
+		heat_level = maxf(heat_level - effective_decay * delta, 0.0)
 		heat_changed.emit(heat_level)
 
 	# Check fever state

@@ -1,4 +1,4 @@
-extends Node
+extends PlayerSubsystem
 class_name KamikazeSystem
 
 ## Kamikaze Missile subsystem.
@@ -45,6 +45,8 @@ var _speed: float = 0.0
 var _launch_timer: float = 0.0
 var _trail: GPUParticles3D = null  ## Flight trail particles (client-side)
 var _flashbang_overlay: FlashbangOverlay = null
+## Pending flashbang data — deferred to _physics_process for threaded physics safety.
+var _pending_flash: Dictionary = {}  ## {pos, radius, energy, speed_ratio}
 ## Altitude tracking: Y position when flight phase starts, used for explosion bonus
 var _flight_start_y: float = 0.0
 ## Total altitude dropped while at max speed (extra explosion scaling)
@@ -54,12 +56,19 @@ var _was_at_cap: bool = false
 ## Y position when we first hit the speed cap
 var _cap_hit_y: float = 0.0
 
-## Player reference
-var player: CharacterBody3D
-
-
 func setup(p: CharacterBody3D) -> void:
-	player = p
+	super.setup(p)
+
+
+func _physics_process(_delta: float) -> void:
+	# Deferred flashbang LOS raycast — must run in physics tick for thread safety.
+	if _pending_flash.is_empty():
+		return
+	var flash := _pending_flash
+	_pending_flash = {}
+	_do_flashbang_raycast(
+		flash["pos"], flash["radius"], flash["energy"], flash["speed_ratio"]
+	)
 
 
 func is_active() -> bool:
@@ -87,8 +96,8 @@ func activate() -> void:
 		sc.end_crouch()
 	# Disable normal collision during flight
 	player.get_node("CollisionShape3D").set_deferred("disabled", true)
-	# Show launch VFX
-	_show_kamikaze_launch.rpc(player.global_position)
+	# Show launch VFX (interpolated so VFX matches rendered body)
+	_show_kamikaze_launch.rpc(player.get_global_transform_interpolated().origin)
 	print("Player %d activated Kamikaze Missile!" % player.peer_id)
 
 
@@ -219,7 +228,7 @@ func _process_flight(delta: float) -> void:
 			player.global_position + _direction * ray_dist
 		)
 		query.exclude = [player.get_rid()]
-		query.collision_mask = 0xFFFFFFFF
+		query.collision_mask = 1 | 2 | 4 | 8 | 16 | 128  # All gameplay layers (excludes debris/toad bodies)
 		var result := space_state.intersect_ray(query)
 		if not result.is_empty():
 			player.global_position = result.position
@@ -241,7 +250,7 @@ func _process_flight(delta: float) -> void:
 func _explode() -> void:
 	## Server-only: explode at current position. Damage, crater, VFX, then die.
 	## Explosion scales with speed AND altitude dropped while at speed cap.
-	var explosion_pos := player.global_position
+	var explosion_pos := player.get_global_transform_interpolated().origin
 	var speed_ratio := maxf((_speed - MIN_SPEED) / (REF_SPEED - MIN_SPEED), 0.0)
 
 	# Altitude bonus: extra scaling for diving distance after hitting speed cap.
@@ -261,7 +270,7 @@ func _explode() -> void:
 
 	# --- Shielded explosion damage (flat HP absorption + multi-point raycast) ---
 	ExplosionHelper.do_explosion(
-		player.get_world_3d(), get_tree().current_scene,
+		player.get_world_3d(),
 		explosion_pos, damage, radius, player.peer_id, player
 	)
 
@@ -307,6 +316,7 @@ func _show_kamikaze_launch(pos: Vector3) -> void:
 	flash.light_energy = 15.0
 	flash.omni_range = 5.0
 	flash.top_level = true
+	flash.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	scene_root.add_child(flash)
 	flash.global_position = pos
 
@@ -318,6 +328,7 @@ func _show_kamikaze_launch(pos: Vector3) -> void:
 	launch_burst.lifetime = 0.8
 	launch_burst.explosiveness = 1.0
 	launch_burst.top_level = true
+	launch_burst.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
 	var burst_mat := ParticleProcessMaterial.new()
 	burst_mat.direction = Vector3(0, 1, 0)
@@ -416,6 +427,7 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 	flash.light_energy = flash_energy
 	flash.omni_range = radius * 2.5
 	flash.top_level = true
+	flash.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	scene_root.add_child(flash)
 	flash.global_position = pos
 
@@ -426,6 +438,7 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 		fill_light.light_energy = flash_energy * 0.4
 		fill_light.omni_range = radius * 4.0
 		fill_light.top_level = true
+		fill_light.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 		scene_root.add_child(fill_light)
 		fill_light.global_position = pos + Vector3(0, 3, 0)
 		var fill_tween := get_tree().create_tween()
@@ -439,6 +452,7 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 	sphere_mesh.height = 1.0
 	fireball.mesh = sphere_mesh
 	fireball.top_level = true
+	fireball.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
 	var mat := StandardMaterial3D.new()
 	var r := clampf(lerpf(1.0, 1.0, vfx_ratio), 0.0, 1.0)
@@ -461,6 +475,7 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 	outer_mesh.height = 1.6
 	outer_ball.mesh = outer_mesh
 	outer_ball.top_level = true
+	outer_ball.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	var outer_mat := StandardMaterial3D.new()
 	outer_mat.albedo_color = Color(1.0, 0.35, 0.05, 0.6)
 	outer_mat.emission_enabled = true
@@ -472,13 +487,14 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 	scene_root.add_child(outer_ball)
 	outer_ball.global_position = pos
 
-	# --- Shockwave ring (expands outward from impact) ---
+	# --- Shockwave ring (expands outward from impact, 3s lifetime) ---
 	var ring := MeshInstance3D.new()
 	var torus := TorusMesh.new()
 	torus.inner_radius = 0.8
 	torus.outer_radius = 1.0
 	ring.mesh = torus
 	ring.top_level = true
+	ring.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	var ring_mat := StandardMaterial3D.new()
 	ring_mat.albedo_color = Color(1.0, 0.8, 0.4, 0.7)
 	ring_mat.emission_enabled = true
@@ -490,6 +506,36 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 	scene_root.add_child(ring)
 	ring.global_position = pos
 
+	# Ring gets its own tween: expand fast, then fade over 3 seconds total
+	var ring_scale: float = lerpf(3.0, 14.0, vfx_ratio)
+	var ring_expand_time := 0.4
+	var ring_fade_time := 2.6  # Remaining time (3s total)
+	var ring_tween := get_tree().create_tween()
+	# Phase 1: fast expansion (0.4s) — scale up, stay bright
+	ring_tween.set_parallel(true)
+	ring_tween.tween_property(ring, "scale", Vector3(ring_scale, 0.3, ring_scale), ring_expand_time).set_ease(Tween.EASE_OUT)
+	ring_tween.set_parallel(false)
+	# Phase 2: slow fade-out (2.6s) — alpha and emission drain to zero
+	ring_tween.set_parallel(true)
+	ring_tween.tween_property(ring_mat, "albedo_color:a", 0.0, ring_fade_time).set_ease(Tween.EASE_IN)
+	ring_tween.tween_property(ring_mat, "emission_energy_multiplier", 0.0, ring_fade_time).set_ease(Tween.EASE_IN)
+	ring_tween.set_parallel(false)
+	ring_tween.tween_callback(ring.queue_free)
+
+	# --- Ring sound effect (3s fade-out matching ring visual) ---
+	var ring_snd := AudioStreamPlayer3D.new()
+	ring_snd.stream = load("res://assets/audio/sfx/ring.ogg")
+	ring_snd.max_distance = 80.0
+	ring_snd.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+	ring_snd.top_level = true
+	ring_snd.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+	scene_root.add_child(ring_snd)
+	ring_snd.global_position = pos
+	ring_snd.play()
+	var ring_snd_tween := get_tree().create_tween()
+	ring_snd_tween.tween_property(ring_snd, "volume_db", -80.0, 3.0).set_ease(Tween.EASE_IN)
+	ring_snd_tween.tween_callback(ring_snd.queue_free)
+
 	# --- Explosion spark/fire particles ---
 	var sparks := GPUParticles3D.new()
 	sparks.emitting = true
@@ -498,6 +544,7 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 	sparks.lifetime = lerpf(0.8, 2.5, vfx_ratio)
 	sparks.explosiveness = 1.0
 	sparks.top_level = true
+	sparks.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
 	var spark_mat := ParticleProcessMaterial.new()
 	spark_mat.direction = Vector3(0, 1, 0)
@@ -538,6 +585,7 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 	smoke.lifetime = lerpf(1.5, 5.0, vfx_ratio)
 	smoke.explosiveness = 0.8
 	smoke.top_level = true
+	smoke.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
 	var smoke_mat := ParticleProcessMaterial.new()
 	smoke_mat.direction = Vector3(0, 1, 0)
@@ -580,6 +628,7 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 		embers.lifetime = lerpf(1.5, 4.0, vfx_ratio)
 		embers.explosiveness = 0.5
 		embers.top_level = true
+		embers.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
 		var ember_mat := ParticleProcessMaterial.new()
 		ember_mat.direction = Vector3(0, 1, 0)
@@ -613,10 +662,9 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 		embers.global_position = pos
 		get_tree().create_timer(lerpf(2.0, 5.0, vfx_ratio)).timeout.connect(embers.queue_free)
 
-	# --- Animate fireball: expand + fade ---
+	# --- Animate fireball: expand + fade (ring handled by its own tween above) ---
 	var final_scale: float = lerpf(5.0, 20.0, vfx_ratio)
 	var outer_scale: float = final_scale * 1.6
-	var ring_scale: float = lerpf(3.0, 14.0, vfx_ratio)
 	var expand_time: float = lerpf(0.3, 0.6, vfx_ratio)
 	var fade_time: float = lerpf(0.4, 0.8, vfx_ratio)
 
@@ -626,13 +674,10 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 	tween.tween_property(mat, "albedo_color:a", 0.0, fade_time)
 	tween.tween_property(outer_ball, "scale", Vector3.ONE * outer_scale, expand_time * 1.3).set_ease(Tween.EASE_OUT)
 	tween.tween_property(outer_mat, "albedo_color:a", 0.0, fade_time * 1.5)
-	tween.tween_property(ring, "scale", Vector3(ring_scale, 0.3, ring_scale), expand_time * 0.7).set_ease(Tween.EASE_OUT)
-	tween.tween_property(ring_mat, "albedo_color:a", 0.0, expand_time * 1.2)
 	tween.tween_property(flash, "light_energy", 0.0, fade_time)
 	tween.set_parallel(false)
 	tween.tween_callback(fireball.queue_free)
 	tween.tween_callback(outer_ball.queue_free)
-	tween.tween_callback(ring.queue_free)
 	tween.tween_callback(flash.queue_free)
 
 	# Clean up particles after they finish
@@ -648,24 +693,12 @@ func _show_kamikaze_explosion(pos: Vector3, radius: float, flash_energy: float, 
 ##  Client-side: flashbang and visuals
 ## ======================================================================
 
-func _check_flashbang(explosion_pos: Vector3, _radius: float, _flash_energy: float, speed_ratio: float) -> void:
-	## Client-side: check if the local player should be flashbanged by this explosion.
-	## Find the LOCAL player on this machine (not necessarily the kamikaze owner).
+func _check_flashbang(explosion_pos: Vector3, radius: float, flash_energy: float, speed_ratio: float) -> void:
+	## Client-side: quick pre-checks (no physics), then defer the LOS raycast
+	## to _physics_process via _pending_flash for threaded physics safety.
 	var local_id := multiplayer.get_unique_id()
 
-	# Find the local player node in the Players container
-	var scene := get_tree().current_scene
-	if scene == null:
-		return
-	var players_container := scene.get_node_or_null("Players")
-	if players_container == null:
-		return
-
-	var local_player: CharacterBody3D = null
-	for child in players_container.get_children():
-		if child is CharacterBody3D and child.name.to_int() == local_id:
-			local_player = child
-			break
+	var local_player: CharacterBody3D = _find_local_player_anywhere(local_id)
 
 	if local_player == null:
 		return
@@ -686,7 +719,39 @@ func _check_flashbang(explosion_pos: Vector3, _radius: float, _flash_energy: flo
 	if dot < FLASH_DOT_THRESHOLD:
 		return
 
-	# Line of sight check
+	# Defer the LOS raycast to _physics_process (thread-safe).
+	_pending_flash = {
+		"pos": explosion_pos,
+		"radius": radius,
+		"energy": flash_energy,
+		"speed_ratio": speed_ratio,
+	}
+
+
+func _do_flashbang_raycast(explosion_pos: Vector3, _radius: float, _flash_energy: float, speed_ratio: float) -> void:
+	## Runs in _physics_process — performs the LOS raycast and applies the flash.
+	var local_id := multiplayer.get_unique_id()
+
+	var local_player: CharacterBody3D = _find_local_player_anywhere(local_id)
+	if local_player == null or not local_player.is_alive:
+		return
+
+	var local_camera: Camera3D = local_player.get_node_or_null("CameraPivot/SpringArm3D/Camera3D")
+	if local_camera == null:
+		return
+
+	var cam_pos: Vector3 = local_camera.global_position
+	var dist: float = cam_pos.distance_to(explosion_pos)
+	if dist > FLASH_MAX_RANGE:
+		return
+
+	var cam_forward: Vector3 = -local_camera.global_transform.basis.z
+	var dir_to_explosion: Vector3 = (explosion_pos - cam_pos).normalized()
+	var dot: float = cam_forward.dot(dir_to_explosion)
+	if dot < FLASH_DOT_THRESHOLD:
+		return
+
+	# Line of sight check — safe here in _physics_process
 	var space_state := local_player.get_world_3d().direct_space_state
 	if space_state:
 		var query := PhysicsRayQueryParameters3D.create(cam_pos, explosion_pos)
@@ -767,3 +832,19 @@ func client_process_visuals(delta: float) -> void:
 
 	# Weapon mount hidden during kamikaze
 	player.weapon_mount.visible = false
+
+
+
+func _find_local_player_anywhere(local_id: int) -> CharacterBody3D:
+	## Find the local player in either the overworld or toad dimension container.
+	var toad_dim := get_node_or_null("/root/ToadDimension")
+	if toad_dim and toad_dim.has_method("find_player_anywhere"):
+		return toad_dim.find_player_anywhere(local_id)
+	var scene := get_tree().current_scene
+	if scene:
+		var players_container := scene.get_node_or_null("Players")
+		if players_container:
+			var p := players_container.get_node_or_null(str(local_id))
+			if p is CharacterBody3D:
+				return p
+	return null
