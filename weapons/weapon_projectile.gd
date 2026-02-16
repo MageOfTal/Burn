@@ -15,9 +15,7 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 		push_warning("WeaponProjectile: no projectile_scene set on " + weapon_data.item_name)
 		return {}
 
-	# Rarity damage bonus: +15% per rarity tier
-	var rarity_mult: float = 1.0 + weapon_data.rarity * 0.15
-	var scaled_damage: float = weapon_data.damage * rarity_mult
+	var scaled_damage: float = weapon_data.get_rarity_damage()
 
 	# Apply ammo damage multiplier when ammo is slotted
 	if ammo_data:
@@ -25,26 +23,14 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 
 	# Spawn projectile in front of the barrel, but check for walls first
 	# so the projectile doesn't clip through nearby geometry.
-	var spawn_offset := 1.0
-	var space_state := shooter.get_world_3d().direct_space_state
-	if space_state:
-		var ray_query := PhysicsRayQueryParameters3D.create(
-			aim_origin, aim_origin + aim_direction * spawn_offset
-		)
-		ray_query.exclude = [shooter.get_rid()]
-		ray_query.collision_mask = 1  # Terrain / structures
-		var ray_result := space_state.intersect_ray(ray_query)
-		if not ray_result.is_empty():
-			# Wall in the way — spawn just before the hit point
-			spawn_offset = maxf(aim_origin.distance_to(ray_result.position) - 0.1, 0.2)
-
+	var spawn_offset := get_safe_spawn_offset(shooter, aim_origin, aim_direction)
 	var spawn_pos := aim_origin + aim_direction * spawn_offset
 
 	# Spawn via ProjectileSpawner — replicates to all clients automatically.
 	# queue_free() on server auto-removes on all clients.
 	var ammo_path := ""
 	if ammo_data and ammo_data.can_slot_as_ammo:
-		ammo_path = ammo_data.resource_path
+		ammo_path = ammo_data.get_source_path()
 	var map := shooter.get_tree().current_scene
 	if map.has_method("spawn_projectile"):
 		map.spawn_projectile(

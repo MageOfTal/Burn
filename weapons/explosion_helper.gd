@@ -27,7 +27,6 @@ const MAX_RAY_ITERATIONS := 8
 
 static func do_explosion(
 	world: World3D,
-	scene_root: Node,
 	explosion_pos: Vector3,
 	base_damage: float,
 	radius: float,
@@ -51,7 +50,7 @@ static func do_explosion(
 	sphere.radius = radius
 	query.shape = sphere
 	query.transform = Transform3D(Basis(), explosion_pos)
-	query.collision_mask = 0xFFFFFFFF
+	query.collision_mask = 1 | 2 | 4 | 128 | 256  # World(1) + items(2) + bubbles(4) + players(128/256)
 	query.collide_with_bodies = true
 	query.collide_with_areas = true
 
@@ -77,27 +76,16 @@ static func do_explosion(
 			if dmg > 0.5:
 				target.take_damage(dmg, attacker_id)
 			already_damaged.append(target)
+		elif target is RigidBody3D and target.has_method("take_damage"):
+			# Destructible physics object (tower chunks, etc.) — simple distance falloff
+			var dist := explosion_pos.distance_to(target.global_position)
+			if dist <= radius:
+				var falloff := clampf(1.0 - (dist / radius), 0.0, 1.0)
+				var dmg := base_damage * falloff
+				if dmg > 0.5:
+					target.take_damage(dmg, attacker_id)
+			already_damaged.append(target)
 
-	# ------------------------------------------------------------------
-	#  Pass 2: Scene-tree scan for walls the sphere query may have missed
-	# ------------------------------------------------------------------
-	var structures: Node = null
-	if scene_root:
-		structures = scene_root.get_node_or_null("SeedWorld/Structures")
-		if structures == null:
-			structures = scene_root.get_node_or_null("BlockoutMap/SeedWorld/Structures")
-	if structures:
-		for child in structures.get_children():
-			if child in already_damaged:
-				continue
-			if child.has_method("take_damage_at"):
-				var dist := explosion_pos.distance_to(child.global_position)
-				var wall_reach: float = 0.0
-				if "wall_size" in child:
-					wall_reach = child.wall_size.length() * 0.5
-				if dist <= radius + wall_reach:
-					child.take_damage_at(explosion_pos, base_damage, radius, attacker_id)
-					already_damaged.append(child)
 
 
 # ======================================================================

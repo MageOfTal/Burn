@@ -1,42 +1,36 @@
-extends RigidBody3D
+extends ProjectileBase
 
 ## Rocket projectile: flies in a straight line, explodes on contact.
 ## Server-authoritative: server handles collision, damage, and cleanup.
 ## Clients see the projectile via replication and the explosion via RPC.
+##
+## Now extends ProjectileBase → PhysicsBodyBase, gaining:
+##   - Unified launch/lifetime/termination interface
+##   - Mass-weighted character push (rocket is lightweight + fast, so minimal push)
+##   - Ammo override system from ProjectileBase
 
 const SPEED := 50.0
 const EXPLOSION_RADIUS := 8.0
 const MAX_LIFETIME := 5.0
 
 var _direction: Vector3 = Vector3.FORWARD
-var _shooter_id: int = -1
-var _damage: float = 70.0
-var _lifetime: float = 0.0
 var _has_exploded: bool = false
 
-## Ammo scatter override: when set, explosion spawns projectiles instead of dealing AOE damage
-var _ammo_projectile_scene: PackedScene = null
-var _ammo_explosion_spawn_count: int = 0
-var _ammo_damage_mult: float = 1.0
+
+func get_launch_speed() -> float:
+	return SPEED
+
+
+func get_max_lifetime() -> float:
+	return MAX_LIFETIME
 
 
 func launch(direction: Vector3, shooter_id: int, damage: float) -> void:
-	## Called by WeaponProjectile before adding to scene tree.
 	_direction = direction.normalized()
-	_shooter_id = shooter_id
-	_damage = damage
+	super.launch(direction, shooter_id, damage)
 
 
-func set_ammo_override(ammo: WeaponData) -> void:
-	## Called by WeaponProjectile when ammo is slotted.
-	## On explosion, this rocket will scatter ammo projectiles instead of dealing AOE damage.
-	if ammo and ammo.can_slot_as_ammo:
-		_ammo_projectile_scene = ammo.projectile_scene
-		_ammo_explosion_spawn_count = ammo.ammo_explosion_spawn_count
-		_ammo_damage_mult = ammo.ammo_damage_mult
-
-
-func _ready() -> void:
+func _setup() -> void:
 	# Straight-line flight: no gravity, locked rotation
 	gravity_scale = 0.0
 	lock_rotation = true
@@ -46,25 +40,11 @@ func _ready() -> void:
 	if _direction.length() > 0.01:
 		look_at(global_position + _direction, Vector3.UP)
 
-	# Server handles collision
-	if multiplayer.is_server():
-		contact_monitor = true
-		max_contacts_reported = 4
-		body_entered.connect(_on_body_entered)
-
 	# Setup smoke trail particles (all peers — visual only)
 	_setup_smoke_trail()
 
 
-func _physics_process(delta: float) -> void:
-	if not multiplayer.is_server():
-		return
-
-	_lifetime += delta
-	if _lifetime >= MAX_LIFETIME and not _has_exploded:
-		_explode()
-		return
-
+func _server_process(delta: float) -> void:
 	# Raycast forward to catch tunneling at high speed.
 	# The rocket moves ~0.83m per frame at 60fps — if terrain is thin or at
 	# a glancing angle, the physics engine can miss the collision.
@@ -86,14 +66,14 @@ func _physics_process(delta: float) -> void:
 				_explode()
 
 
-func _on_body_entered(body: Node) -> void:
-	if not multiplayer.is_server() or _has_exploded:
-		return
-
-	# Ignore the shooter so the rocket doesn't self-destruct
+func _is_shooter_immune(body: Node) -> bool:
+	## Rocket: permanent self-exclude (never damages shooter via body_entered).
 	if body is CharacterBody3D and body.name.to_int() == _shooter_id:
-		return
+		return true
+	return false
 
+
+func _on_body_hit(body: Node) -> void:
 	_explode()
 
 
@@ -101,11 +81,12 @@ func _explode() -> void:
 	if _has_exploded:
 		return
 	_has_exploded = true
+	_is_terminated = true  # Prevent base lifetime kill from also firing
 
-	var explosion_pos := global_position
+	var explosion_pos := get_global_transform_interpolated().origin
 
 	# If ammo is loaded, scatter ammo projectiles instead of normal explosion
-	if _ammo_projectile_scene and _ammo_explosion_spawn_count > 0:
+	if has_ammo_override():
 		_scatter_ammo_projectiles(explosion_pos)
 		# Show a lighter VFX (no structural damage, no crater)
 		_show_ammo_scatter_fx.rpc(explosion_pos)
@@ -114,7 +95,7 @@ func _explode() -> void:
 
 	# --- Shielded explosion damage (flat HP absorption + multi-point raycast) ---
 	ExplosionHelper.do_explosion(
-		get_world_3d(), get_tree().current_scene,
+		get_world_3d(),
 		explosion_pos, _damage, EXPLOSION_RADIUS, _shooter_id, self
 	)
 
@@ -169,8 +150,20 @@ func _scatter_ammo_projectiles(explosion_pos: Vector3) -> void:
 
 @rpc("authority", "call_local", "reliable")
 func _show_explosion(pos: Vector3) -> void:
-	## Visual explosion effect on all clients.
+	## Visual + audio explosion effect on all clients.
 	var scene_root := get_tree().current_scene
+
+	# --- Explosion sound ---
+	var snd := AudioStreamPlayer3D.new()
+	snd.stream = preload("res://assets/audio/sfx/explosion.ogg")
+	snd.max_distance = 80.0
+	snd.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+	snd.top_level = true
+	snd.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+	scene_root.add_child(snd)
+	snd.global_position = pos
+	snd.play()
+	snd.finished.connect(snd.queue_free)
 
 	# --- Bright flash light ---
 	var flash := OmniLight3D.new()

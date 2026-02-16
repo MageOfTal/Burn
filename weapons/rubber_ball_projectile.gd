@@ -1,7 +1,8 @@
-extends RigidBody3D
+extends ProjectileBase
 
 ## Rubber ball projectile: bounces off surfaces, deals velocity-based damage.
 ## Faster impact = more damage. Bounces up to MAX_BOUNCES times.
+## Mass-weighted character push via PhysicsBodyBase (negligible at 0.05kg).
 ## Server-authoritative: server handles collision, damage, and cleanup.
 
 const LAUNCH_SPEED := 40.0
@@ -10,9 +11,6 @@ const MAX_LIFETIME := 8.0
 const BALL_RADIUS := 0.05  ## Golf ball size
 
 var _direction: Vector3 = Vector3.FORWARD
-var _shooter_id: int = -1
-var _base_damage: float = 30.0
-var _lifetime: float = 0.0
 var _bounce_count: int = 0
 var _dying: bool = false
 
@@ -23,14 +21,20 @@ var _already_hit: Array[Node] = []
 var _prev_speed: float = 0.0
 
 
+func get_launch_speed() -> float:
+	return LAUNCH_SPEED
+
+
+func get_max_lifetime() -> float:
+	return MAX_LIFETIME
+
+
 func launch(direction: Vector3, shooter_id: int, damage: float) -> void:
-	## Called by WeaponProjectile before adding to scene tree.
 	_direction = direction.normalized()
-	_shooter_id = shooter_id
-	_base_damage = damage
+	super.launch(direction, shooter_id, damage)
 
 
-func _ready() -> void:
+func _setup() -> void:
 	# Physics setup: gravity + bouncy material
 	gravity_scale = 1.0
 	lock_rotation = false  ## Let the ball spin naturally
@@ -46,12 +50,6 @@ func _ready() -> void:
 	linear_velocity = _direction * LAUNCH_SPEED
 	_prev_speed = LAUNCH_SPEED
 
-	# Server handles collision damage
-	if multiplayer.is_server():
-		contact_monitor = true
-		max_contacts_reported = 4
-		body_entered.connect(_on_body_entered)
-
 	# Set up the visual material (bright rubber blue)
 	var mesh_inst := get_node_or_null("MeshInstance3D")
 	if mesh_inst:
@@ -62,15 +60,7 @@ func _ready() -> void:
 		mesh_inst.material_override = mat
 
 
-func _physics_process(delta: float) -> void:
-	if not multiplayer.is_server():
-		return
-
-	_lifetime += delta
-	if _lifetime >= MAX_LIFETIME and not _dying:
-		queue_free()
-		return
-
+func _server_process(delta: float) -> void:
 	# Detect bounces by checking if speed dropped significantly
 	# (ball hit a wall/floor and physics material made it bounce)
 	var current_speed := linear_velocity.length()
@@ -81,6 +71,7 @@ func _physics_process(delta: float) -> void:
 
 		if _bounce_count >= MAX_BOUNCES and not _dying:
 			_dying = true
+			_is_terminated = true  # Prevent base lifetime kill
 			# Let the ball roll for 1 second then delete
 			var timer := Timer.new()
 			timer.wait_time = 1.0
@@ -92,15 +83,16 @@ func _physics_process(delta: float) -> void:
 	_prev_speed = current_speed
 
 
-func _on_body_entered(body: Node) -> void:
-	if not multiplayer.is_server() or _dying:
-		return
-
-	# Ignore the shooter briefly (prevent self-hit on spawn).
-	# After 0.5s OR after the first bounce, the ball can damage anyone.
+func _is_shooter_immune(body: Node) -> bool:
+	## Rubber ball: shooter immune for 0.5s OR until first bounce.
 	if body is CharacterBody3D and body.name.to_int() == _shooter_id:
-		if _lifetime < 0.5 and _bounce_count == 0:
-			return
+		return _lifetime < 0.5 and _bounce_count == 0
+	return false
+
+
+func _on_body_hit(body: Node) -> void:
+	if _dying:
+		return
 
 	# Don't damage the same body twice in one bounce
 	if body in _already_hit:
@@ -115,7 +107,7 @@ func _on_body_entered(body: Node) -> void:
 	# Velocity-based damage: faster = more damage, minimum 20% at low speed
 	var speed := linear_velocity.length()
 	var speed_ratio := clampf(speed / LAUNCH_SPEED, 0.2, 1.0)
-	var dmg := _base_damage * speed_ratio
+	var dmg := _damage * speed_ratio
 
 	body.take_damage(dmg, _shooter_id)
 	_already_hit.append(body)

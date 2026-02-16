@@ -12,39 +12,52 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 
 	var reach: float = weapon_data.weapon_range if weapon_data else 3.5
 
+	# Toad dimension players are on layer 9 (256) instead of layer 8 (128)
+	var player_bit: int = 256 if shooter.get("in_toad_dimension") else 128
+
 	# Use a thick sphere cast (radius 0.5m) for forgiving melee hits.
-	# This makes it much easier to connect than a thin raycast.
 	var shape := SphereShape3D.new()
 	shape.radius = 0.5
 
 	var params := PhysicsShapeQueryParameters3D.new()
 	params.shape = shape
-	params.transform = Transform3D(Basis.IDENTITY, aim_origin)
-	params.motion = aim_direction * reach
 	params.exclude = [shooter.get_rid()]
-	params.collision_mask = 1 | 2  # Hit anything — we filter for players below
+	params.collision_mask = 1 | 2 | player_bit  # World(1) + items(2) + players
+	params.motion = Vector3.ZERO
 
-	var _results := space_state.cast_motion(params)
+	# Sweep across a 120-degree arc (matching the visual swing effect)
+	# to detect players anywhere in the swing, not just directly ahead.
+	var arc_half_angle := deg_to_rad(60.0)
+	var flat_dir := Vector3(aim_direction.x, 0.0, aim_direction.z).normalized()
+	if flat_dir.length_squared() < 0.01:
+		flat_dir = Vector3.FORWARD
 
-	# Direct collision check along the path
-	# Use intersect_shape at multiple points along the swing arc
 	var hit_player: CharacterBody3D = null
 	var hit_pos := aim_origin + aim_direction * reach
-	var steps := 4
-	for i in range(steps + 1):
-		var t := float(i) / float(steps)
-		var check_pos := aim_origin + aim_direction * (reach * t)
-		params.transform = Transform3D(Basis.IDENTITY, check_pos)
-		params.motion = Vector3.ZERO
-		var collisions := space_state.intersect_shape(params, 8)
-		for col in collisions:
-			var collider = col.get("collider")
-			if collider is CharacterBody3D and collider != shooter:
-				hit_player = collider
-				hit_pos = check_pos
-				break
-		if hit_player:
-			break
+	var best_dist_sq := INF
+
+	var arc_steps := 5   # Angles across the arc
+	var reach_steps := 3 # Distance steps along each ray
+	for a in range(arc_steps + 1):
+		var arc_t := float(a) / float(arc_steps)
+		var angle := lerpf(-arc_half_angle, arc_half_angle, arc_t)
+		var sweep_dir := flat_dir.rotated(Vector3.UP, angle)
+
+		for r in range(1, reach_steps + 1):
+			var t := float(r) / float(reach_steps)
+			var check_pos := aim_origin + sweep_dir * (reach * t)
+			params.transform = Transform3D(Basis.IDENTITY, check_pos)
+			var collisions := space_state.intersect_shape(params, 8)
+			for col in collisions:
+				var collider = col.get("collider")
+				if collider is CharacterBody3D and collider != shooter:
+					# Prefer the closest hit to the aim direction center
+					var d_sq := check_pos.distance_squared_to(aim_origin)
+					if d_sq < best_dist_sq:
+						best_dist_sq = d_sq
+						hit_player = collider
+						hit_pos = check_pos
+			# Don't break on first hit per ray — check all rays for closest
 
 	if hit_player == null:
 		return {"melee_miss": true, "shot_end": aim_origin + aim_direction * reach}

@@ -12,6 +12,11 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 
 	var space_state := shooter.get_world_3d().direct_space_state
 	var count := maxi(weapon_data.pellet_count, 1)
+	if is_shotgun_boosted():
+		count *= 2
+
+	# Toad dimension players are on layer 9 (256) instead of layer 8 (128)
+	var player_bit: int = 256 if shooter.get("in_toad_dimension") else 128
 
 	var pellets: Array[Dictionary] = []
 	for i in count:
@@ -20,7 +25,7 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 
 		var query := PhysicsRayQueryParameters3D.create(aim_origin, end_point)
 		query.exclude = [shooter.get_rid()]
-		query.collision_mask = 0xFFFFFFFF
+		query.collision_mask = 1 | 2 | 4 | 8 | 16 | player_bit  # All gameplay layers (excludes debris/toad bodies)
 
 		var result := space_state.intersect_ray(query)
 
@@ -45,9 +50,10 @@ func _fire_ammo_projectile(shooter: CharacterBody3D, aim_origin: Vector3, aim_di
 	## Fire ammo projectile(s) instead of raycasting when ammo is slotted.
 	## Uses ProjectileSpawner so all clients see the projectiles.
 	var count := maxi(weapon_data.pellet_count, 1)
+	if is_shotgun_boosted():
+		count *= 2
 
-	var rarity_mult: float = 1.0 + weapon_data.rarity * 0.15
-	var per_projectile_damage: float = (weapon_data.damage * rarity_mult * get_ammo_damage_mult()) / count
+	var per_projectile_damage: float = (weapon_data.get_rarity_damage() * get_ammo_damage_mult()) / count
 
 	var proj_scene: PackedScene = get_ammo_projectile_scene()
 	if proj_scene == null:
@@ -61,19 +67,7 @@ func _fire_ammo_projectile(shooter: CharacterBody3D, aim_origin: Vector3, aim_di
 	for i in count:
 		var pellet_dir := _apply_spread(aim_direction)
 
-		# Spawn in front of barrel with wall check
-		var spawn_offset := 1.0
-		var space_state := shooter.get_world_3d().direct_space_state
-		if space_state:
-			var ray_query := PhysicsRayQueryParameters3D.create(
-				aim_origin, aim_origin + pellet_dir * spawn_offset
-			)
-			ray_query.exclude = [shooter.get_rid()]
-			ray_query.collision_mask = 1
-			var ray_result := space_state.intersect_ray(ray_query)
-			if not ray_result.is_empty():
-				spawn_offset = maxf(aim_origin.distance_to(ray_result.position) - 0.1, 0.2)
-
+		var spawn_offset := get_safe_spawn_offset(shooter, aim_origin, pellet_dir)
 		var spawn_pos := aim_origin + pellet_dir * spawn_offset
 		map.spawn_projectile(
 			proj_scene.resource_path, spawn_pos, pellet_dir,

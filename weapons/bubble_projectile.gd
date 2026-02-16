@@ -1,19 +1,19 @@
-extends RigidBody3D
+extends ProjectileBase
 
 ## Bubble projectile: a near-weightless soap bubble that floats, drifts, and
 ## blocks shots. Pops on bullet damage or high-energy collisions.
 ##
 ## Physics model:
-##   - RigidBody3D with mass=0.1 (extremely light)
+##   - ProjectileBase → PhysicsBodyBase with mass=0.1 (extremely light)
 ##   - Zero gravity (floats in place)
 ##   - High linear_damp (air resistance bleeds off speed quickly)
 ##   - Brownian drift: tiny random forces applied every 0.12s
-##   - Soft bubble-on-bubble separation via forces (not hard collision)
-##   - Players push bubbles by applying impulses from player.gd
+##   - Overlap repulsion: Jolt broadphase query (intersect_shape) finds one neighbor, bubble drifts away
+##   - Player overlap via distance check (_check_player_overlap)
 ##
 ## Collision layers:
-##   Layer 3 (bit 4): bubble body. Only walls (layer 1) stop them.
-##   Hitscan raycasts use mask 0xFFFFFFFF, so they hit bubbles.
+##   Layer 3 (bit 4): bubble body. Walls (1) and tower debris (2) stop them.
+##   Hitscan raycasts include layer 3 in their mask, so they hit bubbles.
 ##
 ## Pop condition: kinetic energy (0.5*m*v^2) exceeds threshold.
 
@@ -27,6 +27,7 @@ const NUDGE_INTERVAL := 0.12
 const WIND_STRENGTH := 0.08
 const BOUNCE := 0.5
 const FRICTION := 0.0
+const OVERLAP_PUSH := 2.0   # Repulsion force strength at full overlap
 
 ## Pop thresholds based on kinetic energy (0.5*m*v^2).
 const POP_ENERGY_WALL := 0.8
@@ -34,27 +35,42 @@ const POP_ENERGY_OBJECT := 2.0
 const POP_ENERGY_BUBBLE := 5.0
 
 ## Identity flag — used by _is_bubble() to distinguish from rubber balls.
+## Checked via node.get("is_bubble") by other bubbles.
 var is_bubble := true
 
-var _shooter_id: int = -1
-var _damage: float = 5.0
-var _lifetime: float = 0.0
 var _has_popped: bool = false
 var _nudge_timer: float = 0.0
 var _wind_dir: Vector3 = Vector3.ZERO
-
-## Cached Players container (avoids tree traversal every physics frame)
 var _players_container: Node = null
 var _players_cache_valid: bool = false
 
+# Pre-allocated physics query for O(1) bubble overlap detection via Jolt broadphase.
+var _overlap_query: PhysicsShapeQueryParameters3D = null
+var _overlap_shape: SphereShape3D = null
 
-func launch(direction: Vector3, shooter_id: int, damage: float) -> void:
-	_shooter_id = shooter_id
-	_damage = damage
-	linear_velocity = direction.normalized() * LAUNCH_SPEED
+
+func get_launch_speed() -> float:
+	return LAUNCH_SPEED
+
+
+func get_max_lifetime() -> float:
+	return LIFETIME
+
+
+func get_shooter_immunity_time() -> float:
+	return 0.15
 
 
 func _ready() -> void:
+	super._ready()
+	# Reduce contact tracking overhead: bubbles only need the first body hit to pop.
+	max_contacts_reported = 1
+	# Clients don't process body_entered (server guard) — skip contact tracking entirely.
+	if not multiplayer.is_server():
+		contact_monitor = false
+
+
+func _setup() -> void:
 	_nudge_timer = randf_range(0.0, NUDGE_INTERVAL)
 	_wind_dir = Vector3(randf_range(-1.0, 1.0), 0.0, randf_range(-1.0, 1.0)).normalized()
 
@@ -62,7 +78,7 @@ func _ready() -> void:
 	gravity_scale = 0.0
 	linear_damp = LINEAR_DAMP
 	angular_damp = 10.0
-	continuous_cd = true
+	continuous_cd = false  # Bubbles are large (1.2m) and heavily damped — won't tunnel
 	lock_rotation = true
 
 	var phys_mat := PhysicsMaterial.new()
@@ -70,31 +86,40 @@ func _ready() -> void:
 	phys_mat.friction = FRICTION
 	physics_material_override = phys_mat
 
-	collision_layer = 4  # Layer 3: bubbles
-	collision_mask = 1   # World only (bubble-to-bubble handled by BubbleSeparationManager)
+	if GameManager.debug_bubble_no_collision:
+		collision_layer = 4  # Keep layer so Area3D sensors still detect it
+		collision_mask = 0   # Don't collide with anything
+	else:
+		collision_layer = 4  # Layer 3: bubbles
+		collision_mask = 1   # World only — bubble overlap detected via intersect_shape query
+	if GameManager.debug_bubble_no_ccd:
+		continuous_cd = false
+	if GameManager.debug_bubble_no_contact_monitor:
+		contact_monitor = false
 
-	contact_monitor = true
-	max_contacts_reported = 4
+	add_to_group("bubbles")
+
+	# Pre-allocate overlap query for Jolt broadphase lookups (server only).
 	if multiplayer.is_server():
-		body_entered.connect(_on_body_entered)
-		# Register with centralized spatial-hash separation manager
-		var manager := _find_separation_manager()
-		if manager:
-			manager.register(self)
+		_overlap_shape = SphereShape3D.new()
+		_overlap_shape.radius = BUBBLE_RADIUS  # 0.6m — overlaps another 0.6m bubble at < 1.2m
+		_overlap_query = PhysicsShapeQueryParameters3D.new()
+		_overlap_query.shape = _overlap_shape
+		_overlap_query.collision_mask = 4  # Layer 3 (bubbles) only
+		_overlap_query.collide_with_bodies = true
+		_overlap_query.collide_with_areas = false
+		_overlap_query.exclude = [get_rid()]
 
 	_setup_visual()
 
-
-func _exit_tree() -> void:
-	if multiplayer.is_server():
-		var manager := _find_separation_manager()
-		if manager:
-			manager.unregister(self)
 
 
 func _setup_visual() -> void:
 	var mesh_inst := get_node_or_null("MeshInstance3D")
 	if mesh_inst == null:
+		return
+	if GameManager.debug_hide_bubbles:
+		mesh_inst.visible = false
 		return
 	var mat := StandardMaterial3D.new()
 	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
@@ -111,19 +136,16 @@ func _setup_visual() -> void:
 	mesh_inst.material_override = mat
 
 
-func _physics_process(delta: float) -> void:
-	if not multiplayer.is_server():
+func _server_process(delta: float) -> void:
+	if _has_popped:
 		return
-
-	_lifetime += delta
-	if _lifetime >= LIFETIME and not _has_popped:
-		_pop()
+	if GameManager.debug_bubble_no_processing:
 		return
 
 	# Gentle persistent wind
 	apply_central_force(_wind_dir * WIND_STRENGTH)
 
-	# Brownian drift
+	# Brownian drift + overlap repulsion + player overlap at ~8Hz
 	_nudge_timer -= delta
 	if _nudge_timer <= 0.0:
 		apply_central_force(Vector3(
@@ -134,19 +156,31 @@ func _physics_process(delta: float) -> void:
 		_wind_dir = _wind_dir.rotated(Vector3.UP, randf_range(-0.2, 0.2))
 		_nudge_timer = NUDGE_INTERVAL
 
-	_check_player_overlap()
+		# Drift away from first overlapping bubble (Jolt broadphase query, O(1) amortized)
+		if not GameManager.debug_bubble_no_separation:
+			var my_pos: Vector3 = global_position
+			_overlap_query.transform = Transform3D(Basis(), my_pos)
+			var space := get_world_3d().direct_space_state
+			var results: Array[Dictionary] = space.intersect_shape(_overlap_query, 1)
+			if results.size() > 0:
+				var other: Node = results[0].collider
+				var dist_sq: float = my_pos.distance_squared_to(other.global_position)
+				if dist_sq > 0.0001:
+					var dist: float = sqrt(dist_sq)
+					apply_central_force((my_pos - other.global_position) / dist * OVERLAP_PUSH)
+
+		_check_player_overlap()
 
 
 # ======================================================================
 #  Collision / pop detection
 # ======================================================================
 
-func _on_body_entered(body: Node) -> void:
-	if not multiplayer.is_server() or _has_popped:
+func _on_body_hit(body: Node) -> void:
+	if _has_popped:
 		return
 
-	if _lifetime < 0.15 and body is CharacterBody3D and body.name.to_int() == _shooter_id:
-		return
+	# Shooter immunity handled by base class _on_body_entered → _is_shooter_immune
 
 	var bubble_speed := linear_velocity.length()
 	var bubble_ke := 0.5 * mass * bubble_speed * bubble_speed
@@ -179,20 +213,22 @@ func _is_bubble(node: Node) -> bool:
 	return node is RigidBody3D and node != self and node.get("is_bubble") == true
 
 
-func _find_separation_manager() -> BubbleSeparationManager:
-	var scene := get_tree().current_scene
-	if scene:
-		return scene.get_node_or_null("BubbleSeparationManager") as BubbleSeparationManager
-	return null
+func _check_character_overlaps() -> void:
+	# Skip the expensive intersect_shape() query entirely for bubbles.
+	# Bubbles weigh 0.1kg — the reduced-mass push on players is effectively zero.
+	# Player damage is handled by _check_player_overlap() instead (simple distance check).
+	return
 
 
 func _check_player_overlap() -> void:
 	if _has_popped:
 		return
 
-	# Cache Players container lookup
+	# Cached reference to the Players node for overlap checks
 	if not _players_cache_valid:
-		_players_container = get_tree().current_scene.get_node_or_null("Players")
+		var scene := get_tree().current_scene
+		if scene:
+			_players_container = scene.get_node_or_null("Players")
 		_players_cache_valid = true
 
 	if _players_container == null:
@@ -217,23 +253,29 @@ func take_damage(_amount: float, _attacker_id: int) -> void:
 		_pop()
 
 
-func apply_push_impulse(impulse: Vector3) -> void:
-	if not _has_popped:
-		apply_central_impulse(impulse)
-
-
 # ======================================================================
-#  Pop VFX
+#  Pop / destruction
 # ======================================================================
 
-func _pop() -> void:
+func _on_destroyed() -> void:
+	## Lifetime expired — pop with the same VFX as a player hit.
 	if _has_popped:
 		return
 	_has_popped = true
+	_show_pop_fx.rpc(get_global_transform_interpolated().origin)
 
+
+func _pop() -> void:
+	## Bubble-specific destruction: sets _has_popped flag and calls base _terminate().
+	if _has_popped:
+		return
+	_has_popped = true
+	# Use _is_terminated + queue_free from base, but trigger VFX first
 	if multiplayer.is_server():
-		_show_pop_fx.rpc(global_position)
-
+		_show_pop_fx.rpc(get_global_transform_interpolated().origin)
+	# Don't call _terminate() since we handle queue_free directly here
+	# (base _terminate would call _on_destroyed which we don't use — we have _pop)
+	_is_terminated = true
 	queue_free()
 
 
