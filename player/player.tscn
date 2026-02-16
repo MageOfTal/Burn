@@ -1,4 +1,4 @@
-[gd_scene load_steps=22 format=3 uid="uid://player001"]
+[gd_scene load_steps=21 format=3 uid="uid://player001"]
 
 [ext_resource type="Script" path="res://player/player.gd" id="1_player"]
 [ext_resource type="Script" path="res://player/player_camera.gd" id="2_camera"]
@@ -15,10 +15,11 @@
 [ext_resource type="Script" path="res://player/grapple_system.gd" id="13_grapple"]
 [ext_resource type="Script" path="res://player/demon_system.gd" id="14_demon"]
 [ext_resource type="Shader" path="res://player/player_dissolve.gdshader" id="15_dissolve"]
+[ext_resource type="PackedScene" path="res://player/store_ui.tscn" id="16_store_ui"]
 
 [sub_resource type="ShaderMaterial" id="DissolveMaterial_001"]
 shader = ExtResource("15_dissolve")
-shader_parameter/albedo_color = Color(0.5, 0.5, 0.5, 1.0)
+shader_parameter/albedo_color = Color(1.0, 1.0, 1.0, 1.0)
 shader_parameter/alpha_fade = 1.0
 
 [sub_resource type="CapsuleShape3D" id="CapsuleShape3D_001"]
@@ -93,12 +94,18 @@ properties/19/replication_mode = 1
 properties/20/path = NodePath("DemonSystem:is_eliminated")
 properties/20/spawn = true
 properties/20/replication_mode = 1
-properties/21/path = NodePath(".:equipped_ads_fov")
+properties/21/path = NodePath("DemonSystem:is_being_caught")
 properties/21/spawn = true
 properties/21/replication_mode = 1
-properties/22/path = NodePath(".:equipped_has_scope")
+properties/22/path = NodePath(".:equipped_ads_fov")
 properties/22/spawn = true
 properties/22/replication_mode = 1
+properties/23/path = NodePath(".:equipped_has_scope")
+properties/23/spawn = true
+properties/23/replication_mode = 1
+properties/24/path = NodePath(".:active_bonuses")
+properties/24/spawn = true
+properties/24/replication_mode = 1
 
 [sub_resource type="SceneReplicationConfig" id="InputSyncConfig"]
 properties/0/path = NodePath("PlayerInput:input_direction")
@@ -146,9 +153,13 @@ properties/13/replication_mode = 1
 properties/14/path = NodePath("PlayerInput:action_forfeit")
 properties/14/spawn = true
 properties/14/replication_mode = 1
+properties/15/path = NodePath("PlayerInput:scrap_inv_count")
+properties/15/spawn = true
+properties/15/replication_mode = 1
 
 [node name="Player" type="CharacterBody3D"]
-collision_mask = 19
+collision_layer = 128
+collision_mask = 147
 floor_max_angle = 1.0472
 floor_snap_length = 0.3
 script = ExtResource("1_player")
@@ -221,4 +232,7 @@ script = ExtResource("14_demon")
 [node name="PlayerHUD" parent="HUDLayer" instance=ExtResource("6_hud")]
 
 [node name="InventoryUI" parent="HUDLayer" instance=ExtResource("8_inventory_ui")]
+visible = false
+
+[node name="StoreUI" parent="HUDLayer" instance=ExtResource("16_store_ui")]
 visible = false

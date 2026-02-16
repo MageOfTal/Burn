@@ -1,13 +1,18 @@
 extends Control
 
 ## Player HUD: displays health, heat, 6 weapon slots, time currency,
-## compass strip with markers, and zone info.
+## compass strip with markers, zone info, kill feed, forfeit ring,
+## demon vignette, victory screen, and FPS counter.
 ## Only active for the local player.
+##
+## Composite widgets are extracted into player/hud/ scripts:
+##   HUDCompass, HUDKillFeed, HUDForfeitRing, HUDDemonVignette, HUDVictoryScreen
 
 @onready var health_bar: ProgressBar = $MarginContainer/VBoxLeft/HealthBar
 @onready var heat_bar: ProgressBar = $MarginContainer/VBoxLeft/HeatBar
 @onready var time_currency_label: Label = $MarginContainer/VBoxLeft/TimeCurrencyLabel
 @onready var shoe_slot_label: Label = $MarginContainer/VBoxLeft/ShoeSlotLabel
+@onready var kill_currency_label: Label = $MarginContainer/VBoxLeft/KillCurrencyLabel
 @onready var fuel_label: Label = $MarginContainer/VBoxLeft/FuelLabel
 @onready var inventory_list: VBoxContainer = $MarginContainer/VBoxRight/InventoryList
 @onready var fever_label: Label = $FeverLabel
@@ -29,49 +34,30 @@ const RARITY_TAGS := ["C", "U", "R", "E", "L"]
 ## Zone info label (created in code, shown at bottom center)
 var _zone_label: Label = null
 
-## Kill feed (left side, scrolling event log)
-var _kill_feed_container: VBoxContainer = null
-const KILL_FEED_MAX := 6
-const KILL_FEED_DISPLAY_TIME := 8.0
-const KILL_FEED_FADE_TIME := 1.5
+## FPS counter (top-left corner)
+var _fps_hud_label: Label = null
+var _fps_hud_timer: float = 0.0
+var _physics_tick_count: int = 0
+var _physics_tps: int = 0
 
-## Victory screen overlay
-var _victory_overlay: Control = null
+## Wall-clock TPS measurement — uses monotonic Time.get_ticks_msec() so it's
+## independent of both _process delta and _physics_process delta.  This catches
+## physics falling behind real time (e.g. max_physics_steps_per_frame cap).
+var _wallclock_last_ms: int = 0         ## Time.get_ticks_msec() at last TPS reset
+var _wallclock_tick_count: int = 0      ## physics ticks since last reset
+var _wallclock_tps: int = 0             ## TPS derived from wall-clock elapsed
 
-## Forfeit progress ring
-var _forfeit_ring: Control = null
-var _forfeit_label: Label = null
-var _forfeit_hold_time: float = 0.0
-const FORFEIT_DURATION := 3.0
+## FPS throttle — cycle through caps with F9/F10
+const FPS_CAPS := [0, 120, 60, 30, 15, 10, 5]  ## 0 = unlimited
+var _fps_cap_index: int = 0
+var _f9_was_pressed: bool = false
 
-## Demon proximity red vignette
-var _demon_vignette: ColorRect = null
-var _demon_vignette_material: ShaderMaterial = null
-
-# ======================================================================
-#  Compass strip
-# ======================================================================
-
-const COMPASS_WIDTH := 600.0
-const COMPASS_HEIGHT := 28.0
-const COMPASS_FOV := 180.0  ## Degrees visible across the strip width
-const CARDINALS := ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-const CARDINAL_BEARINGS := [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
-
-var _compass_container: Control = null
-var _compass_labels: Array[Label] = []   ## 8 cardinal direction labels
-var _compass_ticks: Array[ColorRect] = [] ## Tick marks every 15°
-var _compass_center_mark: ColorRect = null
-
-## Player-placed world marker (MMB)
-var _player_marker_pos: Vector3 = Vector3.INF
-var _marker_icon: Label = null
-var _marker_dist_label: Label = null
-var _last_marker_count := 0
-
-## Demon indicator on compass
-var _demon_icon: Label = null
-var _demon_dist_label: Label = null
+## Extracted widgets
+var _compass: HUDCompass = null
+var _kill_feed: HUDKillFeed = null
+var _forfeit_ring: HUDForfeitRing = null
+var _demon_vignette: HUDDemonVignette = null
+var _victory_screen: HUDVictoryScreen = null
 
 
 func setup(player: CharacterBody3D) -> void:
@@ -104,7 +90,7 @@ func setup(player: CharacterBody3D) -> void:
 			_slot_labels.append(entry)
 
 	if inventory_hint:
-		inventory_hint.text = "1-6: switch  |  E: pickup  |  F: extend  |  X: scrap  |  TAB: inventory"
+		inventory_hint.text = "1-6: switch  |  E: pickup/store  |  F: extend  |  X: scrap ground  |  O: scrap equipped  |  TAB: inventory"
 
 	# Create zone info label at bottom center
 	_zone_label = Label.new()
@@ -117,40 +103,126 @@ func setup(player: CharacterBody3D) -> void:
 	_zone_label.offset_right = 250
 	add_child(_zone_label)
 
-	# Build compass strip
-	_create_compass()
+	# --- Extracted widgets ---
 
-	# Build kill feed container (left side, below stats)
-	_create_kill_feed()
+	# Demon vignette (added first so it renders behind everything)
+	_demon_vignette = HUDDemonVignette.new()
+	_demon_vignette.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_demon_vignette.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_demon_vignette)
+	move_child(_demon_vignette, 0)
+	_demon_vignette.setup(player)
 
-	# Forfeit progress ring (center of screen, hidden by default)
-	_create_forfeit_ring()
+	# Compass strip
+	_compass = HUDCompass.new()
+	_compass.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_compass.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_compass)
+	_compass.setup(player)
 
-	# Demon proximity vignette (behind all other HUD elements)
-	_create_demon_vignette()
+	# Kill feed
+	_kill_feed = HUDKillFeed.new()
+	_kill_feed.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_kill_feed.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_kill_feed)
+	_kill_feed.setup(player)
+
+	# Forfeit ring
+	_forfeit_ring = HUDForfeitRing.new()
+	_forfeit_ring.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_forfeit_ring.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_forfeit_ring)
+	_forfeit_ring.setup(player)
+
+	# Victory screen (builds on demand when show_victory_screen is called)
+	_victory_screen = HUDVictoryScreen.new()
+	_victory_screen.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_victory_screen.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_victory_screen)
+
+	# FPS counter (top-left corner)
+	_fps_hud_label = Label.new()
+	_fps_hud_label.text = ""
+	_fps_hud_label.add_theme_font_size_override("font_size", 14)
+	_fps_hud_label.add_theme_color_override("font_color", Color(0.7, 0.9, 0.7))
+	_fps_hud_label.set_anchors_preset(Control.PRESET_TOP_LEFT)
+	_fps_hud_label.offset_left = 10
+	_fps_hud_label.offset_top = 10
+	_fps_hud_label.offset_right = 350
+	_fps_hud_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	_fps_hud_label.visible = GameManager.show_fps_hud
+	add_child(_fps_hud_label)
 
 
-func _process(_delta: float) -> void:
+func _physics_process(_delta: float) -> void:
+	_physics_tick_count += 1
+	_wallclock_tick_count += 1
+
+	# Wall-clock TPS: compare ticks against monotonic clock, not _process delta
+	var now_ms: int = Time.get_ticks_msec()
+	if _wallclock_last_ms == 0:
+		_wallclock_last_ms = now_ms  # First tick — seed the clock
+	var wall_elapsed_ms: int = now_ms - _wallclock_last_ms
+	if wall_elapsed_ms >= 1000:
+		_wallclock_tps = roundi(float(_wallclock_tick_count) / (float(wall_elapsed_ms) / 1000.0))
+		_wallclock_tick_count = 0
+		_wallclock_last_ms = now_ms
+
+	# Compass marker raycast must run in physics tick (threaded physics safety).
+	if _compass:
+		_compass.physics_process_marker()
+
+
+func _process(delta: float) -> void:
 	if _player == null or not is_instance_valid(_player):
 		return
 
 	_update_health()
 	_update_heat()
 	_update_fuel()
+	_update_kill_currency()
 	_update_shoe_display()
 	_update_inventory_display()
 	_update_zone_display()
-	_update_compass()
-	_handle_marker_input()
-	_update_forfeit_ring()
-	_update_demon_vignette()
+	_update_fps_hud(delta)
 
+	# Delegate to widgets
+	if _compass:
+		_compass.update_compass()
+	if _forfeit_ring:
+		_forfeit_ring.update_forfeit_ring()
+	if _demon_vignette:
+		_demon_vignette.update_demon_vignette()
+
+
+# ======================================================================
+#  Public API — called by external systems (NetworkManager RPCs)
+# ======================================================================
+
+func add_kill_feed_entry(bbcode_text: String) -> void:
+	## Called by NetworkManager RPC to add a kill feed entry.
+	if _kill_feed:
+		_kill_feed.add_kill_feed_entry(bbcode_text)
+
+
+func show_victory_screen(winner_id: int, winner_name: String, my_id: int) -> void:
+	## Called by NetworkManager RPC to display the victory overlay.
+	if _victory_screen:
+		_victory_screen.show_victory_screen(winner_id, winner_name, my_id)
+
+
+# ======================================================================
+#  Core HUD updates (health, heat, fuel, shoes, inventory, zone)
+# ======================================================================
 
 func _update_health() -> void:
 	if health_bar == null:
 		return
 	health_bar.value = _player.health
-	health_bar.max_value = _player.MAX_HEALTH
+	if _player.has_method("get_max_health"):
+		health_bar.max_value = _player.get_max_health()
+	else:
+		health_bar.max_value = _player.MAX_HEALTH
 
 
 func _update_heat() -> void:
@@ -183,6 +255,23 @@ func _update_fuel() -> void:
 		fuel_label.modulate = Color(1.0, 0.6, 0.2)
 
 
+func _update_kill_currency() -> void:
+	if kill_currency_label == null or _inventory == null:
+		return
+	var tokens: float = _inventory.kill_currency
+	# Show fractional tokens (e.g. "2.25") or whole number (e.g. "3")
+	if tokens == floorf(tokens):
+		kill_currency_label.text = "KILLS: %d" % int(tokens)
+	else:
+		kill_currency_label.text = "KILLS: %s" % str(snapped(tokens, 0.01)).rstrip("0")
+	if tokens >= 5.0:
+		kill_currency_label.modulate = Color(1.0, 0.85, 0.1)  # Gold
+	elif tokens >= 1.0:
+		kill_currency_label.modulate = Color(0.9, 0.15, 0.15)  # Crimson
+	else:
+		kill_currency_label.modulate = Color(0.5, 0.5, 0.5)  # Gray
+
+
 func _update_shoe_display() -> void:
 	if shoe_slot_label == null or _inventory == null:
 		return
@@ -200,8 +289,18 @@ func _update_shoe_display() -> void:
 	if spd != null:
 		bonus_pct = spd * 100.0
 
-	shoe_slot_label.text = "SHOES: [%s] %s - %ds (+%.0f%%)" % [
-		rarity_tag, shoe.item_data.item_name, time_remaining, bonus_pct]
+	# Build trinket effects string
+	var trinket_info := ""
+	if shoe.slotted_trinkets.size() > 0:
+		var effects: Array[String] = []
+		for trinket in shoe.slotted_trinkets:
+			if trinket is TrinketData and trinket.extra_jumps > 0:
+				effects.append("+%d Jump" % trinket.extra_jumps)
+		if effects.size() > 0:
+			trinket_info = " | " + " ".join(effects)
+
+	shoe_slot_label.text = "SHOES: [%s] %s - %ds (+%.0f%%)%s" % [
+		rarity_tag, shoe.item_data.item_name, time_remaining, bonus_pct, trinket_info]
 
 	if shoe.burn_time_remaining < 15.0:
 		shoe_slot_label.modulate = Color.RED
@@ -255,7 +354,6 @@ func _update_zone_display() -> void:
 
 	_zone_label.visible = true
 
-	# Check if player is outside zone
 	var player_xz := Vector2(_player.global_position.x, _player.global_position.z)
 	var dist_to_center := player_xz.distance_to(zm.zone_center)
 	var outside: bool = dist_to_center > zm.zone_radius
@@ -280,526 +378,34 @@ func _update_zone_display() -> void:
 
 
 # ======================================================================
-#  Compass strip — horizontal bar at top of screen
+#  FPS HUD
 # ======================================================================
 
-func _create_compass() -> void:
-	## Build the compass UI: background strip, cardinal labels, tick marks,
-	## center notch, and marker/demon indicator icons.
-	_compass_container = Control.new()
-	_compass_container.set_anchors_preset(Control.PRESET_CENTER_TOP)
-	_compass_container.offset_left = -COMPASS_WIDTH * 0.5
-	_compass_container.offset_right = COMPASS_WIDTH * 0.5
-	_compass_container.offset_top = 10.0
-	_compass_container.offset_bottom = 10.0 + COMPASS_HEIGHT
-	_compass_container.clip_contents = true
-	_compass_container.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	add_child(_compass_container)
+func _update_fps_hud(delta: float) -> void:
+	# Handle FPS throttle input (works even when HUD is hidden)
+	var f9_pressed: bool = Input.is_key_pressed(KEY_F9)
+	if f9_pressed and not _f9_was_pressed:
+		_fps_cap_index = (_fps_cap_index + 1) % FPS_CAPS.size()
+		Engine.max_fps = FPS_CAPS[_fps_cap_index]
+		print("[HUD] FPS cap: %s" % ("unlimited" if FPS_CAPS[_fps_cap_index] == 0 else str(FPS_CAPS[_fps_cap_index])))
+	_f9_was_pressed = f9_pressed
 
-	# Dark semi-transparent background
-	var bg := ColorRect.new()
-	bg.color = Color(0.0, 0.0, 0.0, 0.45)
-	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
-	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_compass_container.add_child(bg)
-
-	# Cardinal direction labels (N, NE, E, SE, S, SW, W, NW)
-	_compass_labels.clear()
-	for i in CARDINALS.size():
-		var lbl := Label.new()
-		lbl.text = CARDINALS[i]
-		lbl.add_theme_font_size_override("font_size", 13)
-		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		# N is highlighted red, main cardinals are white, inter-cardinals are grey
-		if CARDINALS[i] == "N":
-			lbl.add_theme_color_override("font_color", Color(1.0, 0.3, 0.3))
-		elif CARDINALS[i].length() == 1:  # E, S, W
-			lbl.add_theme_color_override("font_color", Color(0.95, 0.95, 0.95))
-		else:  # NE, SE, SW, NW
-			lbl.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
-		lbl.size = Vector2(30, COMPASS_HEIGHT)
-		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		_compass_container.add_child(lbl)
-		_compass_labels.append(lbl)
-
-	# Tick marks every 15° (24 ticks for 360°)
-	_compass_ticks.clear()
-	for i in 24:
-		var tick := ColorRect.new()
-		var deg: float = i * 15.0
-		# Taller tick at cardinals (0, 90, 180, 270), shorter at others
-		var is_cardinal := int(deg) % 90 == 0
-		var tick_h := 12.0 if is_cardinal else 6.0
-		tick.size = Vector2(1.0, tick_h)
-		tick.color = Color(0.5, 0.5, 0.5, 0.6) if not is_cardinal else Color(0.8, 0.8, 0.8, 0.8)
-		tick.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		_compass_container.add_child(tick)
-		_compass_ticks.append(tick)
-
-	# Center notch — thin white line at strip center
-	_compass_center_mark = ColorRect.new()
-	_compass_center_mark.size = Vector2(2.0, COMPASS_HEIGHT)
-	_compass_center_mark.color = Color(1.0, 1.0, 1.0, 0.8)
-	_compass_center_mark.position = Vector2(COMPASS_WIDTH * 0.5 - 1.0, 0.0)
-	_compass_center_mark.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_compass_container.add_child(_compass_center_mark)
-
-	# Player marker icon (cyan ▼ + distance) — hidden until MMB is pressed
-	_marker_icon = Label.new()
-	_marker_icon.text = "▼"
-	_marker_icon.add_theme_font_size_override("font_size", 16)
-	_marker_icon.add_theme_color_override("font_color", Color(0.2, 0.9, 1.0))
-	_marker_icon.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_marker_icon.size = Vector2(20, COMPASS_HEIGHT)
-	_marker_icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_marker_icon.visible = false
-	_compass_container.add_child(_marker_icon)
-
-	_marker_dist_label = Label.new()
-	_marker_dist_label.add_theme_font_size_override("font_size", 11)
-	_marker_dist_label.add_theme_color_override("font_color", Color(0.2, 0.9, 1.0))
-	_marker_dist_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_marker_dist_label.size = Vector2(40, 16)
-	_marker_dist_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_marker_dist_label.visible = false
-	# Position just below the compass strip
-	add_child(_marker_dist_label)
-
-	# Demon indicator (red ▼ + distance)
-	_demon_icon = Label.new()
-	_demon_icon.text = "▼"
-	_demon_icon.add_theme_font_size_override("font_size", 16)
-	_demon_icon.add_theme_color_override("font_color", Color(1.0, 0.15, 0.1))
-	_demon_icon.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_demon_icon.size = Vector2(20, COMPASS_HEIGHT)
-	_demon_icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_demon_icon.visible = false
-	_compass_container.add_child(_demon_icon)
-
-	_demon_dist_label = Label.new()
-	_demon_dist_label.add_theme_font_size_override("font_size", 11)
-	_demon_dist_label.add_theme_color_override("font_color", Color(1.0, 0.15, 0.1))
-	_demon_dist_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_demon_dist_label.size = Vector2(40, 16)
-	_demon_dist_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_demon_dist_label.visible = false
-	add_child(_demon_dist_label)
-
-
-func _get_heading() -> float:
-	## Player heading in degrees (0=North/+Z, 90=East/+X, clockwise).
-	return fmod(-rad_to_deg(_player.rotation.y) + 360.0, 360.0)
-
-
-func _bearing_to_px(bearing_deg: float, heading_deg: float) -> float:
-	## Convert a world bearing to a pixel X offset within the compass strip.
-	## Returns the X position relative to the compass container's left edge.
-	## Values outside [0, COMPASS_WIDTH] are off-strip.
-	var diff := bearing_deg - heading_deg
-	diff = fmod(diff + 540.0, 360.0) - 180.0  # normalize to -180..180
-	return COMPASS_WIDTH * 0.5 + diff / (COMPASS_FOV * 0.5) * (COMPASS_WIDTH * 0.5)
-
-
-func _update_compass() -> void:
-	if _compass_container == null or _player == null:
+	if _fps_hud_label == null:
 		return
-
-	var heading := _get_heading()
-	var half_w := COMPASS_WIDTH * 0.5
-
-	# Position cardinal labels
-	for i in _compass_labels.size():
-		var px := _bearing_to_px(CARDINAL_BEARINGS[i], heading)
-		var lbl: Label = _compass_labels[i]
-		lbl.position = Vector2(px - lbl.size.x * 0.5, 0.0)
-		lbl.visible = (px > -20.0 and px < COMPASS_WIDTH + 20.0)
-
-	# Position tick marks (every 15°, 24 total)
-	for i in _compass_ticks.size():
-		var deg: float = i * 15.0
-		var px := _bearing_to_px(deg, heading)
-		var tick: ColorRect = _compass_ticks[i]
-		tick.position = Vector2(px - tick.size.x * 0.5, COMPASS_HEIGHT - tick.size.y)
-		tick.visible = (px > -5.0 and px < COMPASS_WIDTH + 5.0)
-
-	# --- Player marker ---
-	if _player_marker_pos != Vector3.INF:
-		var to_marker: Vector3 = _player_marker_pos - _player.global_position
-		var marker_bearing: float = fmod(rad_to_deg(atan2(to_marker.x, to_marker.z)) + 360.0, 360.0)
-		var marker_dist: float = to_marker.length()
-		var px := _bearing_to_px(marker_bearing, heading)
-
-		# Clamp to edges if off-screen
-		var clamped_px := clampf(px, 10.0, COMPASS_WIDTH - 10.0)
-		_marker_icon.position = Vector2(clamped_px - _marker_icon.size.x * 0.5, 0.0)
-		_marker_icon.visible = true
-		# Show arrows at edges if clamped
-		if px < 10.0:
-			_marker_icon.text = "◀"
-		elif px > COMPASS_WIDTH - 10.0:
-			_marker_icon.text = "▶"
-		else:
-			_marker_icon.text = "▼"
-
-		# Distance label below compass
-		_marker_dist_label.text = "%.0fm" % marker_dist
-		_marker_dist_label.visible = true
-		# Position relative to parent (this Control), accounting for compass container offset
-		var global_x := _compass_container.offset_left + clamped_px
-		_marker_dist_label.set_anchors_preset(Control.PRESET_CENTER_TOP)
-		_marker_dist_label.offset_left = global_x - 20.0
-		_marker_dist_label.offset_right = global_x + 20.0
-		_marker_dist_label.offset_top = 10.0 + COMPASS_HEIGHT + 1.0
-		_marker_dist_label.offset_bottom = 10.0 + COMPASS_HEIGHT + 17.0
-	else:
-		_marker_icon.visible = false
-		_marker_dist_label.visible = false
-
-	# --- Demon indicator ---
-	var demon_sys: Node = _player.get_node_or_null("DemonSystem")
-
-	if demon_sys and demon_sys.demon_active and not demon_sys.is_eliminated:
-		var to_demon: Vector3 = Vector3(demon_sys.demon_position) - _player.global_position
-		var demon_bearing: float = fmod(rad_to_deg(atan2(to_demon.x, to_demon.z)) + 360.0, 360.0)
-		var demon_dist: float = Vector2(to_demon.x, to_demon.z).length()
-		var px := _bearing_to_px(demon_bearing, heading)
-
-		var clamped_px := clampf(px, 10.0, COMPASS_WIDTH - 10.0)
-		_demon_icon.position = Vector2(clamped_px - _demon_icon.size.x * 0.5, 0.0)
-		_demon_icon.visible = true
-		if px < 10.0:
-			_demon_icon.text = "◀"
-		elif px > COMPASS_WIDTH - 10.0:
-			_demon_icon.text = "▶"
-		else:
-			_demon_icon.text = "▼"
-
-		# Pulse brighter when close
-		var intensity := clampf(1.0 - (demon_dist - 10.0) / 40.0, 0.4, 1.0)
-		_demon_icon.add_theme_color_override("font_color", Color(intensity, 0.1 * intensity, 0.08 * intensity))
-
-		_demon_dist_label.text = "%.0fm" % demon_dist
-		_demon_dist_label.visible = true
-		_demon_dist_label.add_theme_color_override("font_color", Color(intensity, 0.1 * intensity, 0.08 * intensity))
-		var global_x := _compass_container.offset_left + clamped_px
-		_demon_dist_label.set_anchors_preset(Control.PRESET_CENTER_TOP)
-		_demon_dist_label.offset_left = global_x - 20.0
-		_demon_dist_label.offset_right = global_x + 20.0
-		_demon_dist_label.offset_top = 10.0 + COMPASS_HEIGHT + 1.0
-		_demon_dist_label.offset_bottom = 10.0 + COMPASS_HEIGHT + 17.0
-	else:
-		_demon_icon.visible = false
-		_demon_dist_label.visible = false
-
-
-# ======================================================================
-#  Kill feed (scrolling event log on left side)
-# ======================================================================
-
-func _create_kill_feed() -> void:
-	## Build the kill feed container on the left side of the screen.
-	_kill_feed_container = VBoxContainer.new()
-	_kill_feed_container.set_anchors_preset(Control.PRESET_TOP_LEFT)
-	_kill_feed_container.offset_left = 12.0
-	_kill_feed_container.offset_top = 220.0
-	_kill_feed_container.offset_right = 362.0
-	_kill_feed_container.offset_bottom = 500.0
-	_kill_feed_container.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	# Newest entries at the top
-	add_child(_kill_feed_container)
-
-
-func add_kill_feed_entry(bbcode_text: String) -> void:
-	## Add a new entry to the kill feed. Called by NetworkManager RPC.
-	if _kill_feed_container == null:
+	_fps_hud_label.visible = GameManager.show_fps_hud
+	if not _fps_hud_label.visible:
 		return
+	_fps_hud_timer += delta
+	if _fps_hud_timer >= 1.0:
+		# Scale tick count to exactly 1 second to compensate for timer overshoot
+		var elapsed: float = _fps_hud_timer
+		_physics_tps = roundi(float(_physics_tick_count) / elapsed)
+		_physics_tick_count = 0
+		_fps_hud_timer = 0.0  # Hard reset — carry-remainder drifts under heavy load
 
-	# Resolve player name placeholders ({P:peer_id}) to actual names.
-	# The local player's name is highlighted yellow; everyone else is plain white.
-	# This avoids substring matching issues (e.g. name "a" matching inside words).
-	var display_text := bbcode_text
-	if _player:
-		var my_id: int = _player.peer_id
-		var regex := RegEx.new()
-		regex.compile("\\{P:(\\d+)\\}")
-		var result := regex.search(display_text)
-		while result:
-			var pid := int(result.get_string(1))
-			var pname := GameManager.get_username(pid)
-			var replacement: String
-			if pid == my_id:
-				replacement = "[color=yellow]%s[/color]" % pname
-			else:
-				replacement = pname
-			display_text = display_text.substr(0, result.get_start()) + replacement + display_text.substr(result.get_end())
-			result = regex.search(display_text, result.get_start() + replacement.length())
-
-	var entry := RichTextLabel.new()
-	entry.bbcode_enabled = true
-	entry.fit_content = true
-	entry.scroll_active = false
-	entry.text = display_text
-	entry.add_theme_font_size_override("normal_font_size", 13)
-	entry.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	entry.custom_minimum_size = Vector2(350, 0)
-
-	# Semi-transparent dark background for readability
-	var style := StyleBoxFlat.new()
-	style.bg_color = Color(0.0, 0.0, 0.0, 0.4)
-	style.content_margin_left = 4.0
-	style.content_margin_right = 4.0
-	style.content_margin_top = 2.0
-	style.content_margin_bottom = 2.0
-	style.corner_radius_top_left = 3
-	style.corner_radius_top_right = 3
-	style.corner_radius_bottom_left = 3
-	style.corner_radius_bottom_right = 3
-	entry.add_theme_stylebox_override("normal", style)
-
-	# Insert at top (index 0)
-	_kill_feed_container.add_child(entry)
-	_kill_feed_container.move_child(entry, 0)
-
-	# Remove oldest if over limit
-	while _kill_feed_container.get_child_count() > KILL_FEED_MAX:
-		var oldest := _kill_feed_container.get_child(_kill_feed_container.get_child_count() - 1)
-		_kill_feed_container.remove_child(oldest)
-		oldest.queue_free()
-
-	# Auto-fade after display time
-	var tween := create_tween()
-	tween.tween_interval(KILL_FEED_DISPLAY_TIME)
-	tween.tween_property(entry, "modulate:a", 0.0, KILL_FEED_FADE_TIME)
-	tween.tween_callback(entry.queue_free)
-
-
-# ======================================================================
-#  Victory screen overlay
-# ======================================================================
-
-func show_victory_screen(winner_id: int, winner_name: String, my_id: int) -> void:
-	## Display the victory overlay. Called by NetworkManager RPC on all peers.
-	if _victory_overlay != null:
-		return
-
-	_victory_overlay = ColorRect.new()
-	_victory_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
-	_victory_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
-
-	var is_winner: bool = (winner_id == my_id)
-
-	if is_winner:
-		_victory_overlay.color = Color(0.05, 0.1, 0.0, 0.75)
-	else:
-		_victory_overlay.color = Color(0.05, 0.05, 0.1, 0.75)
-
-	# Main title
-	var title := Label.new()
-	if winner_id == -1:
-		title.text = "DRAW"
-		title.add_theme_color_override("font_color", Color(0.7, 0.7, 0.7))
-	elif is_winner:
-		title.text = "VICTORY"
-		title.add_theme_color_override("font_color", Color(1.0, 0.85, 0.1))
-	else:
-		title.text = "GAME OVER"
-		title.add_theme_color_override("font_color", Color(0.8, 0.4, 0.3))
-	title.add_theme_font_size_override("font_size", 64)
-	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	title.set_anchors_preset(Control.PRESET_CENTER)
-	title.offset_left = -400
-	title.offset_right = 400
-	title.offset_top = -100
-	title.offset_bottom = -30
-	_victory_overlay.add_child(title)
-
-	# Winner name subtitle
-	var sub := Label.new()
-	if winner_id == -1:
-		sub.text = "Everyone was eliminated!"
-	elif is_winner:
-		sub.text = "You are the last one standing!"
-	else:
-		sub.text = "%s is the last one standing!" % winner_name
-	sub.add_theme_font_size_override("font_size", 24)
-	sub.add_theme_color_override("font_color", Color(0.9, 0.9, 0.9))
-	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	sub.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	sub.set_anchors_preset(Control.PRESET_CENTER)
-	sub.offset_left = -400
-	sub.offset_right = 400
-	sub.offset_top = 0
-	sub.offset_bottom = 50
-	_victory_overlay.add_child(sub)
-
-	# Fade in
-	_victory_overlay.modulate = Color(1, 1, 1, 0)
-	add_child(_victory_overlay)
-	var tween := create_tween()
-	tween.tween_property(_victory_overlay, "modulate:a", 1.0, 1.0)
-
-
-# ======================================================================
-#  Marker placement (MMB)
-# ======================================================================
-
-func _handle_marker_input() -> void:
-	## Check if player pressed MMB to place/remove a world marker.
-	if _player == null:
-		return
-	var pi := _player.get_node_or_null("PlayerInput")
-	if pi == null or pi.marker_count <= _last_marker_count:
-		return
-	_last_marker_count = pi.marker_count
-
-	# Raycast from camera center forward to find terrain
-	var camera: Camera3D = _player.camera
-	if camera == null:
-		return
-
-	var cam_pos := camera.global_position
-	var cam_forward := -camera.global_transform.basis.z
-	var space_state := _player.get_world_3d().direct_space_state
-	var query := PhysicsRayQueryParameters3D.create(cam_pos, cam_pos + cam_forward * 200.0)
-	query.collision_mask = 1  # Terrain/world only
-	var result := space_state.intersect_ray(query)
-
-	var new_pos: Vector3
-	if not result.is_empty():
-		new_pos = result.position
-	else:
-		new_pos = cam_pos + cam_forward * 200.0
-
-	# Toggle: if marker already near the new point, remove it
-	if _player_marker_pos != Vector3.INF and _player_marker_pos.distance_to(new_pos) < 10.0:
-		_player_marker_pos = Vector3.INF
-	else:
-		_player_marker_pos = new_pos
-
-
-# ======================================================================
-#  Forfeit progress ring (hold P to self-kill)
-# ======================================================================
-
-func _create_forfeit_ring() -> void:
-	_forfeit_ring = Control.new()
-	_forfeit_ring.set_anchors_preset(Control.PRESET_CENTER)
-	_forfeit_ring.offset_left = -50
-	_forfeit_ring.offset_right = 50
-	_forfeit_ring.offset_top = -50
-	_forfeit_ring.offset_bottom = 50
-	_forfeit_ring.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_forfeit_ring.visible = false
-	_forfeit_ring.draw.connect(_draw_forfeit_ring)
-	add_child(_forfeit_ring)
-
-	_forfeit_label = Label.new()
-	_forfeit_label.text = "FORFEIT"
-	_forfeit_label.add_theme_font_size_override("font_size", 16)
-	_forfeit_label.add_theme_color_override("font_color", Color(1.0, 0.3, 0.2, 0.9))
-	_forfeit_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_forfeit_label.set_anchors_preset(Control.PRESET_CENTER)
-	_forfeit_label.offset_top = 55
-	_forfeit_label.offset_bottom = 75
-	_forfeit_label.offset_left = -50
-	_forfeit_label.offset_right = 50
-	_forfeit_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_forfeit_label.visible = false
-	add_child(_forfeit_label)
-
-
-func _update_forfeit_ring() -> void:
-	if _player == null or _forfeit_ring == null:
-		return
-	var pi: Node = _player.get_node_or_null("PlayerInput")
-	if pi == null:
-		return
-
-	if pi.action_forfeit and _player.is_alive:
-		_forfeit_hold_time += get_process_delta_time()
-		_forfeit_ring.visible = true
-		_forfeit_label.visible = true
-		_forfeit_ring.queue_redraw()
-	else:
-		if _forfeit_hold_time > 0.0:
-			_forfeit_hold_time = 0.0
-			_forfeit_ring.visible = false
-			_forfeit_label.visible = false
-
-
-func _draw_forfeit_ring() -> void:
-	if _forfeit_ring == null or not is_instance_valid(_forfeit_ring):
-		return
-	if _forfeit_hold_time <= 0.0:
-		return
-	var center := _forfeit_ring.size / 2.0
-	var radius := 40.0
-	var width := 4.0
-	var progress := clampf(_forfeit_hold_time / FORFEIT_DURATION, 0.0, 1.0)
-
-	# Background ring (dark grey, full circle)
-	_forfeit_ring.draw_arc(center, radius, 0.0, TAU, 64, Color(0.3, 0.3, 0.3, 0.5), width)
-
-	# Progress arc (red, fills clockwise from top)
-	var start_angle := -PI / 2.0
-	var end_angle := start_angle + TAU * progress
-	var color := Color(1.0, 0.2, 0.1, 0.9)
-	if progress > 0.8:
-		color = Color(1.0, 0.0, 0.0, 1.0)
-	_forfeit_ring.draw_arc(center, radius, start_angle, end_angle, 64, color, width)
-
-
-# ======================================================================
-#  Demon proximity red vignette
-# ======================================================================
-
-func _create_demon_vignette() -> void:
-	_demon_vignette = ColorRect.new()
-	_demon_vignette.set_anchors_preset(Control.PRESET_FULL_RECT)
-	_demon_vignette.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_demon_vignette.visible = false
-
-	var shader := Shader.new()
-	shader.code = "shader_type canvas_item;\n\nuniform float intensity : hint_range(0.0, 1.0) = 0.0;\n\nvoid fragment() {\n\tvec2 uv_centered = UV - vec2(0.5);\n\tfloat dist = length(uv_centered) * 2.0;\n\tfloat vignette = smoothstep(0.3, 1.2, dist);\n\tfloat alpha = vignette * intensity * 0.7;\n\tCOLOR = vec4(0.8, 0.0, 0.0, alpha);\n}\n"
-
-	_demon_vignette_material = ShaderMaterial.new()
-	_demon_vignette_material.shader = shader
-	_demon_vignette_material.set_shader_parameter("intensity", 0.0)
-	_demon_vignette.material = _demon_vignette_material
-
-	# Add as first child so it renders behind all other HUD elements
-	add_child(_demon_vignette)
-	move_child(_demon_vignette, 0)
-
-
-func _update_demon_vignette() -> void:
-	if _demon_vignette == null or _demon_vignette_material == null or _player == null:
-		return
-	if not is_instance_valid(_player):
-		return
-
-	var demon_sys: DemonSystem = _player.get_node_or_null("DemonSystem") as DemonSystem
-	if demon_sys == null or not is_instance_valid(demon_sys) or not demon_sys.demon_active or demon_sys.is_eliminated:
-		_demon_vignette.visible = false
-		return
-
-	if not _player.is_alive:
-		_demon_vignette.visible = false
-		return
-
-	# Hitbox-to-hitbox distance: subtract player capsule radius and demon catch radius
-	var center_dist: float = _player.global_position.distance_to(demon_sys.demon_position)
-	var edge_dist: float = maxf(center_dist - DemonSystem.DEMON_CATCH_RADIUS - 0.4, 0.0)
-
-	var threshold := 10.0  # Red frame starts appearing at 10m edge-to-edge
-
-	if edge_dist >= threshold:
-		_demon_vignette.visible = false
-		return
-
-	# Intensity ramps from 0 at 10m to 1 at 0m (touching)
-	var vignette_intensity: float = clampf(1.0 - (edge_dist / threshold), 0.0, 1.0)
-	_demon_vignette_material.set_shader_parameter("intensity", vignette_intensity)
-	_demon_vignette.visible = true
+	var cap_str: String = "" if _fps_cap_index == 0 else " | CAP: %d" % FPS_CAPS[_fps_cap_index]
+	_fps_hud_label.text = "FPS: %d | TPS: %d/%d%s" % [
+		Engine.get_frames_per_second(),
+		_wallclock_tps,
+		Engine.physics_ticks_per_second,
+		cap_str]

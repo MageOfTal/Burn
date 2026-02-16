@@ -154,6 +154,6 @@ func _apply_fade_to_mesh(mesh: MeshInstance3D) -> void:
 			if existing_mat is StandardMaterial3D:
 				new_mat.set_shader_parameter("albedo_color", existing_mat.albedo_color)
 			else:
-				new_mat.set_shader_parameter("albedo_color", Color(0.6, 0.6, 0.6, 1.0))
+				new_mat.set_shader_parameter("albedo_color", Color(1.0, 1.0, 1.0, 1.0))
 			new_mat.set_shader_parameter("alpha_fade", _fade_alpha)
 			mesh.material_override = new_mat

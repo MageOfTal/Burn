@@ -25,7 +25,8 @@ var look_pitch := 0.0
 var jump_count := 0       ## Space: jump
 var pickup_count := 0     ## E: pickup item / open chest
 var extend_count := 0     ## F: extend equipped item lifespan
-var scrap_count := 0      ## X: scrap item into fuel
+var scrap_count := 0      ## X: scrap ground item into fuel
+var scrap_inv_count := 0  ## O: scrap equipped inventory item into fuel
 var marker_count := 0     ## MMB: place/remove compass marker (client-only)
 var slot_count := 0       ## Weapon slot change event count
 var slot_select := 0      ## Which slot (1-6) was last selected
@@ -39,6 +40,8 @@ var action_forfeit := false  ## P: hold to forfeit (self-kill after 3s)
 
 ## Inventory UI state — when open, gameplay inputs are suppressed and mouse is freed.
 var inventory_open := false
+## Store UI state — when open, gameplay inputs are suppressed and mouse is freed.
+var store_open := false
 
 ## When true, this PlayerInput is driven by BotBrain — skip all keyboard/mouse handling.
 var is_bot := false
@@ -85,8 +88,8 @@ func _input(event: InputEvent) -> void:
 			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 		return  # Don't process anything else on the toggle frame
 
-	# When inventory is open, ignore mouse motion for camera control
-	if inventory_open:
+	# When inventory or store is open, ignore mouse motion for camera control
+	if inventory_open or store_open:
 		return
 
 	# Skip mouse capture when debug freecam is active
@@ -101,7 +104,7 @@ func _input(event: InputEvent) -> void:
 	# Any mouse click re-captures if needed (but does NOT consume the event,
 	# so the click still registers as shoot/pickup/etc.)
 	# Skip re-capture when inventory is open so UI buttons remain clickable.
-	if event is InputEventMouseButton and event.pressed and not inventory_open:
+	if event is InputEventMouseButton and event.pressed and not inventory_open and not store_open:
 		if Input.get_mouse_mode() != Input.MOUSE_MODE_CAPTURED:
 			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
@@ -123,8 +126,8 @@ func _physics_process(_delta: float) -> void:
 		_mouse_delta = Vector2.ZERO
 		return
 
-	# When inventory is open, zero held gameplay inputs (counters just don't increment)
-	if inventory_open:
+	# When inventory or store is open, zero held gameplay inputs (counters just don't increment)
+	if inventory_open or store_open:
 		input_direction = Vector2.ZERO
 		action_shoot = false
 		action_slide = false
@@ -169,6 +172,8 @@ func _physics_process(_delta: float) -> void:
 		extend_count += 1
 	if Input.is_action_just_pressed("scrap_item"):
 		scrap_count += 1
+	if Input.is_action_just_pressed("scrap_inventory"):
+		scrap_inv_count += 1
 	if Input.is_action_just_pressed("place_marker"):
 		marker_count += 1
 

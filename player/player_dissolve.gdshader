@@ -2,7 +2,7 @@ shader_type spatial;
 render_mode blend_mix, depth_draw_opaque, cull_back;
 
 // Base color for the player mesh.
-uniform vec4 albedo_color : source_color = vec4(0.5, 0.5, 0.5, 1.0);
+uniform vec4 albedo_color : source_color = vec4(1.0, 1.0, 1.0, 1.0);
 // Driven by player_camera.gd: 1.0 = fully visible, 0.0 = fully invisible.
 uniform float alpha_fade : hint_range(0.0, 1.0) = 1.0;
 
@@ -29,8 +29,13 @@ void fragment() {
 	// Dithered dissolve: discard pixels whose Bayer threshold exceeds alpha_fade.
 	// When alpha_fade == 1.0 no pixels are discarded (fully opaque).
 	// When alpha_fade == 0.0 all pixels are discarded (fully invisible).
-	float threshold = bayer4x4(FRAGCOORD.xy);
-	if (alpha_fade < threshold + 0.001) {
-		discard;
+	// Skip discard during shadow/depth passes so the shadow stays solid.
+	// Shadow passes use orthographic projection where PROJECTION_MATRIX[3][2] == 0.
+	bool is_shadow_pass = PROJECTION_MATRIX[3][2] == 0.0;
+	if (!is_shadow_pass) {
+		float threshold = bayer4x4(FRAGCOORD.xy);
+		if (alpha_fade < threshold + 0.001) {
+			discard;
+		}
 	}
 }

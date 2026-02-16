@@ -8,7 +8,7 @@ extends CharacterBody3D
 ##   SlideCrouchSystem — slide/crouch physics
 ##   KamikazeSystem — kamikaze missile flight, explosion, flashbang
 ##   CombatVFX — weapon tracer lines, melee arcs, ADS visuals, scope
-##   ItemManager — item pickup, drop, extend, scrap
+##   ItemManager — item pickup, drop, extend, scrap ground (X), scrap equipped (O)
 ##   HeatSystem — heat/fever combat multipliers
 ##   Inventory — item storage, burn fuel, sacrifice
 ##   GrappleSystem — grappling hook swing physics
@@ -17,7 +17,7 @@ extends CharacterBody3D
 const WeaponProjectileScript = preload("res://weapons/weapon_projectile.gd")
 const WeaponMeleeScript = preload("res://weapons/weapon_melee.gd")
 
-const SPEED := 7.0
+const SPEED := 9.1
 const JUMP_VELOCITY := 10.5
 const MAX_HEALTH := 100.0
 const RESPAWN_DELAY := 3.0
@@ -28,9 +28,6 @@ const DECELERATION := 30.0         # ~0.23s to stop — slight momentum
 const AIR_ACCELERATION := 15.0
 const AIR_DECELERATION := 0.0        # No air friction — full momentum preservation
 
-## Rarity damage bonus: +15% per rarity tier
-const RARITY_DAMAGE_BONUS := 0.15
-
 var gravity: float = 17.5  ## Heavier gravity for snappy movement
 
 ## The peer ID that owns this player. Set by NetworkManager on spawn.
@@ -39,6 +36,11 @@ var peer_id: int = 1
 var is_bot: bool = false
 ## True when player is inside the Toad Dimension (immune to fall death).
 var in_toad_dimension: bool = false
+
+## Layer 10 (bit 512) — collision layer for the player's shadow body.
+## Always active — provides the player's RigidBody3D presence in Jolt's solver.
+const SHADOW_BODY_LAYER: int = 512
+const SHADOW_BODY_MASS: float = 80.0
 
 ## Combat state (synced via ServerSync)
 var health: float = MAX_HEALTH
@@ -57,14 +59,24 @@ var _last_jump := 0
 var _last_pickup := 0
 var _last_extend := 0
 var _last_scrap := 0
+var _last_scrap_inv := 0
 var _last_slot := 0
 ## Frame-local flag: true if jump was pressed this frame. Set at the top of
 ## _server_process() and read by subsystems (slide_crouch_system, etc.)
 var _frame_jump := false
+## Air-jump tracking for trinket-granted double jump. Reset on landing.
+var _air_jumps_used: int = 0
 
 ## Forfeit (hold P to self-kill)
 var _forfeit_hold_time := 0.0
 const FORFEIT_DURATION := 3.0
+
+## Kill store bonuses (persist after death, synced via ServerSync)
+## Array of bonus IDs (ints 0-12). Empty = no bonuses.
+var active_bonuses: Array = []
+
+## Second Wind bonus timer (Bonus ID 12)
+var _second_wind_timer: float = 0.0
 
 ## Synced weapon visual paths — clients use these to load 3D model + sound
 var equipped_gun_model_path: String = ""
@@ -103,6 +115,11 @@ var _original_mesh_scale_y: float = 1.0
 @onready var weapon_mount: Node3D = $WeaponMount
 @onready var fire_sound_player: AudioStreamPlayer3D = $FireSoundPlayer
 @onready var inventory_ui: Control = $HUDLayer/InventoryUI
+@onready var store_ui: Control = $HUDLayer/StoreUI
+
+## Player shadow body — dynamic RigidBody3D collision proxy, always active.
+## Added as a sibling node (not child) so Jolt treats it as independent.
+var shadow_body: ToadShadowBody = null
 
 ## Subsystem references
 @onready var slide_crouch: SlideCrouchSystem = $SlideCrouchSystem
@@ -129,6 +146,13 @@ func _enter_tree() -> void:
 		$PlayerInput.set_multiplayer_authority(peer_id)
 
 
+func _exit_tree() -> void:
+	# Clean up the shadow body (it's a sibling in the scene root, not a child)
+	if shadow_body != null and is_instance_valid(shadow_body):
+		shadow_body.queue_free()
+		shadow_body = null
+
+
 func _ready() -> void:
 	peer_id = name.to_int()
 	var my_id: int = multiplayer.get_unique_id()
@@ -136,9 +160,16 @@ func _ready() -> void:
 	print("[Player] _ready() — peer_id=%d  my_id=%d  is_local=%s  is_bot=%s  is_server=%s" % [
 		peer_id, my_id, str(is_local), str(is_bot), str(multiplayer.is_server())])
 
-	# Initialize sync vars to current position so remote clients don't lerp from origin
-	sync_position = global_position
-	sync_rotation_y = rotation.y
+	# Server: copy current position into sync vars so spawn replication sends it.
+	# Client: sync vars already received from the server (spawn=true), so apply
+	# them to the node's transform — otherwise the player starts at origin.
+	if multiplayer.is_server():
+		sync_position = global_position
+		sync_rotation_y = rotation.y
+	else:
+		if sync_position != Vector3.ZERO:
+			global_position = sync_position
+		rotation.y = sync_rotation_y
 
 	# Duplicate collision shape so runtime resize doesn't affect other players
 	var col_shape := $CollisionShape3D
@@ -150,6 +181,7 @@ func _ready() -> void:
 	_original_mesh_scale_y = body_mesh.scale.y
 
 	# Setup subsystems
+	heat_system.setup(self)
 	slide_crouch.setup(self)
 	kamikaze_system.setup(self)
 	combat_vfx.setup(self)
@@ -160,6 +192,13 @@ func _ready() -> void:
 	# Tell inventory which peer owns it so server→client sync works
 	if inventory:
 		inventory._owner_peer_id = peer_id
+
+	# Create the player's shadow body (server-only) — a dynamic RigidBody3D
+	# that gives the player a real physics presence in Jolt's solver.
+	# Without this, RigidBody3D objects (toads, boulders, etc.) can't push
+	# the CharacterBody3D because move_and_slide() is kinematic.
+	if multiplayer.is_server():
+		_create_shadow_body()
 
 	# Add VoxelViewer so the voxel terrain generates around each player.
 	if not is_bot and ClassDB.class_exists(&"VoxelViewer"):
@@ -172,10 +211,16 @@ func _ready() -> void:
 		player_input.is_bot = true
 		camera.current = false
 		camera_pivot.visible = false
+		# Bots are grey to distinguish from white players
+		if body_mesh and body_mesh.material_override is ShaderMaterial:
+			body_mesh.material_override = body_mesh.material_override.duplicate()
+			body_mesh.material_override.set_shader_parameter("albedo_color", Color(0.5, 0.5, 0.5, 1.0))
 		if player_hud:
 			player_hud.visible = false
 		if inventory_ui:
 			inventory_ui.visible = false
+		if store_ui:
+			store_ui.visible = false
 		if multiplayer.is_server():
 			var brain_script := preload("res://player/bot_brain.gd")
 			var brain := Node.new()
@@ -200,6 +245,9 @@ func _ready() -> void:
 		if inventory_ui and inventory_ui.has_method("setup"):
 			inventory_ui.setup(self)
 			inventory_ui.visible = false
+		if store_ui and store_ui.has_method("setup"):
+			store_ui.setup(self)
+			store_ui.visible = false
 		print("[Player] LOCAL player %d ready!" % peer_id)
 	else:
 		print("[Player] peer_id=%d is REMOTE — hiding HUD/camera" % peer_id)
@@ -209,6 +257,8 @@ func _ready() -> void:
 			player_hud.visible = false
 		if inventory_ui:
 			inventory_ui.visible = false
+		if store_ui:
+			store_ui.visible = false
 
 
 func _physics_process(delta: float) -> void:
@@ -224,17 +274,19 @@ func _physics_process(delta: float) -> void:
 	var freecam_frozen: bool = GameManager.debug_freecam_active and peer_id == multiplayer.get_unique_id()
 
 	if multiplayer.is_server() and not freecam_frozen:
+		# Tick Second Wind timer
+		if _second_wind_timer > 0.0:
+			_second_wind_timer -= delta
 		_server_process(delta)
 		# Update sync vars AFTER all server movement (normal, grapple, kamikaze, respawn)
 		sync_position = global_position
 		sync_rotation_y = rotation.y
 
-	# --- Client-side interpolation for REMOTE players ---
-	# Local player and server skip this — they use direct physics position.
-	# Remote players smoothly lerp toward the last synced position.
+	# --- Client-side interpolation (all players on non-server peers) ---
+	# Server runs physics directly via _server_process(); clients apply the
+	# synced position/rotation for ALL player nodes, including the local one.
 	# If distance is large (spawn, respawn, teleport), snap immediately.
-	var is_local := (peer_id == multiplayer.get_unique_id())
-	if not multiplayer.is_server() and not is_local:
+	if not multiplayer.is_server():
 		var dist_sq := global_position.distance_squared_to(sync_position)
 		if dist_sq > 25.0:  # > 5 meters — snap (spawn/respawn/teleport)
 			global_position = sync_position
@@ -244,8 +296,14 @@ func _physics_process(delta: float) -> void:
 			global_position = global_position.lerp(sync_position, weight)
 			rotation.y = lerp_angle(rotation.y, sync_rotation_y, weight)
 
-	# On a listen server the host needs client visuals for ALL player nodes
-	# (own camera/ADS, other players' health bars, grapple rope, demon, etc.)
+
+func _process(delta: float) -> void:
+	# All client visuals run in _process() so they update every render frame and
+	# sample the engine's physics-interpolated positions. This prevents visual
+	# artifacts (e.g. grapple rope splitting) caused by drawing at the physics
+	# tick rate while the player body is interpolated between ticks.
+	if has_node("/root/NetworkManager") and get_node("/root/NetworkManager")._loading_screen != null:
+		return
 	_client_process(delta)
 
 
@@ -267,6 +325,9 @@ func _server_process(delta: float) -> void:
 	var wants_scrap: bool = player_input.scrap_count > _last_scrap
 	if wants_scrap:
 		_last_scrap = player_input.scrap_count
+	var wants_scrap_inv: bool = player_input.scrap_inv_count > _last_scrap_inv
+	if wants_scrap_inv:
+		_last_scrap_inv = player_input.scrap_inv_count
 	var wants_slot: bool = player_input.slot_count > _last_slot
 	if wants_slot:
 		_last_slot = player_input.slot_count
@@ -281,6 +342,12 @@ func _server_process(delta: float) -> void:
 			_do_respawn()
 		return
 
+	# Demon catch animation: freeze all movement, sinking is handled directly
+	# by _tick_catch_animation modifying global_position.y
+	if demon_system.is_being_caught:
+		velocity = Vector3.ZERO
+		return
+
 	# --- Forfeit: hold P for 3 seconds to self-kill ---
 	if player_input.action_forfeit:
 		_forfeit_hold_time += delta
@@ -291,7 +358,7 @@ func _server_process(delta: float) -> void:
 	else:
 		_forfeit_hold_time = 0.0
 
-	# Fall-through-ground safety (skip in Toad Dimension at Y=-500)
+	# Fall-through-ground safety (skip in Toad Dimension — arena at Y=-500)
 	if global_position.y < -50.0 and not in_toad_dimension:
 		_do_respawn()
 		return
@@ -328,6 +395,10 @@ func _server_process(delta: float) -> void:
 	rotation.y = player_input.look_yaw
 	camera_pivot.rotation.x = player_input.look_pitch
 
+	# Reset air-jump counter on landing (trinket-granted double jump)
+	if is_on_floor():
+		_air_jumps_used = 0
+
 	# Slide / crouch / normal movement
 	if slide_crouch.is_sliding:
 		slide_crouch.process_slide(delta)
@@ -342,6 +413,13 @@ func _server_process(delta: float) -> void:
 			if _frame_jump and is_on_floor():
 				velocity.y = JUMP_VELOCITY
 				slide_crouch.clear_slide_on_land()
+			elif _frame_jump and not is_on_floor():
+				# Air-jump (trinket-granted) — only if shoe has an extra-jump trinket
+				# 50% stronger than a ground jump to reward the trinket investment
+				var extra_jumps: int = inventory.get_shoe_extra_jumps() if inventory else 0
+				if _air_jumps_used < extra_jumps:
+					velocity.y = JUMP_VELOCITY * 1.5
+					_air_jumps_used += 1
 
 			# While airborne, queue slide for when we land
 			if not is_on_floor() and player_input.action_slide:
@@ -360,9 +438,6 @@ func _server_process(delta: float) -> void:
 	# Track pre-land velocity for slide-on-land momentum transfer
 	slide_crouch.track_pre_land_velocity()
 	move_and_slide()
-
-	# --- Push nearby bubbles ---
-	_push_nearby_bubbles()
 
 	# --- Slide-on-land system ---
 	slide_crouch.process_landing(delta)
@@ -387,14 +462,19 @@ func _server_process(delta: float) -> void:
 	if wants_extend and inventory:
 		item_manager.try_extend_equipped_item()
 
-	# --- Open nearby chest OR pickup nearby item (E key) ---
+	# --- Open nearby chest OR store OR pickup nearby item (E key) ---
 	if wants_pickup and inventory:
 		if not _try_open_nearby_chest():
-			item_manager.try_pickup_nearby_item()
+			if not _try_open_nearby_store():
+				item_manager.try_pickup_nearby_item()
 
-	# --- Scrap nearby ground item or equipped item (X key) ---
+	# --- Scrap nearby ground item (X key) ---
 	if wants_scrap and inventory:
-		item_manager.try_scrap_item()
+		item_manager.try_scrap_ground_item()
+
+	# --- Scrap equipped inventory item (O key) ---
+	if wants_scrap_inv and inventory:
+		item_manager.try_scrap_equipped_item()
 
 	# --- Consumable activation: shoot while a consumable is equipped ---
 	if player_input.action_shoot and current_weapon == null and inventory:
@@ -421,7 +501,7 @@ func _process_medkit_heal() -> void:
 	## Server-only: heal 1 HP per frame, costing 5 fuel per frame.
 	if heat_system == null or inventory == null:
 		return
-	var effective_max_hp: float = MAX_HEALTH + heat_system.get_health_bonus()
+	var effective_max_hp: float = get_max_health()
 	if health >= effective_max_hp:
 		return
 	if not inventory.spend_fuel_silent(5.0):
@@ -431,18 +511,20 @@ func _process_medkit_heal() -> void:
 
 func _process_combat() -> void:
 	## Server-only: handle weapon firing, damage, and VFX dispatch.
-	# Calculate fuel cost
-	var fuel_cost: float = current_weapon.weapon_data.burn_fuel_cost
+	# Calculate fuel cost (skip if free firing debug is on)
 	var equipped_stack: ItemStack = null
 	if inventory and inventory.equipped_index >= 0 and inventory.equipped_index < inventory.items.size() and inventory.items[inventory.equipped_index] != null:
 		equipped_stack = inventory.items[inventory.equipped_index]
+
+	if not GameManager.debug_free_firing and not is_bot:
+		var fuel_cost: float = current_weapon.weapon_data.burn_fuel_cost
 		if equipped_stack and equipped_stack.slotted_ammo:
 			fuel_cost += equipped_stack.slotted_ammo.ammo_burn_cost_per_shot
 
-	if not inventory.has_fuel(fuel_cost):
-		return
+		if not inventory.has_fuel(fuel_cost):
+			return
 
-	inventory.spend_fuel(fuel_cost)
+		inventory.spend_fuel(fuel_cost)
 
 	# Set ammo context on weapon before firing
 	if equipped_stack and equipped_stack.slotted_ammo:
@@ -463,12 +545,18 @@ func _process_combat() -> void:
 		muzzle_pos = _get_barrel_position()
 	var aim_direction := (aim_target - muzzle_pos).normalized()
 
-	# Reduce spread while ADS
+	# Reduce spread (Steady Hand bonus + ADS)
 	var saved_spread: float = current_weapon.weapon_data.spread
+	if 1 in active_bonuses:  # Steady Hand: -15% spread
+		current_weapon.weapon_data.spread *= 0.85
 	if is_aiming:
 		current_weapon.weapon_data.spread *= current_weapon.weapon_data.ads_spread_mult
 
 	var hit_info := current_weapon.try_fire(self, muzzle_pos, aim_direction)
+
+	# Quick Hands bonus: -20% fire rate cooldown
+	if 4 in active_bonuses and current_weapon:
+		current_weapon.cooldown_remaining *= 0.80
 
 	# Restore original spread
 	current_weapon.weapon_data.spread = saved_spread
@@ -478,15 +566,21 @@ func _process_combat() -> void:
 
 		if hit_info.has("melee_hit"):
 			var melee_target = hit_info.get("hit_collider")
+			print("[Melee] HIT collider=%s is_CB3D=%s has_take_damage=%s" % [
+				str(melee_target), str(melee_target is CharacterBody3D),
+				str(melee_target.has_method("take_damage") if melee_target else false)])
 			if melee_target is CharacterBody3D and melee_target.has_method("take_damage"):
 				if has_node("/root/ToadDimension"):
 					get_node("/root/ToadDimension").enter(self, melee_target)
 				heat_system.on_damage_dealt(10.0)
+		else:
+			print("[Melee] MISS")
 
 	elif hit_info.has("pellets"):
 		# Multi-pellet weapon (shotgun)
 		var pellets: Array = hit_info["pellets"]
 		var pellet_count := pellets.size()
+		var rarity_damage_per_pellet: float = current_weapon.weapon_data.get_rarity_damage() / pellet_count
 		var base_damage_per_pellet: float = current_weapon.weapon_data.damage / pellet_count
 		var total_damage_dealt: float = 0.0
 
@@ -498,39 +592,105 @@ func _process_combat() -> void:
 		if shot_ends.size() > 0:
 			combat_vfx.show_shotgun_fx.rpc(muzzle_pos, shot_ends)
 
-		var rarity_mult: float = 1.0 + current_weapon.weapon_data.rarity * RARITY_DAMAGE_BONUS
-
+		var hit_player_ids: Dictionary = {}  # peer_id -> true, to avoid duplicate whiz on hit targets
 		for pellet in pellets:
 			var collider = pellet.get("hit_collider")
 			if collider != null and collider.has_method("take_damage"):
-				var final_damage: float = base_damage_per_pellet * heat_system.get_damage_multiplier() * rarity_mult
+				var final_damage: float = rarity_damage_per_pellet * heat_system.get_damage_multiplier()
+				if 11 in active_bonuses:  # Juggernaut: +10% damage
+					final_damage *= 1.10
 				collider.take_damage(final_damage, peer_id)
 				# Only generate heat from hitting players, not structures
 				if collider is CharacterBody3D:
 					total_damage_dealt += base_damage_per_pellet
+					hit_player_ids[collider.peer_id] = true
+					combat_vfx.play_bullet_hit_sound.rpc(pellet["shot_end"])
 
 		if total_damage_dealt > 0.0:
 			heat_system.on_damage_dealt(total_damage_dealt)
+
+		# Bullet whiz-by for shotgun: check each pellet ray against nearby players
+		_dispatch_bullet_whiz(muzzle_pos, shot_ends, hit_player_ids)
 
 	elif hit_info.has("shot_end"):
 		# Single-pellet weapon
 		combat_vfx.show_shot_fx.rpc(muzzle_pos, hit_info["shot_end"])
 
+		var hit_player_ids: Dictionary = {}
 		var collider = hit_info.get("hit_collider")
 		if collider != null and collider.has_method("take_damage"):
-			var base_damage: float = current_weapon.weapon_data.damage
-			var rarity_mult: float = 1.0 + current_weapon.weapon_data.rarity * RARITY_DAMAGE_BONUS
-			var final_damage: float = base_damage * heat_system.get_damage_multiplier() * rarity_mult
+			var final_damage: float = current_weapon.weapon_data.get_rarity_damage() * heat_system.get_damage_multiplier()
+			if 11 in active_bonuses:  # Juggernaut: +10% damage
+				final_damage *= 1.10
 			collider.take_damage(final_damage, peer_id)
 			# Only generate heat from hitting players, not structures
 			if collider is CharacterBody3D:
-				heat_system.on_damage_dealt(base_damage)
+				heat_system.on_damage_dealt(current_weapon.weapon_data.damage)
+				hit_player_ids[collider.peer_id] = true
+				combat_vfx.play_bullet_hit_sound.rpc(hit_info["shot_end"])
+
+		# Bullet whiz-by for single shot
+		_dispatch_bullet_whiz(muzzle_pos, [hit_info["shot_end"]], hit_player_ids)
+
+
+func _dispatch_bullet_whiz(muzzle_pos: Vector3, shot_ends: Array, hit_player_ids: Dictionary) -> void:
+	## Server-only: check all other players for bullet close-miss and send whiz sounds.
+	## Uses point-to-line-segment distance from each player's head to each bullet ray.
+	var whiz_dist_sq := CombatVFX.BULLET_WHIZ_DISTANCE * CombatVFX.BULLET_WHIZ_DISTANCE
+	var notified: Dictionary = {}  # peer_id -> true, one whiz per player per volley
+
+	for other_peer_id in NetworkManager.players:
+		if other_peer_id == peer_id:
+			continue  # Don't whiz the shooter
+		if hit_player_ids.has(other_peer_id):
+			continue  # Already hit — they get the hit sound, not whiz
+		if notified.has(other_peer_id):
+			continue
+
+		var other_player: CharacterBody3D = NetworkManager.players[other_peer_id]
+		if other_player == null or not is_instance_valid(other_player):
+			continue
+		if other_player.get("is_dead") == true:
+			continue
+
+		var other_pos: Vector3 = other_player.global_position + Vector3(0, 1.0, 0)  # Approximate head
+		var best_dist_sq := INF
+		var best_closest_point := Vector3.ZERO
+
+		for shot_end in shot_ends:
+			var closest := _closest_point_on_segment(muzzle_pos, shot_end, other_pos)
+			var d_sq := closest.distance_squared_to(other_pos)
+			if d_sq < best_dist_sq:
+				best_dist_sq = d_sq
+				best_closest_point = closest
+
+		if best_dist_sq <= whiz_dist_sq:
+			notified[other_peer_id] = true
+			# Bots don't have clients to receive RPCs
+			if other_peer_id >= 9000:
+				continue
+			other_player.combat_vfx.play_bullet_whiz_sound.rpc_id(other_peer_id, best_closest_point)
+
+
+static func _closest_point_on_segment(a: Vector3, b: Vector3, p: Vector3) -> Vector3:
+	## Returns the closest point on line segment AB to point P.
+	var ab := b - a
+	var ab_len_sq := ab.length_squared()
+	if ab_len_sq < 0.0001:
+		return a
+	var t := clampf((p - a).dot(ab) / ab_len_sq, 0.0, 1.0)
+	return a + ab * t
 
 
 func _process_normal_movement(delta: float) -> void:
 	## Acceleration-based horizontal movement. Uses different rates on ground vs air.
 	var shoe_bonus: float = inventory.get_shoe_speed_bonus() if inventory else 0.0
-	var current_speed := SPEED * (heat_system.get_speed_multiplier() + shoe_bonus)
+	var bonus_speed: float = 0.0
+	if 5 in active_bonuses:   # Adrenaline Rush: +10% speed
+		bonus_speed += 0.10
+	if _second_wind_timer > 0.0:  # Second Wind: +50% speed
+		bonus_speed += 0.50
+	var current_speed := SPEED * (heat_system.get_speed_multiplier() + shoe_bonus + bonus_speed)
 	var input_dir: Vector2 = player_input.input_direction
 	var direction := (transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized()
 
@@ -610,8 +770,8 @@ func _client_process(delta: float) -> void:
 		var height_ratio := body_mesh.scale.y / slide_crouch._original_mesh_scale_y
 		body_mesh.position.y = slide_crouch._original_mesh_y * height_ratio
 
-	# Update mesh visibility based on alive state
-	body_mesh.visible = is_alive
+	# Update mesh visibility based on alive state (stay visible during catch animation)
+	body_mesh.visible = is_alive or demon_system.is_being_caught
 	weapon_mount.visible = is_alive and not kamikaze_system.is_kamikaze and not grapple_system.is_grappling
 
 	# Check if synced weapon visuals changed — load new model/sound on clients
@@ -643,47 +803,15 @@ func _get_camera_aim_target(cam_origin: Vector3, cam_forward: Vector3) -> Vector
 	## Raycast from the camera through screen-center to find the aim target.
 	var space_state := get_world_3d().direct_space_state
 	var far_point := cam_origin + cam_forward * 1000.0
+	# Toad dimension players are on layer 9 (256) instead of layer 8 (128)
+	var player_bit: int = 256 if in_toad_dimension else 128
 	var query := PhysicsRayQueryParameters3D.create(cam_origin, far_point)
 	query.exclude = [get_rid()]
-	query.collision_mask = 0xFFFFFFFF
+	query.collision_mask = 1 | 2 | 4 | 8 | 16 | player_bit  # All gameplay layers (excludes debris/toad bodies)
 	var result := space_state.intersect_ray(query)
 	if not result.is_empty():
 		return result.position
 	return far_point
-
-
-func _push_nearby_bubbles() -> void:
-	## Server-only: push nearby bubbles away from the player using impulses.
-	var scene := get_tree().current_scene
-	if scene == null:
-		return
-	var projectiles := scene.get_node_or_null("Projectiles")
-	if projectiles == null:
-		return
-
-	var player_pos := global_position + Vector3(0, 0.9, 0)
-	var player_speed := velocity.length()
-
-	for child in projectiles.get_children():
-		if not child is RigidBody3D:
-			continue
-		if not child.has_method("apply_push_impulse"):
-			continue
-		if not is_instance_valid(child):
-			continue
-
-		var body: RigidBody3D = child as RigidBody3D
-		var to_bubble := body.global_position - player_pos
-		var dist := to_bubble.length()
-		var push_threshold := 1.4
-
-		if dist < push_threshold and dist > 0.01:
-			var overlap := 1.0 - (dist / push_threshold)
-			var push_dir := to_bubble.normalized()
-			var speed_factor := maxf(player_speed * 0.3, 0.5)
-			var impulse := push_dir * overlap * speed_factor * 0.4
-			impulse.y += 0.2 * overlap
-			body.apply_push_impulse(impulse)
 
 
 ## ======================================================================
@@ -720,6 +848,121 @@ func _try_open_nearby_chest() -> bool:
 
 
 ## ======================================================================
+##  Kill Store interaction
+## ======================================================================
+
+func _try_open_nearby_store() -> bool:
+	## Server-only: find the nearest KillStore within interact range.
+	## If found, send an RPC to the owning client to open the store UI.
+	## Returns true if a store was found (even if bot skips it).
+	var scene := get_tree().current_scene
+	if scene == null:
+		return false
+	var world_items := scene.get_node_or_null("WorldItems")
+	if world_items == null:
+		return false
+
+	var best_store: Node = null
+	var best_dist: float = INF
+
+	for child in world_items.get_children():
+		if not child is KillStore:
+			continue
+		var dist: float = global_position.distance_to(child.global_position)
+		if dist < KillStore.STORE_INTERACT_RANGE and dist < best_dist:
+			best_store = child
+			best_dist = dist
+
+	if best_store == null:
+		return false
+
+	# Bots don't use stores
+	var net_mgr := get_node_or_null("/root/NetworkManager")
+	if net_mgr and peer_id >= net_mgr.BOT_PEER_ID_START:
+		return true  # Consumed the input, just don't open UI
+
+	# Host opens store directly (peer 1 doesn't receive RPCs from itself)
+	if peer_id == 1:
+		if store_ui and store_ui.has_method("open_store"):
+			store_ui.open_store()
+	else:
+		_rpc_open_store_ui.rpc_id(peer_id)
+	return true
+
+
+func _is_near_store() -> bool:
+	## Server-only: check if this player is within interact range of any KillStore.
+	var scene := get_tree().current_scene
+	if scene == null:
+		return false
+	var world_items := scene.get_node_or_null("WorldItems")
+	if world_items == null:
+		return false
+	for child in world_items.get_children():
+		if child is KillStore:
+			if global_position.distance_to(child.global_position) < KillStore.STORE_INTERACT_RANGE:
+				return true
+	return false
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_open_store_ui() -> void:
+	## Client-side: server tells us we're near a store, open the UI.
+	if store_ui and store_ui.has_method("open_store"):
+		store_ui.open_store()
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func rpc_buy_bonus(bonus_id: int) -> void:
+	## Server-only: validate and process a store purchase.
+	if not multiplayer.is_server():
+		return
+	var sender_id := multiplayer.get_remote_sender_id()
+	# Host (peer 1) calls this locally, so sender_id is 0 — allow it
+	if sender_id != 0 and sender_id != peer_id:
+		return
+
+	# Validate bonus_id
+	if bonus_id < 0 or bonus_id >= KillStore.BONUS_CATALOG.size():
+		return
+
+	# Already owned?
+	if bonus_id in active_bonuses:
+		return
+
+	# Near a store?
+	if not _is_near_store():
+		return
+
+	# Can afford?
+	var cost: int = KillStore.BONUS_CATALOG[bonus_id]["cost"]
+	if not inventory.has_kill_currency(cost):
+		return
+
+	# Purchase!
+	inventory.spend_kill_currency(cost)
+	active_bonuses.append(bonus_id)
+
+	print("Player %d bought bonus '%s' for %d tokens (remaining: %.2f)" % [
+		peer_id, KillStore.BONUS_CATALOG[bonus_id]["name"], cost, inventory.kill_currency])
+
+
+func get_max_health() -> float:
+	## Returns effective max health factoring in bonuses and heat.
+	var base := MAX_HEALTH
+	if 2 in active_bonuses:   # Thick Skin
+		base += 15.0
+	if 11 in active_bonuses:  # Juggernaut
+		base += 40.0
+	base += heat_system.get_health_bonus()
+	return base
+
+
+func has_bonus(bonus_id: int) -> bool:
+	return bonus_id in active_bonuses
+
+
+## ======================================================================
 ##  3D health bar (visible above non-local players)
 ## ======================================================================
 
@@ -743,10 +986,11 @@ func _update_health_label_3d() -> void:
 		add_child(_health_label_3d)
 
 	_health_label_3d.visible = true
-	_health_label_3d.text = "HP: %d / %d" % [ceili(health), int(MAX_HEALTH)]
+	var max_hp: float = get_max_health()
+	_health_label_3d.text = "HP: %d / %d" % [ceili(health), int(max_hp)]
 
 	# Color based on health percentage
-	var hp_ratio: float = health / MAX_HEALTH
+	var hp_ratio: float = health / max_hp
 	if hp_ratio > 0.6:
 		_health_label_3d.modulate = Color(0.3, 1.0, 0.3)
 	elif hp_ratio > 0.3:
@@ -766,6 +1010,9 @@ func take_damage(amount: float, attacker_id: int) -> void:
 	# No damage after victory
 	if GameManager.current_state == GameManager.GameState.GAME_OVER:
 		return
+	# Blast Padding bonus: -20% damage taken
+	if 6 in active_bonuses:
+		amount *= 0.80
 	health -= amount
 	heat_system.on_damage_taken(amount)
 	if health <= 0.0:
@@ -778,6 +1025,10 @@ func die(killer_id: int) -> void:
 	is_alive = false
 	_respawn_timer = RESPAWN_DELAY
 	body_mesh.visible = false
+	# Disable shadow body collision while dead
+	if shadow_body != null and is_instance_valid(shadow_body):
+		shadow_body.collision_layer = 0
+		shadow_body.collision_mask = 0
 	# End slide/crouch if active
 	if slide_crouch.is_sliding:
 		slide_crouch.end_slide()
@@ -801,12 +1052,28 @@ func die(killer_id: int) -> void:
 	# Trigger demon stalker (activates on first death, repositions on subsequent)
 	if not demon_system.is_eliminated:
 		demon_system.on_player_death()
-	# Give the killer heat for the kill
+	# Give the killer heat for the kill + award kill currency
 	var players_container := get_parent()
 	if players_container:
 		var killer_node := players_container.get_node_or_null(str(killer_id))
 		if killer_node and killer_node.has_node("HeatSystem"):
 			killer_node.get_node("HeatSystem").on_kill()
+		# Award kill currency (skip self-kills and zone kills)
+		# Bot kills are worth 0.25 tokens; player kills are worth 1.0
+		if killer_id != peer_id and killer_id != -1 and killer_node:
+			if killer_node.has_node("Inventory"):
+				var kill_value: float = 0.25 if is_bot else 1.0
+				killer_node.get_node("Inventory").add_kill_currency(kill_value)
+			# Vulture bonus: killer's kills drop a fuel canister at victim position
+			if 10 in killer_node.active_bonuses:
+				var map := get_tree().current_scene
+				if map and map.has_method("spawn_world_item"):
+					map.spawn_world_item(
+						"res://items/definitions/fuel_uncommon.tres",
+						global_position + Vector3(0, 0.5, 0),
+						60.0,   # 60 second burn time
+						-1      # No pickup immunity
+					)
 	player_killed.emit(peer_id, killer_id)
 	print("Player %d killed by Player %d" % [peer_id, killer_id])
 
@@ -854,6 +1121,10 @@ func _do_respawn() -> void:
 	health = MAX_HEALTH
 	body_mesh.visible = true
 	$CollisionShape3D.set_deferred("disabled", false)
+	# Re-enable shadow body collision on respawn
+	if shadow_body != null and is_instance_valid(shadow_body):
+		shadow_body.collision_layer = SHADOW_BODY_LAYER
+		shadow_body.collision_mask = 1 | 2 | 4 | 8 | 16 | 64
 
 	var map := get_tree().current_scene
 	var spawns := map.get_node("PlayerSpawnPoints").get_children()
@@ -885,13 +1156,31 @@ func _do_respawn() -> void:
 		global_position = spawn_point.global_position
 		velocity = Vector3.ZERO
 
+	# Reset air-jump counter
+	_air_jumps_used = 0
+
 	# Sync input counters so presses during death don't phantom-fire on respawn
 	_last_jump = player_input.jump_count
 	_last_pickup = player_input.pickup_count
 	_last_extend = player_input.extend_count
 	_last_scrap = player_input.scrap_count
+	_last_scrap_inv = player_input.scrap_inv_count
 	_last_slot = player_input.slot_count
 	_forfeit_hold_time = 0.0
+
+	# Apply respawn fuel bonuses (kill store bonuses persist after death)
+	var bonus_fuel: float = 0.0
+	if 0 in active_bonuses:   # Iron Lungs: +100 starting fuel
+		bonus_fuel += 100.0
+	if 9 in active_bonuses:   # Phoenix Fuel: +500 starting fuel
+		bonus_fuel += 500.0
+	if bonus_fuel > 0.0 and inventory:
+		inventory.burn_fuel += bonus_fuel
+		inventory._notify_sync()
+
+	# Second Wind bonus: 5s speed boost on respawn
+	if 12 in active_bonuses:
+		_second_wind_timer = 5.0
 
 	print("Player %d respawned" % peer_id)
 
@@ -1066,3 +1355,149 @@ func rpc_slot_ammo(ammo_index: int, weapon_index: int) -> void:
 func rpc_unslot_ammo(_weapon_index: int) -> void:
 	## Ammo merging is permanent — this RPC is now a no-op.
 	pass
+
+
+# ======================================================================
+#  Trinket slot/unslot (shoe trinkets)
+# ======================================================================
+
+@rpc("any_peer", "call_local", "reliable")
+func rpc_slot_trinket_on_shoe(trinket_bag_index: int) -> void:
+	## Client requests slotting a trinket from the trinket bag onto the equipped shoe.
+	if not multiplayer.is_server():
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if sender != 0 and sender != peer_id:
+		return
+	if inventory == null:
+		return
+
+	# Validate trinket bag index
+	if trinket_bag_index < 0 or trinket_bag_index >= inventory.trinket_bag.size():
+		return
+	var trinket_stack: ItemStack = inventory.trinket_bag[trinket_bag_index]
+	if trinket_stack == null or trinket_stack.item_data == null:
+		return
+	if not trinket_stack.item_data is TrinketData:
+		return
+	var trinket_data: TrinketData = trinket_stack.item_data as TrinketData
+	if not trinket_data.attach_to_shoes:
+		return
+
+	# Validate shoe exists
+	if inventory.equipped_shoe == null or inventory.equipped_shoe.item_data == null:
+		return
+	if not inventory.equipped_shoe.item_data is ShoeData:
+		return
+	var shoe_data: ShoeData = inventory.equipped_shoe.item_data as ShoeData
+
+	# Check trinket slot capacity
+	if inventory.equipped_shoe.slotted_trinkets.size() >= shoe_data.max_trinket_slots:
+		return
+
+	# Attach: move trinket data to shoe, remove from bag
+	inventory.equipped_shoe.slotted_trinkets.append(trinket_data)
+	inventory.trinket_bag.remove_at(trinket_bag_index)
+
+	print("Player %d attached %s to %s" % [peer_id, trinket_data.item_name, shoe_data.item_name])
+
+	inventory.trinket_bag_changed.emit()
+	inventory.shoe_changed.emit()
+	inventory.inventory_changed.emit()
+	inventory._notify_sync()
+
+
+@rpc("any_peer", "call_local", "reliable")
+func rpc_unslot_trinket_from_shoe(trinket_slot_index: int) -> void:
+	## Client requests removing a trinket from the equipped shoe back to trinket bag.
+	if not multiplayer.is_server():
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if sender != 0 and sender != peer_id:
+		return
+	if inventory == null:
+		return
+
+	# Validate shoe and trinket slot
+	if inventory.equipped_shoe == null:
+		return
+	if trinket_slot_index < 0 or trinket_slot_index >= inventory.equipped_shoe.slotted_trinkets.size():
+		return
+
+	var trinket_data: TrinketData = inventory.equipped_shoe.slotted_trinkets[trinket_slot_index]
+	inventory.equipped_shoe.slotted_trinkets.remove_at(trinket_slot_index)
+
+	# Try to return to trinket bag
+	if inventory.trinket_bag.size() < Inventory.MAX_TRINKETS:
+		var stack := ItemStack.create(trinket_data)
+		inventory.trinket_bag.append(stack)
+		print("Player %d detached %s back to bag" % [peer_id, trinket_data.item_name])
+	else:
+		# Bag full — drop to world
+		var stack := ItemStack.create(trinket_data)
+		var item_mgr := get_node_or_null("ItemManager")
+		if item_mgr:
+			item_mgr.drop_item_as_world_item(stack)
+		print("Player %d detached %s — bag full, dropped to world" % [peer_id, trinket_data.item_name])
+
+	inventory.trinket_bag_changed.emit()
+	inventory.shoe_changed.emit()
+	inventory.inventory_changed.emit()
+	inventory._notify_sync()
+
+
+## ======================================================================
+##  Player Shadow Body — dynamic RigidBody3D collision proxy (always active)
+## ======================================================================
+
+func _create_shadow_body() -> void:
+	## Server-only: create the shadow body as a sibling node.
+	## Called once from _ready(). The shadow body persists for the player's lifetime
+	## and provides a real RigidBody3D presence so Jolt can handle mass-weighted
+	## momentum exchange with other rigid bodies (toads, boulders, etc.).
+	## Must be a sibling (not child) — nesting physics bodies causes transform conflicts.
+	if shadow_body != null:
+		return
+
+	shadow_body = ToadShadowBody.new()
+	shadow_body.name = "ShadowBody_%d" % peer_id
+	shadow_body.target = self
+
+	# Dynamic body with custom integrator — NOT frozen/kinematic
+	shadow_body.mass = SHADOW_BODY_MASS
+	shadow_body.custom_integrator = true
+	shadow_body.gravity_scale = 0.0
+	shadow_body.collision_layer = SHADOW_BODY_LAYER
+	# Mask all gameplay physics layers (world, items, bubbles, rubber balls, toad walls, toad rain)
+	# Excludes: debris (32, cosmetic), players (128/256, CharacterBody3D), shadow bodies (512)
+	shadow_body.collision_mask = 1 | 2 | 4 | 8 | 16 | 64
+	shadow_body.contact_monitor = true
+	shadow_body.max_contacts_reported = 8
+
+	# Physics material — slight bounce so objects ricochet naturally
+	var phys_mat := PhysicsMaterial.new()
+	phys_mat.bounce = 0.3
+	phys_mat.friction = 0.5
+	shadow_body.physics_material_override = phys_mat
+
+	# Collision shape matching the player capsule (radius=0.4, height=1.8)
+	var capsule := CapsuleShape3D.new()
+	capsule.radius = 0.4
+	capsule.height = 1.8
+	var col := CollisionShape3D.new()
+	col.shape = capsule
+	col.position = Vector3(0, 0.9, 0)
+	shadow_body.add_child(col)
+
+	# Wire contact signal (server-only push)
+	shadow_body.body_entered.connect(shadow_body._on_body_entered)
+
+	# Add to the map root FIRST (global_position requires being in tree)
+	get_tree().current_scene.add_child(shadow_body)
+
+	# NOW set position (must be after add_child for global_position to work)
+	shadow_body.global_position = global_position
+	print("[Player %d] ShadowBody created — layer=%d mask=%d pos=%s" % [
+		peer_id, shadow_body.collision_layer, shadow_body.collision_mask,
+		shadow_body.global_position
+	])
