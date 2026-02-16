@@ -1,0 +1,17 @@
+[gd_resource type="Resource" script_class="TrinketData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/trinket_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Stormleap Charm"
+item_type = 7
+rarity = 3
+description = "Crackling with static, this charm launches you skyward. Attach to shoes for a double jump."
+base_burn_rate = 0.0
+initial_burn_time = 999999.0
+burn_cost_to_extend = 3.0
+time_currency_value = 18.0
+mesh_color = Color(0.6, 0.3, 0.85, 1)
+extra_jumps = 1
+attach_to_shoes = true

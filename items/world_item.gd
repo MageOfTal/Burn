@@ -15,6 +15,10 @@ var _immune_peer_id: int = -1
 var _immune_timer: float = 0.0
 const PICKUP_IMMUNITY_TIME := 2.0
 
+## Deferred ground check: runs once on the first physics frame instead of
+## call_deferred from _ready(), which is unsafe with threaded physics.
+var _needs_ground_check: bool = false
+
 const SCRAP_POPUP_RANGE := 4.0
 const SCRAP_FUEL_BY_RARITY := [10.0, 30.0, 65.0, 130.0, 250.0]
 
@@ -31,13 +35,10 @@ const PICKUP_POPUP_RANGE := 4.0
 
 @onready var mesh: MeshInstance3D = $MeshInstance3D
 @onready var label: Label3D = $Label3D
-var _scrap_label: Label3D = null
-var _pickup_label: Label3D = null
 
-## Cached local player reference (avoids tree traversal every frame)
-var _cached_local_player: Node = null
-var _player_cache_timer: float = 0.0
-const PLAYER_CACHE_INTERVAL := 1.0
+## Proximity popup components (created in _ready, handle cached player + distance)
+var _scrap_proximity: ProximityLabel = null
+var _pickup_proximity: ProximityLabel = null
 
 
 func _ready() -> void:
@@ -52,7 +53,9 @@ func _ready() -> void:
 	body_entered.connect(_on_body_entered)
 
 	if multiplayer.is_server():
-		_ensure_above_ground.call_deferred()
+		_needs_ground_check = true
+
+	_setup_proximity_labels()
 
 
 func setup(data: ItemData) -> void:
@@ -95,8 +98,23 @@ func _process(delta: float) -> void:
 			if _immune_timer <= 0.0:
 				_immune_peer_id = -1
 
-	# Client: proximity popups (cached player lookup)
-	_update_popups(delta)
+	# Client: disable proximity popups for fuel items (auto-picked up)
+	var is_fuel := item_data != null and item_data.item_type == ItemData.ItemType.FUEL
+	var should_show := item_data != null and not is_fuel
+	if _scrap_proximity:
+		_scrap_proximity.set_process(should_show)
+		if not should_show and _scrap_proximity.label:
+			_scrap_proximity._hide_label()
+	if _pickup_proximity:
+		_pickup_proximity.set_process(should_show)
+		if not should_show and _pickup_proximity.label:
+			_pickup_proximity._hide_label()
+
+
+func _physics_process(_delta: float) -> void:
+	if _needs_ground_check:
+		_needs_ground_check = false
+		_ensure_above_ground()
 
 
 func _update_visual() -> void:
@@ -129,56 +147,51 @@ func _on_body_entered(body: Node3D) -> void:
 
 
 # ======================================================================
-#  Proximity popups (client-side, cached player lookup)
+#  Proximity popups (client-side, via ProximityLabel components)
 # ======================================================================
 
-func _update_popups(delta: float) -> void:
-	if item_data == null:
-		return
+func _setup_proximity_labels() -> void:
+	# Pickup label — create/destroy style, green text, static "[E] PICKUP" (top)
+	_pickup_proximity = ProximityLabel.new()
+	_pickup_proximity.popup_range = PICKUP_POPUP_RANGE
+	_pickup_proximity.label_offset = Vector3(0, 1.5, 0)
+	_pickup_proximity.label_color = Color(0.3, 1.0, 0.4)
+	_pickup_proximity.use_visibility_toggle = false
+	_pickup_proximity.update_callback = _on_pickup_label_update
+	_pickup_proximity.visibility_callback = _is_closest_item_check
+	add_child(_pickup_proximity)
 
-	# Re-find local player periodically instead of every frame
-	_player_cache_timer -= delta
-	if _player_cache_timer <= 0.0 or not is_instance_valid(_cached_local_player):
-		_player_cache_timer = PLAYER_CACHE_INTERVAL
-		_cached_local_player = _find_local_player()
-
-	if _cached_local_player == null:
-		_hide_scrap_popup()
-		_hide_pickup_popup()
-		return
-
-	# Fuel items are auto-picked up — no popups for them
-	if item_data.item_type == ItemData.ItemType.FUEL:
-		_hide_scrap_popup()
-		_hide_pickup_popup()
-		return
-
-	var dist: float = global_position.distance_to(_cached_local_player.global_position)
-	var in_range: bool = dist < PICKUP_POPUP_RANGE
-
-	if not in_range:
-		_hide_scrap_popup()
-		_hide_pickup_popup()
-		return
-
-	# Only show popups on the CLOSEST non-fuel item — prevents popup spam
-	# when multiple items are within range.
-	var am_closest: bool = _is_closest_item_to_player(dist)
-
-	if am_closest:
-		_show_scrap_popup()
-		_show_pickup_popup()
-	else:
-		_hide_scrap_popup()
-		_hide_pickup_popup()
+	# Scrap label — create/destroy style, orange text, updates fuel value each frame (bottom)
+	_scrap_proximity = ProximityLabel.new()
+	_scrap_proximity.popup_range = SCRAP_POPUP_RANGE
+	_scrap_proximity.label_offset = Vector3(0, 1.2, 0)
+	_scrap_proximity.label_color = Color(1.0, 0.6, 0.2)
+	_scrap_proximity.use_visibility_toggle = false
+	_scrap_proximity.update_callback = _on_scrap_label_update
+	_scrap_proximity.visibility_callback = _is_closest_item_check
+	add_child(_scrap_proximity)
 
 
-func _is_closest_item_to_player(my_dist: float) -> bool:
-	## Return true if this WorldItem is the closest non-fuel item to the local player.
+func _on_scrap_label_update(lbl: Label3D, _player: Node, _dist: float) -> void:
+	## Called every frame the scrap label is visible — keep fuel value accurate.
+	var max_fuel: float = SCRAP_FUEL_BY_RARITY[clampi(item_data.rarity, 0, 4)]
+	var initial_time: float = maxf(item_data.initial_burn_time, 0.1)
+	var time_fraction: float = clampf(burn_time_remaining / initial_time, 0.0, 1.0)
+	var fuel: float = max_fuel * time_fraction
+	lbl.text = "[X] SCRAP  +%.0f fuel" % fuel
+
+
+func _on_pickup_label_update(lbl: Label3D, _player: Node, _dist: float) -> void:
+	## Called every frame the pickup label is visible — static text.
+	lbl.text = "[E] PICKUP"
+
+
+func _is_closest_item_check(player: Node, my_dist: float) -> bool:
+	## Only show popups on the CLOSEST non-fuel item — prevents popup spam.
 	var world_items := get_tree().current_scene.get_node_or_null("WorldItems")
 	if world_items == null:
-		return true  # Only item around
-	var player_pos: Vector3 = _cached_local_player.global_position
+		return true
+	var player_pos: Vector3 = player.global_position
 	for child in world_items.get_children():
 		if child == self:
 			continue
@@ -188,64 +201,8 @@ func _is_closest_item_to_player(my_dist: float) -> bool:
 			continue
 		var other_dist: float = player_pos.distance_to(child.global_position)
 		if other_dist < my_dist:
-			return false  # Another non-fuel item is closer
+			return false
 	return true
-
-
-func _find_local_player() -> Node:
-	var players := get_tree().current_scene.get_node_or_null("Players")
-	if players == null:
-		return null
-	return players.get_node_or_null(str(multiplayer.get_unique_id()))
-
-
-func _show_scrap_popup() -> void:
-	var max_fuel: float = SCRAP_FUEL_BY_RARITY[clampi(item_data.rarity, 0, 4)]
-	var initial_time: float = maxf(item_data.initial_burn_time, 0.1)
-	var time_fraction: float = clampf(burn_time_remaining / initial_time, 0.0, 1.0)
-	var fuel: float = max_fuel * time_fraction
-
-	if _scrap_label != null:
-		# Update text each frame so the value stays accurate as the burn timer ticks
-		_scrap_label.text = "[X] SCRAP  +%.0f fuel" % fuel
-		return
-
-	_scrap_label = Label3D.new()
-	_scrap_label.text = "[X] SCRAP  +%.0f fuel" % fuel
-	_scrap_label.font_size = 48
-	_scrap_label.modulate = Color(1.0, 0.6, 0.2)
-	_scrap_label.outline_modulate = Color(0, 0, 0)
-	_scrap_label.outline_size = 6
-	_scrap_label.position = Vector3(0, 1.5, 0)
-	_scrap_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	add_child(_scrap_label)
-
-
-func _hide_scrap_popup() -> void:
-	if _scrap_label != null:
-		_scrap_label.queue_free()
-		_scrap_label = null
-
-
-func _show_pickup_popup() -> void:
-	if _pickup_label != null:
-		return
-
-	_pickup_label = Label3D.new()
-	_pickup_label.text = "[E] PICKUP"
-	_pickup_label.font_size = 48
-	_pickup_label.modulate = Color(0.3, 1.0, 0.4)
-	_pickup_label.outline_modulate = Color(0, 0, 0)
-	_pickup_label.outline_size = 6
-	_pickup_label.position = Vector3(0, 1.2, 0)
-	_pickup_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	add_child(_pickup_label)
-
-
-func _hide_pickup_popup() -> void:
-	if _pickup_label != null:
-		_pickup_label.queue_free()
-		_pickup_label = null
 
 
 func _ensure_above_ground() -> void:

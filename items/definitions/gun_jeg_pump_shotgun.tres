@@ -1,26 +1,19 @@
-[gd_resource type="Resource" script_class="WeaponData" load_steps=2 format=3]
+[gd_resource type="Resource" script_class="WeaponData" format=3 uid="uid://slmyjucpqmil"]
 
-[ext_resource type="Script" path="res://items/weapon_data.gd" id="1"]
+[ext_resource type="Script" uid="uid://bd5kpo5ymkl7u" path="res://items/weapon_data.gd" id="1"]
 
 [resource]
 script = ExtResource("1")
-item_name = "Pump Shotgun"
-item_type = 0
-rarity = 0
-description = "Pump Shotgun (jeg)"
-base_burn_rate = 0.3
-initial_burn_time = 180.0
-burn_cost_to_extend = 1.0
-time_currency_value = 5.0
 damage = 48.0
-fire_rate = 1.10
-weapon_range = 20.0
-spread = 8.0
+fire_rate = 1.1
+weapon_range = 40.0
+spread = 5.0
 pellet_count = 8
-is_hitscan = true
 heat_per_shot = 3.7
-gun_model_path = "res://assets/guns/models/jeg_pump_shotgun.glb"
-fire_sound_path = "res://assets/guns/sounds/jeg_pump_shotgun_fire.ogg"
 ads_fov = 55.0
 ads_spread_mult = 0.7
 barrel_offset = Vector3(0.1, 0.05, -0.8)
+gun_model_path = "res://assets/guns/models/jeg_pump_shotgun.glb"
+fire_sound_path = "res://assets/guns/sounds/jeg_pump_shotgun_fire.ogg"
+item_name = "Pump Shotgun"
+description = "Pump Shotgun (jeg)"

@@ -13,4 +13,4 @@ initial_burn_time = 200.0
 burn_cost_to_extend = 5.0
 time_currency_value = 25.0
 mesh_color = Color(1.0, 0.85, 0.0, 1)
-speed_bonus = 0.35
+speed_bonus = 0.5

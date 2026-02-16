@@ -3,6 +3,13 @@ class_name WeaponData
 
 ## Weapon-specific item data.
 
+## Rarity damage bonus: +15% per rarity tier (COMMON=0 through LEGENDARY=4).
+const RARITY_DAMAGE_BONUS := 0.15
+
+func get_rarity_damage() -> float:
+	## Returns base damage scaled by rarity tier.
+	return damage * (1.0 + rarity * RARITY_DAMAGE_BONUS)
+
 @export_group("Combat")
 @export var damage: float = 15.0
 @export var fire_rate: float = 0.3  ## Seconds between shots.

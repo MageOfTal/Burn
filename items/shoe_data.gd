@@ -7,3 +7,7 @@ class_name ShoeData
 @export_group("Shoe Stats")
 ## Percentage speed bonus (e.g. 0.05 = +5%).
 @export var speed_bonus: float = 0.05
+
+@export_group("Trinket Slots")
+## Maximum number of trinkets this shoe can hold. Designed to vary by rarity.
+@export var max_trinket_slots: int = 1

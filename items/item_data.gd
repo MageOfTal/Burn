@@ -3,7 +3,7 @@ class_name ItemData
 
 ## Base class for all item definitions. Saved as .tres files.
 
-enum ItemType { WEAPON, CONSUMABLE, GADGET, MATERIAL, SHOE, FUEL, AMMO }
+enum ItemType { WEAPON, CONSUMABLE, GADGET, MATERIAL, SHOE, FUEL, AMMO, TRINKET }
 enum Rarity { COMMON, UNCOMMON, RARE, EPIC, LEGENDARY }
 
 @export var item_name: String = ""
@@ -21,6 +21,19 @@ enum Rarity { COMMON, UNCOMMON, RARE, EPIC, LEGENDARY }
 @export var burn_cost_to_extend: float = 1.0
 ## How much time currency this item yields when scrapped.
 @export var time_currency_value: float = 5.0
+
+## Original .tres path — set when an ItemData is .duplicate()'d with a rarity
+## override so we can still re-spawn it via MultiplayerSpawner later.
+## Empty on non-duplicated (original) resources; use get_source_path() instead.
+var _original_resource_path: String = ""
+
+func get_source_path() -> String:
+	## Returns the .tres resource path for spawning this item.
+	## Works for both original resources (resource_path) and duplicates
+	## whose resource_path is empty after .duplicate().
+	if _original_resource_path != "":
+		return _original_resource_path
+	return resource_path
 
 ## Visual (placeholder for now)
 @export_group("Visual")

@@ -1,0 +1,17 @@
+[gd_resource type="Resource" script_class="TrinketData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://items/trinket_data.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+item_name = "Rabbit Charm"
+item_type = 7
+rarity = 0
+description = "A scruffy rabbit's foot on a string. Attach to shoes for a double jump."
+base_burn_rate = 0.0
+initial_burn_time = 999999.0
+burn_cost_to_extend = 1.0
+time_currency_value = 3.0
+mesh_color = Color(0.65, 0.5, 0.35, 1)
+extra_jumps = 1
+attach_to_shoes = true
