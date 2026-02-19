@@ -3,12 +3,19 @@ extends PhysicsBodyBase
 ## A single toad rain body — a physics-simulated frog that falls from the sky,
 ## bounces once off the floor, then phases through the ground and despawns.
 ##
-## Mass: 4.0 kg (1/20th of the player's 80 kg).
+## Mass: 2.0 kg (1/40th of the player's 80 kg).
 ##
 ## Collision layer 7 (toad bodies), masks layer 1 (world) + layer 10 (player
-## shadow body). Player push is handled natively by Jolt — toads collide with
-## the player's ToadShadowBody (a dynamic 80kg RigidBody3D on layer 10) with
-## proper mass-weighted momentum exchange. No intersect_shape polling needed.
+## shadow body). The shadow body is a dynamic 80 kg RigidBody3D that follows
+## the player. Jolt handles the collision natively — correct contact normals,
+## edge deflections, mass-weighted impulse exchange. The shadow body extracts
+## the solver's impulse delta and transfers it to the player's CharacterBody3D.
+##
+## No intersect_shape polling, no manual impulse math in toad code. Toads just
+## collide with things and Jolt does the rest. O(collisions) not O(toads).
+##
+## NOTE: The shadow body is a RigidBody3D, NOT a StaticBody3D. So the
+## `body is StaticBody3D` check for floor bounce correctly excludes it.
 ##
 ## After the first bounce the toad is fully removed from Jolt's physics
 ## simulation (frozen + collision shape disabled) and its fall + tumble is
@@ -16,8 +23,8 @@ extends PhysicsBodyBase
 ## BVH entirely, preventing thousands of dead bodies from bloating physics
 ## queries during heavy toad rain.
 
-const TOAD_MASS: float = 4.0          ## 1/20th of player mass (80 kg)
-const DESPAWN_Y_OFFSET: float = -10.0 ## How far below the floor before queue_free()
+const TOAD_MASS: float = 2.0          ## 1/40th of player mass (80 kg)
+const DESPAWN_Y_OFFSET: float = -3.0  ## How far below the floor before queue_free()
 const MAX_LIFETIME: float = 15.0      ## Safety net — despawn if stuck somehow
 const POST_BOUNCE_GRAVITY: float = 19.6  ## 2x normal gravity (9.8 * 2), applied manually
 
@@ -26,21 +33,28 @@ var _floor_y: float = -500.0   ## Set by ToadDimension on spawn
 var _age: float = 0.0
 var _physics_disabled: bool = false  ## When true, skip all Jolt physics — visual-only fall
 
-## Pre-collision velocity snapshot — captured each physics frame before Jolt's
-## solver runs. The ToadShadowBody reads this in body_entered (which fires
-## post-solve, when linear_velocity is already post-bounce and useless for
-## closing speed calculations).
-var pre_collision_velocity: Vector3 = Vector3.ZERO
+## When true, the toad stays in Jolt physics forever — never disables collision
+## after bouncing, never despawns from age or falling below floor. Used by the
+## debug toad bowl so toads bounce around persistently.
+var persistent: bool = false
 
 ## Post-bounce manual animation state (set when transitioning out of Jolt)
 var _manual_velocity: Vector3 = Vector3.ZERO
 var _manual_angular_vel: Vector3 = Vector3.ZERO
 
+## Debug hitbox visualization
+var _hitbox_mesh: MeshInstance3D = null
+static var _hitbox_mat: StandardMaterial3D = null  ## Shared across all toads
+
 
 func _ready() -> void:
+	add_to_group("toad_bodies")
+	if GameManager.debug_toad_show_hitboxes:
+		_create_hitbox_mesh()
 	mass = TOAD_MASS
 	gravity_scale = 2.0  ## 2x gravity (matches original TOAD_GRAVITY = 19.6)
 	lock_rotation = false
+	continuous_cd = true  ## Prevent tunneling through ground when hit by heavy shadow body
 	# PhysicsMaterial (bounce=0.3, friction=0.5) is set in toad_body.tscn
 
 	# Wire collision signal for bounce detection (server only)
@@ -51,11 +65,6 @@ func _ready() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	# Snapshot velocity before Jolt's solver modifies it this frame.
-	# ToadShadowBody reads this in body_entered (which fires post-solve).
-	if not _has_bounced and not _physics_disabled:
-		pre_collision_velocity = linear_velocity
-
 	if _physics_disabled:
 		# Visual-only mode: manual fall + tumble, no Jolt, no push queries
 		if not multiplayer.is_server():
@@ -71,17 +80,18 @@ func _physics_process(delta: float) -> void:
 			queue_free()
 		return
 
-	if not _has_bounced:
-		# Toad-player collisions are handled natively by Jolt via the player's
-		# ToadShadowBody (a dynamic 80kg RigidBody3D on layer 10). Toads bounce
-		# off it through Jolt's solver with proper mass-weighted momentum exchange.
-		# No intersect_shape needed.
-		pass
+	# NOTE: We intentionally do NOT call super._physics_process(delta) here.
+	# Toad → player push is handled entirely by Jolt's native solver via the
+	# shadow body. No intersect_shape polling needed.
 
 	if not multiplayer.is_server():
 		return
 
 	_age += delta
+
+	# Persistent toads (toad bowl) never despawn or leave Jolt — skip all of this
+	if persistent:
+		return
 
 	# Safety lifetime cap
 	if _age >= MAX_LIFETIME:
@@ -103,8 +113,14 @@ func _on_body_entered_toad(body: Node) -> void:
 	if _has_bounced:
 		return
 
-	# Only count floor/wall collisions as a bounce (StaticBody3D = world geometry)
+	# Only count floor/wall collisions as a bounce (StaticBody3D = world geometry).
+	# The shadow body is a RigidBody3D, so this check correctly excludes it —
+	# toads bounce off the shadow body without freezing.
 	if not (body is StaticBody3D):
+		return
+
+	# Persistent toads (toad bowl) stay in Jolt forever — don't freeze on bounce
+	if persistent:
 		return
 
 	_has_bounced = true
@@ -196,3 +212,44 @@ func set_shadows_enabled(enabled: bool) -> void:
 	for child in get_children():
 		if child is MeshInstance3D:
 			child.cast_shadow = shadow_mode
+
+
+# ======================================================================
+#  Debug hitbox visualization
+# ======================================================================
+
+func _create_hitbox_mesh() -> void:
+	## Add a transparent wireframe sphere matching the collision shape radius.
+	var col_shape := get_node_or_null("CollisionShape3D") as CollisionShape3D
+	if col_shape == null or not (col_shape.shape is SphereShape3D):
+		return
+	var radius: float = (col_shape.shape as SphereShape3D).radius
+
+	# Lazy-init shared material (one allocation for all toads)
+	if _hitbox_mat == null:
+		_hitbox_mat = StandardMaterial3D.new()
+		_hitbox_mat.albedo_color = Color(1.0, 0.2, 0.2, 0.35)
+		_hitbox_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		_hitbox_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		_hitbox_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+
+	_hitbox_mesh = MeshInstance3D.new()
+	_hitbox_mesh.name = "HitboxDebug"
+	var sphere := SphereMesh.new()
+	sphere.radius = radius
+	sphere.height = radius * 2.0
+	sphere.radial_segments = 12
+	sphere.rings = 6
+	_hitbox_mesh.mesh = sphere
+	_hitbox_mesh.material_override = _hitbox_mat
+	_hitbox_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(_hitbox_mesh)
+
+
+func set_hitbox_visible(visible: bool) -> void:
+	## Show or hide the debug hitbox sphere.
+	if visible and _hitbox_mesh == null:
+		_create_hitbox_mesh()
+	elif not visible and _hitbox_mesh != null:
+		_hitbox_mesh.queue_free()
+		_hitbox_mesh = null

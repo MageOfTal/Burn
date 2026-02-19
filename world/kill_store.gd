@@ -77,14 +77,23 @@ func _build_visuals() -> void:
 	_glow_light.position.y = 2.0
 	add_child(_glow_light)
 
-	# Prompt label (proximity-based)
+	# Prompt label (proximity-based, participates in unified closest-interactable system)
 	_prompt_proximity = ProximityLabel.new()
 	_prompt_proximity.popup_range = STORE_POPUP_RANGE
 	_prompt_proximity.label_offset = Vector3(0, 2.2, 0)
 	_prompt_proximity.label_color = Color(0.3, 0.85, 1.0)
 	_prompt_proximity.use_visibility_toggle = true
 	_prompt_proximity.update_callback = _on_prompt_label_update
+	_prompt_proximity.interactable_group = "interact"
 	add_child(_prompt_proximity)
+
+
+func get_interact_distance(player_pos: Vector3) -> float:
+	## Unified interactable interface — stores always compete for the [E] prompt.
+	var d: float = global_position.distance_to(player_pos)
+	if d < STORE_POPUP_RANGE:
+		return d
+	return INF
 
 
 func _on_prompt_label_update(lbl: Label3D, player_node: Node, _dist: float) -> void:

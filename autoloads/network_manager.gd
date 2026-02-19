@@ -692,15 +692,21 @@ func _show_lobby_ui() -> void:
 	bg.mouse_filter = Control.MOUSE_FILTER_STOP
 	_lobby_screen.add_child(bg)
 
+	# Scroll container for lobby content
+	var scroll := ScrollContainer.new()
+	scroll.set_anchors_preset(Control.PRESET_FULL_RECT)
+	scroll.anchor_left = 0.2
+	scroll.anchor_right = 0.8
+	scroll.anchor_top = 0.02
+	scroll.anchor_bottom = 0.98
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	bg.add_child(scroll)
+
 	# Center container
 	var center := VBoxContainer.new()
-	center.set_anchors_preset(Control.PRESET_CENTER)
-	center.offset_left = -200
-	center.offset_right = 200
-	center.offset_top = -250
-	center.offset_bottom = 250
+	center.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	center.add_theme_constant_override("separation", 14)
-	bg.add_child(center)
+	scroll.add_child(center)
 
 	# Title
 	var title := Label.new()
@@ -753,8 +759,32 @@ func _show_lobby_ui() -> void:
 
 	center.add_child(HSeparator.new())
 
-	# Start button (host only) or waiting text (clients)
+	# Debug modifier toggles (host only, before the start button)
 	var is_match_in_progress := GameManager.current_state == GameManager.GameState.PLAYING
+	if is_server and not is_match_in_progress:
+		var debug_label := Label.new()
+		debug_label.text = "— Debug Modifiers —"
+		debug_label.add_theme_font_size_override("font_size", 16)
+		debug_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+		debug_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		center.add_child(debug_label)
+
+		_add_lobby_toggle(center, "Disable Burn Timers", GameManager.debug_disable_burn_timers,
+			func(v: bool): GameManager.debug_disable_burn_timers = v)
+		_add_lobby_toggle(center, "Disable Demon", GameManager.debug_disable_demon,
+			func(v: bool): GameManager.debug_disable_demon = v)
+		_add_lobby_toggle(center, "Disable Zone Damage", GameManager.debug_disable_zone_damage,
+			func(v: bool): GameManager.debug_disable_zone_damage = v)
+		_add_lobby_toggle(center, "Skip Walls & Ramps", GameManager.debug_skip_structures,
+			func(v: bool): GameManager.debug_skip_structures = v)
+		_add_lobby_toggle(center, "Free Firing (No Fuel Cost)", GameManager.debug_free_firing,
+			func(v: bool): GameManager.debug_free_firing = v)
+		_add_lobby_toggle(center, "Shotgun Boost (2x Pellets, 2x Fire Rate)", GameManager.debug_shotgun_boost,
+			func(v: bool): GameManager.debug_shotgun_boost = v)
+
+		center.add_child(HSeparator.new())
+
+	# Start button (host only) or waiting text (clients)
 	if is_server and not is_match_in_progress:
 		_lobby_start_button = Button.new()
 		_lobby_start_button.text = "Start Game"
@@ -814,6 +844,41 @@ func _update_lobby_player_list(peer_list: Array) -> void:
 	_refresh_lobby_player_list()
 
 
+func _add_lobby_toggle(parent: Control, label_text: String, initial: bool, callback: Callable) -> void:
+	## Helper: creates a CheckBox for the lobby debug toggles section.
+	var cb := CheckBox.new()
+	cb.text = label_text
+	cb.button_pressed = initial
+	cb.add_theme_font_size_override("font_size", 15)
+	cb.add_theme_color_override("font_color", Color(0.85, 0.85, 0.85))
+	cb.toggled.connect(callback)
+	parent.add_child(cb)
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_sync_debug_flags(flags: Dictionary) -> void:
+	## Client receives: host's debug flags, applied before match starts.
+	GameManager.debug_disable_burn_timers = flags.get("burn", false)
+	GameManager.debug_disable_demon = flags.get("demon", false)
+	GameManager.debug_disable_zone_damage = flags.get("zone", false)
+	GameManager.debug_skip_structures = flags.get("structures", false)
+	GameManager.debug_free_firing = flags.get("firing", false)
+	GameManager.debug_shotgun_boost = flags.get("shotgun", false)
+
+
+func _broadcast_debug_flags() -> void:
+	## Server-only: send current debug flags to all clients.
+	var flags := {
+		"burn": GameManager.debug_disable_burn_timers,
+		"demon": GameManager.debug_disable_demon,
+		"zone": GameManager.debug_disable_zone_damage,
+		"structures": GameManager.debug_skip_structures,
+		"firing": GameManager.debug_free_firing,
+		"shotgun": GameManager.debug_shotgun_boost,
+	}
+	_rpc_sync_debug_flags.rpc(flags)
+
+
 # ======================================================================
 #  Start Game (from lobby)
 # ======================================================================
@@ -823,6 +888,8 @@ func _on_lobby_start_pressed() -> void:
 	if not is_server:
 		return
 	print("[Server] ======== STARTING GAME ========")
+	# Sync host's debug flags to all clients before starting
+	_broadcast_debug_flags()
 	_start_match()
 	_rpc_start_match.rpc()
 
@@ -862,7 +929,8 @@ func _start_match() -> void:
 			players[pid].demon_system.debug_spawn_nearby()
 
 		# Spawn bots
-		_spawn_bots()
+		if not GameManager.debug_disable_bots:
+			_spawn_bots()
 
 		# Spawn demo items
 		if map and map.has_method("_spawn_demo_items"):
@@ -871,6 +939,8 @@ func _start_match() -> void:
 			map.spawn_lemon_shapes()
 		if map and map.has_method("spawn_toad_rail_cannon"):
 			map.spawn_toad_rail_cannon()
+		if map and map.has_method("spawn_toad_bowl"):
+			map.spawn_toad_bowl()
 
 		# Start burn clock
 		var burn_clock := get_node_or_null("/root/BurnClock")

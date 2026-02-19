@@ -16,13 +16,14 @@ var debug_disable_burn_timers: bool = false
 var debug_disable_demon: bool = false
 var debug_disable_zone_damage: bool = false
 var debug_skip_structures: bool = false
+var debug_disable_bots: bool = true          # Don't spawn bots on host
 var debug_free_firing: bool = false          # No burn fuel cost when firing weapons
 var debug_shotgun_boost: bool = false        # Double barrel: halved fire rate, doubled pellets
 var debug_grapple_ground_pump: bool = false
 var debug_grapple_reel_speed: float = 1.2  # Default reel speed (m/s)
 var debug_grapple_visuals: bool = false     # Show pill, angle display, spheres, raycasts
 var debug_grapple_horiz_nudge: bool = true # Launch nudge includes horizontal component toward anchor
-var show_fps_hud: bool = false               # Show FPS counter on gameplay HUD
+var show_fps_hud: bool = true                # Show FPS counter on gameplay HUD
 var debug_freecam_active: bool = false      # Set by DebugFreecam autoload
 
 # Bubble / physics debug toggles (set from pause menu)
@@ -40,6 +41,7 @@ var debug_velocity_iterations: int = 10
 # Toad dimension debug toggles (set from pause menu)
 var debug_toad_no_physics: bool = false   # Disable all physics for toad rain bodies
 var debug_toad_no_shadows: bool = false   # Disable shadow casting on toad rain bodies
+var debug_toad_show_hitboxes: bool = false  # Show collision sphere wireframe on toad bodies
 
 signal game_state_changed(new_state: GameState)
 signal match_started

@@ -59,6 +59,11 @@ func _server_process(delta: float) -> void:
 			)
 			query.collision_mask = collision_mask
 			query.exclude = [get_rid()]
+			# Exclude the shooter's shadow body from the tunneling raycast
+			# to prevent the rocket from detonating on its own shooter.
+			var shooter_node := _find_shooter_node()
+			if shooter_node and shooter_node.shadow_body:
+				query.exclude.append(shooter_node.shadow_body.get_rid())
 			var result := space_state.intersect_ray(query)
 			if not result.is_empty():
 				# Move to impact point and explode
@@ -70,7 +75,21 @@ func _is_shooter_immune(body: Node) -> bool:
 	## Rocket: permanent self-exclude (never damages shooter via body_entered).
 	if body is CharacterBody3D and body.name.to_int() == _shooter_id:
 		return true
+	if body is ToadShadowBody and body.target != null and body.target.name.to_int() == _shooter_id:
+		return true
 	return false
+
+
+func _find_shooter_node() -> CharacterBody3D:
+	## Find the shooter's player node for shadow body exclusion in raycasts.
+	var scene := get_tree().current_scene
+	if scene:
+		var players := scene.get_node_or_null("Players")
+		if players:
+			var p := players.get_node_or_null(str(_shooter_id))
+			if p is CharacterBody3D:
+				return p
+	return null
 
 
 func _on_body_hit(body: Node) -> void:

@@ -39,6 +39,7 @@ const SWING_PUMP_STRENGTH := 8.0      ## W pumps along swing velocity (air only)
 
 ## Launch nudge — small upward kick on fire to unstick from the floor.
 const LAUNCH_NUDGE_SPEED := 8.0       ## Max directional speed added on fire (m/s)
+const LAUNCH_NUDGE_COOLDOWN := 1.0    ## Seconds after release before nudge is allowed again
 
 
 ## Low-momentum inward pull — lets you scale buildings when nearly stationary.
@@ -114,6 +115,9 @@ var _recharge_timer: float = 0.0      ## Time until next charge is restored
 ## Boost gate — must grapple for this long before release boost is allowed.
 var _grapple_time: float = 0.0        ## Seconds spent in current grapple
 const MIN_GRAPPLE_TIME_FOR_BOOST := 1.4
+
+## Launch nudge cooldown — tracks when the last grapple was released.
+var _last_release_time: float = -999.0 ## Time.get_ticks_msec()/1000 of last release
 
 
 ## Debug timing — spike detection
@@ -385,9 +389,12 @@ func try_fire() -> void:
 		slide_crouch.end_crouch()
 
 	# Launch nudge — kick toward anchor to unstick from the floor
+	# Suppressed if grapple was released less than LAUNCH_NUDGE_COOLDOWN seconds ago
+	var now_sec: float = Time.get_ticks_msec() / 1000.0
+	var nudge_on_cooldown: bool = (now_sec - _last_release_time) < LAUNCH_NUDGE_COOLDOWN
 	var anchor_dist: float = player.global_position.distance_to(anchor_point)
 	var dist_factor: float = clampf((anchor_dist - 2.0) / (7.0 - 2.0), 0.0, 1.0)
-	if dist_factor > 0.0:
+	if dist_factor > 0.0 and not nudge_on_cooldown:
 		var to_anchor: Vector3 = anchor_point - player.global_position
 		var nudge_dir: Vector3 = to_anchor.normalized()
 		var full_nudge: float = LAUNCH_NUDGE_SPEED * dist_factor
@@ -643,6 +650,7 @@ func process(delta: float) -> void:
 	#    velocity, so the player glides horizontally.  In the air, the
 	#    full velocity applies.
 	# =================================================================
+	player._apply_external_push(delta)
 	var _t_move := Time.get_ticks_usec()
 	player.move_and_slide()
 	var _t_move_end := Time.get_ticks_usec()
@@ -1324,6 +1332,7 @@ func _do_release(with_boost: bool) -> void:
 	if with_boost:
 		boosted = _apply_release_boost()
 
+	_last_release_time = Time.get_ticks_msec() / 1000.0
 	var release_pos: Vector3 = player.global_position + Vector3(0, 1.2, 0)
 	is_grappling = false
 	anchor_point = Vector3.ZERO

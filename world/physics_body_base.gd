@@ -3,21 +3,20 @@ class_name PhysicsBodyBase
 
 ## Base class for all game physics objects (tower chunks, bubbles, projectiles, etc.).
 ##
-## Provides automatic mass-weighted push interactions with CharacterBody3D (players).
-## Godot's CharacterBody3D uses kinematic move_and_slide() which does NOT participate
-## in Jolt's rigid body solver — so RigidBody3D objects can't push players natively.
-## This base class bridges that gap using the reduced-mass collision formula:
+## Push interactions with players use one of two paths:
 ##
-##   reduced_mass = (m_rigid * m_char) / (m_rigid + m_char)
-##   impulse = (1 + restitution) * closing_speed * reduced_mass
+## 1. **Shadow body path (preferred):** If this body's collision_mask includes layer 10
+##    (512, the player's shadow body), Jolt handles the collision natively — correct
+##    contact normals, edge deflections, mass ratios, restitution. The shadow body
+##    transfers the solver impulse to the player automatically. No manual math needed.
 ##
-## Heavy objects (tower chunks at 300kg) push players hard.
-## Light objects (bubbles at 0.1kg) barely affect players.
-## Speed matters — faster closing speed = bigger impulse.
+## 2. **Polling fallback:** If this body does NOT mask layer 10, the base class polls
+##    for CharacterBody3D overlaps every 0.1s and applies the reduced-mass formula:
+##      reduced_mass = (m_rigid * m_char) / (m_rigid + m_char)
+##      impulse = (1 + restitution) * closing_speed * reduced_mass
+##    This is a legacy path for objects that can't use the shadow body for some reason.
 ##
-## RigidBody3D ↔ RigidBody3D interactions are handled by Jolt natively
-## (just ensure collision masks allow it). This class only handles the
-## RigidBody3D ↔ CharacterBody3D case.
+## Objects that mask layer 10 automatically skip the polling path to avoid double-push.
 ##
 ## Usage: extend this class instead of RigidBody3D. Set mass and collision_layer.
 ## If overriding _physics_process(), call super._physics_process(delta) at the top.
@@ -56,6 +55,12 @@ func _physics_process(delta: float) -> void:
 	if not multiplayer.is_server():
 		return
 
+	# If this body masks layer 10 (shadow body), Jolt handles push transfer
+	# natively via the shadow body's solver-delta mechanism. Skip manual polling
+	# to avoid double-pushing the player.
+	if collision_mask & 512:
+		return
+
 	_push_check_timer -= delta
 	if _push_check_timer > 0.0:
 		return
@@ -75,6 +80,7 @@ func _check_character_overlaps() -> void:
 	if _cached_shape == null:
 		_cached_shape = _get_first_shape()
 	if _cached_shape == null:
+		print("[PhysicsBodyBase] %s: NO cached shape — skipping overlap check" % name)
 		return
 
 	var space_state := get_world_3d().direct_space_state
@@ -91,9 +97,14 @@ func _check_character_overlaps() -> void:
 
 	var results := space_state.intersect_shape(query, 8)  # Up to 8 overlapping bodies
 
+	if results.size() > 0:
+		print("[PhysicsBodyBase] %s: intersect_shape found %d hit(s) at pos=%s vel=%s" % [
+			name, results.size(), global_position, linear_velocity])
+
 	for result in results:
 		var collider = result.get("collider")
 		if collider == null or not collider is CharacterBody3D:
+			print("[PhysicsBodyBase] %s: skipping non-CharacterBody3D collider: %s" % [name, collider])
 			continue
 		if not is_instance_valid(collider):
 			continue
@@ -111,6 +122,9 @@ func _check_character_overlaps() -> void:
 		# Player capsule radius ≈ 0.4, so at dist=0 they're fully inside.
 		# This is used as a depenetration pseudo-velocity for stationary overlaps.
 		var overlap_depth: float = maxf(0.4 - dist * 0.3, 0.0)
+
+		print("[PhysicsBodyBase] %s → %s: dist=%.2f overlap=%.3f closing_speed will be computed" % [
+			name, collider.name, dist, overlap_depth])
 
 		_apply_character_push(collider, contact_normal, overlap_depth)
 
@@ -145,6 +159,8 @@ func _apply_character_push(char_body: CharacterBody3D, contact_normal: Vector3,
 		closing_speed = maxf(closing_speed, overlap_depth * 5.0)
 
 	if closing_speed < MIN_CLOSING_SPEED:
+		print("[PhysicsBodyBase] %s → %s: REJECTED — closing_speed=%.2f < %.2f (rigid_vel=%s char_vel=%s)" % [
+			name, char_body.name, closing_speed, MIN_CLOSING_SPEED, linear_velocity, char_body.velocity])
 		return
 
 	var mass_rigid: float = mass
@@ -160,3 +176,6 @@ func _apply_character_push(char_body: CharacterBody3D, contact_normal: Vector3,
 	if char_push.length() > MAX_CHAR_PUSH_SPEED:
 		char_push = char_push.normalized() * MAX_CHAR_PUSH_SPEED
 	char_body.velocity += char_push
+
+	print("[PhysicsBodyBase] %s → %s: PUSHED closing=%.2f impulse=%.1f push=%s (mass=%.1f)" % [
+		name, char_body.name, closing_speed, impulse_magnitude, char_push, mass_rigid])

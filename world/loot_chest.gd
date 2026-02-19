@@ -80,13 +80,14 @@ func _build_visuals() -> void:
 	col.position.y = 0.375
 	add_child(col)
 
-	# Prompt label (proximity-based)
+	# Prompt label (proximity-based, participates in unified closest-interactable system)
 	_prompt_proximity = ProximityLabel.new()
 	_prompt_proximity.popup_range = CHEST_POPUP_RANGE
 	_prompt_proximity.label_offset = Vector3(0, 1.5, 0)
 	_prompt_proximity.label_color = Color(1.0, 0.85, 0.3)
 	_prompt_proximity.use_visibility_toggle = true
 	_prompt_proximity.update_callback = _on_prompt_label_update
+	_prompt_proximity.interactable_group = "interact"
 	add_child(_prompt_proximity)
 
 
@@ -153,6 +154,10 @@ func _process(delta: float) -> void:
 		if refill_timer <= 0.0:
 			_refill()
 
+	# Toggle interaction group: open chests don't compete, they always show "EMPTY"
+	if _prompt_proximity:
+		_prompt_proximity.interactable_group = "" if is_open else "interact"
+
 	# Client: update visuals
 	_update_visuals(delta)
 
@@ -195,6 +200,17 @@ func _update_visuals(_delta: float) -> void:
 		_lid_mesh.position.z = lerpf(_lid_mesh.position.z, 0.0, 0.15)
 		if _glow_light:
 			_glow_light.light_energy = lerpf(_glow_light.light_energy, 1.5, 0.15)
+
+
+func get_interact_distance(player_pos: Vector3) -> float:
+	## Unified interactable interface — closed chests compete for the [E] prompt.
+	## Open chests return INF so they don't steal the prompt from other interactables.
+	if is_open:
+		return INF
+	var d: float = global_position.distance_to(player_pos)
+	if d < CHEST_POPUP_RANGE:
+		return d
+	return INF
 
 
 func _on_prompt_label_update(lbl: Label3D, _player: Node, _dist: float) -> void:

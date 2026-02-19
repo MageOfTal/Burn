@@ -1081,9 +1081,13 @@ func _spawn_topple_body(centroid: Vector3, baked_mesh: Mesh, mesh_offset: Vector
 	topple.max_contacts_reported = 4
 	topple.gravity_scale = 1.0
 	# Use dedicated collision layer 2 for tower debris so topple body and chunks
-	# don't collide with each other. Mask world(1) + players(128) for impact.
+	# don't collide with each other. Mask world(1) + shadow body(512) for impact/push.
+	# Shadow body (layer 10) is the player's RigidBody3D proxy — Jolt resolves
+	# collisions natively, then the shadow body transfers the impulse to the player.
+	# Do NOT mask layer 8 (128, CharacterBody3D) — it's kinematic and would act as
+	# an immovable wall, stopping the topple body dead instead of pushing through.
 	topple.collision_layer = 2
-	topple.collision_mask = 1 | 128
+	topple.collision_mask = 1 | 512
 
 	# Set custom properties BEFORE adding to tree (these are simple vars, not transforms)
 	topple.section_height = section_height
@@ -1251,7 +1255,7 @@ func _sync_collapse_start(sever_y: float, torque_dir: Vector3) -> void:
 	topple.gravity_scale = 1.0
 	# Use dedicated collision layer 2 for tower debris (matches server topple body)
 	topple.collision_layer = 2
-	topple.collision_mask = 1 | 128
+	topple.collision_mask = 1 | 512
 
 	# Set position BEFORE adding to tree so there's no 1-frame flash at (0,0,0)
 	topple.position = centroid
@@ -1369,7 +1373,7 @@ func _spawn_slab_fragments(body_transform: Transform3D, is_server: bool,
 		slab.gravity_scale = 1.0
 		slab.angular_damp = 1.5
 		slab.collision_layer = 2  # Tower debris layer
-		slab.collision_mask = 15 | 128  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + players(128)
+		slab.collision_mask = 15 | 512  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + shadow body(512)
 
 		if is_server:
 			slab.contact_monitor = true
@@ -1462,7 +1466,7 @@ func _spawn_rock_chunks_legacy(impact_pos: Vector3, chunk_count: int,
 		chunk.gravity_scale = 1.0
 		chunk.angular_damp = 2.0
 		chunk.collision_layer = 2  # Tower debris layer
-		chunk.collision_mask = 15 | 128  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + players(128)
+		chunk.collision_mask = 15 | 512  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + shadow body(512)
 
 		if is_server:
 			chunk.contact_monitor = true

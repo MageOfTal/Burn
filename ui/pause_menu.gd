@@ -30,6 +30,7 @@ var _hide_bubbles_button: CheckButton = null
 var _toad_density_input: LineEdit = null
 var _toad_no_physics_button: CheckButton = null
 var _toad_no_shadows_button: CheckButton = null
+var _toad_show_hitboxes_button: CheckButton = null
 var _quit_btn: Button = null
 
 # ── Video Settings panel UI refs ─────────────────────────────────────────
@@ -268,6 +269,9 @@ func _build_main_panel() -> void:
 
 	_toad_no_shadows_button = _add_check("Disable Toad Shadows", GameManager.debug_toad_no_shadows, vbox)
 	_toad_no_shadows_button.toggled.connect(_on_toad_no_shadows_toggled)
+
+	_toad_show_hitboxes_button = _add_check("Show Toad Hitboxes", GameManager.debug_toad_show_hitboxes, vbox)
+	_toad_show_hitboxes_button.toggled.connect(_on_toad_show_hitboxes_toggled)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -883,6 +887,15 @@ func _on_toad_no_shadows_toggled(pressed: bool) -> void:
 	if toad_dim:
 		toad_dim.apply_toad_shadow_toggle(not pressed)
 	print("[PauseMenu] Toad shadows disabled: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_toad_show_hitboxes_toggled(pressed: bool) -> void:
+	GameManager.debug_toad_show_hitboxes = pressed
+	# Apply to all existing toad bodies in the scene (all sources: rain, rail cannon, bowl)
+	for node in get_tree().get_nodes_in_group("toad_bodies"):
+		if node.has_method("set_hitbox_visible"):
+			node.set_hitbox_visible(pressed)
+	print("[PauseMenu] Toad hitboxes: %s" % ("ON" if pressed else "OFF"))
 
 
 func _refresh_toad_density_text() -> void:

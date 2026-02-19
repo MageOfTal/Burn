@@ -80,6 +80,11 @@ theme_override_colors/font_color = Color(0.6, 0.6, 0.6, 1)
 text = "— Debug Toggles —"
 horizontal_alignment = 1
 
+[node name="DisableBots" type="CheckBox" parent="CenterContainer/VBoxContainer" unique_id=1258340991]
+layout_mode = 2
+button_pressed = true
+text = "Disable Bots"
+
 [node name="DisableBurnTimers" type="CheckBox" parent="CenterContainer/VBoxContainer" unique_id=1258340990]
 layout_mode = 2
 text = "Disable Burn Timers"
@@ -122,6 +127,7 @@ autowrap_mode = 2
 
 [connection signal="pressed" from="CenterContainer/VBoxContainer/HostButton" to="." method="_on_host_pressed"]
 [connection signal="pressed" from="CenterContainer/VBoxContainer/JoinButton" to="." method="_on_join_pressed"]
+[connection signal="toggled" from="CenterContainer/VBoxContainer/DisableBots" to="." method="_on_disable_bots_toggled"]
 [connection signal="toggled" from="CenterContainer/VBoxContainer/DisableBurnTimers" to="." method="_on_burn_timers_toggled"]
 [connection signal="toggled" from="CenterContainer/VBoxContainer/DisableDemon" to="." method="_on_demon_toggled"]
 [connection signal="toggled" from="CenterContainer/VBoxContainer/DisableZoneDamage" to="." method="_on_zone_damage_toggled"]

@@ -6,12 +6,14 @@ class_name ProximityLabel
 ##   - Cached local player lookup (avoids tree traversal every frame)
 ##   - Distance-based label visibility
 ##   - Label3D creation and lifecycle
+##   - Unified closest-interactable check (when interactable_group is set)
 ##
 ## The parent interactable controls behavior via:
 ##   - popup_range: distance threshold to show the label
 ##   - label_offset: local position offset for the Label3D
 ##   - update_callback: called every frame the player is in range, receives (label, player, dist)
 ##   - visibility_callback: optional, called to decide if the label should show (returns bool)
+##   - interactable_group: when non-empty, only shows label on the closest interactable
 
 ## Distance within which the label becomes visible.
 @export var popup_range := 5.0
@@ -36,7 +38,13 @@ var update_callback: Callable = Callable()
 ## Optional callback to control visibility beyond just distance.
 ## Signature: func(player: Node, distance: float) -> bool
 ## Return false to hide the label even when in range.
+## Ignored when interactable_group is set (unified system takes over).
 var visibility_callback: Callable = Callable()
+
+## When non-empty, this label participates in the unified closest-interactable
+## system. Only the closest interactable (by get_interact_distance()) in the
+## WorldItems node will have its label shown. All others are hidden.
+var interactable_group: String = ""
 
 ## The managed Label3D — read-only from outside.
 var label: Label3D = null
@@ -48,6 +56,45 @@ const PLAYER_CACHE_INTERVAL := 1.0
 
 ## Reference to the parent Node3D (set in _ready).
 var _parent_3d: Node3D = null
+
+# ======================================================================
+#  Unified closest-interactable cache (static — shared across all instances)
+# ======================================================================
+## Caches the result of the closest-interactable scan so it only runs once
+## per frame, no matter how many ProximityLabels query it.
+
+static var _closest_interactable: Node3D = null
+static var _closest_frame: int = -1
+
+static func find_closest_interactable(player: Node, scene_tree: SceneTree) -> Node3D:
+	## Returns the closest interactable node to the player this frame.
+	## Result is cached per engine frame for performance.
+	var frame := Engine.get_process_frames()
+	if frame == _closest_frame:
+		return _closest_interactable
+
+	_closest_frame = frame
+	_closest_interactable = null
+
+	var scene := scene_tree.current_scene
+	if scene == null:
+		return null
+	var world_items := scene.get_node_or_null("WorldItems")
+	if world_items == null:
+		return null
+
+	var player_pos: Vector3 = player.global_position
+	var best_dist := INF
+
+	for child in world_items.get_children():
+		if not child.has_method("get_interact_distance"):
+			continue
+		var d: float = child.get_interact_distance(player_pos)
+		if d < best_dist:
+			best_dist = d
+			_closest_interactable = child
+
+	return _closest_interactable
 
 
 func _ready() -> void:
@@ -84,8 +131,14 @@ func _process(delta: float) -> void:
 		_hide_label()
 		return
 
-	# Optional visibility gate (e.g. "am I the closest item?")
-	if visibility_callback.is_valid():
+	# Unified closest-interactable gate (replaces per-item visibility_callback)
+	if interactable_group != "":
+		var closest := find_closest_interactable(_cached_local_player, get_tree())
+		if closest != _parent_3d:
+			_hide_label()
+			return
+	elif visibility_callback.is_valid():
+		# Legacy per-label visibility gate
 		if not visibility_callback.call(_cached_local_player, dist):
 			_hide_label()
 			return

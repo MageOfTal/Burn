@@ -85,7 +85,12 @@ func _server_process(delta: float) -> void:
 
 func _is_shooter_immune(body: Node) -> bool:
 	## Rubber ball: shooter immune for 0.5s OR until first bounce.
+	var is_shooter := false
 	if body is CharacterBody3D and body.name.to_int() == _shooter_id:
+		is_shooter = true
+	elif body is ToadShadowBody and body.target != null and body.target.name.to_int() == _shooter_id:
+		is_shooter = true
+	if is_shooter:
 		return _lifetime < 0.5 and _bounce_count == 0
 	return false
 

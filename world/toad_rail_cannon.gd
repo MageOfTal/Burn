@@ -7,7 +7,7 @@ extends Node3D
 ##
 ## Placed by blockout_map.gd near the host player for debugging purposes.
 
-const TOAD_SPEED: float = 20.0        ## Toad launch speed (m/s)
+const TOAD_SPEED: float = 100.0       ## Toad launch speed (m/s)
 const FIRE_INTERVAL: float = 0.4      ## Seconds between shots
 const TOAD_SCALE: float = 0.35        ## Collision radius / visual scale
 
@@ -68,13 +68,16 @@ func _fire_toad() -> void:
 	# Override gravity — we want the toad to fly in a straight line (rail cannon)
 	toad.gravity_scale = 0.0
 
+	# CCD prevents tunneling at 100 m/s through thin bodies (shadow body, walls)
+	toad.continuous_cd = true
+
 	# Add to scene tree FIRST, then set world-space properties.
 	# Setting global_position before add_child would be interpreted as local
 	# position relative to the container, causing a double-offset.
 	_toads_container.add_child(toad)
 
 	# Now that the toad is in the tree, set its world-space position
-	toad.global_position = global_position + Vector3(0, 2.5, 0)
+	toad.global_position = global_position + Vector3(0, -0.3, 0)
 
 	# Set velocity after entering the tree so Jolt picks it up
 	toad.linear_velocity = _fire_direction * TOAD_SPEED

@@ -31,40 +31,22 @@ func setup(p: CharacterBody3D) -> void:
 ##  Item Pickup (called from world_item.gd via player proxy)
 ## ======================================================================
 
-func try_pickup_nearby_item() -> void:
-	## Server-only: find the nearest non-fuel WorldItem within range and pick it up.
-	## Fuel is auto-picked up on contact; this handles everything else via E key.
+func try_pickup_item(world_item: Node) -> void:
+	## Server-only: pick up a specific WorldItem (already identified as closest
+	## by the unified _find_closest_interactable() in player.gd).
+	## Validates range and immunity before picking up.
 	if not multiplayer.is_server() or not player.is_alive:
 		return
-
-	var world_items := get_tree().current_scene.get_node_or_null("WorldItems")
-	if world_items == null:
+	if not is_instance_valid(world_item) or not ("item_data" in world_item) or world_item.item_data == null:
 		return
-
-	var player_pos := player.global_position
-	var best_item: Node = null
-	var best_dist := SCRAP_PICKUP_RANGE  # Reuse the same 4m range
-
-	for child in world_items.get_children():
-		if not child is Area3D or not child.has_method("setup"):
-			continue
-		if not "item_data" in child or child.item_data == null:
-			continue
-		# Skip fuel — fuel is auto-picked up on contact
-		if child.item_data.item_type == ItemData.ItemType.FUEL:
-			continue
-		# Check pickup immunity
-		if child.has_method("is_immune_to") and child.is_immune_to(player.peer_id):
-			continue
-		var dist: float = player_pos.distance_to(child.global_position)
-		if dist < best_dist:
-			best_dist = dist
-			best_item = child
-
-	if best_item == null:
+	if world_item.item_data.item_type == ItemData.ItemType.FUEL:
 		return
-
-	on_item_pickup(best_item)
+	if world_item.has_method("is_immune_to") and world_item.is_immune_to(player.peer_id):
+		return
+	var dist: float = player.global_position.distance_to(world_item.global_position)
+	if dist > SCRAP_PICKUP_RANGE:
+		return
+	on_item_pickup(world_item)
 
 
 func on_item_pickup(world_item: Node) -> void:

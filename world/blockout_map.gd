@@ -762,6 +762,27 @@ func _place_world_item(item_data: ItemData, pos: Vector3) -> void:
 #  Toad Rail Cannon (debug — fires toads at a target platform)
 # ======================================================================
 
+func spawn_toad_bowl() -> void:
+	## Spawn a toad bowl near the host player: a circular arena filled with 30
+	## persistent bouncing toads for testing shadow body push physics.
+	var players_node := get_node_or_null("Players")
+	if players_node == null:
+		return
+	var host_player := players_node.get_node_or_null("1")
+	if host_player == null:
+		return
+
+	var host_pos: Vector3 = host_player.global_position
+	# Place the bowl 15m in front of the host player (+Z) and 8m up
+	var bowl_center: Vector3 = host_pos + Vector3(0, 8.0, 15.0)
+
+	var bowl := Node3D.new()
+	bowl.name = "ToadBowl"
+	bowl.set_script(load("res://world/toad_bowl.gd"))
+	add_child(bowl)
+	bowl.build(bowl_center)
+
+
 func spawn_toad_rail_cannon() -> void:
 	## Build a toad rail cannon near the host player with two platforms:
 	## a cannon platform (with the cannon on it) and a target platform

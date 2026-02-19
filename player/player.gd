@@ -38,9 +38,8 @@ var is_bot: bool = false
 var in_toad_dimension: bool = false
 
 ## Layer 10 (bit 512) — collision layer for the player's shadow body.
-## Always active — provides the player's RigidBody3D presence in Jolt's solver.
+## Always active — provides the player's dynamic RigidBody3D presence in Jolt's solver.
 const SHADOW_BODY_LAYER: int = 512
-const SHADOW_BODY_MASS: float = 80.0
 
 ## Combat state (synced via ServerSync)
 var health: float = MAX_HEALTH
@@ -121,6 +120,11 @@ var _original_mesh_scale_y: float = 1.0
 ## Added as a sibling node (not child) so Jolt treats it as independent.
 var shadow_body: ToadShadowBody = null
 
+## External push velocity from physics collisions (shadow body solver delta).
+## Stored separately so the movement system doesn't immediately overwrite it.
+## Applied additively to velocity each frame and decayed over time.
+var _external_push: Vector3 = Vector3.ZERO
+
 ## Subsystem references
 @onready var slide_crouch: SlideCrouchSystem = $SlideCrouchSystem
 @onready var kamikaze_system: KamikazeSystem = $KamikazeSystem
@@ -192,6 +196,10 @@ func _ready() -> void:
 	# Tell inventory which peer owns it so server→client sync works
 	if inventory:
 		inventory._owner_peer_id = peer_id
+
+	# Put player visuals on both render layer 1 (overworld) and 2 (toad dimension)
+	# so the camera sees players regardless of which dimension it's showing.
+	_set_player_render_layers()
 
 	# Create the player's shadow body (server-only) — a dynamic RigidBody3D
 	# that gives the player a real physics presence in Jolt's solver.
@@ -435,6 +443,9 @@ func _server_process(delta: float) -> void:
 			else:
 				_process_normal_movement(delta)
 
+	# Apply external push from physics collisions (shadow body solver delta)
+	_apply_external_push(delta)
+
 	# Track pre-land velocity for slide-on-land momentum transfer
 	slide_crouch.track_pre_land_velocity()
 	move_and_slide()
@@ -463,10 +474,20 @@ func _server_process(delta: float) -> void:
 		item_manager.try_extend_equipped_item()
 
 	# --- Open nearby chest OR store OR pickup nearby item (E key) ---
+	# Unified: find the single closest interactable and act on it.
+	# Note: get_interact_distance() uses popup range (visual), but the
+	# actual action must be within the tighter interact range.
 	if wants_pickup and inventory:
-		if not _try_open_nearby_chest():
-			if not _try_open_nearby_store():
-				item_manager.try_pickup_nearby_item()
+		var interact_target := _find_closest_interactable()
+		if interact_target is LootChest:
+			var chest: LootChest = interact_target as LootChest
+			if not chest.is_open and global_position.distance_to(chest.global_position) < LootChest.CHEST_INTERACT_RANGE:
+				chest.open(peer_id)
+		elif interact_target is KillStore:
+			if global_position.distance_to(interact_target.global_position) < KillStore.STORE_INTERACT_RANGE:
+				_open_store_for_player()
+		elif interact_target is WorldItem:
+			item_manager.try_pickup_item(interact_target)
 
 	# --- Scrap nearby ground item (X key) ---
 	if wants_scrap and inventory:
@@ -719,6 +740,24 @@ func _process_normal_movement(delta: float) -> void:
 	velocity.z = horizontal.y
 
 
+func _apply_external_push(_delta: float) -> void:
+	## Apply external push velocity from physics collisions (shadow body solver delta).
+	## Called right before move_and_slide() so the push actually moves the player.
+	##
+	## This is a ONE-SHOT impulse: Jolt already computed the exact velocity change
+	## with correct mass ratios, contact normals, and restitution. We just add it
+	## to velocity once and clear it. The player's normal movement deceleration
+	## (move_toward in _process_normal_movement) naturally bleeds it off — no
+	## manual decay needed. Applying it every frame would stack the push and
+	## launch the player into orbit.
+	if _external_push.length_squared() < 0.0001:
+		return
+	print("[Player %d] _apply_external_push: push=%s (len=%.3f) vel_before=%s" % [
+		peer_id, _external_push, _external_push.length(), velocity])
+	velocity += _external_push
+	_external_push = Vector3.ZERO
+
+
 ## ======================================================================
 ##  Client-side visuals
 ## ======================================================================
@@ -815,71 +854,40 @@ func _get_camera_aim_target(cam_origin: Vector3, cam_forward: Vector3) -> Vector
 
 
 ## ======================================================================
-##  Chest interaction (E key opens nearest chest in range)
+##  Unified interaction (E key — closest interactable wins)
 ## ======================================================================
 
-func _try_open_nearby_chest() -> bool:
-	## Server-only: find the nearest closed LootChest within interact range and open it.
-	## Returns true if a chest was opened, false otherwise.
+func _find_closest_interactable() -> Node:
+	## Server-only: find the single closest interactable (WorldItem, LootChest,
+	## or KillStore) using the same get_interact_distance() interface that the
+	## client-side ProximityLabel uses for label display.
 	var scene := get_tree().current_scene
 	if scene == null:
-		return false
+		return null
 	var world_items := scene.get_node_or_null("WorldItems")
 	if world_items == null:
-		world_items = scene
+		return null
 
-	var best_chest: Node = null
-	var best_dist: float = INF
-
-	for child in world_items.get_children():
-		if not child is LootChest:
-			continue
-		if child.is_open:
-			continue
-		var dist: float = global_position.distance_to(child.global_position)
-		if dist < LootChest.CHEST_INTERACT_RANGE and dist < best_dist:
-			best_chest = child
-			best_dist = dist
-
-	if best_chest != null:
-		best_chest.open(peer_id)
-		return true
-	return false
-
-
-## ======================================================================
-##  Kill Store interaction
-## ======================================================================
-
-func _try_open_nearby_store() -> bool:
-	## Server-only: find the nearest KillStore within interact range.
-	## If found, send an RPC to the owning client to open the store UI.
-	## Returns true if a store was found (even if bot skips it).
-	var scene := get_tree().current_scene
-	if scene == null:
-		return false
-	var world_items := scene.get_node_or_null("WorldItems")
-	if world_items == null:
-		return false
-
-	var best_store: Node = null
-	var best_dist: float = INF
+	var best: Node = null
+	var best_dist := INF
 
 	for child in world_items.get_children():
-		if not child is KillStore:
+		if not child.has_method("get_interact_distance"):
 			continue
-		var dist: float = global_position.distance_to(child.global_position)
-		if dist < KillStore.STORE_INTERACT_RANGE and dist < best_dist:
-			best_store = child
-			best_dist = dist
+		var d: float = child.get_interact_distance(global_position)
+		if d < best_dist:
+			best_dist = d
+			best = child
 
-	if best_store == null:
-		return false
+	return best
 
+
+func _open_store_for_player() -> void:
+	## Server-only: open the store UI for this player.
 	# Bots don't use stores
 	var net_mgr := get_node_or_null("/root/NetworkManager")
 	if net_mgr and peer_id >= net_mgr.BOT_PEER_ID_START:
-		return true  # Consumed the input, just don't open UI
+		return
 
 	# Host opens store directly (peer 1 doesn't receive RPCs from itself)
 	if peer_id == 1:
@@ -887,7 +895,6 @@ func _try_open_nearby_store() -> bool:
 			store_ui.open_store()
 	else:
 		_rpc_open_store_ui.rpc_id(peer_id)
-	return true
 
 
 func _is_near_store() -> bool:
@@ -1029,6 +1036,7 @@ func die(killer_id: int) -> void:
 	if shadow_body != null and is_instance_valid(shadow_body):
 		shadow_body.collision_layer = 0
 		shadow_body.collision_mask = 0
+	_external_push = Vector3.ZERO
 	# End slide/crouch if active
 	if slide_crouch.is_sliding:
 		slide_crouch.end_slide()
@@ -1124,7 +1132,7 @@ func _do_respawn() -> void:
 	# Re-enable shadow body collision on respawn
 	if shadow_body != null and is_instance_valid(shadow_body):
 		shadow_body.collision_layer = SHADOW_BODY_LAYER
-		shadow_body.collision_mask = 1 | 2 | 4 | 8 | 16 | 64
+		shadow_body.collision_mask = 2 | 4 | 8 | 16 | 64
 
 	var map := get_tree().current_scene
 	var spawns := map.get_node("PlayerSpawnPoints").get_children()
@@ -1155,6 +1163,7 @@ func _do_respawn() -> void:
 		var spawn_point: Marker3D = valid_spawns[randi() % valid_spawns.size()]
 		global_position = spawn_point.global_position
 		velocity = Vector3.ZERO
+		_external_push = Vector3.ZERO
 
 	# Reset air-jump counter
 	_air_jumps_used = 0
@@ -1242,6 +1251,7 @@ func _load_gun_model(model_path: String) -> void:
 
 	_current_gun_model = scene.instantiate()
 	_current_gun_model.scale = Vector3(0.15, 0.15, 0.15)
+	_set_render_layers_recursive(_current_gun_model, 1 | 2)
 	weapon_mount.add_child(_current_gun_model)
 
 
@@ -1447,15 +1457,37 @@ func rpc_unslot_trinket_from_shoe(trinket_slot_index: int) -> void:
 
 
 ## ======================================================================
+##  Render layer setup — visible in both overworld and toad dimension
+## ======================================================================
+
+func _set_player_render_layers() -> void:
+	## Set all VisualInstance3D children to render layers 1 | 2 so player meshes
+	## are visible regardless of which dimension the camera is showing.
+	## Layer 1 = overworld, Layer 2 = toad dimension.
+	_set_render_layers_recursive(self, 1 | 2)
+
+
+static func _set_render_layers_recursive(node: Node, layer_mask: int) -> void:
+	if node is VisualInstance3D:
+		node.layers = layer_mask
+	for child in node.get_children():
+		_set_render_layers_recursive(child, layer_mask)
+
+
+## ======================================================================
 ##  Player Shadow Body — dynamic RigidBody3D collision proxy (always active)
 ## ======================================================================
 
 func _create_shadow_body() -> void:
 	## Server-only: create the shadow body as a sibling node.
 	## Called once from _ready(). The shadow body persists for the player's lifetime
-	## and provides a real RigidBody3D presence so Jolt can handle mass-weighted
-	## momentum exchange with other rigid bodies (toads, boulders, etc.).
+	## and provides a dynamic 80 kg RigidBody3D presence in Jolt's solver.
 	## Must be a sibling (not child) — nesting physics bodies causes transform conflicts.
+	##
+	## The shadow body handles BOTH collision AND push transfer natively through Jolt.
+	## _integrate_forces sets velocity to match the player (pre-solver), then
+	## _physics_process reads the velocity delta after the solver ran and transfers
+	## it to the player. No manual impulse math — Jolt computes everything.
 	if shadow_body != null:
 		return
 
@@ -1463,20 +1495,27 @@ func _create_shadow_body() -> void:
 	shadow_body.name = "ShadowBody_%d" % peer_id
 	shadow_body.target = self
 
-	# Dynamic body with custom integrator — NOT frozen/kinematic
-	shadow_body.mass = SHADOW_BODY_MASS
+	# Dynamic body with custom integrator — Jolt still runs its solver on it,
+	# but we control velocity in _integrate_forces instead of letting Jolt
+	# integrate gravity/forces. Position is corrected in _physics_process
+	# AFTER the solver runs — teleporting in _integrate_forces makes Jolt
+	# treat the body as kinematic (infinite mass in the solver).
+	shadow_body.mass = ToadShadowBody.SHADOW_MASS
 	shadow_body.custom_integrator = true
 	shadow_body.gravity_scale = 0.0
+	shadow_body.lock_rotation = true  # Prevent solver torque from tilting the capsule
+	shadow_body.can_sleep = false  # Must stay awake — Jolt skips contacts for sleeping bodies
 	shadow_body.collision_layer = SHADOW_BODY_LAYER
-	# Mask all gameplay physics layers (world, items, bubbles, rubber balls, toad walls, toad rain)
-	# Excludes: debris (32, cosmetic), players (128/256, CharacterBody3D), shadow bodies (512)
-	shadow_body.collision_mask = 1 | 2 | 4 | 8 | 16 | 64
-	shadow_body.contact_monitor = true
-	shadow_body.max_contacts_reported = 8
+	# Mask gameplay physics layers that should interact with the player.
+	# Does NOT mask world geometry (layer 1) — the CharacterBody3D handles
+	# terrain via move_and_slide(). If the shadow body masks terrain, Jolt's
+	# solver fights the position correction, causing the shadow to lag behind
+	# and get stuck in geometry while the player walks freely.
+	shadow_body.collision_mask = 2 | 4 | 8 | 16 | 64
+	shadow_body.continuous_cd = true  # CCD for fast-moving objects hitting the shadow
 
-	# Physics material — slight bounce so objects ricochet naturally
 	var phys_mat := PhysicsMaterial.new()
-	phys_mat.bounce = 0.3
+	phys_mat.bounce = 0.0
 	phys_mat.friction = 0.5
 	shadow_body.physics_material_override = phys_mat
 
@@ -1489,15 +1528,46 @@ func _create_shadow_body() -> void:
 	col.position = Vector3(0, 0.9, 0)
 	shadow_body.add_child(col)
 
-	# Wire contact signal (server-only push)
-	shadow_body.body_entered.connect(shadow_body._on_body_entered)
+	# DEBUG: transparent blue capsule mesh to visualize the shadow body
+	var debug_mesh := MeshInstance3D.new()
+	debug_mesh.name = "DebugMesh"
+	var debug_capsule := CapsuleMesh.new()
+	debug_capsule.radius = 0.4
+	debug_capsule.height = 1.8
+	debug_mesh.mesh = debug_capsule
+	debug_mesh.position = Vector3(0, 0.9, 0)
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = ToadShadowBody.DEBUG_COLOR
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	debug_mesh.material_override = mat
+	shadow_body.add_child(debug_mesh)
 
 	# Add to the map root FIRST (global_position requires being in tree)
 	get_tree().current_scene.add_child(shadow_body)
+	shadow_body.add_to_group("shadow_bodies")  # DEBUG: for near-miss detection
+
+	# Mass-ratio stabilization is handled automatically in the engine's contact
+	# listener: when two dynamic bodies have an extreme mass ratio (>4:1), the
+	# heavier body's inverse mass is scaled down so the solver converges without
+	# launching. No per-body override needed here — the shadow body (80 kg) vs
+	# a toad (4-8 kg) triggers automatic scaling, while a boulder (200 kg) vs
+	# the shadow body gets full two-way interaction.
+	#
+	# To add a per-body override on top (e.g. make shadow fully immovable):
+	#   PhysicsServer3D.body_set_contact_inv_mass_scale(shadow_body.get_rid(), 0.0)
+
+	# NOTE: The automatic mass-ratio scaling runs in C++ inside the Jolt contact
+	# listener on every contact pair — no GDScript call needed. The per-body override
+	# API (body_set_contact_inv_mass_scale) is bound on JoltPhysicsServer3D but NOT
+	# forwarded through PhysicsServer3DWrapMT (threaded physics wrapper), so
+	# has_method() returns false even though the C++ scaling code IS active.
+	print("[Player %d] Engine binary: mass-ratio scaling active in C++ contact listener" % peer_id)
 
 	# NOW set position (must be after add_child for global_position to work)
 	shadow_body.global_position = global_position
-	print("[Player %d] ShadowBody created — layer=%d mask=%d pos=%s" % [
+	print("[Player %d] ShadowBody created — layer=%d mask=%d mass=%.0f pos=%s" % [
 		peer_id, shadow_body.collision_layer, shadow_body.collision_mask,
-		shadow_body.global_position
+		shadow_body.mass, shadow_body.global_position
 	])

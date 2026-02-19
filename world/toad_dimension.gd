@@ -6,8 +6,11 @@ extends Node
 ## swapping so overworld hitscan/physics queries don't interact with toad
 ## dimension players and vice versa.
 ##
-## Visual isolation is handled by environment swapping (fog, sky, ambient light)
-## — 500m underground, the overworld is not visible.
+## Visual isolation is handled by render layer separation: toad arena meshes
+## use visibility layer 2, overworld uses default layer 1. The camera's
+## cull_mask is swapped on entry/exit so each dimension only renders its own
+## geometry. Players are on both layers (1|2) so they're always visible.
+## Environment swapping (fog, sky, ambient light) completes the effect.
 ##
 ## Each player gets their own independent exit timer. Multiple pairs can fight
 ## simultaneously in the same space amid a shared toad rain.
@@ -17,20 +20,22 @@ extends Node
 ## Toad bodies are full RigidBody3D physics objects (toad_body.tscn).
 ## Each toad bounces once off the floor, then phases through the ground
 ## and despawns when it falls far enough below. Toads push players on
-## contact via PhysicsBodyBase (mass = 4 kg, 1/20th of player mass).
+## contact via PhysicsBodyBase (mass = 2 kg, 1/40th of player mass).
 
 const DIMENSION_Y: float = -500.0        ## Arena floor Y
-const FLOOR_SIZE: float = 500.0          ## Massive floor to look endless
-const CEILING_HEIGHT: float = 60.0       ## Invisible ceiling height
+const FLOOR_SIZE: float = 500.0          ## Collision floor size (players can't reach the edge)
+const VISUAL_PLANE_SIZE: float = 10000.0 ## Huge visual ground/ceiling plane (looks infinite)
+const CEILING_HEIGHT: float = 200.0      ## Invisible ceiling height (spacious)
+const TOAD_SPAWN_HEIGHT: float = CEILING_HEIGHT * 0.3  ## Toads spawn at the fog ceiling so they emerge from it
 const SESSION_DURATION: float = 10.0     ## Seconds trapped in the dimension
 const GIANT_TOAD_Y_OFFSET: float = 30.0  ## Raise toad so it sits on the floor
 const GIANT_TOAD_DISTANCE: float = 350.0 ## Far enough players can't reach it
 const TOAD_RAIN_INTERVAL: float = 0.03   ## Seconds between toad spawns (massive downpour)
-const TOAD_RAIN_AREA: float = 52.5       ## Radius of toad rain spread (50% larger)
-var toads_per_tick: int = 400             ## Toads spawned per rain tick (adjustable via pause menu)
+const TOAD_RAIN_RADIUS: float = 100.0    ## Radius of circular toad rain spread (200m diameter)
+var toads_per_tick: int = 6               ## Toads spawned per rain tick (adjustable via pause menu)
 const TOAD_SCATTER_SPEED: float = 8.0    ## How fast toads scatter on session end
 const TOAD_DESPAWN_DELAY: float = 3.0    ## Seconds after session ends before remaining toads are freed
-const TOAD_MAX: int = 1000000              ## Maximum toad bodies alive at once
+const TOAD_MAX: int = 100000               ## Maximum toad bodies alive at once
 
 ## Collision layers saved/restored during dimension transition.
 ## Toad dimension players move to layer 9 (bit 256) — an unused layer
@@ -41,8 +46,32 @@ const TOAD_MAX: int = 1000000              ## Maximum toad bodies alive at once
 const TOAD_COLLISION_LAYER: int = 256        ## Layer 9 (toad dimension players)
 const TOAD_COLLISION_MASK: int = 1 | 16 | 64 | 256  ## World + toad walls + toad rain + toad players
 
+## Render (visibility) layer for toad dimension meshes.
+## Overworld uses default layer 1 (bit 0). Toad dimension uses layer 2 (bit 1).
+## Camera cull_mask is swapped so only the relevant world renders.
+const TOAD_RENDER_LAYER: int = 2          ## Visibility layer bit 2 (second layer)
+
 ## Pre-loaded toad body scene
 var _toad_body_scene: PackedScene = null
+
+## Pre-created collision shapes bucketed by size to avoid per-toad duplication.
+## 5 buckets spanning the [0.2, 0.4] range — each toad snaps to the nearest.
+const TOAD_SCALE_MIN: float = 0.2
+const TOAD_SCALE_MAX: float = 0.4
+const TOAD_SHAPE_BUCKETS: int = 5
+var _shared_shapes: Array[SphereShape3D] = []
+
+func _get_shared_shape(body_scale: float) -> SphereShape3D:
+	if _shared_shapes.is_empty():
+		for i in range(TOAD_SHAPE_BUCKETS):
+			var radius: float = TOAD_SCALE_MIN + (TOAD_SCALE_MAX - TOAD_SCALE_MIN) * float(i) / float(TOAD_SHAPE_BUCKETS - 1)
+			var shape := SphereShape3D.new()
+			shape.radius = radius
+			_shared_shapes.append(shape)
+	# Snap to nearest bucket
+	var t: float = clampf((body_scale - TOAD_SCALE_MIN) / (TOAD_SCALE_MAX - TOAD_SCALE_MIN), 0.0, 1.0)
+	var idx: int = roundi(t * float(TOAD_SHAPE_BUCKETS - 1))
+	return _shared_shapes[idx]
 
 ## Fixed arena center — all sessions share the same space
 var _arena_center: Vector3 = Vector3(0, DIMENSION_Y + 1.0, 0)
@@ -57,6 +86,8 @@ var _floor_mat: StandardMaterial3D = null
 var _toad_env: Environment = null
 var _overworld_env: Environment = null
 var _is_showing_toad_env: bool = false
+var _saved_camera_cull_mask: int = 0
+var _saved_sun_visible: bool = true
 
 ## Container node for spawned toad RigidBody3D instances
 var _shared_toads_container: Node3D = null
@@ -136,6 +167,12 @@ func enter(attacker: CharacterBody3D, victim: CharacterBody3D) -> void:
 
 	# Reset (not stack) the shared rain timer
 	_rain_duration = SESSION_DURATION
+
+	# If this is a fresh entry (no toads currently raining), pre-populate the
+	# column so players don't see an empty sky while toads take time to fall.
+	var was_empty: bool = _shared_toads_container.get_child_count() == 0
+	if was_empty:
+		_spawn_initial_toads()
 
 	# Notify clients for VFX / environment swap
 	_on_enter_toad_dimension.rpc(attacker.peer_id, victim.peer_id)
@@ -304,6 +341,18 @@ func _apply_toad_env() -> void:
 	world_env.environment = _toad_env
 	_is_showing_toad_env = true
 
+	# Swap camera cull_mask: only render toad dimension layer (2)
+	var cam := _find_local_camera()
+	if cam:
+		_saved_camera_cull_mask = cam.cull_mask
+		cam.cull_mask = TOAD_RENDER_LAYER
+
+	# Hide the overworld sun so it doesn't light the toad dimension
+	var sun := _find_sun()
+	if sun:
+		_saved_sun_visible = sun.visible
+		sun.visible = false
+
 
 func _restore_overworld_env() -> void:
 	if _overworld_env == null:
@@ -313,6 +362,16 @@ func _restore_overworld_env() -> void:
 	var world_env := _find_world_environment()
 	if world_env:
 		world_env.environment = _overworld_env
+
+	# Restore camera cull_mask to see overworld again
+	var cam := _find_local_camera()
+	if cam and _saved_camera_cull_mask != 0:
+		cam.cull_mask = _saved_camera_cull_mask
+
+	# Restore sun visibility
+	var sun := _find_sun()
+	if sun:
+		sun.visible = _saved_sun_visible
 
 	_is_showing_toad_env = false
 
@@ -344,11 +403,11 @@ func _create_toad_environment() -> Environment:
 	env.tonemap_white = 1.0
 
 	env.fog_enabled = true
-	env.fog_light_color = Color(0.45, 0.47, 0.45)
-	env.fog_density = 0.003
-	env.fog_sky_affect = 0.8
-	env.fog_height = DIMENSION_Y + 30
-	env.fog_height_density = 0.005
+	env.fog_light_color = Color(0.35, 0.38, 0.35)
+	env.fog_density = 0.008
+	env.fog_sky_affect = 1.0
+	env.fog_height = DIMENSION_Y + CEILING_HEIGHT * 0.3
+	env.fog_height_density = 0.04
 
 	return env
 
@@ -365,6 +424,30 @@ func _find_world_environment() -> WorldEnvironment:
 		for child in seed_world.get_children():
 			if child is WorldEnvironment:
 				return child
+	return null
+
+
+func _find_local_camera() -> Camera3D:
+	var player := _get_local_player()
+	if player == null:
+		return null
+	return player.get_node_or_null("CameraPivot/SpringArm3D/Camera3D")
+
+
+func _find_sun() -> DirectionalLight3D:
+	var scene := get_tree().current_scene
+	if scene == null:
+		return null
+	# Sun is a child of SeedWorld
+	var seed_world := scene.get_node_or_null("SeedWorld")
+	if seed_world:
+		for child in seed_world.get_children():
+			if child is DirectionalLight3D:
+				return child
+	# Also check direct children of scene root
+	for child in scene.get_children():
+		if child is DirectionalLight3D:
+			return child
 	return null
 
 
@@ -397,13 +480,12 @@ func _spawn_toad() -> void:
 	var toad: RigidBody3D = _toad_body_scene.instantiate()
 
 	# Random size (collision radius and visual scale)
-	var body_scale: float = randf_range(0.2, 0.4)
+	var body_scale: float = randf_range(TOAD_SCALE_MIN, TOAD_SCALE_MAX)
 
-	# Set collision shape radius to match visual scale
+	# Use shared collision shape (bucketed by size — avoids per-toad resource duplication)
 	var col_shape: CollisionShape3D = toad.get_node("CollisionShape3D")
-	if col_shape and col_shape.shape is SphereShape3D:
-		col_shape.shape = col_shape.shape.duplicate()
-		col_shape.shape.radius = body_scale
+	if col_shape:
+		col_shape.shape = _get_shared_shape(body_scale)
 
 	# Scale the body mesh (squished sphere — 0.65 height ratio like original)
 	var body_mesh: MeshInstance3D = toad.get_node("Body")
@@ -413,16 +495,21 @@ func _spawn_toad() -> void:
 	# Position eyes and pupils relative to body size
 	_setup_toad_eyes(toad, body_scale)
 
-	# Random spawn position in rain area
-	var rng_x: float = randf_range(-TOAD_RAIN_AREA, TOAD_RAIN_AREA)
-	var rng_z: float = randf_range(-TOAD_RAIN_AREA, TOAD_RAIN_AREA)
-	toad.position = _arena_center + Vector3(rng_x, CEILING_HEIGHT - 5.0 + randf() * 3.0, rng_z)
+	# Random spawn position in circular rain area (uniform distribution)
+	var angle: float = randf() * TAU
+	var dist: float = TOAD_RAIN_RADIUS * sqrt(randf())
+	var rng_x: float = cos(angle) * dist
+	var rng_z: float = sin(angle) * dist
+	toad.position = _arena_center + Vector3(rng_x, TOAD_SPAWN_HEIGHT - 5.0 + randf() * 3.0, rng_z)
 
 	# Give a small random angular velocity so they tumble
 	toad.angular_velocity = Vector3(randf_range(-4, 4), randf_range(-4, 4), randf_range(-4, 4))
 
 	# Tell the toad body where the floor is for despawn detection
 	toad._floor_y = DIMENSION_Y
+
+	# Set toad meshes to toad render layer so they're invisible to overworld cameras
+	_set_toad_render_layer_recursive(toad)
 
 	# Apply current toggle states before adding to scene
 	if GameManager.debug_toad_no_physics:
@@ -432,6 +519,118 @@ func _spawn_toad() -> void:
 		toad.set_shadows_enabled(false)
 
 	_shared_toads_container.add_child(toad)
+
+
+const INITIAL_SPAWN_BATCH_SIZE: int = 50  ## Toads spawned per frame during pre-population
+
+func _spawn_initial_toads() -> void:
+	## Pre-populate the toad rain column to simulate steady-state rainfall.
+	## Spawns toads distributed vertically as if rain had already been falling
+	## long enough to fill the sky. Each toad gets a position and velocity
+	## consistent with having fallen for a random duration under gravity.
+	##
+	## Spawns in batches of INITIAL_SPAWN_BATCH_SIZE per frame to avoid
+	## freezing the game. All initial toads are visual-only (physics disabled)
+	## so spreading across frames is safe.
+	##
+	## All parameters (gravity, area, density, ceiling height) are derived from
+	## existing constants/vars so this adapts automatically to future changes.
+
+	var effective_gravity: float = 9.8 * 2.0  # ProjectSettings gravity * gravity_scale
+	var spawn_ceiling: float = TOAD_SPAWN_HEIGHT - 5.0  # Highest spawn Y above arena_center
+	var spawn_ceiling_jitter: float = 3.0            # Random Y range at spawn height
+	var max_fall_dist: float = spawn_ceiling + spawn_ceiling_jitter  # Max distance a toad falls
+
+	# Time for a toad to fall the full distance from ceiling to floor
+	var t_fall: float = sqrt(2.0 * max_fall_dist / effective_gravity)
+
+	# Steady-state toad count = spawn_rate * fall_time
+	# spawn_rate = toads_per_tick / TOAD_RAIN_INTERVAL (toads per second)
+	var spawn_rate: float = float(toads_per_tick) / TOAD_RAIN_INTERVAL
+	var initial_count: int = int(spawn_rate * t_fall)
+
+	# Cap to something reasonable
+	initial_count = mini(initial_count, TOAD_MAX / 2)
+
+	if initial_count <= 0:
+		return
+
+	print("[ToadDimension] Pre-populating %d toads (rate=%.0f/s, t_fall=%.2fs)" % [
+		initial_count, spawn_rate, t_fall
+	])
+
+	if _toad_body_scene == null:
+		_toad_body_scene = load("res://world/toad_body.tscn")
+
+	var spawned_this_frame: int = 0
+	for i in range(initial_count):
+		# Yield every batch to keep the game responsive
+		if spawned_this_frame >= INITIAL_SPAWN_BATCH_SIZE:
+			spawned_this_frame = 0
+			await get_tree().process_frame
+			# Safety: container may have been freed if dimension was exited mid-spawn
+			if not is_instance_valid(_shared_toads_container):
+				return
+
+		var toad: RigidBody3D = _toad_body_scene.instantiate()
+
+		# --- Random size (same logic as _spawn_toad) ---
+		var body_scale: float = randf_range(TOAD_SCALE_MIN, TOAD_SCALE_MAX)
+		var col_shape: CollisionShape3D = toad.get_node("CollisionShape3D")
+		if col_shape:
+			col_shape.shape = _get_shared_shape(body_scale)
+		var body_mesh: MeshInstance3D = toad.get_node("Body")
+		if body_mesh:
+			body_mesh.scale = Vector3(body_scale, body_scale * 0.65, body_scale)
+		_setup_toad_eyes(toad, body_scale)
+
+		# --- Position: simulate a random fall time in [0, t_fall) ---
+		# Each toad has been falling for a uniformly random duration.
+		# distance_fallen = 0.5 * g * t^2, velocity = g * t
+		var t: float = randf() * t_fall
+		var dist_fallen: float = 0.5 * effective_gravity * t * t
+		var fall_velocity: float = effective_gravity * t  # downward speed
+
+		# Horizontal position — same uniform-in-circle distribution as _spawn_toad
+		var angle: float = randf() * TAU
+		var dist: float = TOAD_RAIN_RADIUS * sqrt(randf())
+		var rng_x: float = cos(angle) * dist
+		var rng_z: float = sin(angle) * dist
+
+		# Vertical position: start from a random ceiling point and subtract fall distance
+		var spawn_y: float = spawn_ceiling + randf() * spawn_ceiling_jitter
+		var current_y: float = spawn_y - dist_fallen
+
+		# Skip toads that would already be below the floor (they'd have bounced/despawned)
+		if current_y < 0.0:
+			toad.queue_free()
+			continue
+
+		toad.position = _arena_center + Vector3(rng_x, current_y, rng_z)
+
+		toad._floor_y = DIMENSION_Y
+		_set_toad_render_layer_recursive(toad)
+
+		# Pre-populated toads are visual-only: no Jolt collision. If they had
+		# physics enabled, dozens of high-velocity toads near the floor would
+		# all slam into the shadow body on the first few frames, creating a
+		# massive combined impulse that launches the player. Instead, we put
+		# them straight into physics-disabled mode with manual velocity so
+		# they fall visually, pass through the floor, and despawn — identical
+		# to post-bounce toads. The normal rain loop spawns real physics toads
+		# from the ceiling moments later.
+		toad.start_physics_disabled()
+		# Set velocity AFTER start_physics_disabled() — that method captures
+		# linear_velocity (which is zero pre-scene-tree) into _manual_velocity.
+		# We overwrite with the correct simulated fall velocity.
+		toad._manual_velocity = Vector3(0, -fall_velocity, 0)
+		toad._manual_angular_vel = Vector3(randf_range(-4, 4), randf_range(-4, 4), randf_range(-4, 4))
+
+		if GameManager.debug_toad_no_shadows:
+			toad.set_shadows_enabled(false)
+
+		_shared_toads_container.add_child(toad)
+		spawned_this_frame += 1
 
 
 func _setup_toad_eyes(toad: RigidBody3D, radius: float) -> void:
@@ -569,8 +768,14 @@ func _build_arena() -> void:
 	_build_arena_lighting()
 	_spawn_ground_details()
 
+	# Set all visual nodes (meshes, lights) to the toad render layer
+	# so the overworld camera can't see them and vice versa.
+	_set_toad_render_layer_recursive(_arena_node)
+
 	_arena_built = true
-	print("[ToadDimension] Shared arena built at Y=%.0f (max_toads=%d)" % [DIMENSION_Y, TOAD_MAX])
+	print("[ToadDimension] Shared arena built at Y=%.0f ceiling=%.0f (max_toads=%d)" % [
+		DIMENSION_Y, CEILING_HEIGHT, TOAD_MAX
+	])
 
 
 func _build_floor() -> void:
@@ -588,17 +793,20 @@ func _build_floor() -> void:
 	floor_col.position = Vector3(0, -0.5, 0)
 	floor_body.add_child(floor_col)
 
+	# Visual ground plane — massive so it looks infinite in every direction
 	var floor_mesh := MeshInstance3D.new()
-	var floor_box := BoxMesh.new()
-	floor_box.size = Vector3(FLOOR_SIZE, 0.5, FLOOR_SIZE)
-	floor_mesh.mesh = floor_box
-	floor_mesh.position = Vector3(0, -0.25, 0)
+	var floor_plane := PlaneMesh.new()
+	floor_plane.size = Vector2(VISUAL_PLANE_SIZE, VISUAL_PLANE_SIZE)
+	floor_mesh.mesh = floor_plane
+	floor_mesh.position = Vector3(0, 0, 0)
 	floor_mesh.material_override = _floor_mat
+	floor_mesh.layers = TOAD_RENDER_LAYER
 	floor_body.add_child(floor_mesh)
 
 
 func _build_ceiling() -> void:
 	var ceil_body := StaticBody3D.new()
+	ceil_body.name = "ToadCeiling"
 	ceil_body.position = Vector3(0, DIMENSION_Y + CEILING_HEIGHT, 0)
 	ceil_body.collision_layer = 1
 	ceil_body.collision_mask = 0
@@ -608,6 +816,23 @@ func _build_ceiling() -> void:
 	ceil_shape.size = Vector3(FLOOR_SIZE, 1.0, FLOOR_SIZE)
 	ceil_col.shape = ceil_shape
 	ceil_body.add_child(ceil_col)
+
+	# Visual ceiling plane — blocks the overworld from being seen above.
+	# Rendered on toad layer only. Fog hides the flat surface so it looks natural.
+	var ceil_mesh := MeshInstance3D.new()
+	var ceil_plane := PlaneMesh.new()
+	ceil_plane.size = Vector2(VISUAL_PLANE_SIZE, VISUAL_PLANE_SIZE)
+	ceil_mesh.mesh = ceil_plane
+	# PlaneMesh faces up (+Y) by default — flip it to face downward
+	ceil_mesh.rotation_degrees = Vector3(180, 0, 0)
+	ceil_mesh.position = Vector3(0, 0, 0)
+	ceil_mesh.layers = TOAD_RENDER_LAYER
+	var ceil_mat := StandardMaterial3D.new()
+	ceil_mat.albedo_color = Color(0.08, 0.08, 0.08)
+	ceil_mat.roughness = 1.0
+	ceil_mat.metallic = 0.0
+	ceil_mesh.material_override = ceil_mat
+	ceil_body.add_child(ceil_mesh)
 
 
 func _build_cylindrical_barrier() -> void:
@@ -672,6 +897,15 @@ func _build_arena_lighting() -> void:
 	light2.omni_range = 100.0
 	light2.position = _arena_center + Vector3(10, 10, -10)
 	_arena_node.add_child(light2)
+
+
+func _set_toad_render_layer_recursive(node: Node) -> void:
+	## Recursively set visibility_layer on all VisualInstance3D nodes (meshes, lights)
+	## so they only render when the camera's cull_mask includes TOAD_RENDER_LAYER.
+	if node is VisualInstance3D:
+		node.layers = TOAD_RENDER_LAYER
+	for child in node.get_children():
+		_set_toad_render_layer_recursive(child)
 
 
 func _create_shared_materials() -> void:

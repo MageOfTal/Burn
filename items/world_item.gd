@@ -33,12 +33,24 @@ const RARITY_COLORS := {
 
 const PICKUP_POPUP_RANGE := 4.0
 
+## Rarity label stacking constants
+const STACK_SPACING := 0.35         ## World units between stacked labels
+const MAX_STACK := 5                ## Labels per column before wrapping
+const WRAP_X_OFFSET := 1.5          ## World units horizontal offset for wrapped column
+const SCREEN_OVERLAP_X := 80.0      ## Pixels — labels within this X range are "same column"
+const SCREEN_OVERLAP_Y := 40.0      ## Pixels — labels within this Y range overlap
+const STACK_VISIBLE_RANGE := 30.0   ## Max distance to include in stacking computation
+const BASE_LABEL_Y := 1.0           ## Default rarity label Y offset
+
 @onready var mesh: MeshInstance3D = $MeshInstance3D
 @onready var label: Label3D = $Label3D
 
 ## Proximity popup components (created in _ready, handle cached player + distance)
 var _scrap_proximity: ProximityLabel = null
 var _pickup_proximity: ProximityLabel = null
+
+## Rarity label stacking — static frame cache (computed once per frame)
+static var _stack_frame: int = -1
 
 
 func _ready() -> void:
@@ -110,6 +122,10 @@ func _process(delta: float) -> void:
 		if not should_show and _pickup_proximity.label:
 			_pickup_proximity._hide_label()
 
+	# Rarity label stacking (runs once per frame via static cache)
+	if not multiplayer.is_server() and label:
+		_try_compute_rarity_stacking()
+
 
 func _physics_process(_delta: float) -> void:
 	if _needs_ground_check:
@@ -150,6 +166,17 @@ func _on_body_entered(body: Node3D) -> void:
 #  Proximity popups (client-side, via ProximityLabel components)
 # ======================================================================
 
+func get_interact_distance(player_pos: Vector3) -> float:
+	## Unified interactable interface — returns distance to player, or INF if not
+	## interactable (fuel items don't compete for the [E] prompt).
+	if item_data == null or item_data.item_type == ItemData.ItemType.FUEL:
+		return INF
+	var d: float = global_position.distance_to(player_pos)
+	if d < PICKUP_POPUP_RANGE:
+		return d
+	return INF
+
+
 func _setup_proximity_labels() -> void:
 	# Pickup label — create/destroy style, green text, static "[E] PICKUP" (top)
 	_pickup_proximity = ProximityLabel.new()
@@ -158,7 +185,7 @@ func _setup_proximity_labels() -> void:
 	_pickup_proximity.label_color = Color(0.3, 1.0, 0.4)
 	_pickup_proximity.use_visibility_toggle = false
 	_pickup_proximity.update_callback = _on_pickup_label_update
-	_pickup_proximity.visibility_callback = _is_closest_item_check
+	_pickup_proximity.interactable_group = "interact"
 	add_child(_pickup_proximity)
 
 	# Scrap label — create/destroy style, orange text, updates fuel value each frame (bottom)
@@ -168,7 +195,7 @@ func _setup_proximity_labels() -> void:
 	_scrap_proximity.label_color = Color(1.0, 0.6, 0.2)
 	_scrap_proximity.use_visibility_toggle = false
 	_scrap_proximity.update_callback = _on_scrap_label_update
-	_scrap_proximity.visibility_callback = _is_closest_item_check
+	_scrap_proximity.interactable_group = "interact"
 	add_child(_scrap_proximity)
 
 
@@ -186,23 +213,111 @@ func _on_pickup_label_update(lbl: Label3D, _player: Node, _dist: float) -> void:
 	lbl.text = "[E] PICKUP"
 
 
-func _is_closest_item_check(player: Node, my_dist: float) -> bool:
-	## Only show popups on the CLOSEST non-fuel item — prevents popup spam.
+# ======================================================================
+#  Rarity label stacking (client-side, screen-space overlap prevention)
+# ======================================================================
+
+func _try_compute_rarity_stacking() -> void:
+	## Called from each WorldItem's _process(). Static frame cache ensures
+	## the expensive computation only runs once per engine frame.
+	var frame := Engine.get_process_frames()
+	if frame == _stack_frame:
+		return
+	_stack_frame = frame
+
+	# Find local player + camera
+	var local_player: Node = null
+	if _pickup_proximity:
+		local_player = _pickup_proximity.get_local_player()
+	if _scrap_proximity and local_player == null:
+		local_player = _scrap_proximity.get_local_player()
+	if local_player == null:
+		return
+	var camera: Camera3D = local_player.get("camera") as Camera3D
+	if camera == null:
+		return
+
+	var player_pos: Vector3 = local_player.global_position
 	var world_items := get_tree().current_scene.get_node_or_null("WorldItems")
 	if world_items == null:
-		return true
-	var player_pos: Vector3 = player.global_position
+		return
+
+	# Collect all visible rarity labels with their screen positions
+	var entries: Array[Dictionary] = []
 	for child in world_items.get_children():
-		if child == self:
+		if not child is WorldItem:
 			continue
-		if not child is Area3D or not ("item_data" in child) or child.item_data == null:
+		var wi: WorldItem = child as WorldItem
+		if wi.label == null or wi.item_data == null:
 			continue
-		if child.item_data.item_type == ItemData.ItemType.FUEL:
+		var dist: float = player_pos.distance_to(wi.global_position)
+		if dist > STACK_VISIBLE_RANGE:
+			# Reset far-away labels to default position
+			wi.label.position = Vector3(0, BASE_LABEL_Y, 0)
 			continue
-		var other_dist: float = player_pos.distance_to(child.global_position)
-		if other_dist < my_dist:
-			return false
-	return true
+		var world_label_pos: Vector3 = wi.global_position + Vector3(0, BASE_LABEL_Y, 0)
+		if camera.is_position_behind(world_label_pos):
+			wi.label.position = Vector3(0, BASE_LABEL_Y, 0)
+			continue
+		var screen_pos: Vector2 = camera.unproject_position(world_label_pos)
+		entries.append({
+			"item": wi,
+			"screen": screen_pos,
+			"dist": dist,
+		})
+
+	if entries.is_empty():
+		return
+
+	# Cluster labels by screen proximity using greedy grouping
+	var clusters: Array[Array] = []
+	var assigned: Array[bool] = []
+	assigned.resize(entries.size())
+	assigned.fill(false)
+
+	for i in entries.size():
+		if assigned[i]:
+			continue
+		var cluster: Array[Dictionary] = [entries[i]]
+		assigned[i] = true
+		# Find all unassigned entries that overlap with any member of this cluster
+		var search_idx := 0
+		while search_idx < cluster.size():
+			var anchor: Vector2 = cluster[search_idx]["screen"]
+			for j in entries.size():
+				if assigned[j]:
+					continue
+				var other: Vector2 = entries[j]["screen"]
+				if absf(anchor.x - other.x) < SCREEN_OVERLAP_X and absf(anchor.y - other.y) < SCREEN_OVERLAP_Y:
+					cluster.append(entries[j])
+					assigned[j] = true
+			search_idx += 1
+		clusters.append(cluster)
+
+	# For each cluster, sort by distance (closest at bottom) and assign stack offsets
+	for cluster in clusters:
+		if cluster.size() <= 1:
+			# Single item — reset to default
+			var wi: WorldItem = cluster[0]["item"]
+			wi.label.position = Vector3(0, BASE_LABEL_Y, 0)
+			continue
+
+		# Sort: closest items first (bottom of stack)
+		cluster.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+			return a["dist"] < b["dist"]
+		)
+
+		var col := 0  # Current column (0 = first, 1 = wrapped)
+		var row := 0  # Row within current column
+		for entry in cluster:
+			var wi: WorldItem = entry["item"]
+			var x_offset: float = col * WRAP_X_OFFSET
+			var y_offset: float = BASE_LABEL_Y + row * STACK_SPACING
+			wi.label.position = Vector3(x_offset, y_offset, 0)
+			row += 1
+			if row >= MAX_STACK:
+				row = 0
+				col += 1
 
 
 func _ensure_above_ground() -> void:

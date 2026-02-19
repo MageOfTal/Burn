@@ -143,6 +143,10 @@ func _on_body_hit(_body: Node) -> void:
 func _is_shooter_immune(body: Node) -> bool:
 	if body is CharacterBody3D and body.name.to_int() == _shooter_id:
 		return _lifetime < get_shooter_immunity_time()
+	# Shadow body: physics objects collide with the shadow body (layer 10) instead
+	# of the kinematic CharacterBody3D. Check if this is the shooter's shadow body.
+	if body is ToadShadowBody and body.target != null and body.target.name.to_int() == _shooter_id:
+		return _lifetime < get_shooter_immunity_time()
 	return false
 
 

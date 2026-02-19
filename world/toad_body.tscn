@@ -13,20 +13,6 @@ height = 1.3
 albedo_color = Color(0.15, 0.55, 0.1, 1)
 roughness = 0.7
 
-[sub_resource type="SphereMesh" id="ToadEyeMesh"]
-radius = 1.0
-height = 1.5
-
-[sub_resource type="StandardMaterial3D" id="ToadEyeMat"]
-albedo_color = Color(0.95, 0.95, 0.8, 1)
-
-[sub_resource type="SphereMesh" id="ToadPupilMesh"]
-radius = 1.0
-height = 1.56
-
-[sub_resource type="StandardMaterial3D" id="ToadPupilMat"]
-albedo_color = Color(0.05, 0.05, 0.0, 1)
-
 [sub_resource type="PhysicsMaterial" id="ToadPhysMat"]
 bounce = 0.3
 friction = 0.5
@@ -34,9 +20,8 @@ friction = 0.5
 [node name="ToadBody" type="RigidBody3D"]
 collision_layer = 64
 collision_mask = 513
-mass = 4.0
+mass = 2.0
 physics_material_override = SubResource("ToadPhysMat")
-continuous_cd = true
 script = ExtResource("1_toad")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="."]
@@ -45,19 +30,3 @@ shape = SubResource("ToadCollision")
 [node name="Body" type="MeshInstance3D" parent="."]
 mesh = SubResource("ToadBodyMesh")
 material_override = SubResource("ToadBodyMat")
-
-[node name="EyeL" type="MeshInstance3D" parent="."]
-mesh = SubResource("ToadEyeMesh")
-material_override = SubResource("ToadEyeMat")
-
-[node name="EyeR" type="MeshInstance3D" parent="."]
-mesh = SubResource("ToadEyeMesh")
-material_override = SubResource("ToadEyeMat")
-
-[node name="PupilL" type="MeshInstance3D" parent="."]
-mesh = SubResource("ToadPupilMesh")
-material_override = SubResource("ToadPupilMat")
-
-[node name="PupilR" type="MeshInstance3D" parent="."]
-mesh = SubResource("ToadPupilMesh")
-material_override = SubResource("ToadPupilMat")

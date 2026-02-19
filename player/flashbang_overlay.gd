@@ -38,11 +38,10 @@ func apply_flash(intensity: float, duration: float) -> void:
 	color.a = _flash_intensity
 	visible = true
 
-	# Play ear ringing sound scaled by intensity
-	if _ring_player and _ring_player.stream:
-		# Louder for stronger flashes: -20 dB at min intensity, 0 dB at full
-		_ring_player.volume_db = lerpf(-20.0, 0.0, intensity)
-		_ring_player.play()
+	# Play ear ringing sound scaled by intensity (disabled)
+	#if _ring_player and _ring_player.stream:
+	#	_ring_player.volume_db = lerpf(-20.0, 0.0, intensity)
+	#	_ring_player.play()
 
 
 func _process(delta: float) -> void:
