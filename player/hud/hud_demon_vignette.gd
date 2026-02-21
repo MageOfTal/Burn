@@ -4,13 +4,13 @@ class_name HUDDemonVignette
 ## Demon proximity red vignette — full-screen shader overlay that intensifies
 ## as the player's demon gets closer (within 10m edge-to-edge).
 
-var _player: CharacterBody3D = null
+var _player: Player = null
 
 var _vignette: ColorRect = null
 var _vignette_material: ShaderMaterial = null
 
 
-func setup(player: CharacterBody3D) -> void:
+func setup(player: Player) -> void:
 	_player = player
 	_build_vignette()
 

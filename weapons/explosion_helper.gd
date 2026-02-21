@@ -46,15 +46,19 @@ static func do_explosion(
 	#  Pass 1: Physics sphere query (catches players + rigid bodies)
 	# ------------------------------------------------------------------
 	var query := PhysicsShapeQueryParameters3D.new()
-	var sphere := SphereShape3D.new()
-	sphere.radius = radius
-	query.shape = sphere
+	# Create the sphere shape via PhysicsServer3D so Jolt registers it properly.
+	# A bare SphereShape3D.new() with .radius set in GDScript stays at radius 0
+	# on the Jolt side, causing the query to silently fail.
+	var sphere_rid := PhysicsServer3D.sphere_shape_create()
+	PhysicsServer3D.shape_set_data(sphere_rid, radius)
+	query.shape_rid = sphere_rid
 	query.transform = Transform3D(Basis(), explosion_pos)
 	query.collision_mask = 1 | 2 | 4 | 128 | 256  # World(1) + items(2) + bubbles(4) + players(128/256)
 	query.collide_with_bodies = true
 	query.collide_with_areas = true
 
 	var results := space_state.intersect_shape(query, 64)
+	PhysicsServer3D.free_rid(sphere_rid)
 
 	for result in results:
 		var collider: Node = result["collider"]
@@ -68,7 +72,7 @@ static func do_explosion(
 			# Wall: let take_damage_at handle per-block shielding internally
 			target.take_damage_at(explosion_pos, base_damage, radius, attacker_id)
 			already_damaged.append(target)
-		elif target is CharacterBody3D and target.has_method("take_damage"):
+		elif target is Player and target.has_method("take_damage"):
 			# Player: multi-point raycast with flat shielding
 			var dmg := _calc_player_explosion_damage(
 				space_state, explosion_pos, base_damage, radius, target, exclude_rid
@@ -97,7 +101,7 @@ static func _calc_player_explosion_damage(
 	explosion_pos: Vector3,
 	base_damage: float,
 	radius: float,
-	player: CharacterBody3D,
+	player: Player,
 	exclude_rid: RID
 ) -> float:
 	## Cast 5 rays from explosion to player sample points. For each ray,
@@ -182,7 +186,7 @@ static func calc_ray_shielding(
 			break  # Reached the target itself
 
 		# Identify what we hit and add its HP as absorption
-		if hit_node is CharacterBody3D and hit_node.has_method("take_damage"):
+		if hit_node is Player and hit_node.has_method("take_damage"):
 			# Player in the way: absorbs up to their current health
 			absorbed += hit_node.health
 		elif _is_wall_block(hit_node):

@@ -27,7 +27,7 @@ const GRAPPLE_RANGE := 60.0
 const HAND_HEIGHT := 1.2
 const EXTENDED_RAY := 500.0  ## Cast well past range to always hit terrain
 
-var _player: CharacterBody3D = null
+var _player: Player = null
 
 ## Cached results from _physics_process, consumed by _draw.
 var _draw_offset: Vector2 = Vector2.ZERO
@@ -37,7 +37,7 @@ var _should_show: bool = false
 var _needs_redraw: bool = false
 
 
-func setup(player: CharacterBody3D) -> void:
+func setup(player: Player) -> void:
 	_player = player
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
 	visible = false

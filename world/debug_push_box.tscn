@@ -1,0 +1,33 @@
+[gd_scene format=3 uid="uid://debug_push_box_001"]
+
+[ext_resource type="Script" path="res://world/debug_push_box.gd" id="1_script"]
+
+[sub_resource type="BoxShape3D" id="BoxShape"]
+size = Vector3(1.2, 2.0, 1.2)
+
+[sub_resource type="BoxMesh" id="BoxMesh"]
+size = Vector3(1.2, 2.0, 1.2)
+
+[sub_resource type="StandardMaterial3D" id="BoxMat"]
+albedo_color = Color(0.9, 0.3, 0.1, 1)
+roughness = 0.6
+
+[sub_resource type="PhysicsMaterial" id="BoxPhysMat"]
+bounce = 0.1
+friction = 0.8
+
+[node name="DebugPushBox" type="RigidBody3D"]
+collision_layer = 2
+collision_mask = 513
+mass = 80.0
+physics_material_override = SubResource("BoxPhysMat")
+script = ExtResource("1_script")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.0, 0)
+shape = SubResource("BoxShape")
+
+[node name="Mesh" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.0, 0)
+mesh = SubResource("BoxMesh")
+material_override = SubResource("BoxMat")

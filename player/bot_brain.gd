@@ -72,7 +72,7 @@ const DEMON_PANIC_RANGE := 10.0      ## Sprint and jump when demon is very close
 #  State
 # ======================================================================
 
-var _player: CharacterBody3D = null
+var _player: Player = null
 var _player_input: Node = null
 var _map_half_size: float = 112.0
 var _rng := RandomNumberGenerator.new()
@@ -89,7 +89,7 @@ var _target_yaw: float = 0.0
 var _stuck_timer: float = 0.0
 
 ## Combat
-var _combat_target: CharacterBody3D = null
+var _combat_target: Player = null
 var _combat_scan_timer: float = 0.0
 var _weapon_class: int = WeaponClass.NONE
 
@@ -118,7 +118,7 @@ var _needs_first_wander: bool = false
 #  Setup
 # ======================================================================
 
-func setup(player: CharacterBody3D) -> void:
+func setup(player: Player) -> void:
 	_player = player
 	_player_input = player.get_node("PlayerInput")
 	_rng.seed = hash(player.name) + Time.get_ticks_msec()
@@ -772,7 +772,7 @@ func _scan_for_targets() -> void:
 		var other: Node = NetworkManager.players[peer_id]
 		if other == _player:
 			continue
-		if not other is CharacterBody3D:
+		if not other is Player:
 			continue
 		if not other.get("is_alive"):
 			continue
@@ -897,7 +897,7 @@ func _scan_for_demons() -> void:
 
 	for peer_id in NetworkManager.players:
 		var other: Node = NetworkManager.players[peer_id]
-		if not other is CharacterBody3D:
+		if not other is Player:
 			continue
 		var demon_sys = other.get_node_or_null("DemonSystem")
 		if demon_sys == null:

@@ -167,7 +167,7 @@ func _damage_outside_players(delta: float) -> void:
 	var dmg_per_sec: float = ZONE_DAMAGE_PER_SECOND * (1.0 + effective_phase * ZONE_DAMAGE_SCALE_PER_PHASE)
 
 	for player_node in players_container.get_children():
-		if not player_node is CharacterBody3D:
+		if not player_node is Player:
 			continue
 		if not player_node.get("is_alive"):
 			continue

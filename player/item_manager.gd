@@ -23,7 +23,7 @@ const EXTEND_SCALE_RATE := 0.003     ## How fast cost ramps up per fuel spent (h
 const SCRAP_FUEL_BY_RARITY := [10.0, 30.0, 65.0, 130.0, 250.0]  # Common → Legendary
 const SCRAP_PICKUP_RANGE := 4.0  ## Max distance to scrap a ground item
 
-func setup(p: CharacterBody3D) -> void:
+func setup(p: Player) -> void:
 	super.setup(p)
 
 
@@ -198,6 +198,34 @@ func try_extend_equipped_item() -> void:
 
 
 ## ======================================================================
+##  Extend shoe lifespan (F key while shoe selected)
+## ======================================================================
+
+func try_extend_shoe() -> void:
+	## Server-only: extend the equipped shoe's burn timer by spending fuel.
+	if not multiplayer.is_server():
+		return
+	var inventory: Inventory = player.inventory
+	if inventory.equipped_shoe == null or inventory.equipped_shoe.item_data == null:
+		return
+
+	var stack: ItemStack = inventory.equipped_shoe
+	# Calculate scaling cost
+	var progress: float = 1.0 - exp(-EXTEND_SCALE_RATE * stack.fuel_spent_extending)
+	var cost_mult: float = 1.0 + (EXTEND_MAX_COST_MULT - 1.0) * progress
+	var fuel_cost: float = EXTEND_BASE_COST * cost_mult
+
+	if not inventory.has_fuel(fuel_cost):
+		return
+
+	inventory.spend_fuel(fuel_cost)
+	stack.burn_time_remaining += EXTEND_TIME_ADDED
+	stack.fuel_spent_extending += fuel_cost
+	print("Player %d extended shoe %s by %.0fs (cost: %.0f fuel, total spent: %.0f)" % [
+		player.peer_id, stack.item_data.item_name, EXTEND_TIME_ADDED, fuel_cost, stack.fuel_spent_extending])
+
+
+## ======================================================================
 ##  Scrap ground item (X key)
 ## ======================================================================
 
@@ -287,3 +315,39 @@ func try_scrap_equipped_item() -> void:
 	inventory.remove_item(idx)
 	inventory.add_fuel(fuel_gained)
 	print("Player %d scrapped %s for %.0f fuel" % [player.peer_id, item_name, fuel_gained])
+
+
+## ======================================================================
+##  Scrap shoe (O key while shoe selected)
+## ======================================================================
+
+func try_scrap_shoe() -> void:
+	## Server-only: scrap the equipped shoe for fuel.
+	if not multiplayer.is_server():
+		return
+
+	var inventory: Inventory = player.inventory
+	if inventory.equipped_shoe == null or inventory.equipped_shoe.item_data == null:
+		return
+
+	var stack: ItemStack = inventory.equipped_shoe
+	var rarity: int = stack.item_data.rarity
+	var max_fuel: float = SCRAP_FUEL_BY_RARITY[clampi(rarity, 0, 4)]
+	var initial_time: float = maxf(stack.item_data.initial_burn_time, 0.1)
+	var time_fraction: float = clampf(stack.burn_time_remaining / initial_time, 0.0, 1.0)
+	var fuel_gained: float = max_fuel * time_fraction
+	# Scavenger bonus: +50% scrap fuel
+	if 3 in player.active_bonuses:
+		fuel_gained *= 1.5
+
+	var item_name: String = stack.item_data.item_name
+
+	# Eject trinkets before scrapping
+	_eject_shoe_trinkets()
+
+	inventory.equipped_shoe = null
+	inventory.shoe_selected = false
+	inventory.shoe_changed.emit()
+	inventory.inventory_changed.emit()
+	inventory.add_fuel(fuel_gained)
+	print("Player %d scrapped shoe %s for %.0f fuel" % [player.peer_id, item_name, fuel_gained])

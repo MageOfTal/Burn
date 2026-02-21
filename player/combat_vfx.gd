@@ -25,7 +25,7 @@ var _bullet_close_streams: Array[AudioStream] = []
 ## State
 var _scope_overlay: ColorRect = null
 
-func setup(p: CharacterBody3D) -> void:
+func setup(p: Player) -> void:
 	super.setup(p)
 	# Preload bullet sounds
 	_bullet_hit_stream = load("res://assets/audio/sfx/bullet/hit.ogg")

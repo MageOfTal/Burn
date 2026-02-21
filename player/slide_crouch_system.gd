@@ -59,7 +59,7 @@ var _original_camera_y: float = 1.5
 var _original_mesh_y: float = 0.9
 var _original_mesh_scale_y: float = 1.0
 
-func setup(p: CharacterBody3D) -> void:
+func setup(p: Player) -> void:
 	super.setup(p)
 	_original_capsule_height = p._original_capsule_height
 	_original_camera_y = p._original_camera_y
@@ -134,6 +134,7 @@ func process_slide(delta: float) -> void:
 		player.velocity.x = _slide_velocity.x
 		player.velocity.z = _slide_velocity.z
 		player.velocity.y = player.JUMP_VELOCITY
+		player._is_grounded = false  # Override hysteresis — airborne now
 		# End slide directly — bypass end_slide() which would transition to crouch
 		# since we're still on_floor and holding shift
 		is_sliding = false
@@ -367,6 +368,7 @@ func process_post_slide_window(delta: float) -> bool:
 		player.velocity.x = _post_slide_dir.x * _post_slide_speed
 		player.velocity.z = _post_slide_dir.z * _post_slide_speed
 		player.velocity.y = player.JUMP_VELOCITY
+		player._is_grounded = false  # Override hysteresis — airborne now
 		_post_slide_timer = 0.0
 		_post_slide_speed = 0.0
 		_post_slide_dir = Vector3.ZERO
@@ -422,6 +424,7 @@ func process_crouch(delta: float) -> void:
 	if player._frame_jump and on_floor and has_headroom():
 		end_crouch()
 		player.velocity.y = player.JUMP_VELOCITY
+		player._is_grounded = false  # Override hysteresis — airborne now
 		return
 
 	# Crouched movement — slower, same acceleration feel (only when grounded)

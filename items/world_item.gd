@@ -153,7 +153,7 @@ func is_immune_to(peer_id: int) -> bool:
 func _on_body_entered(body: Node3D) -> void:
 	if not multiplayer.is_server():
 		return
-	if body is CharacterBody3D and body.has_method("_on_item_pickup"):
+	if body is Player and body.has_method("_on_item_pickup"):
 		if body.get("peer_id") is int:
 			if is_immune_to(body.peer_id):
 				return

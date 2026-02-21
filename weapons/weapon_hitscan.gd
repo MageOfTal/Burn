@@ -5,7 +5,7 @@ class_name WeaponHitscan
 ## Supports multi-pellet shotgun firing — each pellet gets independent spread.
 ## Server-side only.
 
-func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
+func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
 	# If ammo is slotted with a projectile scene, fire projectiles instead
 	if has_ammo_override():
 		return _fire_ammo_projectile(shooter, aim_origin, aim_direction)
@@ -46,7 +46,7 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 	return {"pellets": pellets}
 
 
-func _fire_ammo_projectile(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
+func _fire_ammo_projectile(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
 	## Fire ammo projectile(s) instead of raycasting when ammo is slotted.
 	## Uses ProjectileSpawner so all clients see the projectiles.
 	var count := maxi(weapon_data.pellet_count, 1)

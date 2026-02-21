@@ -43,7 +43,7 @@ const TOAD_MAX: int = 100000               ## Maximum toad bodies alive at once
 ## (toad floor/ceiling), toad walls, toad rain, and other toad players.
 ## Overworld hitscan masks (1|2|4|8|16|128) don't include 256, so
 ## toad players are completely invisible to overworld weapons.
-const TOAD_COLLISION_LAYER: int = 256        ## Layer 9 (toad dimension players)
+const TOAD_COLLISION_LAYER: int = 256 | 512   ## Layer 9 (toad dimension players) + layer 10 (physics push)
 const TOAD_COLLISION_MASK: int = 1 | 16 | 64 | 256  ## World + toad walls + toad rain + toad players
 
 ## Render (visibility) layer for toad dimension meshes.
@@ -103,14 +103,14 @@ var _rain_duration: float = 0.0
 
 
 class PlayerToadData:
-	var player: CharacterBody3D
+	var player: Player
 	var saved_pos: Vector3
 	var saved_collision_layer: int
 	var saved_collision_mask: int
 	var timer: float
 
 
-func enter(attacker: CharacterBody3D, victim: CharacterBody3D) -> void:
+func enter(attacker: Player, victim: Player) -> void:
 	## Server-only: send two players to the toad dimension.
 	## Each player gets their own independent exit timer.
 	## The shared rain timer is reset (not stacked) on each new entry.
@@ -182,7 +182,7 @@ func enter(attacker: CharacterBody3D, victim: CharacterBody3D) -> void:
 	])
 
 
-func _register_player(player: CharacterBody3D, overworld_pos: Vector3) -> void:
+func _register_player(player: Player, overworld_pos: Vector3) -> void:
 	## Add a player to the dimension with their own exit timer.
 	## If already inside, reset their timer.
 	var data := PlayerToadData.new()
@@ -285,7 +285,7 @@ func _get_safe_return_pos(saved_pos: Vector3) -> Vector3:
 #  Collision layer isolation
 # ======================================================================
 
-func _apply_toad_collision(player: CharacterBody3D) -> void:
+func _apply_toad_collision(player: Player) -> void:
 	## Swap the player's collision layers so they only interact with
 	## toad arena geometry and other players — not overworld objects.
 	player.collision_layer = TOAD_COLLISION_LAYER
@@ -299,7 +299,7 @@ func _restore_collision(data: PlayerToadData) -> void:
 		data.player.collision_mask = data.saved_collision_mask
 
 
-func _set_voxel_viewer_enabled(player: CharacterBody3D, enabled: bool) -> void:
+func _set_voxel_viewer_enabled(player: Player, enabled: bool) -> void:
 	## Enable/disable the VoxelViewer child to prevent streaming at Y=-500.
 	var viewer := player.get_node_or_null("VoxelViewer")
 	if viewer:
@@ -451,7 +451,7 @@ func _find_sun() -> DirectionalLight3D:
 	return null
 
 
-func _get_local_player() -> CharacterBody3D:
+func _get_local_player() -> Player:
 	var scene := get_tree().current_scene
 	if scene == null:
 		return null
@@ -460,7 +460,7 @@ func _get_local_player() -> CharacterBody3D:
 		return null
 	var local_id := multiplayer.get_unique_id()
 	var player_node := players.get_node_or_null(str(local_id))
-	if player_node is CharacterBody3D:
+	if player_node is Player:
 		return player_node
 	return null
 
@@ -1018,11 +1018,11 @@ func _on_exit_toad_dimension_player(peer_id: int) -> void:
 #  Query helpers
 # ======================================================================
 
-func is_in_toad_dimension(player: CharacterBody3D) -> bool:
+func is_in_toad_dimension(player: Player) -> bool:
 	return player.get("in_toad_dimension") == true
 
 
-func find_player_anywhere(peer_id: int) -> CharacterBody3D:
+func find_player_anywhere(peer_id: int) -> Player:
 	## Find a player node by peer_id. Players always remain in the
 	## Players container (no reparenting), so this is a simple lookup.
 	var scene := get_tree().current_scene
@@ -1030,21 +1030,21 @@ func find_player_anywhere(peer_id: int) -> CharacterBody3D:
 		var players := scene.get_node_or_null("Players")
 		if players:
 			var p: Node = players.get_node_or_null(str(peer_id))
-			if p is CharacterBody3D:
+			if p is Player:
 				return p
 	return null
 
 
-func get_all_player_nodes() -> Array[CharacterBody3D]:
+func get_all_player_nodes() -> Array[Player]:
 	## Returns all player nodes. Players always remain in the Players
 	## container (no reparenting), so this iterates that container.
-	var result: Array[CharacterBody3D] = []
+	var result: Array[Player] = []
 	var scene := get_tree().current_scene
 	if scene:
 		var players := scene.get_node_or_null("Players")
 		if players:
 			for child in players.get_children():
-				if child is CharacterBody3D:
+				if child is Player:
 					result.append(child)
 	return result
 

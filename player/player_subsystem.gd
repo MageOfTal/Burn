@@ -13,10 +13,10 @@ class_name PlayerSubsystem
 ## are no-ops so subsystems only implement what's relevant to them.
 
 ## The owning player. Set by setup().
-var player: CharacterBody3D
+var player: Player
 
 
-func setup(p: CharacterBody3D) -> void:
+func setup(p: Player) -> void:
 	## Store the player reference. Subclasses that need extra initialization
 	## should override this and call super.setup(p) first.
 	player = p

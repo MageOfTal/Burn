@@ -25,7 +25,7 @@ func is_shotgun_boosted() -> bool:
 		and weapon_data.get_source_path() == "res://items/definitions/gun_jeg_double_barrel_shotgun.tres")
 
 
-func try_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
+func try_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
 	## Attempts to fire. Returns hit info dictionary or empty dict on miss.
 	## Only call on the server.
 	if not can_fire():
@@ -35,7 +35,7 @@ func try_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 	return _do_fire(shooter, aim_origin, aim_direction)
 
 
-func _do_fire(_shooter: CharacterBody3D, _aim_origin: Vector3, _aim_direction: Vector3) -> Dictionary:
+func _do_fire(_shooter: Player, _aim_origin: Vector3, _aim_direction: Vector3) -> Dictionary:
 	## Override in subclasses.
 	return {}
 
@@ -47,7 +47,7 @@ func _physics_process(delta: float) -> void:
 
 ## --- Projectile spawn helper ---
 
-func get_safe_spawn_offset(shooter: CharacterBody3D, origin: Vector3, direction: Vector3, base_offset: float = 1.0) -> float:
+func get_safe_spawn_offset(shooter: Player, origin: Vector3, direction: Vector3, base_offset: float = 1.0) -> float:
 	## Raycast from origin along direction to prevent spawning projectiles inside walls.
 	## Returns a safe offset distance (may be shorter than base_offset if a wall is close).
 	var space_state := shooter.get_world_3d().direct_space_state

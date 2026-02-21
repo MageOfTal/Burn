@@ -46,7 +46,7 @@ var _players_cache_valid: bool = false
 
 # Pre-allocated physics query for O(1) bubble overlap detection via Jolt broadphase.
 var _overlap_query: PhysicsShapeQueryParameters3D = null
-var _overlap_shape: SphereShape3D = null
+var _overlap_shape_rid: RID = RID()
 
 
 func get_launch_speed() -> float:
@@ -60,6 +60,12 @@ func get_max_lifetime() -> float:
 func get_shooter_immunity_time() -> float:
 	return 0.15
 
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_PREDELETE:
+		if _overlap_shape_rid.is_valid():
+			PhysicsServer3D.free_rid(_overlap_shape_rid)
+			_overlap_shape_rid = RID()
 
 func _ready() -> void:
 	super._ready()
@@ -100,11 +106,13 @@ func _setup() -> void:
 	add_to_group("bubbles")
 
 	# Pre-allocate overlap query for Jolt broadphase lookups (server only).
+	# Shape must be created via PhysicsServer3D so Jolt registers the radius
+	# properly — a bare SphereShape3D.new() stays at radius 0 on the Jolt side.
 	if multiplayer.is_server():
-		_overlap_shape = SphereShape3D.new()
-		_overlap_shape.radius = BUBBLE_RADIUS  # 0.6m — overlaps another 0.6m bubble at < 1.2m
+		_overlap_shape_rid = PhysicsServer3D.sphere_shape_create()
+		PhysicsServer3D.shape_set_data(_overlap_shape_rid, BUBBLE_RADIUS)
 		_overlap_query = PhysicsShapeQueryParameters3D.new()
-		_overlap_query.shape = _overlap_shape
+		_overlap_query.shape_rid = _overlap_shape_rid
 		_overlap_query.collision_mask = 4  # Layer 3 (bubbles) only
 		_overlap_query.collide_with_bodies = true
 		_overlap_query.collide_with_areas = false
@@ -196,7 +204,7 @@ func _on_body_hit(body: Node) -> void:
 	var impactor_ke := 0.0
 	if body is RigidBody3D:
 		impactor_ke = 0.5 * body.mass * body.linear_velocity.length_squared()
-	elif body is CharacterBody3D:
+	elif body is Player:
 		impactor_ke = 0.5 * 80.0 * body.velocity.length_squared()
 
 	var collision_ke := maxf(bubble_ke, impactor_ke)
@@ -236,7 +244,7 @@ func _check_player_overlap() -> void:
 
 	var hit_radius: float = BUBBLE_RADIUS + 0.4
 	for child in _players_container.get_children():
-		if not child is CharacterBody3D:
+		if not child is Player:
 			continue
 		if _lifetime < 0.15 and child.name.to_int() == _shooter_id:
 			continue

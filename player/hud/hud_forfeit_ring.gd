@@ -6,14 +6,14 @@ class_name HUDForfeitRing
 
 const FORFEIT_DURATION := 3.0
 
-var _player: CharacterBody3D = null
+var _player: Player = null
 
 var _ring: Control = null
 var _label: Label = null
 var _hold_time: float = 0.0
 
 
-func setup(player: CharacterBody3D) -> void:
+func setup(player: Player) -> void:
 	_player = player
 	_build_ring()
 

@@ -203,10 +203,10 @@ func _deactivate() -> void:
 	print("[DebugFreecam] Deactivated — player resumed")
 
 
-func _find_local_player() -> CharacterBody3D:
+func _find_local_player() -> Player:
 	var toad_dim := get_node_or_null("/root/ToadDimension")
 	if toad_dim and toad_dim.has_method("find_player_anywhere"):
-		var p: CharacterBody3D = toad_dim.find_player_anywhere(multiplayer.get_unique_id())
+		var p: Player = toad_dim.find_player_anywhere(multiplayer.get_unique_id())
 		if p:
 			return p
 	var scene := get_tree().current_scene
@@ -217,6 +217,6 @@ func _find_local_player() -> CharacterBody3D:
 		return null
 	var local_id := multiplayer.get_unique_id()
 	var player_node := players.get_node_or_null(str(local_id))
-	if player_node and player_node is CharacterBody3D:
+	if player_node and player_node is Player:
 		return player_node
 	return null

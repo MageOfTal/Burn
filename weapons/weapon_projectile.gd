@@ -5,7 +5,7 @@ class_name WeaponProjectile
 ## Server-side only — projectile is spawned via ProjectileSpawner so all
 ## clients see it. queue_free() on server auto-removes on clients.
 
-func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
+func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
 	# ALWAYS fire the weapon's own projectile (e.g. rocket).
 	# Ammo overrides are passed TO the projectile via set_ammo_override(),
 	# so rockets explode into bubbles/balls rather than being replaced by them.

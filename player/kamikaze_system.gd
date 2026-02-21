@@ -56,7 +56,7 @@ var _was_at_cap: bool = false
 ## Y position when we first hit the speed cap
 var _cap_hit_y: float = 0.0
 
-func setup(p: CharacterBody3D) -> void:
+func setup(p: Player) -> void:
 	super.setup(p)
 
 
@@ -153,7 +153,8 @@ func _process_launch(delta: float) -> void:
 	player.rotation.y = player.player_input.look_yaw
 	player.camera_pivot.rotation.x = player.player_input.look_pitch
 
-	player.move_and_slide()
+	# During kamikaze, collision shape is disabled — move position manually.
+	player.global_position += player.velocity * delta
 
 	if _launch_timer <= 0.0:
 		# Transition to Phase 2: flight
@@ -235,12 +236,9 @@ func _process_flight(delta: float) -> void:
 			_explode()
 			return
 
-	player.move_and_slide()
-
-	# Post-move collision check
-	if player.get_slide_collision_count() > 0:
-		_explode()
-		return
+	# During kamikaze flight, collision shape is disabled — Jolt won't move the body.
+	# Move position manually. The pre-frame raycast above handles tunneling detection.
+	player.global_position += player.velocity * delta
 
 
 ## ======================================================================
@@ -698,7 +696,7 @@ func _check_flashbang(explosion_pos: Vector3, radius: float, flash_energy: float
 	## to _physics_process via _pending_flash for threaded physics safety.
 	var local_id := multiplayer.get_unique_id()
 
-	var local_player: CharacterBody3D = _find_local_player_anywhere(local_id)
+	var local_player: Player = _find_local_player_anywhere(local_id)
 
 	if local_player == null:
 		return
@@ -732,7 +730,7 @@ func _do_flashbang_raycast(explosion_pos: Vector3, _radius: float, _flash_energy
 	## Runs in _physics_process — performs the LOS raycast and applies the flash.
 	var local_id := multiplayer.get_unique_id()
 
-	var local_player: CharacterBody3D = _find_local_player_anywhere(local_id)
+	var local_player: Player = _find_local_player_anywhere(local_id)
 	if local_player == null or not local_player.is_alive:
 		return
 
@@ -835,7 +833,7 @@ func client_process_visuals(delta: float) -> void:
 
 
 
-func _find_local_player_anywhere(local_id: int) -> CharacterBody3D:
+func _find_local_player_anywhere(local_id: int) -> Player:
 	## Find the local player in either the overworld or toad dimension container.
 	var toad_dim := get_node_or_null("/root/ToadDimension")
 	if toad_dim and toad_dim.has_method("find_player_anywhere"):
@@ -845,6 +843,6 @@ func _find_local_player_anywhere(local_id: int) -> CharacterBody3D:
 		var players_container := scene.get_node_or_null("Players")
 		if players_container:
 			var p := players_container.get_node_or_null(str(local_id))
-			if p is CharacterBody3D:
+			if p is Player:
 				return p
 	return null

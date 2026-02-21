@@ -10,7 +10,7 @@ const COMPASS_FOV := 180.0  ## Degrees visible across the strip width
 const CARDINALS := ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 const CARDINAL_BEARINGS := [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
 
-var _player: CharacterBody3D = null
+var _player: Player = null
 
 var _compass_container: Control = null
 var _compass_labels: Array[Label] = []
@@ -28,8 +28,11 @@ var _marker_raycast_pending := false  ## Set true in _process, consumed in _phys
 var _demon_icon: Label = null
 var _demon_dist_label: Label = null
 
+## Demon warning label (below compass)
+var _warning_label: Label = null
 
-func setup(player: CharacterBody3D) -> void:
+
+func setup(player: Player) -> void:
 	_player = player
 	_build_compass()
 
@@ -135,6 +138,19 @@ func _build_compass() -> void:
 	_demon_dist_label.visible = false
 	get_parent().add_child(_demon_dist_label)
 
+	# Demon warning label — positioned below compass strip, centered
+	_warning_label = Label.new()
+	_warning_label.add_theme_font_size_override("font_size", 20)
+	_warning_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_warning_label.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	_warning_label.offset_top = 10.0 + COMPASS_HEIGHT + 4.0
+	_warning_label.offset_bottom = 10.0 + COMPASS_HEIGHT + 34.0
+	_warning_label.offset_left = -200
+	_warning_label.offset_right = 200
+	_warning_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_warning_label.visible = false
+	get_parent().add_child(_warning_label)
+
 
 func update_compass() -> void:
 	if _compass_container == null or _player == null:
@@ -210,6 +226,7 @@ func _update_demon_indicator(heading: float) -> void:
 		var to_demon: Vector3 = Vector3(demon_sys.demon_position) - _player.global_position
 		var demon_bearing: float = fmod(rad_to_deg(atan2(to_demon.x, to_demon.z)) + 360.0, 360.0)
 		var demon_dist: float = Vector2(to_demon.x, to_demon.z).length()
+		var center_dist: float = to_demon.length()
 		var px := _bearing_to_px(demon_bearing, heading)
 
 		var clamped_px := clampf(px, 10.0, COMPASS_WIDTH - 10.0)
@@ -234,9 +251,22 @@ func _update_demon_indicator(heading: float) -> void:
 		_demon_dist_label.offset_right = global_x + 20.0
 		_demon_dist_label.offset_top = 10.0 + COMPASS_HEIGHT + 1.0
 		_demon_dist_label.offset_bottom = 10.0 + COMPASS_HEIGHT + 17.0
+
+		# Warning label below compass
+		if center_dist < demon_sys.DEMON_WARNING_DISTANCE:
+			_warning_label.visible = true
+			if center_dist < demon_sys.DEMON_CLOSE_WARNING:
+				_warning_label.text = "THE DEMON IS NEAR... (%.0fm)" % center_dist
+				_warning_label.add_theme_color_override("font_color", Color(1.0, 0.1, 0.0))
+			else:
+				_warning_label.text = "Demon approaching... (%.0fm)" % center_dist
+				_warning_label.add_theme_color_override("font_color", Color(0.8, 0.3, 0.1))
+		else:
+			_warning_label.visible = false
 	else:
 		_demon_icon.visible = false
 		_demon_dist_label.visible = false
+		_warning_label.visible = false
 
 
 func _handle_marker_input() -> void:

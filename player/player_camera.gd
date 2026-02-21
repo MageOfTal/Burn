@@ -31,7 +31,7 @@ const MIN_CAMERA_DIST := 0.3   ## Never let camera go closer than this
 var _fade_alpha: float = 1.0
 
 ## Cache the player reference (two levels up: SpringArm3D -> CameraPivot -> Player)
-var _player: CharacterBody3D = null
+var _player: Player = null
 var _camera: Camera3D = null
 
 

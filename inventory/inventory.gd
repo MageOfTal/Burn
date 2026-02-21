@@ -17,6 +17,8 @@ var kill_currency: float = 0.0
 
 ## Shoe equipment slot (separate from the 6 item slots)
 var equipped_shoe: ItemStack = null
+## Whether the shoe slot is the currently selected slot (for extend/scrap targeting)
+var shoe_selected: bool = false
 
 ## Trinket bag — separate storage for trinket items.
 const MAX_TRINKETS := 4
@@ -315,6 +317,7 @@ func clear_all() -> void:
 	items.clear()
 	equipped_index = -1
 	equipped_shoe = null
+	shoe_selected = false
 	trinket_bag.clear()
 	burn_fuel = STARTING_FUEL
 	shoe_changed.emit()
@@ -407,6 +410,7 @@ func _serialize_full_state() -> Dictionary:
 	return {
 		"items": item_list,
 		"equipped": equipped_index,
+		"shoe_sel": shoe_selected,
 		"tc": time_currency,
 		"fuel": burn_fuel,
 		"kc": kill_currency,
@@ -448,6 +452,7 @@ func _rpc_sync_inventory(state: Dictionary) -> void:
 		items.append(stack)
 
 	equipped_index = state["equipped"]
+	shoe_selected = state.get("shoe_sel", false)
 	time_currency = state["tc"]
 	burn_fuel = state["fuel"]
 	kill_currency = state.get("kc", 0.0)

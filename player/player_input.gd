@@ -177,6 +177,11 @@ func _physics_process(_delta: float) -> void:
 	if Input.is_action_just_pressed("place_marker"):
 		marker_count += 1
 
+	# Shoe slot key (0)
+	if Input.is_action_just_pressed("slot_0"):
+		slot_select = 0
+		slot_count += 1
+
 	# Weapon slot keys (1-6) — increment counter + record which slot
 	for i in range(1, 7):
 		if Input.is_action_just_pressed("slot_%d" % i):

@@ -85,12 +85,7 @@ func _server_process(delta: float) -> void:
 
 func _is_shooter_immune(body: Node) -> bool:
 	## Rubber ball: shooter immune for 0.5s OR until first bounce.
-	var is_shooter := false
-	if body is CharacterBody3D and body.name.to_int() == _shooter_id:
-		is_shooter = true
-	elif body is ToadShadowBody and body.target != null and body.target.name.to_int() == _shooter_id:
-		is_shooter = true
-	if is_shooter:
+	if body is Player and body.peer_id == _shooter_id:
 		return _lifetime < 0.5 and _bounce_count == 0
 	return false
 
@@ -103,8 +98,8 @@ func _on_body_hit(body: Node) -> void:
 	if body in _already_hit:
 		return
 
-	# Only damage players and dummies (CharacterBody3D), not walls/structures
-	if not (body is CharacterBody3D or body is RigidBody3D):
+	# Only damage players and dummies, not walls/structures
+	if not (body is Player or body is RigidBody3D):
 		return
 	if not body.has_method("take_damage"):
 		return

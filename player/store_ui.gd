@@ -6,13 +6,13 @@ extends Control
 
 const KillStoreScript = preload("res://world/kill_store.gd")
 
-var _player: CharacterBody3D = null
+var _player: Player = null
 var _inventory: Node = null
 var _dirty: bool = true
 var _is_open: bool = false
 
 
-func setup(player: CharacterBody3D) -> void:
+func setup(player: Player) -> void:
 	_player = player
 	_inventory = player.get_node_or_null("Inventory")
 	_dirty = true

@@ -55,12 +55,6 @@ layout_mode = 2
 text = "TC: 0"
 theme_override_font_sizes/font_size = 16
 
-[node name="ShoeSlotLabel" type="Label" parent="MarginContainer/VBoxLeft"]
-layout_mode = 2
-text = "SHOES: ---"
-theme_override_font_sizes/font_size = 14
-theme_override_colors/font_color = Color(0.8, 0.8, 0.8, 1)
-
 [node name="KillCurrencyLabel" type="Label" parent="MarginContainer/VBoxLeft"]
 layout_mode = 2
 text = "KILLS: 0"
@@ -72,26 +66,6 @@ layout_mode = 2
 text = "FUEL: 1000"
 theme_override_font_sizes/font_size = 16
 theme_override_colors/font_color = Color(1.0, 0.6, 0.2, 1)
-
-[node name="VBoxRight" type="VBoxContainer" parent="MarginContainer"]
-layout_mode = 2
-size_flags_horizontal = 10
-
-[node name="InventoryLabel" type="Label" parent="MarginContainer/VBoxRight"]
-layout_mode = 2
-text = "INVENTORY"
-horizontal_alignment = 2
-theme_override_font_sizes/font_size = 12
-
-[node name="InventoryList" type="VBoxContainer" parent="MarginContainer/VBoxRight"]
-layout_mode = 2
-
-[node name="InventoryHint" type="Label" parent="MarginContainer/VBoxRight"]
-layout_mode = 2
-text = "TAB: inventory"
-horizontal_alignment = 2
-theme_override_font_sizes/font_size = 11
-theme_override_colors/font_color = Color(0.7, 0.7, 0.7, 1)
 
 [node name="Crosshair" type="CenterContainer" parent="."]
 layout_mode = 1

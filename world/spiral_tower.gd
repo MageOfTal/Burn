@@ -1081,11 +1081,9 @@ func _spawn_topple_body(centroid: Vector3, baked_mesh: Mesh, mesh_offset: Vector
 	topple.max_contacts_reported = 4
 	topple.gravity_scale = 1.0
 	# Use dedicated collision layer 2 for tower debris so topple body and chunks
-	# don't collide with each other. Mask world(1) + shadow body(512) for impact/push.
-	# Shadow body (layer 10) is the player's RigidBody3D proxy — Jolt resolves
-	# collisions natively, then the shadow body transfers the impulse to the player.
-	# Do NOT mask layer 8 (128, CharacterBody3D) — it's kinematic and would act as
-	# an immovable wall, stopping the topple body dead instead of pushing through.
+	# don't collide with each other. Mask world(1) + player layer 10 (512) for
+	# impact/push. The player RigidBody3D is on layers 128|512 — masking 512
+	# gives Jolt native collision with correct mass ratios.
 	topple.collision_layer = 2
 	topple.collision_mask = 1 | 512
 

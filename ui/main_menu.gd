@@ -5,6 +5,9 @@ extends Control
 @onready var address_input: LineEdit = $CenterContainer/VBoxContainer/AddressInput
 @onready var status_label: Label = $CenterContainer/VBoxContainer/StatusLabel
 @onready var username_input: LineEdit = $CenterContainer/VBoxContainer/UsernameInput
+@onready var _burn_timers_check: CheckBox = $CenterContainer/VBoxContainer/DisableBurnTimers
+@onready var _demon_check: CheckBox = $CenterContainer/VBoxContainer/DisableDemon
+@onready var _zone_damage_check: CheckBox = $CenterContainer/VBoxContainer/DisableZoneDamage
 
 var _connect_timer: float = 0.0
 var _is_connecting := false
@@ -81,14 +84,35 @@ func _on_connection_failed() -> void:
 
 # ---- Debug toggles ----
 
+var _god_mode_updating := false  ## Prevents recursive toggling
+
+func _on_god_mode_toggled(enabled: bool) -> void:
+	_god_mode_updating = true
+	GameManager.set_god_mode(enabled)
+	_burn_timers_check.set_pressed_no_signal(enabled)
+	_demon_check.set_pressed_no_signal(enabled)
+	_zone_damage_check.set_pressed_no_signal(enabled)
+	_god_mode_updating = false
+
 func _on_burn_timers_toggled(enabled: bool) -> void:
 	GameManager.debug_disable_burn_timers = enabled
+	_sync_god_mode_check()
 
 func _on_demon_toggled(enabled: bool) -> void:
 	GameManager.debug_disable_demon = enabled
+	_sync_god_mode_check()
 
 func _on_zone_damage_toggled(enabled: bool) -> void:
 	GameManager.debug_disable_zone_damage = enabled
+	_sync_god_mode_check()
+
+func _sync_god_mode_check() -> void:
+	if _god_mode_updating:
+		return
+	var all_on := GameManager.debug_disable_burn_timers and GameManager.debug_disable_demon and GameManager.debug_disable_zone_damage
+	GameManager.debug_god_mode = all_on
+	var god_check: CheckBox = $CenterContainer/VBoxContainer/GodMode
+	god_check.set_pressed_no_signal(all_on)
 
 func _on_skip_structures_toggled(enabled: bool) -> void:
 	GameManager.debug_skip_structures = enabled

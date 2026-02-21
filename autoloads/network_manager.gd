@@ -26,6 +26,7 @@ var player_container: Node = null
 var player_spawner: MultiplayerSpawner = null
 
 const PLAYER_SCENE := preload("res://player/player.tscn")
+const DEBUG_PUSH_BOX_SCENE := preload("res://world/debug_push_box.tscn")
 
 ## Bot configuration
 const BOT_COUNT := 8               ## Number of bots to spawn on host
@@ -326,6 +327,14 @@ func _spawn_player(peer_id: int) -> void:
 		str(player_spawner != null),
 		str(player_spawner.spawn_path) if player_spawner else "N/A"])
 
+	# DEBUG: Spawn a push box near the host player for physics testing
+	if peer_id == 1:
+		var box := DEBUG_PUSH_BOX_SCENE.instantiate()
+		box.name = "DebugPushBox"
+		box.position = player_node.position + Vector3(3, 0, 0)
+		get_tree().current_scene.add_child(box)
+		print("[Debug] Spawned push box at %s" % str(box.position))
+
 	# Kill feed: announce human players joining (not bots)
 	if peer_id < BOT_PEER_ID_START:
 		broadcast_kill_feed("[color=teal]{P:%d} joined[/color]" % peer_id)
@@ -351,7 +360,7 @@ func _reposition_to_spawn_point(peer_id: int) -> void:
 	## Move an already-spawned player to a spawn point.
 	if not players.has(peer_id):
 		return
-	var player_node: CharacterBody3D = players[peer_id]
+	var player_node: Player = players[peer_id]
 	var map := get_tree().current_scene
 	var spawn_container := map.get_node_or_null("PlayerSpawnPoints") if map else null
 	if spawn_container and spawn_container.get_child_count() > 0:

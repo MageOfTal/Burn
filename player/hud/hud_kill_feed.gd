@@ -8,11 +8,11 @@ const KILL_FEED_MAX := 6
 const KILL_FEED_DISPLAY_TIME := 8.0
 const KILL_FEED_FADE_TIME := 1.5
 
-var _player: CharacterBody3D = null
+var _player: Player = null
 var _kill_feed_container: VBoxContainer = null
 
 
-func setup(player: CharacterBody3D) -> void:
+func setup(player: Player) -> void:
 	_player = player
 	_build_kill_feed()
 

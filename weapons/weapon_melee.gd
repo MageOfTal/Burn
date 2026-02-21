@@ -4,8 +4,30 @@ class_name WeaponMelee
 ## Melee weapon: short-range sphere-cast "swing" instead of firing projectiles.
 ## Uses a shape cast for a forgiving hit area (not a thin raycast).
 ## Returns {"melee_hit": true, "hit_collider": Node} on hit.
+##
+## The query shape is created once via PhysicsServer3D and reused across swings.
+## Jolt requires shapes to be registered with the physics server before use in
+## queries — a bare SphereShape3D.new() with .radius set in GDScript isn't
+## picked up (radius stays 0 on the engine side, causing the query to fail).
 
-func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
+const MELEE_SPHERE_RADIUS: float = 0.5
+
+## Lazily-created RID for the sphere shape used in melee sweep queries.
+var _query_shape_rid: RID = RID()
+
+func _get_query_shape_rid() -> RID:
+	if not _query_shape_rid.is_valid():
+		_query_shape_rid = PhysicsServer3D.sphere_shape_create()
+		PhysicsServer3D.shape_set_data(_query_shape_rid, MELEE_SPHERE_RADIUS)
+	return _query_shape_rid
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_PREDELETE:
+		if _query_shape_rid.is_valid():
+			PhysicsServer3D.free_rid(_query_shape_rid)
+			_query_shape_rid = RID()
+
+func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
 	var space_state := shooter.get_world_3d().direct_space_state
 	if space_state == null:
 		return {"melee_miss": true}
@@ -15,12 +37,8 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 	# Toad dimension players are on layer 9 (256) instead of layer 8 (128)
 	var player_bit: int = 256 if shooter.get("in_toad_dimension") else 128
 
-	# Use a thick sphere cast (radius 0.5m) for forgiving melee hits.
-	var shape := SphereShape3D.new()
-	shape.radius = 0.5
-
 	var params := PhysicsShapeQueryParameters3D.new()
-	params.shape = shape
+	params.shape_rid = _get_query_shape_rid()
 	params.exclude = [shooter.get_rid()]
 	params.collision_mask = 1 | 2 | player_bit  # World(1) + items(2) + players
 	params.motion = Vector3.ZERO
@@ -32,7 +50,7 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 	if flat_dir.length_squared() < 0.01:
 		flat_dir = Vector3.FORWARD
 
-	var hit_player: CharacterBody3D = null
+	var hit_player: Player = null
 	var hit_pos := aim_origin + aim_direction * reach
 	var best_dist_sq := INF
 
@@ -50,7 +68,7 @@ func _do_fire(shooter: CharacterBody3D, aim_origin: Vector3, aim_direction: Vect
 			var collisions := space_state.intersect_shape(params, 8)
 			for col in collisions:
 				var collider = col.get("collider")
-				if collider is CharacterBody3D and collider != shooter:
+				if collider is Player and collider != shooter:
 					# Prefer the closest hit to the aim direction center
 					var d_sq := check_pos.distance_squared_to(aim_origin)
 					if d_sq < best_dist_sq:

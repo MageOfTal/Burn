@@ -15,7 +15,7 @@ const RARITY_COLORS := {
 
 const RARITY_NAMES := ["Common", "Uncommon", "Rare", "Epic", "Legendary"]
 
-var _player: CharacterBody3D = null
+var _player: Player = null
 var _inventory: Node = null  # Inventory
 var _selected_ammo_index: int = -1  ## Inventory index of ammo selected for slotting
 var _selected_trinket_index: int = -1  ## Trinket bag index of trinket selected for attaching
@@ -23,7 +23,7 @@ var _dirty: bool = true  ## When true, rebuild UI next frame
 var _was_visible: bool = false  ## Track visibility changes to trigger rebuild
 
 
-func setup(player: CharacterBody3D) -> void:
+func setup(player: Player) -> void:
 	_player = player
 	_inventory = player.get_node_or_null("Inventory")
 	_dirty = true

@@ -6,15 +6,14 @@ extends PhysicsBodyBase
 ## Mass: 2.0 kg (1/40th of the player's 80 kg).
 ##
 ## Collision layer 7 (toad bodies), masks layer 1 (world) + layer 10 (player
-## shadow body). The shadow body is a dynamic 80 kg RigidBody3D that follows
-## the player. Jolt handles the collision natively — correct contact normals,
-## edge deflections, mass-weighted impulse exchange. The shadow body extracts
-## the solver's impulse delta and transfers it to the player's CharacterBody3D.
+## RigidBody3D). The player is an 80 kg RigidBody3D on layers 128|512.
+## Jolt handles the collision natively — correct contact normals, edge
+## deflections, mass-weighted impulse exchange via the solver delta pattern.
 ##
 ## No intersect_shape polling, no manual impulse math in toad code. Toads just
 ## collide with things and Jolt does the rest. O(collisions) not O(toads).
 ##
-## NOTE: The shadow body is a RigidBody3D, NOT a StaticBody3D. So the
+## NOTE: The player is a RigidBody3D, NOT a StaticBody3D. So the
 ## `body is StaticBody3D` check for floor bounce correctly excludes it.
 ##
 ## After the first bounce the toad is fully removed from Jolt's physics

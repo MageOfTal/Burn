@@ -188,7 +188,7 @@ var _arc_contacts: Array[Array] = [[], []]
 ## Debug: on-screen label showing bend angle, wrap count, rope state.
 var _debug_label: Label = null
 
-func setup(p: CharacterBody3D) -> void:
+func setup(p: Player) -> void:
 	super.setup(p)
 	_rope_material = StandardMaterial3D.new()
 	_rope_material.albedo_color = Color(0.3, 0.6, 1.0, 1.0)
@@ -645,14 +645,13 @@ func process(delta: float) -> void:
 		player.velocity.z *= ratio
 
 	# =================================================================
-	# 7. MOVE — move_and_slide() handles floor and wall collisions.
-	#    On the floor it blocks the downward component of our derived
+	# 7. MOVE — Jolt's solver handles floor/wall collisions natively.
+	#    On the floor Jolt blocks the downward component of our derived
 	#    velocity, so the player glides horizontally.  In the air, the
 	#    full velocity applies.
 	# =================================================================
-	player._apply_external_push(delta)
 	var _t_move := Time.get_ticks_usec()
-	player.move_and_slide()
+	# No move_and_slide needed — Jolt integrates velocity on the RigidBody3D directly.
 	var _t_move_end := Time.get_ticks_usec()
 
 	# --- Release conditions ---
@@ -684,7 +683,7 @@ func process(delta: float) -> void:
 	var now_sec: float = Time.get_ticks_msec() / 1000.0
 	if total_us > DEBUG_SPIKE_THRESHOLD_US and (now_sec - _debug_last_print_time) > 1.0:
 		_debug_last_print_time = now_sec
-		print("[GRAPPLE SPIKE] total=%.0fµs  move_and_slide=%.0fµs  LOS_check=%.0fµs  other=%.0fµs" % [
+		print("[GRAPPLE SPIKE] total=%.0fµs  move=%.0fµs  LOS_check=%.0fµs  other=%.0fµs" % [
 			total_us, move_us, los_us, total_us - move_us - los_us])
 
 
@@ -715,7 +714,7 @@ func _is_rope_obstructed() -> bool:
 	if _anchor_collider_rid.is_valid():
 		excludes.append(_anchor_collider_rid)
 	for peer_id in NetworkManager.players:
-		var other_player: CharacterBody3D = NetworkManager.players[peer_id]
+		var other_player: Player = NetworkManager.players[peer_id]
 		if other_player and other_player != player:
 			excludes.append(other_player.get_rid())
 

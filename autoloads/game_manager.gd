@@ -12,9 +12,10 @@ var local_username: String = "Player"           ## Set from main menu before hos
 var player_usernames: Dictionary = {}           ## peer_id -> username (server-authoritative)
 
 # Debug toggles (set from main menu, checked by subsystems)
-var debug_disable_burn_timers: bool = false
-var debug_disable_demon: bool = false
-var debug_disable_zone_damage: bool = false
+var debug_god_mode: bool = true            # Disables burn timers, demon, and zone damage
+var debug_disable_burn_timers: bool = true
+var debug_disable_demon: bool = true
+var debug_disable_zone_damage: bool = true
 var debug_skip_structures: bool = false
 var debug_disable_bots: bool = true          # Don't spawn bots on host
 var debug_free_firing: bool = false          # No burn fuel cost when firing weapons
@@ -47,6 +48,15 @@ signal game_state_changed(new_state: GameState)
 signal match_started
 signal match_ended
 signal player_usernames_changed
+signal god_mode_changed(enabled: bool)
+
+
+func set_god_mode(enabled: bool) -> void:
+	debug_god_mode = enabled
+	debug_disable_burn_timers = enabled
+	debug_disable_demon = enabled
+	debug_disable_zone_damage = enabled
+	god_mode_changed.emit(enabled)
 
 
 func change_state(new_state: GameState) -> void:

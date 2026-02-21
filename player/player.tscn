@@ -157,11 +157,17 @@ properties/15/path = NodePath("PlayerInput:scrap_inv_count")
 properties/15/spawn = true
 properties/15/replication_mode = 1
 
-[node name="Player" type="CharacterBody3D"]
-collision_layer = 128
-collision_mask = 147
-floor_max_angle = 1.0472
-floor_snap_length = 0.3
+[node name="Player" type="RigidBody3D"]
+collision_layer = 640
+collision_mask = 223
+mass = 80.0
+gravity_scale = 0.0
+custom_integrator = true
+lock_rotation = true
+can_sleep = false
+continuous_cd = true
+contact_monitor = true
+max_contacts_reported = 32
 script = ExtResource("1_player")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="."]

@@ -52,7 +52,6 @@ var _catch_total_duration: float = 2.0     ## Computed total animation duration
 # ======================================================================
 
 var _demon_mesh: Node3D = null
-var _warning_label: Label = null
 var _game_over_overlay: Control = null
 var _was_eliminated: bool = false  ## Track transition for game over overlay
 
@@ -65,7 +64,7 @@ const ARROW_ORBIT_RADIUS := 1.2      ## Distance from player center the arrow fl
 const ARROW_HEIGHT_OFFSET := 1.0     ## Y offset above player feet
 const PLAYER_CAPSULE_RADIUS := 0.4   ## Player capsule radius for edge distance calc
 
-func setup(p: CharacterBody3D) -> void:
+func setup(p: Player) -> void:
 	super.setup(p)
 
 
@@ -134,6 +133,9 @@ func on_player_death() -> void:
 func process(delta: float) -> void:
 	## Server-only: move demon toward player, check catch distance.
 	if GameManager.debug_disable_demon:
+		if demon_active:
+			demon_active = false
+			print("Player %d: Demon removed (debug disabled)" % player.peer_id)
 		return
 
 	# Tick the catch animation if active (runs even when demon_active is false)
@@ -288,7 +290,6 @@ func client_process_visuals(delta: float) -> void:
 		_was_eliminated = true
 		_show_game_over_overlay()
 		_cleanup_demon_mesh()
-		_cleanup_warning_label()
 		_cleanup_arrow()
 		return
 	if is_eliminated:
@@ -296,7 +297,6 @@ func client_process_visuals(delta: float) -> void:
 
 	if not demon_active or is_being_caught:
 		_cleanup_demon_mesh()
-		_cleanup_warning_label()
 		_cleanup_arrow()
 		return
 
@@ -315,10 +315,8 @@ func client_process_visuals(delta: float) -> void:
 	# Use interpolated position so visuals match where the player is rendered
 	var interp_pos: Vector3 = player.get_global_transform_interpolated().origin
 
-	# Proximity warning on HUD
 	var center_dist: float = interp_pos.distance_to(demon_position)
 	var edge_dist: float = maxf(center_dist - DEMON_CATCH_RADIUS - PLAYER_CAPSULE_RADIUS, 0.0)
-	_update_warning_label(center_dist < DEMON_WARNING_DISTANCE, center_dist)
 
 	# 3D arrowhead pointing toward demon when within 10m edge-to-edge
 	_update_demon_arrow(edge_dist, delta)
@@ -403,36 +401,6 @@ func _create_demon_mesh() -> void:
 #  Client: HUD warning label
 # ======================================================================
 
-func _update_warning_label(show: bool, dist: float) -> void:
-	## Update or create the proximity warning label.
-	if show and _warning_label == null:
-		_warning_label = Label.new()
-		_warning_label.add_theme_font_size_override("font_size", 20)
-		_warning_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		_warning_label.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
-		_warning_label.offset_top = -60
-		_warning_label.offset_bottom = -30
-		_warning_label.offset_left = -200
-		_warning_label.offset_right = 200
-		var hud_layer := player.get_node_or_null("HUDLayer")
-		if hud_layer:
-			hud_layer.add_child(_warning_label)
-
-	if _warning_label:
-		_warning_label.visible = show
-		if show:
-			if dist < DEMON_CLOSE_WARNING:
-				_warning_label.text = "THE DEMON IS NEAR... (%.0fm)" % dist
-				_warning_label.add_theme_color_override("font_color", Color(1.0, 0.1, 0.0))
-			else:
-				_warning_label.text = "Demon approaching... (%.0fm)" % dist
-				_warning_label.add_theme_color_override("font_color", Color(0.8, 0.3, 0.1))
-
-
-func _cleanup_warning_label() -> void:
-	if _warning_label and is_instance_valid(_warning_label):
-		_warning_label.queue_free()
-		_warning_label = null
 
 
 # ======================================================================
@@ -619,7 +587,6 @@ func _cleanup_demon_mesh() -> void:
 func _exit_tree() -> void:
 	## Clean up top-level nodes that survive player despawning (e.g. on game reset).
 	_cleanup_demon_mesh()
-	_cleanup_warning_label()
 	_cleanup_arrow()
 	if _game_over_overlay and is_instance_valid(_game_over_overlay):
 		_game_over_overlay.queue_free()

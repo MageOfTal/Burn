@@ -1,9 +1,13 @@
 extends Control
 
-## Player HUD: displays health, heat, 6 weapon slots, time currency,
-## compass strip with markers, zone info, kill feed, forfeit ring,
+## Player HUD: displays health, heat, equipment slot boxes along the bottom,
+## time currency, compass strip with markers, zone info, kill feed, forfeit ring,
 ## demon vignette, victory screen, and FPS counter.
 ## Only active for the local player.
+##
+## Bottom bar layout:
+##   [0: Shoe] ---- gap ---- [1] [2] [3] [4] [5] [6]
+##   Selected slot gets a dark border outline.
 ##
 ## Composite widgets are extracted into player/hud/ scripts:
 ##   HUDCompass, HUDKillFeed, HUDForfeitRing, HUDDemonVignette, HUDVictoryScreen
@@ -11,25 +15,38 @@ extends Control
 @onready var health_bar: ProgressBar = $MarginContainer/VBoxLeft/HealthBar
 @onready var heat_bar: ProgressBar = $MarginContainer/VBoxLeft/HeatBar
 @onready var time_currency_label: Label = $MarginContainer/VBoxLeft/TimeCurrencyLabel
-@onready var shoe_slot_label: Label = $MarginContainer/VBoxLeft/ShoeSlotLabel
 @onready var kill_currency_label: Label = $MarginContainer/VBoxLeft/KillCurrencyLabel
 @onready var fuel_label: Label = $MarginContainer/VBoxLeft/FuelLabel
-@onready var inventory_list: VBoxContainer = $MarginContainer/VBoxRight/InventoryList
 @onready var fever_label: Label = $FeverLabel
-@onready var inventory_hint: Label = $MarginContainer/VBoxRight/InventoryHint
 @onready var ip_label: Label = $IPLabel
 
-var _player: CharacterBody3D = null
+var _player: Player = null
 
 ## Cached subsystem references (resolved once in setup, not every frame)
 var _heat_system: Node = null
 var _inventory: Node = null
 
-## Pre-created slot labels (reused every frame instead of queue_free + new)
-var _slot_labels: Array[Label] = []
 const SLOT_COUNT := 6
-
 const RARITY_TAGS := ["C", "U", "R", "E", "L"]
+
+## Bottom bar slot boxes
+var _slot_boxes: Array[PanelContainer] = []  ## Indices 0-5 for weapon slots 1-6
+var _slot_box_labels: Array[Label] = []
+var _shoe_box: PanelContainer = null
+var _shoe_box_label: Label = null
+var _hint_label: Label = null  ## Keybind hints above the bottom bar
+
+## Shared style resources (created once, reused)
+var _style_normal: StyleBoxFlat = null
+var _style_selected: StyleBoxFlat = null
+var _style_empty: StyleBoxFlat = null
+
+const BOX_WIDTH := 130
+const BOX_HEIGHT := 48
+const BOX_GAP := 4       ## Gap between weapon slot boxes
+const SHOE_GAP := 20     ## Gap between shoe box and weapon boxes
+const BOX_FONT_SIZE := 11
+const BOTTOM_MARGIN := 15
 
 ## Zone info label (created in code, shown at bottom center)
 var _zone_label: Label = null
@@ -60,7 +77,7 @@ var _demon_vignette: HUDDemonVignette = null
 var _victory_screen: HUDVictoryScreen = null
 
 
-func setup(player: CharacterBody3D) -> void:
+func setup(player: Player) -> void:
 	_player = player
 	_heat_system = player.get_node_or_null("HeatSystem")
 	_inventory = player.get_node_or_null("Inventory")
@@ -78,27 +95,38 @@ func setup(player: CharacterBody3D) -> void:
 		else:
 			ip_label.text = "IPs: %s" % " | ".join(lan_ips)
 
-	# Pre-create the 6 inventory slot labels once (never freed, just updated)
-	if inventory_list:
-		for child in inventory_list.get_children():
-			child.queue_free()
-		_slot_labels.clear()
-		for i in SLOT_COUNT:
-			var entry := Label.new()
-			entry.add_theme_font_size_override("font_size", 14)
-			inventory_list.add_child(entry)
-			_slot_labels.append(entry)
+	# --- Create shared box styles ---
+	_style_normal = StyleBoxFlat.new()
+	_style_normal.bg_color = Color(0.1, 0.1, 0.1, 0.25)
+	_style_normal.border_color = Color(0.3, 0.3, 0.3, 0.4)
+	_style_normal.set_border_width_all(1)
+	_style_normal.set_corner_radius_all(4)
+	_style_normal.set_content_margin_all(4)
 
-	if inventory_hint:
-		inventory_hint.text = "1-6: switch  |  E: pickup/store  |  F: extend  |  X: scrap ground  |  O: scrap equipped  |  TAB: inventory"
+	_style_selected = StyleBoxFlat.new()
+	_style_selected.bg_color = Color(0.1, 0.1, 0.1, 0.3)
+	_style_selected.border_color = Color(0.9, 0.9, 0.9, 1.0)
+	_style_selected.set_border_width_all(2)
+	_style_selected.set_corner_radius_all(4)
+	_style_selected.set_content_margin_all(4)
 
-	# Create zone info label at bottom center
+	_style_empty = StyleBoxFlat.new()
+	_style_empty.bg_color = Color(0.05, 0.05, 0.05, 0.15)
+	_style_empty.border_color = Color(0.2, 0.2, 0.2, 0.3)
+	_style_empty.set_border_width_all(1)
+	_style_empty.set_corner_radius_all(4)
+	_style_empty.set_content_margin_all(4)
+
+	# --- Build bottom bar ---
+	_build_bottom_bar()
+
+	# Create zone info label at bottom center (above the slot bar)
 	_zone_label = Label.new()
 	_zone_label.add_theme_font_size_override("font_size", 16)
 	_zone_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_zone_label.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
-	_zone_label.offset_top = -90
-	_zone_label.offset_bottom = -70
+	_zone_label.offset_top = -(BOTTOM_MARGIN + BOX_HEIGHT + 30)
+	_zone_label.offset_bottom = -(BOTTOM_MARGIN + BOX_HEIGHT + 10)
 	_zone_label.offset_left = -250
 	_zone_label.offset_right = 250
 	add_child(_zone_label)
@@ -154,6 +182,73 @@ func setup(player: CharacterBody3D) -> void:
 	add_child(_fps_hud_label)
 
 
+func _build_bottom_bar() -> void:
+	## Build the bottom bar: shoe box on the left, 6 weapon boxes to the right.
+	## All positioned manually at the bottom-center of the screen.
+
+	# Total width: shoe_box + shoe_gap + 6 * box_width + 5 * box_gap
+	var weapon_bar_width: float = SLOT_COUNT * BOX_WIDTH + (SLOT_COUNT - 1) * BOX_GAP
+	var total_width: float = BOX_WIDTH + SHOE_GAP + weapon_bar_width
+	var start_x: float = -total_width / 2.0
+
+	# --- Shoe box (slot 0, left side) ---
+	_shoe_box = _create_slot_box()
+	_shoe_box.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+	_shoe_box.offset_left = start_x
+	_shoe_box.offset_right = start_x + BOX_WIDTH
+	_shoe_box.offset_top = -(BOTTOM_MARGIN + BOX_HEIGHT)
+	_shoe_box.offset_bottom = -BOTTOM_MARGIN
+	add_child(_shoe_box)
+	_shoe_box_label = _shoe_box.get_child(0) as Label
+
+	# --- Weapon boxes (slots 1-6) ---
+	var weapon_start_x: float = start_x + BOX_WIDTH + SHOE_GAP
+	_slot_boxes.clear()
+	_slot_box_labels.clear()
+	for i in SLOT_COUNT:
+		var box := _create_slot_box()
+		box.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+		var x_offset: float = weapon_start_x + i * (BOX_WIDTH + BOX_GAP)
+		box.offset_left = x_offset
+		box.offset_right = x_offset + BOX_WIDTH
+		box.offset_top = -(BOTTOM_MARGIN + BOX_HEIGHT)
+		box.offset_bottom = -BOTTOM_MARGIN
+		add_child(box)
+		_slot_boxes.append(box)
+		_slot_box_labels.append(box.get_child(0) as Label)
+
+	# --- Keybind hint label (centered above the bottom bar) ---
+	_hint_label = Label.new()
+	_hint_label.text = "E: pickup  |  F: extend  |  X: scrap ground  |  O: scrap equipped  |  TAB: inventory"
+	_hint_label.add_theme_font_size_override("font_size", 11)
+	_hint_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6, 0.7))
+	_hint_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_hint_label.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+	_hint_label.offset_left = -total_width / 2.0
+	_hint_label.offset_right = total_width / 2.0
+	_hint_label.offset_top = -(BOTTOM_MARGIN + BOX_HEIGHT + 18)
+	_hint_label.offset_bottom = -(BOTTOM_MARGIN + BOX_HEIGHT + 2)
+	add_child(_hint_label)
+
+
+func _create_slot_box() -> PanelContainer:
+	## Creates a single slot box (PanelContainer with a Label child).
+	var panel := PanelContainer.new()
+	panel.custom_minimum_size = Vector2(BOX_WIDTH, BOX_HEIGHT)
+	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_theme_stylebox_override("panel", _style_empty)
+
+	var label := Label.new()
+	label.add_theme_font_size_override("font_size", BOX_FONT_SIZE)
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_child(label)
+
+	return panel
+
+
 func _physics_process(_delta: float) -> void:
 	_physics_tick_count += 1
 	_wallclock_tick_count += 1
@@ -181,8 +276,7 @@ func _process(delta: float) -> void:
 	_update_heat()
 	_update_fuel()
 	_update_kill_currency()
-	_update_shoe_display()
-	_update_inventory_display()
+	_update_bottom_bar()
 	_update_zone_display()
 	_update_fps_hud(delta)
 
@@ -212,7 +306,7 @@ func show_victory_screen(winner_id: int, winner_name: String, my_id: int) -> voi
 
 
 # ======================================================================
-#  Core HUD updates (health, heat, fuel, shoes, inventory, zone)
+#  Core HUD updates (health, heat, fuel, bottom bar, zone)
 # ======================================================================
 
 func _update_health() -> void:
@@ -259,7 +353,6 @@ func _update_kill_currency() -> void:
 	if kill_currency_label == null or _inventory == null:
 		return
 	var tokens: float = _inventory.kill_currency
-	# Show fractional tokens (e.g. "2.25") or whole number (e.g. "3")
 	if tokens == floorf(tokens):
 		kill_currency_label.text = "KILLS: %d" % int(tokens)
 	else:
@@ -272,72 +365,69 @@ func _update_kill_currency() -> void:
 		kill_currency_label.modulate = Color(0.5, 0.5, 0.5)  # Gray
 
 
-func _update_shoe_display() -> void:
-	if shoe_slot_label == null or _inventory == null:
+func _update_bottom_bar() -> void:
+	## Update all slot boxes in the bottom bar (shoe + 6 weapon slots).
+	if _inventory == null:
 		return
 
-	if _inventory.equipped_shoe == null:
-		shoe_slot_label.text = "SHOES: ---"
-		shoe_slot_label.modulate = Color(0.5, 0.5, 0.5, 1)
-		return
+	# --- Shoe box ---
+	if _shoe_box and _shoe_box_label:
+		var shoe_selected: bool = _inventory.shoe_selected
+		if _inventory.equipped_shoe != null and _inventory.equipped_shoe.item_data != null:
+			var shoe: ItemStack = _inventory.equipped_shoe
+			var rarity_tag: String = RARITY_TAGS[shoe.item_data.rarity] if shoe.item_data else "?"
+			var time_remaining := ceili(shoe.burn_time_remaining)
+			var bonus_pct := 0.0
+			var spd = shoe.item_data.get("speed_bonus") if shoe.item_data else null
+			if spd != null:
+				bonus_pct = spd * 100.0
+			_shoe_box_label.text = "0: [%s] %s\n%ds (+%.0f%%)" % [
+				rarity_tag, shoe.item_data.item_name, time_remaining, bonus_pct]
 
-	var shoe: ItemStack = _inventory.equipped_shoe
-	var rarity_tag: String = RARITY_TAGS[shoe.item_data.rarity] if shoe.item_data else "?"
-	var time_remaining := ceili(shoe.burn_time_remaining)
-	var bonus_pct := 0.0
-	var spd = shoe.item_data.get("speed_bonus") if shoe.item_data else null
-	if spd != null:
-		bonus_pct = spd * 100.0
+			# Color by burn time
+			if shoe.burn_time_remaining < 15.0:
+				_shoe_box_label.modulate = Color.RED
+			elif shoe.burn_time_remaining < 45.0:
+				_shoe_box_label.modulate = Color.YELLOW
+			else:
+				_shoe_box_label.modulate = Color.WHITE
 
-	# Build trinket effects string
-	var trinket_info := ""
-	if shoe.slotted_trinkets.size() > 0:
-		var effects: Array[String] = []
-		for trinket in shoe.slotted_trinkets:
-			if trinket is TrinketData and trinket.extra_jumps > 0:
-				effects.append("+%d Jump" % trinket.extra_jumps)
-		if effects.size() > 0:
-			trinket_info = " | " + " ".join(effects)
+			_shoe_box.add_theme_stylebox_override("panel", _style_selected if shoe_selected else _style_normal)
+		else:
+			_shoe_box_label.text = "0: ---"
+			_shoe_box_label.modulate = Color(0.4, 0.4, 0.4, 1)
+			_shoe_box.add_theme_stylebox_override("panel", _style_selected if shoe_selected else _style_empty)
 
-	shoe_slot_label.text = "SHOES: [%s] %s - %ds (+%.0f%%)%s" % [
-		rarity_tag, shoe.item_data.item_name, time_remaining, bonus_pct, trinket_info]
-
-	if shoe.burn_time_remaining < 15.0:
-		shoe_slot_label.modulate = Color.RED
-	elif shoe.burn_time_remaining < 45.0:
-		shoe_slot_label.modulate = Color.YELLOW
-	else:
-		shoe_slot_label.modulate = Color.WHITE
-
-
-func _update_inventory_display() -> void:
-	if _slot_labels.is_empty() or _inventory == null:
-		return
-
+	# --- Weapon slot boxes (1-6) ---
 	for i in SLOT_COUNT:
-		var entry: Label = _slot_labels[i]
+		if i >= _slot_boxes.size():
+			break
+		var box: PanelContainer = _slot_boxes[i]
+		var label: Label = _slot_box_labels[i]
 		var slot_num := i + 1
-		var is_equipped: bool = (i == _inventory.equipped_index)
+		var is_equipped: bool = (i == _inventory.equipped_index) and not _inventory.shoe_selected
 
 		if i < _inventory.items.size() and _inventory.items[i] != null:
 			var stack: ItemStack = _inventory.items[i]
 			var time_str := "%ds" % ceili(stack.burn_time_remaining)
 			var rarity_tag: String = RARITY_TAGS[stack.item_data.rarity] if stack.item_data else "?"
-			var equip_marker := " <<" if is_equipped else ""
-			entry.text = "[%d] [%s] %s - %s%s" % [
-				slot_num, rarity_tag, stack.item_data.item_name, time_str, equip_marker]
+			label.text = "%d: [%s] %s\n%s" % [
+				slot_num, rarity_tag, stack.item_data.item_name, time_str]
 
 			if is_equipped:
-				entry.modulate = Color.CYAN
+				label.modulate = Color.CYAN
 			elif stack.burn_time_remaining < 15.0:
-				entry.modulate = Color.RED
+				label.modulate = Color.RED
 			elif stack.burn_time_remaining < 45.0:
-				entry.modulate = Color.YELLOW
+				label.modulate = Color.YELLOW
 			else:
-				entry.modulate = Color.WHITE
+				label.modulate = Color.WHITE
+
+			box.add_theme_stylebox_override("panel", _style_selected if is_equipped else _style_normal)
 		else:
-			entry.text = "[%d] ---" % slot_num
-			entry.modulate = Color(0.4, 0.4, 0.4, 1)
+			label.text = "%d: ---" % slot_num
+			label.modulate = Color(0.4, 0.4, 0.4, 1)
+			box.add_theme_stylebox_override("panel", _style_empty)
 
 
 func _update_zone_display() -> void:

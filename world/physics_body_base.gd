@@ -103,8 +103,8 @@ func _check_character_overlaps() -> void:
 
 	for result in results:
 		var collider = result.get("collider")
-		if collider == null or not collider is CharacterBody3D:
-			print("[PhysicsBodyBase] %s: skipping non-CharacterBody3D collider: %s" % [name, collider])
+		if collider == null or not collider is Player:
+			print("[PhysicsBodyBase] %s: skipping non-Player collider: %s" % [name, collider])
 			continue
 		if not is_instance_valid(collider):
 			continue
@@ -137,7 +137,7 @@ func _get_first_shape() -> Shape3D:
 	return null
 
 
-func _apply_character_push(char_body: CharacterBody3D, contact_normal: Vector3,
+func _apply_character_push(char_body: Player, contact_normal: Vector3,
 		overlap_depth: float) -> void:
 	## Apply mass-weighted impulse between this rigid body and a character.
 	##
