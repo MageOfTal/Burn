@@ -1,0 +1,21 @@
+# Godot 4 ignores
+.godot/
+# Do NOT ignore *.uid files - Godot 4 needs them for cross-machine scene linking
+
+# Export
+export/
+*.exe
+*.pck
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# Windows NUL device artifact
+nul

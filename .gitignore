@@ -1,21 +1,54 @@
-# Godot 4 ignores
-.godot/
-# Do NOT ignore *.uid files - Godot 4 needs them for cross-machine scene linking
+# ===========================================================
+# Root .gitignore for Burn Royale
+# Repo root: C:\The Great Project\
+# Game files: ProjectFiles/
+# Engine patches: Engine/godot-source/modules/jolt_physics/
+# ===========================================================
 
-# Export
-export/
-*.exe
-*.pck
+# --- Only track ProjectFiles/ and Engine patches ---
+# Ignore everything else at root level
+Tools/
+.claude/
+plan.md
 
-# OS
+# --- ProjectFiles ignores (same as before) ---
+ProjectFiles/.godot/
+ProjectFiles/export/
+ProjectFiles/*.exe
+ProjectFiles/*.pck
+
+# --- Engine: ignore everything, then whitelist patched files ---
+# Must un-ignore each directory level for negation to work.
+Engine/**
+!Engine/godot-source/
+Engine/godot-source/**
+!Engine/godot-source/build.bat
+!Engine/godot-source/modules/
+Engine/godot-source/modules/**
+!Engine/godot-source/modules/jolt_physics/
+Engine/godot-source/modules/jolt_physics/**
+!Engine/godot-source/modules/jolt_physics/jolt_physics_server_3d.h
+!Engine/godot-source/modules/jolt_physics/jolt_physics_server_3d.cpp
+!Engine/godot-source/modules/jolt_physics/jolt_project_settings.h
+!Engine/godot-source/modules/jolt_physics/jolt_project_settings.cpp
+!Engine/godot-source/modules/jolt_physics/objects/
+Engine/godot-source/modules/jolt_physics/objects/**
+!Engine/godot-source/modules/jolt_physics/objects/jolt_body_3d.h
+!Engine/godot-source/modules/jolt_physics/spaces/
+Engine/godot-source/modules/jolt_physics/spaces/**
+!Engine/godot-source/modules/jolt_physics/spaces/jolt_contact_listener_3d.h
+!Engine/godot-source/modules/jolt_physics/spaces/jolt_contact_listener_3d.cpp
+!Engine/godot-source/modules/jolt_physics/spaces/jolt_space_3d.cpp
+
+# --- OS junk ---
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# IDE
+# --- IDE ---
 .vscode/
 *.swp
 *.swo
 
-# Windows NUL device artifact
+# --- Windows NUL device artifact ---
 nul
