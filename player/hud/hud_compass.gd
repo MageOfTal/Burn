@@ -301,7 +301,7 @@ func physics_process_marker() -> void:
 	if space_state == null:
 		return
 	var query := PhysicsRayQueryParameters3D.create(cam_pos, cam_pos + cam_forward * 200.0)
-	query.collision_mask = 1
+	query.collision_mask = 1 | 2048  # World(1) + smooth walls(2048)
 	var result := space_state.intersect_ray(query)
 
 	var new_pos: Vector3

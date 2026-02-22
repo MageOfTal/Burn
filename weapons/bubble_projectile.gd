@@ -97,7 +97,7 @@ func _setup() -> void:
 		collision_mask = 0   # Don't collide with anything
 	else:
 		collision_layer = 4  # Layer 3: bubbles
-		collision_mask = 1   # World only — bubble overlap detected via intersect_shape query
+		collision_mask = 1 | 2048   # World(1) + smooth walls(2048) — bubble overlap detected via intersect_shape query
 	if GameManager.debug_bubble_no_ccd:
 		continuous_cd = false
 	if GameManager.debug_bubble_no_contact_monitor:

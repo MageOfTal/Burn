@@ -37,6 +37,13 @@ var _block_script: GDScript = preload("res://world/wall_block.gd")
 var _mesh_instance: MeshInstance3D = null
 var _mesh_dirty: bool = false
 
+## Smooth collision — single StaticBody3D for player physics (layer 12, bit 2048).
+## Per-block bodies are on layer 11 (bit 1024) for weapon raycasts only.
+## This eliminates seam bouncing when the player slides along the wall.
+var _collision_body: StaticBody3D = null
+## Maps Vector2i(bx, bz) → Array[CollisionShape3D] for column shape rebuild.
+var _col_shapes: Dictionary = {}
+
 ## Cached debris config from subclass (populated in _ready)
 var _debris_size: float = 0.15
 var _debris_per_block: int = 2
@@ -67,6 +74,29 @@ func _get_debris_config() -> Dictionary:
 	}
 
 
+func _should_spawn_block(_bx: int, _by: int, _bz: int) -> bool:
+	## Return true if a block should exist at grid position (bx, by, bz).
+	## Default: all cells in the rectangular grid are populated.
+	## Subclasses override to create non-rectangular shapes (e.g. OBJ voxelization).
+	return true
+
+
+func _create_structure_material(tier_info: Dictionary) -> StandardMaterial3D:
+	## Create the material for the greedy mesh. Default: flat color from tier info.
+	## Subclasses override to add textures, custom shaders, etc.
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = tier_info["color"]
+	return mat
+
+
+func _compute_quad_uvs(_normal: Vector3,
+		_p0: Vector3, _p1: Vector3, _p2: Vector3, _p3: Vector3) -> Array[Vector2]:
+	## Return [uv0, uv1, uv2, uv3] for the four quad vertices.
+	## Default: simple 0-1 per face (unchanged behavior for walls/ramps).
+	## Subclasses override for custom UV projection (e.g. triplanar mapping).
+	return [Vector2(0, 0), Vector2(1, 0), Vector2(1, 1), Vector2(0, 1)]
+
+
 # ======================================================================
 #  Lifecycle
 # ======================================================================
@@ -88,8 +118,7 @@ func _ready() -> void:
 	_block_shape = BoxShape3D.new()
 	_block_shape.size = Vector3.ONE * BLOCK_SIZE
 
-	_structure_material = StandardMaterial3D.new()
-	_structure_material.albedo_color = tier_info["color"]
+	_structure_material = _create_structure_material(tier_info)
 
 	# Calculate grid dimensions
 	_num_x = maxi(int(structure_size.x / BLOCK_SIZE), 1)
@@ -100,7 +129,8 @@ func _ready() -> void:
 	for bx in _num_x:
 		for by in _num_y:
 			for bz in _num_z:
-				_spawn_block(bx, by, bz)
+				if _should_spawn_block(bx, by, bz):
+					_spawn_block(bx, by, bz)
 
 	# Build single greedy-meshed visual
 	_mesh_instance = MeshInstance3D.new()
@@ -108,6 +138,9 @@ func _ready() -> void:
 	_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	add_child(_mesh_instance)
 	_rebuild_greedy_mesh()
+
+	# Build smooth collision shell for player physics (no seam bouncing)
+	_build_smooth_collision()
 
 	# Disable per-frame processing — only needed when _mesh_dirty is set
 	set_process(false)
@@ -128,11 +161,14 @@ func _process(_delta: float) -> void:
 func _spawn_block(bx: int, by: int, bz: int) -> void:
 	## Create a single block at grid position (bx, by, bz).
 	## Block has collision only — no individual mesh (greedy mesh handles visuals).
+	## Layer 11 (1024): weapon raycast detection only, NOT player physics.
 	var block_body := StaticBody3D.new()
 	block_body.set_script(_block_script)
 	block_body.name = "Block_%d_%d_%d" % [bx, by, bz]
 	block_body.grid_key = Vector3i(bx, by, bz)
 	block_body.parent_wall = self
+	block_body.collision_layer = 1024  # Layer 11: block detection (weapons only)
+	block_body.collision_mask = 0
 
 	# Position relative to structure center (local space)
 	var local_offset := Vector3(
@@ -188,6 +224,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		_blocks.erase(key)
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
+		_rebuild_column(key.x, key.z)
 		_sync_block_destroyed.rpc(key, block_pos, block_pos + Vector3(0, 0, 0.5), debris_count)
 
 		# Host also spawns debris locally (RPC is call_remote, host needs it too).
@@ -209,6 +246,7 @@ func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 		_blocks.erase(key)
 		_mesh_dirty = true
 		set_process(true)
+		_rebuild_column(key.x, key.z)
 
 	# Spawn cosmetic debris on the client.
 	if debris_count > 0:
@@ -280,6 +318,13 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	if destroyed_keys.size() > 0:
 		_mesh_dirty = true
 		set_process(true)
+		# Rebuild smooth collision for affected columns
+		var rebuilt_columns: Dictionary = {}
+		for key in destroyed_keys:
+			var col_key := Vector2i(key.x, key.z)
+			if not rebuilt_columns.has(col_key):
+				rebuilt_columns[col_key] = true
+				_rebuild_column(key.x, key.z)
 
 	# If all blocks gone, remove the structure node entirely
 	if _blocks.is_empty():
@@ -299,6 +344,102 @@ func _spawn_debris(block_pos: Vector3, blast_center: Vector3, count: int) -> voi
 			"name": _debris_name,
 		}
 	)
+
+
+# ======================================================================
+#  Smooth collision — one body per structure, no seam bouncing
+# ======================================================================
+#
+# Per-block StaticBody3D nodes are on layer 11 (1024) for weapon raycasts
+# only. This single body on layer 12 (2048) handles player physics collision.
+# One CollisionShape3D per contiguous vertical run of blocks. Rebuilt per-
+# column when blocks are destroyed.
+
+func _build_smooth_collision() -> void:
+	## Create the smooth collision body and populate all column shapes.
+	_collision_body = StaticBody3D.new()
+	_collision_body.name = "SmoothCollision"
+	_collision_body.collision_layer = 2048  # Layer 12: smooth wall collision
+	_collision_body.collision_mask = 0
+	add_child(_collision_body)
+
+	for bx in _num_x:
+		for bz in _num_z:
+			_build_column_shapes(bx, bz)
+
+
+func _rebuild_column(bx: int, bz: int) -> void:
+	## Remove and recreate collision shapes for one (bx, bz) column.
+	var col_key := Vector2i(bx, bz)
+	if _col_shapes.has(col_key):
+		for shape_node: CollisionShape3D in _col_shapes[col_key]:
+			if is_instance_valid(shape_node):
+				shape_node.queue_free()
+		_col_shapes.erase(col_key)
+
+	if _collision_body == null or not is_instance_valid(_collision_body):
+		return
+
+	_build_column_shapes(bx, bz)
+
+
+func _build_column_shapes(bx: int, bz: int) -> void:
+	## Scan blocks in this column, find contiguous Y runs, create shapes.
+	if _collision_body == null or not is_instance_valid(_collision_body):
+		return
+
+	var col_key := Vector2i(bx, bz)
+	var shapes: Array = []
+
+	# Collect which Y indices still have blocks in this column
+	var y_present: Array[int] = []
+	for by in _num_y:
+		if _blocks.has(Vector3i(bx, by, bz)):
+			y_present.append(by)
+
+	if y_present.is_empty():
+		_col_shapes[col_key] = shapes
+		return
+
+	# Find contiguous runs
+	var run_start: int = y_present[0]
+	var run_end: int = y_present[0]
+
+	for i in range(1, y_present.size()):
+		if y_present[i] == run_end + 1:
+			run_end = y_present[i]
+		else:
+			# Emit shape for previous run
+			_add_column_shape(shapes, bx, bz, run_start, run_end)
+			run_start = y_present[i]
+			run_end = y_present[i]
+
+	# Emit final run
+	_add_column_shape(shapes, bx, bz, run_start, run_end)
+
+	_col_shapes[col_key] = shapes
+
+
+func _add_column_shape(shapes: Array,
+		bx: int, bz: int, by_start: int, by_end: int) -> void:
+	## Add a single CollisionShape3D for a contiguous vertical run.
+	var run_count: int = by_end - by_start + 1
+	var run_height: float = run_count * BLOCK_SIZE
+
+	var box := BoxShape3D.new()
+	box.size = Vector3(BLOCK_SIZE, run_height, BLOCK_SIZE)
+
+	var col := CollisionShape3D.new()
+	col.shape = box
+
+	# Position in structure local space (same coordinate system as _spawn_block)
+	var cx: float = (bx + 0.5 - _num_x * 0.5) * BLOCK_SIZE
+	var cy: float = ((by_start + by_end) * 0.5 + 0.5 - _num_y * 0.5) * BLOCK_SIZE
+	var cz: float = (bz + 0.5 - _num_z * 0.5) * BLOCK_SIZE
+	col.position = Vector3(cx, cy, cz)
+
+	_collision_body.add_child(col)
+	shapes.append(col)
 
 
 # ======================================================================
@@ -403,22 +544,23 @@ func _rebuild_greedy_mesh() -> void:
 func _add_quad(st: SurfaceTool, normal: Vector3,
 		p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3) -> void:
 	## Emit a quad as 2 triangles. Winding is CCW: p0->p1->p2, p0->p2->p3.
+	var uvs := _compute_quad_uvs(normal, p0, p1, p2, p3)
 	st.set_normal(normal)
-	st.set_uv(Vector2(0, 0))
+	st.set_uv(uvs[0])
 	st.add_vertex(p0)
 	st.set_normal(normal)
-	st.set_uv(Vector2(1, 0))
+	st.set_uv(uvs[1])
 	st.add_vertex(p1)
 	st.set_normal(normal)
-	st.set_uv(Vector2(1, 1))
+	st.set_uv(uvs[2])
 	st.add_vertex(p2)
 
 	st.set_normal(normal)
-	st.set_uv(Vector2(0, 0))
+	st.set_uv(uvs[0])
 	st.add_vertex(p0)
 	st.set_normal(normal)
-	st.set_uv(Vector2(1, 1))
+	st.set_uv(uvs[2])
 	st.add_vertex(p2)
 	st.set_normal(normal)
-	st.set_uv(Vector2(0, 1))
+	st.set_uv(uvs[3])
 	st.add_vertex(p3)

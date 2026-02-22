@@ -28,6 +28,7 @@ var _bubble_no_collision_button: CheckButton = null
 var _bubble_no_separation_button: CheckButton = null
 var _hide_bubbles_button: CheckButton = null
 var _toad_density_input: LineEdit = null
+var _toad_fog_density_input: LineEdit = null
 var _toad_no_physics_button: CheckButton = null
 var _toad_no_shadows_button: CheckButton = null
 var _toad_show_hitboxes_button: CheckButton = null
@@ -260,9 +261,24 @@ func _build_main_panel() -> void:
 	_toad_density_input.custom_minimum_size = Vector2(80, 0)
 	_toad_density_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_toad_density_input.text_submitted.connect(_on_toad_density_submitted)
+	_toad_density_input.focus_exited.connect(_on_toad_density_focus_lost)
 	toad_hbox.add_child(_toad_density_input)
 	vbox.add_child(toad_hbox)
 	_refresh_toad_density_text()
+
+	var fog_hbox := HBoxContainer.new()
+	var fog_label := Label.new()
+	fog_label.text = "Fog Density"
+	fog_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	fog_hbox.add_child(fog_label)
+	_toad_fog_density_input = LineEdit.new()
+	_toad_fog_density_input.custom_minimum_size = Vector2(80, 0)
+	_toad_fog_density_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_toad_fog_density_input.text_submitted.connect(_on_toad_fog_density_submitted)
+	_toad_fog_density_input.focus_exited.connect(_on_toad_fog_density_focus_lost)
+	fog_hbox.add_child(_toad_fog_density_input)
+	vbox.add_child(fog_hbox)
+	_refresh_toad_fog_density_text()
 
 	_toad_no_physics_button = _add_check("Disable Toad Physics", GameManager.debug_toad_no_physics, vbox)
 	_toad_no_physics_button.toggled.connect(_on_toad_no_physics_toggled)
@@ -898,6 +914,13 @@ func _on_toad_show_hitboxes_toggled(pressed: bool) -> void:
 	print("[PauseMenu] Toad hitboxes: %s" % ("ON" if pressed else "OFF"))
 
 
+func _on_toad_density_focus_lost() -> void:
+	## Apply toad density when the user clicks away (not just on Enter).
+	if _toad_density_input == null:
+		return
+	_on_toad_density_submitted(_toad_density_input.text)
+
+
 func _refresh_toad_density_text() -> void:
 	if _toad_density_input == null:
 		return
@@ -906,6 +929,33 @@ func _refresh_toad_density_text() -> void:
 		_toad_density_input.text = "%d" % toad_dim.toads_per_tick
 	else:
 		_toad_density_input.text = "45"
+
+
+func _on_toad_fog_density_submitted(text: String) -> void:
+	var val := text.to_float()
+	if val > 0.0 and val <= 1.0:
+		var toad_dim := get_node_or_null("/root/ToadDimension")
+		if toad_dim:
+			toad_dim.apply_fog_density(val)
+			print("[PauseMenu] Toad fog density set to %.4f" % val)
+	_refresh_toad_fog_density_text()
+
+
+func _on_toad_fog_density_focus_lost() -> void:
+	## Apply fog density when the user clicks away (not just on Enter).
+	if _toad_fog_density_input == null:
+		return
+	_on_toad_fog_density_submitted(_toad_fog_density_input.text)
+
+
+func _refresh_toad_fog_density_text() -> void:
+	if _toad_fog_density_input == null:
+		return
+	var toad_dim := get_node_or_null("/root/ToadDimension")
+	if toad_dim:
+		_toad_fog_density_input.text = "%.4f" % toad_dim.toad_fog_density
+	else:
+		_toad_fog_density_input.text = "0.0030"
 
 
 func _update_quit_button() -> void:

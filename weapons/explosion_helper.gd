@@ -53,7 +53,7 @@ static func do_explosion(
 	PhysicsServer3D.shape_set_data(sphere_rid, radius)
 	query.shape_rid = sphere_rid
 	query.transform = Transform3D(Basis(), explosion_pos)
-	query.collision_mask = 1 | 2 | 4 | 128 | 256  # World(1) + items(2) + bubbles(4) + players(128/256)
+	query.collision_mask = 1 | 2 | 4 | 128 | 256 | 1024  # World(1) + items(2) + bubbles(4) + players(128/256) + blocks(1024)
 	query.collide_with_bodies = true
 	query.collide_with_areas = true
 
@@ -175,7 +175,7 @@ static func calc_ray_shielding(
 
 	for _i in MAX_RAY_ITERATIONS:
 		var query := PhysicsRayQueryParameters3D.create(current_from, to)
-		query.collision_mask = 1  # Layer 1: terrain, wall blocks, players
+		query.collision_mask = 1 | 1024  # Terrain(1) + wall blocks(1024)
 		query.exclude = exclude_rids
 		var result := space_state.intersect_ray(query)
 		if result.is_empty():

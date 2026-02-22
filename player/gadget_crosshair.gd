@@ -111,7 +111,7 @@ func _update_grapple_preview() -> void:
 	var cam_far := cam_origin + cam_forward * 1000.0
 	var cam_query := PhysicsRayQueryParameters3D.create(cam_origin, cam_far)
 	cam_query.exclude = [_player.get_rid()]
-	cam_query.collision_mask = 1
+	cam_query.collision_mask = 1 | 2048
 	var cam_result := space_state.intersect_ray(cam_query)
 
 	var aim_target: Vector3
@@ -134,7 +134,7 @@ func _update_grapple_preview() -> void:
 	var extended_far := hand_origin + aim_dir * EXTENDED_RAY
 	var query := PhysicsRayQueryParameters3D.create(hand_origin, extended_far)
 	query.exclude = [_player.get_rid()]
-	query.collision_mask = 1
+	query.collision_mask = 1 | 2048
 
 	var result := space_state.intersect_ray(query)
 

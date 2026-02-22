@@ -1085,7 +1085,7 @@ func _spawn_topple_body(centroid: Vector3, baked_mesh: Mesh, mesh_offset: Vector
 	# impact/push. The player RigidBody3D is on layers 128|512 — masking 512
 	# gives Jolt native collision with correct mass ratios.
 	topple.collision_layer = 2
-	topple.collision_mask = 1 | 512
+	topple.collision_mask = 1 | 512 | 2048
 
 	# Set custom properties BEFORE adding to tree (these are simple vars, not transforms)
 	topple.section_height = section_height
@@ -1253,7 +1253,7 @@ func _sync_collapse_start(sever_y: float, torque_dir: Vector3) -> void:
 	topple.gravity_scale = 1.0
 	# Use dedicated collision layer 2 for tower debris (matches server topple body)
 	topple.collision_layer = 2
-	topple.collision_mask = 1 | 512
+	topple.collision_mask = 1 | 512 | 2048
 
 	# Set position BEFORE adding to tree so there's no 1-frame flash at (0,0,0)
 	topple.position = centroid
@@ -1371,7 +1371,7 @@ func _spawn_slab_fragments(body_transform: Transform3D, is_server: bool,
 		slab.gravity_scale = 1.0
 		slab.angular_damp = 1.5
 		slab.collision_layer = 2  # Tower debris layer
-		slab.collision_mask = 15 | 512  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + shadow body(512)
+		slab.collision_mask = 15 | 512 | 2048  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + shadow body(512) + smooth walls(2048)
 
 		if is_server:
 			slab.contact_monitor = true
@@ -1464,7 +1464,7 @@ func _spawn_rock_chunks_legacy(impact_pos: Vector3, chunk_count: int,
 		chunk.gravity_scale = 1.0
 		chunk.angular_damp = 2.0
 		chunk.collision_layer = 2  # Tower debris layer
-		chunk.collision_mask = 15 | 512  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + shadow body(512)
+		chunk.collision_mask = 15 | 512 | 2048  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + shadow body(512) + smooth walls(2048)
 
 		if is_server:
 			chunk.contact_monitor = true

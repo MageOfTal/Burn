@@ -27,6 +27,7 @@ extends Node3D
 @export var num_ramps: int = 200
 @export var num_player_spawns: int = 40
 @export var num_loot_spawns: int = 500
+@export var num_obj_structures: int = 30
 @export var num_dummies: int = 0
 @export var structure_margin: float = 25.0  ## Keep structures this far from edges
 
@@ -207,6 +208,7 @@ func _spawn_heavy_structures() -> void:
 	if not GameManager.debug_skip_structures:
 		await _spawn_walls_batched(rng, structures_node)
 		await _spawn_ramps_batched(rng, structures_node)
+		await _spawn_obj_structures_batched(rng, structures_node)
 		await _spawn_tower(rng, structures_node)
 	else:
 		print("[SeedWorld] Skipping structures (debug toggle)")
@@ -493,6 +495,62 @@ func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 			await get_tree().process_frame
 
 	print("[SeedWorld] Spawned %d destructible ramps" % spawned)
+
+
+func _spawn_obj_structures_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
+	## Spawn destructible OBJ structures, yielding every batch for responsiveness.
+	## Auto-discovers ObjStructureData .tres files from res://world/definitions/.
+	var obj_defs: Array = []
+	var dir := DirAccess.open("res://world/definitions/")
+	if dir:
+		dir.list_dir_begin()
+		var file_name := dir.get_next()
+		while file_name != "":
+			if file_name.ends_with("_structure.tres"):
+				var res := load("res://world/definitions/" + file_name)
+				if res is ObjStructureData:
+					obj_defs.append(res)
+			file_name = dir.get_next()
+
+	if obj_defs.is_empty():
+		print("[SeedWorld] No ObjStructureData definitions found, skipping OBJ structures")
+		return
+
+	var obj_scene := preload("res://world/destructible_obj_structure.tscn")
+	var spawned := 0
+
+	for i in num_obj_structures:
+		var data: ObjStructureData = obj_defs[rng.randi() % obj_defs.size()]
+
+		var y_offset := data.grid_dimensions.y * DestructibleBlockStructure.BLOCK_SIZE * 0.5
+		var pos := _get_random_ground_pos(rng, y_offset, 25.0)
+		if pos == Vector3.INF:
+			continue
+
+		var y_rot := rng.randf_range(0, TAU)
+
+		# Skip if inside tower exclusion zone
+		if _tower_position != Vector3.INF:
+			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
+			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
+				continue
+
+		var obj_structure: Node3D = obj_scene.instantiate()
+		obj_structure.name = "ObjStructure_%d" % spawned
+		obj_structure.structure_data = data
+		obj_structure.position = pos
+		obj_structure.rotation.y = y_rot
+		parent.add_child(obj_structure)
+		if spawned < 3:
+			print("[SeedWorld] ObjStructure_%d at %s (grid %s, %d cells)" % [
+				spawned, pos, data.grid_dimensions, data.occupied_cells.size()])
+		spawned += 1
+
+		# Yield every 3 structures (OBJ structures have more blocks than walls)
+		if spawned % 3 == 0:
+			await get_tree().process_frame
+
+	print("[SeedWorld] Spawned %d OBJ structures" % spawned)
 
 
 func _spawn_player_spawns(rng: RandomNumberGenerator) -> void:

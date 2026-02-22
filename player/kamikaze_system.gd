@@ -229,7 +229,7 @@ func _process_flight(delta: float) -> void:
 			player.global_position + _direction * ray_dist
 		)
 		query.exclude = [player.get_rid()]
-		query.collision_mask = 1 | 2 | 4 | 8 | 16 | 128  # All gameplay layers (excludes debris/toad bodies)
+		query.collision_mask = 1 | 2 | 4 | 8 | 16 | 128 | 2048  # All gameplay layers + smooth walls (excludes debris/toad bodies)
 		var result := space_state.intersect_ray(query)
 		if not result.is_empty():
 			player.global_position = result.position
@@ -753,7 +753,7 @@ func _do_flashbang_raycast(explosion_pos: Vector3, _radius: float, _flash_energy
 	var space_state := local_player.get_world_3d().direct_space_state
 	if space_state:
 		var query := PhysicsRayQueryParameters3D.create(cam_pos, explosion_pos)
-		query.collision_mask = 1
+		query.collision_mask = 1 | 2048  # World(1) + smooth walls(2048)
 		query.exclude = [local_player.get_rid()]
 		var result := space_state.intersect_ray(query)
 		if not result.is_empty():

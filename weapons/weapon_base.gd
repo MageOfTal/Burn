@@ -56,7 +56,7 @@ func get_safe_spawn_offset(shooter: Player, origin: Vector3, direction: Vector3,
 			origin, origin + direction * base_offset
 		)
 		ray_query.exclude = [shooter.get_rid()]
-		ray_query.collision_mask = 1  # Terrain / structures
+		ray_query.collision_mask = 1 | 2048  # Terrain(1) + smooth wall(2048)
 		var ray_result := space_state.intersect_ray(ray_query)
 		if not ray_result.is_empty():
 			return maxf(origin.distance_to(ray_result.position) - 0.1, 0.2)

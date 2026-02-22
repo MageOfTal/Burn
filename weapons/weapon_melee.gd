@@ -40,7 +40,7 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 	var params := PhysicsShapeQueryParameters3D.new()
 	params.shape_rid = _get_query_shape_rid()
 	params.exclude = [shooter.get_rid()]
-	params.collision_mask = 1 | 2 | player_bit  # World(1) + items(2) + players
+	params.collision_mask = 1 | 2 | 1024 | player_bit  # World(1) + items(2) + blocks(1024) + players
 	params.motion = Vector3.ZERO
 
 	# Sweep across a 120-degree arc (matching the visual swing effect)

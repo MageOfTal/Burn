@@ -25,7 +25,7 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 
 		var query := PhysicsRayQueryParameters3D.create(aim_origin, end_point)
 		query.exclude = [shooter.get_rid()]
-		query.collision_mask = 1 | 2 | 4 | 8 | 16 | player_bit  # All gameplay layers (excludes debris/toad bodies)
+		query.collision_mask = 1 | 2 | 4 | 8 | 16 | 1024 | player_bit  # All gameplay layers + block detection (excludes debris/toad bodies)
 
 		var result := space_state.intersect_ray(query)
 

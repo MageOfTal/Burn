@@ -152,5 +152,5 @@ common/max_physics_steps_per_frame=4
 3d/physics_engine="Jolt Physics"
 jolt_physics_3d/simulation/velocity_steps=30
 jolt_physics_3d/simulation/position_steps=6
-jolt_physics_3d/limits/max_bodies=100000
+jolt_physics_3d/limits/max_bodies=300000
 common/physics_interpolation=true

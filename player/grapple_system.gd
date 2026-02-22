@@ -226,14 +226,14 @@ func setup(p: Player) -> void:
 	_left_half_shape = ConvexPolygonShape3D.new()
 	_left_half_query = PhysicsShapeQueryParameters3D.new()
 	_left_half_query.shape = _left_half_shape
-	_left_half_query.collision_mask = 1
+	_left_half_query.collision_mask = 1 | 2048
 	_left_half_query.collide_with_bodies = true
 	_left_half_query.collide_with_areas = false
 
 	_right_half_shape = ConvexPolygonShape3D.new()
 	_right_half_query = PhysicsShapeQueryParameters3D.new()
 	_right_half_query.shape = _right_half_shape
-	_right_half_query.collision_mask = 1
+	_right_half_query.collision_mask = 1 | 2048
 	_right_half_query.collide_with_bodies = true
 	_right_half_query.collide_with_areas = false
 
@@ -241,7 +241,7 @@ func setup(p: Player) -> void:
 	_center_sweep_shape = ConvexPolygonShape3D.new()
 	_center_sweep_query = PhysicsShapeQueryParameters3D.new()
 	_center_sweep_query.shape = _center_sweep_shape
-	_center_sweep_query.collision_mask = 1
+	_center_sweep_query.collision_mask = 1 | 2048
 	_center_sweep_query.collide_with_bodies = true
 	_center_sweep_query.collide_with_areas = false
 
@@ -249,7 +249,7 @@ func setup(p: Player) -> void:
 	_arc_sweep_shape = ConvexPolygonShape3D.new()
 	_arc_sweep_query = PhysicsShapeQueryParameters3D.new()
 	_arc_sweep_query.shape = _arc_sweep_shape
-	_arc_sweep_query.collision_mask = 1
+	_arc_sweep_query.collision_mask = 1 | 2048
 	_arc_sweep_query.collide_with_bodies = true
 	_arc_sweep_query.collide_with_areas = false
 
@@ -358,7 +358,7 @@ func try_fire() -> void:
 
 	var query := PhysicsRayQueryParameters3D.create(hand_origin, far_point)
 	query.exclude = [player.get_rid()]
-	query.collision_mask = 1
+	query.collision_mask = 1 | 2048
 
 	var result := space_state.intersect_ray(query)
 	if result.is_empty():
@@ -449,7 +449,7 @@ func _get_grapple_aim_target(space_state: PhysicsDirectSpaceState3D,
 	var cam_far := cam_origin + cam_forward * 1000.0
 	var cam_query := PhysicsRayQueryParameters3D.create(cam_origin, cam_far)
 	cam_query.exclude = [player.get_rid()]
-	cam_query.collision_mask = 1
+	cam_query.collision_mask = 1 | 2048
 	var cam_result := space_state.intersect_ray(cam_query)
 	if not cam_result.is_empty():
 		return cam_result.position
@@ -915,7 +915,7 @@ func _check_rope_rays(space_state: PhysicsDirectSpaceState3D,
 	# Player chest to anchor
 	var rope_query := PhysicsRayQueryParameters3D.create(player_chest, anchor_point)
 	rope_query.exclude = excludes
-	rope_query.collision_mask = 1
+	rope_query.collision_mask = 1 | 2048
 	var rope_result := space_state.intersect_ray(rope_query)
 	if not rope_result.is_empty():
 		if rope_result.position.distance_to(anchor_point) >= ROPE_LOS_MARGIN:
@@ -924,7 +924,7 @@ func _check_rope_rays(space_state: PhysicsDirectSpaceState3D,
 	# Anchor to player chest (catches backface hits)
 	var anchor_query := PhysicsRayQueryParameters3D.create(anchor_point, player_chest)
 	anchor_query.exclude = excludes
-	anchor_query.collision_mask = 1
+	anchor_query.collision_mask = 1 | 2048
 	var anchor_result := space_state.intersect_ray(anchor_query)
 	if not anchor_result.is_empty():
 		if anchor_result.position.distance_to(player_chest) >= ROPE_LOS_MARGIN:
@@ -1132,7 +1132,7 @@ func _ray_hits_rid(space_state: PhysicsDirectSpaceState3D,
 	# Chest → anchor
 	var fwd_query := PhysicsRayQueryParameters3D.create(chest, anchor_point)
 	fwd_query.exclude = excludes
-	fwd_query.collision_mask = 1
+	fwd_query.collision_mask = 1 | 2048
 	var fwd_result := space_state.intersect_ray(fwd_query)
 	if not fwd_result.is_empty():
 		var hit_rid: RID = fwd_result.get("rid", RID())
@@ -1143,7 +1143,7 @@ func _ray_hits_rid(space_state: PhysicsDirectSpaceState3D,
 	# Anchor → chest (catches backface hits)
 	var rev_query := PhysicsRayQueryParameters3D.create(anchor_point, chest)
 	rev_query.exclude = excludes
-	rev_query.collision_mask = 1
+	rev_query.collision_mask = 1 | 2048
 	var rev_result := space_state.intersect_ray(rev_query)
 	if not rev_result.is_empty():
 		var hit_rid: RID = rev_result.get("rid", RID())

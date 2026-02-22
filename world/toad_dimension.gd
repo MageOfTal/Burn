@@ -33,6 +33,7 @@ const GIANT_TOAD_DISTANCE: float = 350.0 ## Far enough players can't reach it
 const TOAD_RAIN_INTERVAL: float = 0.03   ## Seconds between toad spawns (massive downpour)
 const TOAD_RAIN_RADIUS: float = 100.0    ## Radius of circular toad rain spread (200m diameter)
 var toads_per_tick: int = 6               ## Toads spawned per rain tick (adjustable via pause menu)
+var toad_fog_density: float = 0.003      ## Fog density in toad dimension (adjustable via pause menu)
 const TOAD_SCATTER_SPEED: float = 8.0    ## How fast toads scatter on session end
 const TOAD_DESPAWN_DELAY: float = 3.0    ## Seconds after session ends before remaining toads are freed
 const TOAD_MAX: int = 100000               ## Maximum toad bodies alive at once
@@ -404,10 +405,10 @@ func _create_toad_environment() -> Environment:
 
 	env.fog_enabled = true
 	env.fog_light_color = Color(0.35, 0.38, 0.35)
-	env.fog_density = 0.008
+	env.fog_density = toad_fog_density
 	env.fog_sky_affect = 1.0
 	env.fog_height = DIMENSION_Y + CEILING_HEIGHT * 0.3
-	env.fog_height_density = 0.04
+	env.fog_height_density = 0.02
 
 	return env
 
@@ -494,6 +495,9 @@ func _spawn_toad() -> void:
 
 	# Position eyes and pupils relative to body size
 	_setup_toad_eyes(toad, body_scale)
+
+	# Add dark stripe on the back so rotation is visible
+	_add_toad_back_stripe(toad, body_scale)
 
 	# Random spawn position in circular rain area (uniform distribution)
 	var angle: float = randf() * TAU
@@ -583,6 +587,7 @@ func _spawn_initial_toads() -> void:
 		if body_mesh:
 			body_mesh.scale = Vector3(body_scale, body_scale * 0.65, body_scale)
 		_setup_toad_eyes(toad, body_scale)
+		_add_toad_back_stripe(toad, body_scale)
 
 		# --- Position: simulate a random fall time in [0, t_fall) ---
 		# Each toad has been falling for a uniformly random duration.
@@ -660,6 +665,26 @@ func _setup_toad_eyes(toad: RigidBody3D, radius: float) -> void:
 		pupil_r.position = Vector3(-eye_offset * 0.7, radius * 0.5, -radius * 0.6 + pupil_z_offset)
 
 
+var _dark_stripe_mat: StandardMaterial3D = null
+
+func _add_toad_back_stripe(toad: RigidBody3D, radius: float) -> void:
+	## Add a dark green patch on the back (+Z) of the toad so spinning is visible.
+	if _dark_stripe_mat == null:
+		_dark_stripe_mat = StandardMaterial3D.new()
+		_dark_stripe_mat.albedo_color = Color(0.05, 0.25, 0.03)
+		_dark_stripe_mat.roughness = 0.8
+	var stripe := MeshInstance3D.new()
+	stripe.name = "BackStripe"
+	var sphere := SphereMesh.new()
+	sphere.radius = radius * 0.55
+	sphere.height = radius * 0.5
+	stripe.mesh = sphere
+	stripe.material_override = _dark_stripe_mat
+	# Place on the back of the toad (+Z is back, eyes are on -Z)
+	stripe.position = Vector3(0, radius * 0.1, radius * 0.45)
+	toad.add_child(stripe)
+
+
 func _remove_oldest_toads(count: int) -> void:
 	## Free the oldest `count` toad nodes from the container.
 	var children := _shared_toads_container.get_children()
@@ -693,6 +718,13 @@ func apply_toad_physics_toggle(physics_enabled: bool) -> void:
 			child.restore_physics()
 		else:
 			child.start_physics_disabled()
+
+
+func apply_fog_density(density: float) -> void:
+	## Update the toad fog density and apply it to the live environment if active.
+	toad_fog_density = density
+	if _toad_env != null:
+		_toad_env.fog_density = density
 
 
 func apply_toad_shadow_toggle(shadows_enabled: bool) -> void:

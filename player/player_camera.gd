@@ -58,7 +58,7 @@ func _ready() -> void:
 	margin = 0.15
 
 	# Only collide with world geometry
-	collision_mask = 1
+	collision_mask = 1 | 2048  # World(1) + smooth walls(2048)
 
 	target_length = spring_length
 	_current_length = spring_length

@@ -51,6 +51,11 @@ var velocity: Vector3:
 	set(v): linear_velocity = v
 
 ## Floor detection constants (were CharacterBody3D scene properties)
+## NOTE: This angle is mirrored in Jolt's mass-ratio pin setting:
+##   Project Settings → physics/jolt_physics_3d/collisions/mass_ratio_vertical_pin_angle
+## That setting (default 60°) controls when a heavy body pins a lighter body
+## to infinite mass on contact. Keep both at the same angle — if you can walk
+## on a slope, you should also pin lightweight objects under you at that slope.
 const FLOOR_MAX_ANGLE: float = 1.0472  ## 60 degrees — steeper surfaces are walls
 const FLOOR_SNAP_MARGIN: float = 0.3  ## Extra reach below feet for slope detection
 const CAPSULE_RADIUS: float = 0.4  ## Must match CapsuleShape3D in player.tscn
@@ -60,6 +65,11 @@ var _is_grounded: bool = false
 var _floor_normal: Vector3 = Vector3.UP
 var _floor_y: float = -INF  ## Y position of the floor surface (feet level)
 var _was_grounded: bool = false  ## Previous frame's grounded state (for snap logic)
+
+## Dynamic body contact tracking (set in _integrate_forces each tick)
+var _touching_dynamic_body: bool = false  ## True when ANY RigidBody3D contact exists
+var _on_dynamic_body: bool = false  ## True when a RigidBody3D contact supports us from below (normal.y > 0.7)
+var _dynamic_body_ref: RigidBody3D = null  ## The dynamic body we're touching
 
 ## Contact tolerance for is_on_floor() — true when capsule feet are within
 ## this distance of the floor surface. Must be large enough to absorb Jolt's
@@ -321,11 +331,24 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	## _physics_process(). We only sample contact normals for wall-slide detection.
 	if not multiplayer.is_server():
 		return
+
+	# Track dynamic body contacts (for floor snap / grounding override)
+	_touching_dynamic_body = false
+	_on_dynamic_body = false
+	_dynamic_body_ref = null
+
 	var normals: Array[Vector2] = []
 	for i in state.get_contact_count():
 		var normal: Vector3 = state.get_contact_local_normal(i)
+		var collider := state.get_contact_collider_object(i)
+		if collider is RigidBody3D:
+			_touching_dynamic_body = true
+			_dynamic_body_ref = collider
+			# On top when contact normal is mostly upward (same threshold as
+			# CharacterBody3D floor detection: ~45° from vertical)
+			if normal.y > 0.7:
+				_on_dynamic_body = true
 		if normal.angle_to(Vector3.UP) > FLOOR_MAX_ANGLE:
-			var collider := state.get_contact_collider_object(i)
 			if collider is RigidBody3D:
 				continue
 			var n2 := Vector2(normal.x, normal.z).normalized()
@@ -412,9 +435,15 @@ func _physics_process(delta: float) -> void:
 		#   pull overshoots — no clipping. Closes the gap over 1-2 frames.
 		#
 		# Skipped when rising while airborne (mid-jump).
+		# Skipped when ON TOP of a lightweight dynamic body — the terrain below
+		# the body is NOT the effective floor. Floor snap would fight Jolt's
+		# contact solver (snap to terrain → Jolt pushes back up → repeat).
+		# Side contacts (standing next to a toad) keep floor snap working.
 		var is_rising_airborne := velocity.y > 0.0 and not _is_grounded
+		var on_top_of_lightweight := _on_dynamic_body and _dynamic_body_ref != null \
+				and is_instance_valid(_dynamic_body_ref) and _dynamic_body_ref.mass < 20.0
 		var is_nearly_flat := _floor_normal.dot(Vector3.UP) > 0.999  # ~2.5 degree tolerance
-		if not is_rising_airborne and _floor_y > -INF:
+		if not is_rising_airborne and _floor_y > -INF and not on_top_of_lightweight:
 			# Hemisphere offset: how much higher the capsule naturally sits
 			# above the center-ray hit point on a slope.
 			var hemi_offset := CAPSULE_RADIUS * (1.0 - _floor_normal.y)
@@ -1033,6 +1062,20 @@ func _update_ground_state() -> void:
 		_is_grounded = feet_gap <= FLOOR_SNAP_MARGIN
 	else:
 		_is_grounded = feet_gap <= FLOOR_CONTACT_TOLERANCE
+
+	# When ON TOP of a lightweight dynamic body (contact normal.y > 0.7),
+	# force grounded. The terrain raycast hits through/under the body, so
+	# terrain-based grounding is wrong — use contact-based grounding instead.
+	# No gravity → no force pushing into sphere → no sliding.
+	# Floor snap (below) is also skipped when on top.
+	#
+	# When touching from the SIDE (not on top), keep terrain-based grounding
+	# unchanged — the player may be standing on the ground next to the body
+	# and needs to jump/walk normally.
+	if _on_dynamic_body and _dynamic_body_ref != null \
+			and is_instance_valid(_dynamic_body_ref) \
+			and _dynamic_body_ref.mass < 20.0:
+		_is_grounded = true
 
 
 ## ======================================================================

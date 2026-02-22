@@ -42,7 +42,8 @@ var debug_velocity_iterations: int = 10
 # Toad dimension debug toggles (set from pause menu)
 var debug_toad_no_physics: bool = false   # Disable all physics for toad rain bodies
 var debug_toad_no_shadows: bool = false   # Disable shadow casting on toad rain bodies
-var debug_toad_show_hitboxes: bool = false  # Show collision sphere wireframe on toad bodies
+var debug_toad_show_hitboxes: bool = false  # Show collision shape wireframe on toad bodies
+var debug_toad_contacts: bool = false      # Log toad-side contact details (F10 toggles player-side, F11 toggles toad-side)
 
 signal game_state_changed(new_state: GameState)
 signal match_started

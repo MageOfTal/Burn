@@ -45,6 +45,115 @@ var _manual_angular_vel: Vector3 = Vector3.ZERO
 var _hitbox_mesh: MeshInstance3D = null
 static var _hitbox_mat: StandardMaterial3D = null  ## Shared across all toads
 
+## Debug: previous frame velocity for delta tracking
+var _debug_prev_vel: Vector3 = Vector3.ZERO
+
+
+func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
+	if not GameManager.debug_toad_contacts:
+		return
+
+	var contact_count := state.get_contact_count()
+	if contact_count == 0:
+		return
+
+	# Only log if a player is among our contacts (avoid spamming for every toad)
+	var has_player_contact := false
+	for i in contact_count:
+		var collider := state.get_contact_collider_object(i)
+		if collider is Player:
+			has_player_contact = true
+			break
+	if not has_player_contact:
+		return
+
+	var my_vel := state.get_linear_velocity()
+	var vel_delta := my_vel - _debug_prev_vel
+	_debug_prev_vel = my_vel
+
+	# Classify each contact
+	var player_contacts := 0
+	var static_contacts := 0
+	var other_contacts := 0
+	var total_impulse := Vector3.ZERO
+	var ground_impulse := Vector3.ZERO
+	var player_impulse := Vector3.ZERO
+
+	print("[TOAD_SELF %s] %d contacts | vel=(%.3f,%.3f,%.3f) vel_delta=(%.4f,%.4f,%.4f) |vel|=%.3f pos=(%.2f,%.2f,%.2f) frozen=%s" % [
+		name, contact_count,
+		my_vel.x, my_vel.y, my_vel.z,
+		vel_delta.x, vel_delta.y, vel_delta.z,
+		my_vel.length(),
+		global_position.x, global_position.y, global_position.z,
+		str(freeze)])
+
+	for i in contact_count:
+		var normal: Vector3 = state.get_contact_local_normal(i)
+		var impulse: Vector3 = state.get_contact_impulse(i)
+		var collider := state.get_contact_collider_object(i)
+		var contact_pos: Vector3 = state.get_contact_collider_position(i)
+		total_impulse += impulse
+
+		var collider_type: String
+		var collider_name: String = collider.name if collider else "null"
+		var collider_vel: Vector3 = Vector3.ZERO
+		var collider_mass: float = 0.0
+
+		if collider is Player:
+			collider_vel = collider.linear_velocity
+			collider_mass = collider.mass
+			collider_type = "PLAYER"
+			player_contacts += 1
+			player_impulse += impulse
+		elif collider is RigidBody3D:
+			collider_vel = collider.linear_velocity
+			collider_mass = collider.mass
+			collider_type = "DYNAMIC"
+			other_contacts += 1
+		elif collider is StaticBody3D:
+			collider_type = "STATIC"
+			static_contacts += 1
+			ground_impulse += impulse
+		elif collider is AnimatableBody3D:
+			collider_type = "ANIMATABLE"
+			static_contacts += 1
+			ground_impulse += impulse
+		else:
+			collider_type = "UNKNOWN"
+			other_contacts += 1
+
+		# Contact normal dot with Y tells us if this is a floor-like or side-like contact
+		var angle_deg := rad_to_deg(normal.angle_to(Vector3.UP))
+
+		# Compute closing velocity along contact normal (positive = approaching)
+		var my_vel_along_n := my_vel.dot(normal)
+		var col_vel_along_n := collider_vel.dot(normal)
+		var closing_speed := my_vel_along_n - col_vel_along_n
+
+		print("  [%d] %s %s n=(%.3f,%.3f,%.3f) n.y=%.3f angle=%.1f° impulse=(%.4f,%.4f,%.4f) |imp|=%.4f closing_v=%.3f col_vel=(%.3f,%.3f,%.3f) col_mass=%.1f pos=(%.2f,%.2f,%.2f)" % [
+			i, collider_type, collider_name,
+			normal.x, normal.y, normal.z, normal.y, angle_deg,
+			impulse.x, impulse.y, impulse.z, impulse.length(),
+			closing_speed,
+			collider_vel.x, collider_vel.y, collider_vel.z,
+			collider_mass,
+			contact_pos.x, contact_pos.y, contact_pos.z])
+
+	# Summary line showing the balance of forces
+	var net_impulse := total_impulse
+	print("  [TOAD_FORCES] player_imp=(%.4f,%.4f,%.4f) ground_imp=(%.4f,%.4f,%.4f) net=(%.4f,%.4f,%.4f) |net|=%.4f  contacts: %d player, %d static, %d other" % [
+		player_impulse.x, player_impulse.y, player_impulse.z,
+		ground_impulse.x, ground_impulse.y, ground_impulse.z,
+		net_impulse.x, net_impulse.y, net_impulse.z, net_impulse.length(),
+		player_contacts, static_contacts, other_contacts])
+
+	# If player pushing but ground absorbing, flag it
+	if player_contacts > 0 and static_contacts > 0 and my_vel.length() < 0.5:
+		var player_push_mag := player_impulse.length()
+		var ground_resist_mag := ground_impulse.length()
+		print("  [TOAD_STUCK!] Player impulse %.4f absorbed by ground impulse %.4f — toad vel %.3f" % [
+			player_push_mag, ground_resist_mag, my_vel.length()])
+
 
 func _ready() -> void:
 	add_to_group("toad_bodies")
@@ -59,7 +168,7 @@ func _ready() -> void:
 	# Wire collision signal for bounce detection (server only)
 	if multiplayer.is_server() and not _physics_disabled:
 		contact_monitor = true
-		max_contacts_reported = 4
+		max_contacts_reported = 8  # Need enough for ground + player + other contacts simultaneously
 		body_entered.connect(_on_body_entered_toad)
 
 
@@ -113,8 +222,8 @@ func _on_body_entered_toad(body: Node) -> void:
 		return
 
 	# Only count floor/wall collisions as a bounce (StaticBody3D = world geometry).
-	# The shadow body is a RigidBody3D, so this check correctly excludes it —
-	# toads bounce off the shadow body without freezing.
+	# The player is a RigidBody3D, so this check correctly excludes it —
+	# toads bounce off the player without triggering the post-bounce freeze.
 	if not (body is StaticBody3D):
 		return
 
@@ -218,11 +327,10 @@ func set_shadows_enabled(enabled: bool) -> void:
 # ======================================================================
 
 func _create_hitbox_mesh() -> void:
-	## Add a transparent wireframe sphere matching the collision shape radius.
+	## Add a transparent mesh matching the actual collision shape (sphere or cylinder).
 	var col_shape := get_node_or_null("CollisionShape3D") as CollisionShape3D
-	if col_shape == null or not (col_shape.shape is SphereShape3D):
+	if col_shape == null or col_shape.shape == null:
 		return
-	var radius: float = (col_shape.shape as SphereShape3D).radius
 
 	# Lazy-init shared material (one allocation for all toads)
 	if _hitbox_mat == null:
@@ -231,22 +339,37 @@ func _create_hitbox_mesh() -> void:
 		_hitbox_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 		_hitbox_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 		_hitbox_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		_hitbox_mat.no_depth_test = true
+
+	var debug_mesh: Mesh = null
+	var shape := col_shape.shape
+	if shape is SphereShape3D:
+		var sphere := SphereMesh.new()
+		sphere.radius = shape.radius
+		sphere.height = shape.radius * 2.0
+		sphere.radial_segments = 12
+		sphere.rings = 6
+		debug_mesh = sphere
+	elif shape is CylinderShape3D:
+		var cyl := CylinderMesh.new()
+		cyl.top_radius = shape.radius
+		cyl.bottom_radius = shape.radius
+		cyl.height = shape.height
+		cyl.radial_segments = 16
+		debug_mesh = cyl
+	else:
+		return
 
 	_hitbox_mesh = MeshInstance3D.new()
 	_hitbox_mesh.name = "HitboxDebug"
-	var sphere := SphereMesh.new()
-	sphere.radius = radius
-	sphere.height = radius * 2.0
-	sphere.radial_segments = 12
-	sphere.rings = 6
-	_hitbox_mesh.mesh = sphere
+	_hitbox_mesh.mesh = debug_mesh
 	_hitbox_mesh.material_override = _hitbox_mat
 	_hitbox_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_hitbox_mesh)
 
 
 func set_hitbox_visible(visible: bool) -> void:
-	## Show or hide the debug hitbox sphere.
+	## Show or hide the debug hitbox visualization.
 	if visible and _hitbox_mesh == null:
 		_create_hitbox_mesh()
 	elif not visible and _hitbox_mesh != null:

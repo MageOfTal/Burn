@@ -18,7 +18,7 @@ friction = 0.8
 
 [node name="DebugPushBox" type="RigidBody3D"]
 collision_layer = 2
-collision_mask = 513
+collision_mask = 2561
 mass = 80.0
 physics_material_override = SubResource("BoxPhysMat")
 script = ExtResource("1_script")

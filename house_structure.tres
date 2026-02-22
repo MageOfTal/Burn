@@ -1,0 +1,11 @@
+[gd_resource type="Resource" script_class="ObjStructureData" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://world/obj_structure_data.gd" id="1_script"]
+
+[resource]
+script = ExtResource("1_script")
+occupied_cells = Array[Vector3i]([Vector3i(0, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, 2), Vector3i(0, 1, 0), Vector3i(0, 1, 1), Vector3i(0, 1, 2), Vector3i(0, 2, 0), Vector3i(0, 2, 1), Vector3i(0, 2, 2), Vector3i(1, 0, 0), Vector3i(1, 0, 1), Vector3i(1, 0, 2), Vector3i(1, 1, 0), Vector3i(1, 1, 1), Vector3i(1, 1, 2), Vector3i(1, 2, 0), Vector3i(1, 2, 1), Vector3i(1, 2, 2)])
+grid_dimensions = Vector3i(2, 3, 3)
+texture = null
+mesh_aabb_position = Vector3(-0.46875, -0.03125000000000002, -0.71875)
+mesh_aabb_size = Vector3(0.9375, 1.25, 1.1875)
