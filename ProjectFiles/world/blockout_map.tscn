@@ -1,7 +1,8 @@
-[gd_scene load_steps=3 format=3 uid="uid://blockout001"]
+[gd_scene load_steps=4 format=3 uid="uid://blockout001"]
 
 [ext_resource type="Script" path="res://world/blockout_map.gd" id="1_mapscript"]
 [ext_resource type="Script" path="res://world/seed_world.gd" id="2_seedworld"]
+[ext_resource type="Script" path="res://world/permtoad_rain.gd" id="3_permtoad"]
 
 [node name="BlockoutMap" type="Node3D"]
 script = ExtResource("1_mapscript")
@@ -31,3 +32,12 @@ spawn_path = NodePath("../Projectiles")
 spawn_limit = 500
 
 [node name="Projectiles" type="Node3D" parent="."]
+
+[node name="PermtoadRain" type="Node3D" parent="."]
+script = ExtResource("3_permtoad")
+host_offset = Vector3(12, 0, 15)
+spawn_height = 50.0
+spawn_radius = 4.0
+toads_per_tick = 2
+spawn_interval = 0.2
+max_toads = 150

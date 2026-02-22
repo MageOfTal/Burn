@@ -177,7 +177,7 @@ var _original_mesh_scale_y: float = 1.0
 
 ## Player collision layers — on both layer 8 (player targeting) and layer 10 (physics push).
 const PLAYER_COLLISION_LAYER: int = 640   ## 128 | 512
-const PLAYER_COLLISION_MASK: int = 223    ## 1|2|4|8|16|64|128
+const PLAYER_COLLISION_MASK: int = 2271   ## 1|2|4|8|16|64|128|2048
 
 ## Subsystem references
 @onready var slide_crouch: SlideCrouchSystem = $SlideCrouchSystem
@@ -254,7 +254,7 @@ func _ready() -> void:
 	# RigidBody3D setup: physics material for contact response
 	var phys_mat := PhysicsMaterial.new()
 	phys_mat.bounce = 0.0
-	phys_mat.friction = 0.5
+	phys_mat.friction = 0.0  # Zero friction — all movement is script-driven, Jolt friction only helps edges grip the capsule
 	physics_material_override = phys_mat
 
 	# Client peers: freeze the RigidBody3D to prevent physics simulation.
@@ -337,6 +337,14 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	_on_dynamic_body = false
 	_dynamic_body_ref = null
 
+	# When airborne, use a tighter angle threshold for wall normals so that
+	# edge contacts (~40-50° from vertical) are treated as walls. This prevents
+	# the capsule from catching on wall top corners — without this, edge
+	# contacts slip through the 60° floor threshold, the movement code applies
+	# full horizontal input into the edge, and friction/reaction forces create
+	# an equilibrium that holds the player on the corner.
+	var wall_angle_threshold := FLOOR_MAX_ANGLE if _is_grounded else deg_to_rad(30.0)
+
 	var normals: Array[Vector2] = []
 	for i in state.get_contact_count():
 		var normal: Vector3 = state.get_contact_local_normal(i)
@@ -348,7 +356,7 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 			# CharacterBody3D floor detection: ~45° from vertical)
 			if normal.y > 0.7:
 				_on_dynamic_body = true
-		if normal.angle_to(Vector3.UP) > FLOOR_MAX_ANGLE:
+		if normal.angle_to(Vector3.UP) > wall_angle_threshold:
 			if collider is RigidBody3D:
 				continue
 			var n2 := Vector2(normal.x, normal.z).normalized()
@@ -443,7 +451,11 @@ func _physics_process(delta: float) -> void:
 		var on_top_of_lightweight := _on_dynamic_body and _dynamic_body_ref != null \
 				and is_instance_valid(_dynamic_body_ref) and _dynamic_body_ref.mass < 20.0
 		var is_nearly_flat := _floor_normal.dot(Vector3.UP) > 0.999  # ~2.5 degree tolerance
-		if not is_rising_airborne and _floor_y > -INF and not on_top_of_lightweight:
+		# Only snap when we were grounded last frame (walking over bumps/slopes).
+		# When landing from air (_was_grounded == false), let gravity + Jolt's
+		# contact solver handle the landing naturally — the player already has
+		# downward velocity and doesn't need a hard position teleport.
+		if not is_rising_airborne and _was_grounded and _floor_y > -INF and not on_top_of_lightweight:
 			# Hemisphere offset: how much higher the capsule naturally sits
 			# above the center-ray hit point on a slope.
 			var hemi_offset := CAPSULE_RADIUS * (1.0 - _floor_normal.y)
@@ -1025,7 +1037,7 @@ func _update_ground_state() -> void:
 	var origin := global_position + Vector3(0, 0.9, 0)  # Capsule center
 	var end := origin + Vector3(0, -(0.9 + FLOOR_SNAP_MARGIN), 0)  # Below feet + snap margin
 	var query := PhysicsRayQueryParameters3D.create(origin, end)
-	query.collision_mask = 1 | 2 | 16  # World + items + toad walls
+	query.collision_mask = 1 | 2 | 16 | 64 | 2048  # World + items + toad walls + toad bodies + smooth walls (layer 12)
 	query.exclude = [get_rid()]
 
 	var result := space.intersect_ray(query)
@@ -1072,9 +1084,15 @@ func _update_ground_state() -> void:
 	# When touching from the SIDE (not on top), keep terrain-based grounding
 	# unchanged — the player may be standing on the ground next to the body
 	# and needs to jump/walk normally.
+	#
+	# Skip when rising (velocity.y > 0) — the player just jumped off the body.
+	# Without this check, the contact persists for 1-2 frames after liftoff,
+	# forcing _is_grounded = true, which makes _server_process() zero velocity.y
+	# and kills the jump.
 	if _on_dynamic_body and _dynamic_body_ref != null \
 			and is_instance_valid(_dynamic_body_ref) \
-			and _dynamic_body_ref.mass < 20.0:
+			and _dynamic_body_ref.mass < 20.0 \
+			and velocity.y <= 0.0:
 		_is_grounded = true
 
 

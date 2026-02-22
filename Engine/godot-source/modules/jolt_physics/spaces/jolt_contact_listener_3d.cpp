@@ -212,11 +212,26 @@ void JoltContactListener3D::_apply_contact_mass_scale(const JPH::Body &p_jolt_bo
 				float final_scale = 1.0f; // Default: no scaling
 
 				if (abs_dot > VERTICAL_THRESHOLD) {
-					// Vertical contact — pin the lighter body (infinite mass).
-					// Keep normal friction so the heavy body grips the surface.
-					final_scale = 0.0f;
-					p_settings.mCombinedRestitution = 0.0f;
-					MassScaleDiag::vertical_pin.fetch_add(1, std::memory_order_relaxed);
+					// Vertical contact — only pin lighter body if it's BELOW
+					// (sandwiched between ground and heavy body). If lighter is
+					// on top, pinning it creates infinite downward weight that
+					// pushes the heavy body through terrain.
+					// Normal points from body1 toward body2:
+					//   dot_up > 0 → body1 below, body2 above
+					//   dot_up < 0 → body1 above, body2 below
+					const bool body1_is_lighter = (mass1 < mass2);
+					const bool lighter_is_below = (body1_is_lighter && dot_up > 0.0f) || (!body1_is_lighter && dot_up < 0.0f);
+
+					if (lighter_is_below) {
+						// Sandwich case — pin lighter body so heavy body rests on it.
+						final_scale = 0.0f;
+						p_settings.mCombinedRestitution = 0.0f;
+						MassScaleDiag::vertical_pin.fetch_add(1, std::memory_order_relaxed);
+					} else {
+						// Lighter body on top of heavier — no pinning, just suppress bounce.
+						p_settings.mCombinedRestitution = 0.0f;
+						MassScaleDiag::angled_scale.fetch_add(1, std::memory_order_relaxed);
+					}
 				} else {
 					// Angled/side contact — full mass interaction, suppress bounce.
 					MassScaleDiag::angled_scale.fetch_add(1, std::memory_order_relaxed);
@@ -229,13 +244,18 @@ void JoltContactListener3D::_apply_contact_mass_scale(const JPH::Body &p_jolt_bo
 					const JPH::Vec3 v1 = p_jolt_body1.GetLinearVelocity();
 					const JPH::Vec3 v2 = p_jolt_body2.GetLinearVelocity();
 					const float depth = p_manifold.mPenetrationDepth;
+					const bool body1_lighter = (mass1 < mass2);
+					const bool l_below = (body1_lighter && dot_up > 0.0f) || (!body1_lighter && dot_up < 0.0f);
+					const char *branch_str = (abs_dot > VERTICAL_THRESHOLD)
+						? (l_below ? "VERT_PIN_SANDWICH" : "VERT_SKIP_ON_TOP")
+						: "ANGLED";
 					char buf[512];
 					snprintf(buf, sizeof(buf),
 						"[MASS_SCALE] abs_dot=%.4f branch=%s scale=%.2f masses=(%.1f,%.1f) "
 						"normal=(%.3f,%.3f,%.3f) depth=%.4f "
 						"vel1=(%.2f,%.2f,%.2f) vel2=(%.2f,%.2f,%.2f)",
 						abs_dot,
-						(abs_dot > VERTICAL_THRESHOLD) ? "VERT_PIN" : "ANGLED",
+						branch_str,
 						final_scale,
 						mass1, mass2,
 						(double)n.GetX(), (double)n.GetY(), (double)n.GetZ(),

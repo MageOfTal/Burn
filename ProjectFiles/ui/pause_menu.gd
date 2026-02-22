@@ -29,10 +29,12 @@ var _bubble_no_separation_button: CheckButton = null
 var _hide_bubbles_button: CheckButton = null
 var _toad_density_input: LineEdit = null
 var _toad_fog_density_input: LineEdit = null
+var _toad_mass_input: LineEdit = null
 var _toad_no_physics_button: CheckButton = null
 var _toad_no_shadows_button: CheckButton = null
 var _toad_show_hitboxes_button: CheckButton = null
 var _quit_btn: Button = null
+var _box_mass_input: LineEdit = null
 
 # ── Video Settings panel UI refs ─────────────────────────────────────────
 var _video_panel: PanelContainer = null
@@ -280,6 +282,20 @@ func _build_main_panel() -> void:
 	vbox.add_child(fog_hbox)
 	_refresh_toad_fog_density_text()
 
+	var mass_hbox := HBoxContainer.new()
+	var mass_label := Label.new()
+	mass_label.text = "Toad Mass (kg)"
+	mass_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	mass_hbox.add_child(mass_label)
+	_toad_mass_input = LineEdit.new()
+	_toad_mass_input.custom_minimum_size = Vector2(80, 0)
+	_toad_mass_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_toad_mass_input.text = "%.1f" % GameManager.debug_toad_mass
+	_toad_mass_input.text_submitted.connect(_on_toad_mass_submitted)
+	_toad_mass_input.focus_exited.connect(_on_toad_mass_focus_lost)
+	mass_hbox.add_child(_toad_mass_input)
+	vbox.add_child(mass_hbox)
+
 	_toad_no_physics_button = _add_check("Disable Toad Physics", GameManager.debug_toad_no_physics, vbox)
 	_toad_no_physics_button.toggled.connect(_on_toad_no_physics_toggled)
 
@@ -288,6 +304,30 @@ func _build_main_panel() -> void:
 
 	_toad_show_hitboxes_button = _add_check("Show Toad Hitboxes", GameManager.debug_toad_show_hitboxes, vbox)
 	_toad_show_hitboxes_button.toggled.connect(_on_toad_show_hitboxes_toggled)
+
+	# Separator
+	vbox.add_child(HSeparator.new())
+
+	# ── Debug Push Box ──────────────────────────────────────────────────
+	_add_section_header("Debug Push Box", vbox)
+
+	var box_mass_hbox := HBoxContainer.new()
+	box_mass_hbox.add_theme_constant_override("separation", 8)
+	var box_mass_label := Label.new()
+	box_mass_label.text = "Box Mass (kg)"
+	box_mass_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	box_mass_hbox.add_child(box_mass_label)
+	_box_mass_input = LineEdit.new()
+	_box_mass_input.custom_minimum_size = Vector2(80, 0)
+	_box_mass_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_box_mass_input.text = "4.0"
+	var box_node := get_tree().current_scene.get_node_or_null("DebugPushBox") if get_tree().current_scene else null
+	if box_node is RigidBody3D:
+		_box_mass_input.text = "%.1f" % box_node.mass
+	_box_mass_input.text_submitted.connect(_on_box_mass_submitted)
+	_box_mass_input.focus_exited.connect(_on_box_mass_focus_lost)
+	box_mass_hbox.add_child(_box_mass_input)
+	vbox.add_child(box_mass_hbox)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -956,6 +996,44 @@ func _refresh_toad_fog_density_text() -> void:
 		_toad_fog_density_input.text = "%.4f" % toad_dim.toad_fog_density
 	else:
 		_toad_fog_density_input.text = "0.0030"
+
+
+func _on_toad_mass_submitted(text: String) -> void:
+	var val := text.to_float()
+	if val > 0.0 and val <= 1000.0:
+		GameManager.debug_toad_mass = val
+		# Apply to all existing toad bodies
+		for node in get_tree().get_nodes_in_group("toad_bodies"):
+			if node is RigidBody3D and not node.freeze:
+				node.mass = val
+		print("[PauseMenu] Toad mass set to %.1f kg" % val)
+	else:
+		_toad_mass_input.text = "%.1f" % GameManager.debug_toad_mass
+
+
+func _on_toad_mass_focus_lost() -> void:
+	if _toad_mass_input == null:
+		return
+	_on_toad_mass_submitted(_toad_mass_input.text)
+
+
+func _on_box_mass_submitted(text: String) -> void:
+	var val := text.to_float()
+	if val > 0.0 and val <= 10000.0:
+		var box := get_tree().current_scene.get_node_or_null("DebugPushBox") if get_tree().current_scene else null
+		if box is RigidBody3D:
+			box.mass = val
+			print("[PauseMenu] Debug box mass set to %.1f kg" % val)
+		else:
+			print("[PauseMenu] DebugPushBox not found in scene")
+	else:
+		_box_mass_input.text = "4.0"
+
+
+func _on_box_mass_focus_lost() -> void:
+	if _box_mass_input == null:
+		return
+	_on_box_mass_submitted(_box_mass_input.text)
 
 
 func _update_quit_button() -> void:

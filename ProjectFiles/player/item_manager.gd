@@ -100,9 +100,26 @@ func on_item_pickup(world_item: Node) -> void:
 		print("Player %d equipped %s" % [player.peer_id, item_data.item_name])
 		return
 
+	var did_swap := false
 	var idx := inventory.add_item(item_data)
 	if idx < 0:
-		return  # Inventory full
+		# Inventory full — swap with equipped item if one is selected
+		if inventory.equipped_index < 0 or inventory.equipped_index >= inventory.items.size():
+			return  # No equipped item to swap with
+		var old_stack: ItemStack = inventory.items[inventory.equipped_index]
+		if old_stack == null:
+			return
+		var swap_idx := inventory.equipped_index
+		# Drop the old equipped item into the world
+		player.clear_equipped_weapon()
+		var removed := inventory.remove_item(swap_idx)
+		if removed:
+			drop_item_as_world_item(removed)
+		# Place the new item into the freed slot
+		idx = inventory.add_item(item_data)
+		if idx < 0:
+			return  # Shouldn't happen, but guard anyway
+		did_swap = true
 
 	# Preserve the world item's remaining burn time instead of resetting
 	# (skip permanent items — they use 999999 as a marker, not a real timer)
@@ -114,6 +131,12 @@ func on_item_pickup(world_item: Node) -> void:
 	if 7 in player.active_bonuses and idx >= 0:
 		if stack:
 			stack.burn_time_remaining *= 1.4
+
+	# Auto-equip the swapped-in item and create its weapon node
+	if did_swap:
+		inventory.equip_slot(idx)
+		if item_data is WeaponData:
+			player.equip_weapon(item_data)
 
 	# Remove the world item
 	world_item.queue_free()

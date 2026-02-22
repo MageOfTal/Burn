@@ -44,6 +44,7 @@ var debug_toad_no_physics: bool = false   # Disable all physics for toad rain bo
 var debug_toad_no_shadows: bool = false   # Disable shadow casting on toad rain bodies
 var debug_toad_show_hitboxes: bool = false  # Show collision shape wireframe on toad bodies
 var debug_toad_contacts: bool = false      # Log toad-side contact details (F10 toggles player-side, F11 toggles toad-side)
+var debug_toad_mass: float = 4.0           # Runtime-adjustable toad mass (kg), default matches TOAD_MASS
 
 signal game_state_changed(new_state: GameState)
 signal match_started

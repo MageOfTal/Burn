@@ -197,24 +197,6 @@ func _spawn_toads() -> void:
 		if body_mesh:
 			body_mesh.scale = Vector3(TOAD_SCALE, TOAD_SCALE * 0.65, TOAD_SCALE)
 
-		# Debug: visualize collision shape as semi-transparent cylinder
-		var debug_mesh := MeshInstance3D.new()
-		debug_mesh.name = "DebugCollision"
-		var cyl_mesh := CylinderMesh.new()
-		cyl_mesh.top_radius = TOAD_SCALE
-		cyl_mesh.bottom_radius = TOAD_SCALE
-		cyl_mesh.height = TOAD_SCALE * 0.65 * 1.3
-		cyl_mesh.radial_segments = 16
-		debug_mesh.mesh = cyl_mesh
-		var debug_mat := StandardMaterial3D.new()
-		debug_mat.albedo_color = Color(1.0, 0.2, 0.2, 0.3)
-		debug_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		debug_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
-		debug_mat.no_depth_test = true
-		debug_mesh.material_override = debug_mat
-		debug_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		toad.add_child(debug_mesh)
-
 		# Position eyes
 		_setup_toad_eyes(toad, TOAD_SCALE)
 

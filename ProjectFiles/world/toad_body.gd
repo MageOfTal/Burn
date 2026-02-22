@@ -22,7 +22,7 @@ extends PhysicsBodyBase
 ## BVH entirely, preventing thousands of dead bodies from bloating physics
 ## queries during heavy toad rain.
 
-const TOAD_MASS: float = 2.0          ## 1/40th of player mass (80 kg)
+const TOAD_MASS: float = 4.0          ## 1/20th of player mass (80 kg)
 const DESPAWN_Y_OFFSET: float = -3.0  ## How far below the floor before queue_free()
 const MAX_LIFETIME: float = 15.0      ## Safety net — despawn if stuck somehow
 const POST_BOUNCE_GRAVITY: float = 19.6  ## 2x normal gravity (9.8 * 2), applied manually
@@ -159,7 +159,7 @@ func _ready() -> void:
 	add_to_group("toad_bodies")
 	if GameManager.debug_toad_show_hitboxes:
 		_create_hitbox_mesh()
-	mass = TOAD_MASS
+	mass = GameManager.debug_toad_mass
 	gravity_scale = 2.0  ## 2x gravity (matches original TOAD_GRAVITY = 19.6)
 	lock_rotation = false
 	continuous_cd = true  ## Prevent tunneling through ground when hit by heavy shadow body
@@ -327,9 +327,9 @@ func set_shadows_enabled(enabled: bool) -> void:
 # ======================================================================
 
 func _create_hitbox_mesh() -> void:
-	## Add a transparent mesh matching the actual collision shape (sphere or cylinder).
-	var col_shape := get_node_or_null("CollisionShape3D") as CollisionShape3D
-	if col_shape == null or col_shape.shape == null:
+	## Add a transparent mesh matching the visual "Body" mesh exactly.
+	var body_mesh := get_node_or_null("Body") as MeshInstance3D
+	if body_mesh == null or body_mesh.mesh == null:
 		return
 
 	# Lazy-init shared material (one allocation for all toads)
@@ -341,28 +341,10 @@ func _create_hitbox_mesh() -> void:
 		_hitbox_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 		_hitbox_mat.no_depth_test = true
 
-	var debug_mesh: Mesh = null
-	var shape := col_shape.shape
-	if shape is SphereShape3D:
-		var sphere := SphereMesh.new()
-		sphere.radius = shape.radius
-		sphere.height = shape.radius * 2.0
-		sphere.radial_segments = 12
-		sphere.rings = 6
-		debug_mesh = sphere
-	elif shape is CylinderShape3D:
-		var cyl := CylinderMesh.new()
-		cyl.top_radius = shape.radius
-		cyl.bottom_radius = shape.radius
-		cyl.height = shape.height
-		cyl.radial_segments = 16
-		debug_mesh = cyl
-	else:
-		return
-
 	_hitbox_mesh = MeshInstance3D.new()
 	_hitbox_mesh.name = "HitboxDebug"
-	_hitbox_mesh.mesh = debug_mesh
+	_hitbox_mesh.mesh = body_mesh.mesh
+	_hitbox_mesh.scale = body_mesh.scale
 	_hitbox_mesh.material_override = _hitbox_mat
 	_hitbox_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_hitbox_mesh)
