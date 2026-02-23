@@ -271,11 +271,19 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		return
 
 	var space_state := get_world_3d().direct_space_state
+	var debug_rays := GameManager.debug_show_explosion_rays
 
 	var debris_spawned := 0
 	var destroyed_keys: Array[Vector3i] = []
 	var destroyed_positions: Array[Vector3] = []
+	var debug_ray_data: Array = []
 
+	# Two-pass damage: compute all damage first (read-only), then apply.
+	# This prevents block HP mutations from affecting shielding calculations
+	# for later blocks, which caused directional bias in single-pass.
+	var damage_map: Dictionary = {}  # Vector3i -> float
+
+	# --- Pass 1: Compute damage for all blocks (read-only) ---
 	for key: Vector3i in _blocks:
 		var block_data: Dictionary = _blocks[key]
 		var block_body: StaticBody3D = block_data["body"]
@@ -288,25 +296,52 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		if dist > blast_radius:
 			continue
 
-		# Base damage with distance falloff
-		var falloff: float = clampf(1.0 - (dist / blast_radius), 0.0, 1.0)
+		# Base damage with inverse-square distance falloff
+		var norm_dist: float = dist / blast_radius
+		var falloff: float = 1.0 / (1.0 + (norm_dist * 3.0) ** 2)
 		var dmg: float = amount * falloff
+		var raw_dmg: float = dmg
 
 		# --- Flat HP shielding: raycast from explosion to this block ---
+		var shield_hits: Array[Vector3] = []
 		if space_state and dist > 0.3:
-			var absorbed: float = ExplosionHelper.calc_ray_shielding(
-				space_state, hit_pos, block_world_pos, [block_body.get_rid()], block_body
-			)
-			dmg = maxf(dmg - absorbed, 0.0)
+			if debug_rays:
+				var result: Array = ExplosionHelper.calc_ray_shielding_debug(
+					space_state, hit_pos, block_world_pos, [block_body.get_rid()], block_body
+				)
+				dmg = maxf(dmg - result[0], 0.0)
+				shield_hits = result[1]
+			else:
+				var absorbed: float = ExplosionHelper.calc_ray_shielding(
+					space_state, hit_pos, block_world_pos, [block_body.get_rid()], block_body
+				)
+				dmg = maxf(dmg - absorbed, 0.0)
 
-		if dmg < 0.5:
+		if debug_rays:
+			debug_ray_data.append({
+				"from": hit_pos, "to": block_world_pos,
+				"raw_dmg": raw_dmg, "final_dmg": dmg,
+				"hits": shield_hits,
+			})
+
+		if dmg >= 0.5:
+			damage_map[key] = dmg
+
+	# --- Pass 2: Apply all damage simultaneously ---
+	for key: Vector3i in damage_map:
+		if not _blocks.has(key):
 			continue
-
-		block_data["hp"] -= dmg
+		var block_data: Dictionary = _blocks[key]
+		var block_body: StaticBody3D = block_data["body"]
+		block_data["hp"] -= damage_map[key]
 		if block_data["hp"] <= 0.0:
 			destroyed_keys.append(key)
-			destroyed_positions.append(block_world_pos)
+			destroyed_positions.append(block_body.global_position)
 			block_body.queue_free()
+
+	# Draw debug rays if toggled on
+	if debug_rays and not debug_ray_data.is_empty():
+		ExplosionHelper.draw_debug_rays(debug_ray_data)
 
 	# Clean up destroyed entries and sync to clients (with debris info).
 	for i in destroyed_keys.size():

@@ -5,27 +5,18 @@ class_name WeaponMelee
 ## Uses a shape cast for a forgiving hit area (not a thin raycast).
 ## Returns {"melee_hit": true, "hit_collider": Node} on hit.
 ##
-## The query shape is created once via PhysicsServer3D and reused across swings.
-## Jolt requires shapes to be registered with the physics server before use in
-## queries — a bare SphereShape3D.new() with .radius set in GDScript isn't
-## picked up (radius stays 0 on the engine side, causing the query to fail).
+## Uses a persistent SphereShape3D resource for sweep queries. With threaded
+## physics, PhysicsServer3D.shape_set_data() is deferred — creating a shape
+## and querying it in the same frame sees radius=0. A persistent resource
+## has its data flushed by the time the next frame's query runs.
 
 const MELEE_SPHERE_RADIUS: float = 0.5
 
-## Lazily-created RID for the sphere shape used in melee sweep queries.
-var _query_shape_rid: RID = RID()
+## Persistent sphere shape — created once, reused across all swings.
+var _query_sphere := SphereShape3D.new()
 
-func _get_query_shape_rid() -> RID:
-	if not _query_shape_rid.is_valid():
-		_query_shape_rid = PhysicsServer3D.sphere_shape_create()
-		PhysicsServer3D.shape_set_data(_query_shape_rid, MELEE_SPHERE_RADIUS)
-	return _query_shape_rid
-
-func _notification(what: int) -> void:
-	if what == NOTIFICATION_PREDELETE:
-		if _query_shape_rid.is_valid():
-			PhysicsServer3D.free_rid(_query_shape_rid)
-			_query_shape_rid = RID()
+func _ready() -> void:
+	_query_sphere.radius = MELEE_SPHERE_RADIUS
 
 func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> Dictionary:
 	var space_state := shooter.get_world_3d().direct_space_state
@@ -38,7 +29,7 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 	var player_bit: int = 256 if shooter.get("in_toad_dimension") else 128
 
 	var params := PhysicsShapeQueryParameters3D.new()
-	params.shape_rid = _get_query_shape_rid()
+	params.shape = _query_sphere
 	params.exclude = [shooter.get_rid()]
 	params.collision_mask = 1 | 2 | 1024 | player_bit  # World(1) + items(2) + blocks(1024) + players
 	params.motion = Vector3.ZERO

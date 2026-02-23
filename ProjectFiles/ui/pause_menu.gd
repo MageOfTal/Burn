@@ -21,6 +21,7 @@ var _velocity_iter_slider: HSlider = null
 var _velocity_iter_label: Label = null
 var _mass_pin_button: CheckButton = null
 var _explosion_spheres_button: CheckButton = null
+var _explosion_rays_button: CheckButton = null
 var _toad_density_input: LineEdit = null
 var _toad_fog_density_input: LineEdit = null
 var _toad_mass_input: LineEdit = null
@@ -210,6 +211,9 @@ func _build_main_panel() -> void:
 	_explosion_spheres_button = _add_check("Show Explosion Spheres (Tower Rubble)", false, vbox)
 	_explosion_spheres_button.toggled.connect(_on_explosion_spheres_toggled)
 
+	_explosion_rays_button = _add_check("Show Explosion Rays (Wall Blocks)", false, vbox)
+	_explosion_rays_button.toggled.connect(_on_explosion_rays_toggled)
+
 	# Separator
 	vbox.add_child(HSeparator.new())
 
@@ -271,6 +275,15 @@ func _build_main_panel() -> void:
 
 	_toad_show_hitboxes_button = _add_check("Show Toad Hitboxes", GameManager.debug_toad_show_hitboxes, vbox)
 	_toad_show_hitboxes_button.toggled.connect(_on_toad_show_hitboxes_toggled)
+
+	# Separator
+	vbox.add_child(HSeparator.new())
+
+	# ── Performance ─────────────────────────────────────────────────────
+	_add_section_header("Performance", vbox)
+
+	_debris_button = _add_check("Disable Debris", GameManager.disable_debris, vbox)
+	_debris_button.toggled.connect(_on_debris_toggled)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -487,9 +500,6 @@ func _build_video_panel() -> void:
 
 	_fps_hud_button = _add_check("Show FPS", false, vbox)
 	_fps_hud_button.toggled.connect(_on_fps_hud_toggled)
-
-	_debris_button = _add_check("Disable Debris", GameManager.disable_debris, vbox)
-	_debris_button.toggled.connect(_on_debris_toggled)
 
 	vbox.add_child(HSeparator.new())
 
@@ -830,6 +840,11 @@ func _on_mass_pin_toggled(pressed: bool) -> void:
 func _on_explosion_spheres_toggled(pressed: bool) -> void:
 	GameManager.debug_show_explosion_spheres = pressed
 	print("[PauseMenu] Explosion spheres: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_explosion_rays_toggled(pressed: bool) -> void:
+	GameManager.debug_show_explosion_rays = pressed
+	print("[PauseMenu] Explosion rays: %s" % ("ON" if pressed else "OFF"))
 
 
 func _on_toad_density_submitted(text: String) -> void:

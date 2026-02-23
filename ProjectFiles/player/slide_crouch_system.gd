@@ -455,8 +455,9 @@ func end_crouch() -> void:
 ## ---- Slide-on-land system ----
 
 func clear_slide_on_land() -> void:
-	## Clear the queued slide-on-land request (e.g. on new jump).
+	## Clear the queued slide-on-land request (e.g. on new jump or button release).
 	_wants_slide_on_land = false
+	_slide_on_land_grace = 0.0
 
 
 func queue_slide_on_land() -> void:
@@ -500,14 +501,18 @@ func process_landing(delta: float) -> void:
 
 	# Process grace window
 	if _slide_on_land_grace > 0.0 and not is_sliding and not is_crouching:
-		_slide_on_land_grace -= delta
-		if player.is_on_floor() and can_start_slide():
+		if not player.player_input.action_slide:
+			# Button released — cancel queued slide-on-land
 			_wants_slide_on_land = false
 			_slide_on_land_grace = 0.0
-			start_slide()
-		elif _slide_on_land_grace <= 0.0:
-			_wants_slide_on_land = false
-			if player.player_input.action_slide:
+		else:
+			_slide_on_land_grace -= delta
+			if player.is_on_floor() and can_start_slide():
+				_wants_slide_on_land = false
+				_slide_on_land_grace = 0.0
+				start_slide()
+			elif _slide_on_land_grace <= 0.0:
+				_wants_slide_on_land = false
 				start_crouch()
 
 

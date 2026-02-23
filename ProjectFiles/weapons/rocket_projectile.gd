@@ -126,7 +126,7 @@ func _do_explode() -> void:
 	# --- Shielded explosion damage (flat HP absorption + multi-point raycast) ---
 	ExplosionHelper.do_explosion(
 		get_world_3d(),
-		explosion_pos, _damage, EXPLOSION_RADIUS, _shooter_id, self
+		explosion_pos, _damage, EXPLOSION_RADIUS, _shooter_id, self, 0.2
 	)
 
 	# --- Create terrain crater (server deforms, then tells clients) ---

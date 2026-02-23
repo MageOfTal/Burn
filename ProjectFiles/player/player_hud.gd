@@ -71,9 +71,9 @@ var _f9_was_pressed: bool = false
 
 ## Performance graph
 var _perf_graph: HUDPerfGraph = null
-var _graph_tps: float = 60.0       ## Smoothed TPS for graph (computed in _physics_process)
-var _prev_phys_us: int = 0         ## Wall-clock usec of previous physics tick
-var _smooth_phys_delta: float = 1.0 / 60.0  ## EMA-filtered wall-clock physics tick delta
+var _graph_tps: float = 60.0          ## Exact TPS from last completed window
+var _tps_window_start_us: int = 0     ## Wall-clock usec at start of current window
+var _tps_window_ticks: int = 0        ## Physics ticks counted since window start
 
 ## Extracted widgets
 var _compass: HUDCompass = null
@@ -276,15 +276,24 @@ func _physics_process(_delta: float) -> void:
 	_physics_tick_count += 1
 	_wallclock_tick_count += 1
 
-	# Graph TPS: EMA on wall-clock delta between consecutive physics ticks.
-	# Computed entirely in _physics_process so render-frame jitter can't affect it.
+	# Graph TPS: exact tick count over a 500 ms wall-clock window.
+	# Measured tick-to-tick so there's no clock-boundary quantisation error.
 	var now_us := Time.get_ticks_usec()
-	if _prev_phys_us > 0:
-		var dt := float(now_us - _prev_phys_us) / 1_000_000.0
-		if dt > 0.0 and dt < 1.0:  # Ignore huge gaps (pause menu, loading)
-			_smooth_phys_delta = lerpf(_smooth_phys_delta, dt, 0.1)
-			_graph_tps = 1.0 / _smooth_phys_delta
-	_prev_phys_us = now_us
+	if _tps_window_start_us == 0:
+		# First tick — seed the window, don't count this tick.
+		_tps_window_start_us = now_us
+		_tps_window_ticks = 0
+	else:
+		_tps_window_ticks += 1
+		var elapsed_us := now_us - _tps_window_start_us
+		if elapsed_us >= 1_000_000:
+			# Gap > 1 s (pause menu, loading) — reset without updating TPS.
+			_tps_window_start_us = now_us
+			_tps_window_ticks = 0
+		elif elapsed_us >= 500_000:
+			_graph_tps = float(_tps_window_ticks) / (float(elapsed_us) / 1_000_000.0)
+			_tps_window_start_us = now_us
+			_tps_window_ticks = 0
 
 	# Wall-clock TPS: compare ticks against monotonic clock, not _process delta
 	var now_ms: int = Time.get_ticks_msec()
@@ -515,8 +524,8 @@ func _update_fps_hud(delta: float) -> void:
 		print("[HUD] FPS cap: %s" % ("unlimited" if FPS_CAPS[_fps_cap_index] == 0 else str(FPS_CAPS[_fps_cap_index])))
 	_f9_was_pressed = f9_pressed
 
-	# Feed performance graph. TPS is computed entirely in _physics_process via
-	# wall-clock EMA — _process just reads the latest _graph_tps value.
+	# Feed performance graph. _graph_tps is computed in _physics_process
+	# (exact tick count over a 500 ms wall-clock window, no smoothing).
 	if _perf_graph:
 		_perf_graph.visible = GameManager.show_fps_hud
 		if _perf_graph.visible and delta > 0.0:

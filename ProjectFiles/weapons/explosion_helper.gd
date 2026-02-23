@@ -17,8 +17,17 @@ const PLAYER_TOP_Y := 1.7
 const PLAYER_BOTTOM_Y := 0.1
 const PLAYER_SIDE_OFFSET := 0.35  ## Half-width at capsule center height
 
-## Max raycasts per shielding check to prevent infinite loops
+## Max hits per shielding raycast (controls intersect_ray_all max_results)
 const MAX_RAY_ITERATIONS := 8
+
+## Debug ray auto-delete time (seconds)
+const DEBUG_RAY_LIFETIME := 4.0
+
+## Persistent sphere shape for physics queries. With threaded physics,
+## PhysicsServer3D.shape_set_data() is deferred — a shape created + configured
+## in the same frame reads radius=0. By reusing a persistent shape, the radius
+## from the previous frame's set_data has already been flushed by Jolt.
+static var _query_sphere := SphereShape3D.new()
 
 
 # ======================================================================
@@ -31,7 +40,8 @@ static func do_explosion(
 	base_damage: float,
 	radius: float,
 	attacker_id: int,
-	exclude_body: Node = null
+	exclude_body: Node = null,
+	player_damage_mult: float = 1.0
 ) -> void:
 	## Deal shielded explosion damage to all players and walls in radius.
 	## exclude_body: the rocket RigidBody3D or kamikaze player to skip.
@@ -46,22 +56,19 @@ static func do_explosion(
 	#  Pass 1: Physics sphere query (catches players + rigid bodies)
 	# ------------------------------------------------------------------
 	var query := PhysicsShapeQueryParameters3D.new()
-	# Create the sphere shape via PhysicsServer3D so Jolt registers it properly.
-	# A bare SphereShape3D.new() with .radius set in GDScript stays at radius 0
-	# on the Jolt side, causing the query to silently fail.
-	var sphere_rid := PhysicsServer3D.sphere_shape_create()
-	PhysicsServer3D.shape_set_data(sphere_rid, radius)
-	query.shape_rid = sphere_rid
+	# Reuse persistent sphere shape — see _query_sphere comment above.
+	# The radius set here is deferred (threaded physics), so on the FIRST
+	# explosion call the shape uses its default radius (0.5m). Pass 2's
+	# scene scan catches anything missed. All subsequent calls use the
+	# correct radius from the previous frame's flush.
+	_query_sphere.radius = radius
+	query.shape = _query_sphere
 	query.transform = Transform3D(Basis(), explosion_pos)
 	query.collision_mask = 1 | 2 | 4 | 128 | 256 | 1024  # World(1) + items(2) + bubbles(4) + players(128/256) + blocks(1024)
 	query.collide_with_bodies = true
 	query.collide_with_areas = true
 
 	var results := space_state.intersect_shape(query, 64)
-	PhysicsServer3D.free_rid(sphere_rid)
-
-	print("[EXPLOSION] pos=%s radius=%.1f damage=%.1f results=%d attacker=%d" % [
-		explosion_pos, radius, base_damage, results.size(), attacker_id])
 
 	for result in results:
 		var collider: Node = result["collider"]
@@ -73,23 +80,22 @@ static func do_explosion(
 
 		if target.has_method("take_damage_at"):
 			# Wall: let take_damage_at handle per-block shielding internally
-			print("[EXPLOSION]   → wall '%s' take_damage_at" % target.name)
 			target.take_damage_at(explosion_pos, base_damage, radius, attacker_id)
 			already_damaged.append(target)
 		elif target is Player and target.has_method("take_damage"):
 			# Player: multi-point raycast with flat shielding
 			var dmg := _calc_player_explosion_damage(
-				space_state, explosion_pos, base_damage, radius, target, exclude_rid
+				space_state, explosion_pos, base_damage * player_damage_mult, radius, target, exclude_rid
 			)
-			print("[EXPLOSION]   → player '%s' shielded_dmg=%.1f" % [target.name, dmg])
 			if dmg > 0.5:
 				target.take_damage(dmg, attacker_id)
 			already_damaged.append(target)
 		elif target is RigidBody3D and target.has_method("take_damage"):
-			# Destructible physics object (tower chunks, etc.) — simple distance falloff
+			# Destructible physics object (tower chunks, etc.) — inverse-square falloff
 			var dist := explosion_pos.distance_to(target.global_position)
 			if dist <= radius:
-				var falloff := clampf(1.0 - (dist / radius), 0.0, 1.0)
+				var norm_dist := dist / radius
+				var falloff := 1.0 / (1.0 + (norm_dist * 3.0) ** 2)
 				var dmg := base_damage * falloff
 				if dmg > 0.5:
 					target.take_damage(dmg, attacker_id)
@@ -112,9 +118,8 @@ static func do_explosion(
 				if dist > radius:
 					continue
 				var dmg := _calc_player_explosion_damage(
-					space_state, explosion_pos, base_damage, radius, p, exclude_rid
+					space_state, explosion_pos, base_damage * player_damage_mult, radius, p, exclude_rid
 				)
-				print("[EXPLOSION]   → player '%s' (fallback) shielded_dmg=%.1f dist=%.1f" % [p.name, dmg, dist])
 				if dmg > 0.5:
 					p.take_damage(dmg, attacker_id)
 				already_damaged.append(p)
@@ -136,10 +141,8 @@ static func do_explosion(
 					var dist := explosion_pos.distance_to(s.global_position)
 					if dist > radius + 10.0:
 						continue
-					print("[EXPLOSION]   → structure '%s' (fallback) take_damage_at dist=%.1f" % [s.name, dist])
 					s.take_damage_at(explosion_pos, base_damage, radius, attacker_id)
 					already_damaged.append(s)
-
 
 
 # ======================================================================
@@ -182,27 +185,51 @@ static func _calc_player_explosion_damage(
 	if exclude_rid.is_valid():
 		exclude_rids_base.append(exclude_rid)
 
+	var debug_rays := GameManager.debug_show_explosion_rays
+	var debug_ray_data: Array = []
+
 	for sample_pos in sample_points:
-		# Distance falloff from explosion to this sample point
+		# Distance falloff from explosion to this sample point (inverse-square)
 		var dist := explosion_pos.distance_to(sample_pos)
 		if dist > radius:
 			continue  # This sample point is out of blast radius
-		var falloff := clampf(1.0 - (dist / radius), 0.0, 1.0)
+		var norm_dist := dist / radius
+		var falloff := 1.0 / (1.0 + (norm_dist * 3.0) ** 2)
 		var raw_dmg := base_damage * falloff
 
 		# Sum flat shielding along this ray
-		var absorbed := calc_ray_shielding(
-			space_state, explosion_pos, sample_pos, exclude_rids_base.duplicate(), null
-		)
+		var final_dmg: float
+		var shield_hits: Array[Vector3] = []
+		if debug_rays:
+			var result: Array = calc_ray_shielding_debug(
+				space_state, explosion_pos, sample_pos, exclude_rids_base.duplicate(), null
+			)
+			final_dmg = maxf(raw_dmg - result[0], 0.0)
+			shield_hits = result[1]
+		else:
+			var absorbed := calc_ray_shielding(
+				space_state, explosion_pos, sample_pos, exclude_rids_base.duplicate(), null
+			)
+			final_dmg = maxf(raw_dmg - absorbed, 0.0)
 
-		total_damage += maxf(raw_dmg - absorbed, 0.0)
+		total_damage += final_dmg
+
+		if debug_rays:
+			debug_ray_data.append({
+				"from": explosion_pos, "to": sample_pos,
+				"raw_dmg": raw_dmg, "final_dmg": final_dmg,
+				"hits": shield_hits,
+			})
+
+	if debug_rays and not debug_ray_data.is_empty():
+		draw_debug_rays(debug_ray_data)
 
 	# Average across all 5 sample points
 	return total_damage / 5.0
 
 
 # ======================================================================
-#  Ray shielding: iterative raycast summing flat HP absorption
+#  Ray shielding: single multi-hit raycast summing flat HP absorption
 # ======================================================================
 
 static func calc_ray_shielding(
@@ -212,51 +239,166 @@ static func calc_ray_shielding(
 	exclude_rids: Array[RID],
 	target_body: Node
 ) -> float:
-	## Cast iterative rays from→to, summing flat HP absorption of everything
-	## in the path. Returns total damage absorbed.
+	## Single multi-hit raycast from→to, summing flat HP absorption of
+	## everything in the path. Returns total damage absorbed.
+	##
+	## Uses intersect_ray_all (Jolt AllHitCollector) — one engine call
+	## returns all hits sorted by distance, replacing the old iterative loop.
 	##
 	## - Wall blocks contribute their current block HP
 	## - Players contribute their current health
 	## - Terrain blocks the ray completely (infinite absorption)
+	var query := PhysicsRayQueryParameters3D.create(from, to)
+	query.collision_mask = 1 | 128 | 256 | 1024  # Terrain(1) + players(128/256) + wall blocks(1024)
+	query.exclude = exclude_rids
+	var results := space_state.intersect_ray_all(query, MAX_RAY_ITERATIONS)
+
 	var absorbed := 0.0
-	var current_from := from
-	var dir := (to - from).normalized()
-	var max_dist := from.distance_to(to)
-
-	for _i in MAX_RAY_ITERATIONS:
-		var query := PhysicsRayQueryParameters3D.create(current_from, to)
-		query.collision_mask = 1 | 1024  # Terrain(1) + wall blocks(1024)
-		query.exclude = exclude_rids
-		var result := space_state.intersect_ray(query)
-		if result.is_empty():
-			break  # Clear path to target
-
+	for result in results:
 		var hit_node: Node = result["collider"]
 		if hit_node == target_body:
 			break  # Reached the target itself
 
 		# Identify what we hit and add its HP as absorption
 		if hit_node is Player and hit_node.has_method("take_damage"):
-			# Player in the way: absorbs up to their current health
 			absorbed += hit_node.health
 		elif _is_wall_block(hit_node):
-			# Wall block: absorbs up to its current HP
 			var wall = hit_node.parent_wall
 			var key: Vector3i = hit_node.grid_key
 			if wall and is_instance_valid(wall) and wall._blocks.has(key):
 				absorbed += wall._blocks[key]["hp"]
 		else:
-			# Terrain or unknown solid — fully blocks (infinite absorption)
+			# Terrain or unknown solid — fully blocks
 			absorbed += 99999.0
 			break
 
-		# Skip past this hit and continue
-		exclude_rids.append(hit_node.get_rid())
-		current_from = result["position"] + dir * 0.05
-		if current_from.distance_to(from) >= max_dist:
+	return absorbed
+
+
+# ======================================================================
+#  Debug ray visualization
+# ======================================================================
+
+## Draw debug rays for an explosion. Each entry in ray_data is:
+##   { "from": Vector3, "to": Vector3, "raw_dmg": float, "final_dmg": float,
+##     "hits": Array of Vector3 positions where shielding occurred }
+## Green = full damage, yellow = partial shielding, red = fully blocked.
+static func draw_debug_rays(ray_data: Array) -> void:
+	var tree := Engine.get_main_loop() as SceneTree
+	if tree == null or tree.current_scene == null:
+		return
+	if ray_data.is_empty():
+		return
+
+	var mesh_node := MeshInstance3D.new()
+	mesh_node.name = "DebugExplosionRays"
+
+	var im := ImmediateMesh.new()
+	mesh_node.mesh = im
+
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.no_depth_test = true
+	mat.vertex_color_use_as_albedo = true
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mesh_node.material_override = mat
+
+	# Draw lines
+	im.surface_begin(Mesh.PRIMITIVE_LINES)
+	for entry in ray_data:
+		var from: Vector3 = entry["from"]
+		var to: Vector3 = entry["to"]
+		var raw: float = entry["raw_dmg"]
+		var final: float = entry["final_dmg"]
+		var absorbed: float = raw - final
+
+		# Color based on shielding, not absolute damage level:
+		#   Green  = no shielding encountered (full damage reaches target)
+		#   Yellow = partial shielding (some damage still gets through)
+		#   Red    = fully blocked by shielding (all damage absorbed)
+		#   Gray   = out of blast range
+		var color: Color
+		if raw <= 0.01:
+			color = Color(0.5, 0.5, 0.5, 0.4)  # Out of range — gray
+		elif absorbed <= 0.01:
+			color = Color(0.2, 1.0, 0.2, 0.6)  # No shielding — green
+		elif final >= 0.5:
+			color = Color(1.0, 1.0, 0.0, 0.6)  # Partial shielding — yellow
+		else:
+			color = Color(1.0, 0.2, 0.2, 0.6)  # Fully blocked — red
+
+		im.surface_set_color(color)
+		im.surface_add_vertex(from)
+		im.surface_set_color(color)
+		im.surface_add_vertex(to)
+
+		# Draw small cross markers at each shielding hit point
+		var hits: Array = entry.get("hits", [])
+		var hit_color := Color(1.0, 0.5, 0.0, 0.8)  # Orange hit markers
+		for hit_pos: Vector3 in hits:
+			var s := 0.08
+			im.surface_set_color(hit_color)
+			im.surface_add_vertex(hit_pos + Vector3(-s, 0, 0))
+			im.surface_set_color(hit_color)
+			im.surface_add_vertex(hit_pos + Vector3(s, 0, 0))
+			im.surface_set_color(hit_color)
+			im.surface_add_vertex(hit_pos + Vector3(0, -s, 0))
+			im.surface_set_color(hit_color)
+			im.surface_add_vertex(hit_pos + Vector3(0, s, 0))
+			im.surface_set_color(hit_color)
+			im.surface_add_vertex(hit_pos + Vector3(0, 0, -s))
+			im.surface_set_color(hit_color)
+			im.surface_add_vertex(hit_pos + Vector3(0, 0, s))
+	im.surface_end()
+
+	tree.current_scene.add_child(mesh_node)
+
+	# Auto-delete after DEBUG_RAY_LIFETIME seconds
+	tree.create_timer(DEBUG_RAY_LIFETIME, false).timeout.connect(
+		func():
+			if is_instance_valid(mesh_node):
+				mesh_node.queue_free()
+	)
+
+
+## Variant of calc_ray_shielding that also collects hit positions for debug drawing.
+## Returns [absorbed: float, hit_positions: Array[Vector3]].
+static func calc_ray_shielding_debug(
+	space_state: PhysicsDirectSpaceState3D,
+	from: Vector3,
+	to: Vector3,
+	exclude_rids: Array[RID],
+	target_body: Node
+) -> Array:
+	var query := PhysicsRayQueryParameters3D.create(from, to)
+	query.collision_mask = 1 | 1024
+	query.exclude = exclude_rids
+	var results := space_state.intersect_ray_all(query, MAX_RAY_ITERATIONS)
+
+	var absorbed := 0.0
+	var hit_positions: Array[Vector3] = []
+	for result in results:
+		var hit_node: Node = result["collider"]
+		if hit_node == target_body:
 			break
 
-	return absorbed
+		var hit_pos: Vector3 = result["position"]
+
+		if hit_node is Player and hit_node.has_method("take_damage"):
+			absorbed += hit_node.health
+			hit_positions.append(hit_pos)
+		elif _is_wall_block(hit_node):
+			var wall = hit_node.parent_wall
+			var key: Vector3i = hit_node.grid_key
+			if wall and is_instance_valid(wall) and wall._blocks.has(key):
+				absorbed += wall._blocks[key]["hp"]
+				hit_positions.append(hit_pos)
+		else:
+			absorbed += 99999.0
+			hit_positions.append(hit_pos)
+			break
+
+	return [absorbed, hit_positions]
 
 
 # ======================================================================

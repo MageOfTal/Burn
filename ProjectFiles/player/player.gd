@@ -681,9 +681,12 @@ func _server_process(delta: float) -> void:
 					velocity.y = JUMP_VELOCITY * 1.5
 					_air_jumps_used += 1
 
-			# While airborne, queue slide for when we land
-			if not is_on_floor() and player_input.action_slide:
-				slide_crouch.queue_slide_on_land()
+			# While airborne, queue/cancel slide for when we land
+			if not is_on_floor():
+				if player_input.action_slide:
+					slide_crouch.queue_slide_on_land()
+				else:
+					slide_crouch.clear_slide_on_land()
 
 			# Check if we should start a slide
 			if player_input.action_slide and slide_crouch.can_start_slide():

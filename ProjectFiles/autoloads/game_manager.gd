@@ -39,6 +39,7 @@ var debug_bubble_no_separation: bool = false  # Disable bubble overlap repulsion
 var debug_bubble_no_processing: bool = false  # Skip ALL bubble GDScript (wind, drift, overlap, damage)
 var debug_velocity_iterations: int = 10
 var debug_show_explosion_spheres: bool = false  # Show tower rubble explosion radii
+var debug_show_explosion_rays: bool = false     # Show explosion raycast lines to wall blocks
 var disable_debris: bool = false                 # Skip spawning cosmetic wall debris
 
 # Toad dimension debug toggles (set from pause menu)
