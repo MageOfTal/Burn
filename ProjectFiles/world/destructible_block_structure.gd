@@ -263,10 +263,11 @@ func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 		_spawn_debris(block_pos, blast_center, debris_count)
 
 
-func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attacker_id: int) -> void:
+func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attacker_id: int, exclude_rids: Array[RID] = []) -> void:
 	## Damage blocks within blast_radius of hit_pos. Only blocks in range take damage.
 	## Shielding uses flat HP absorption: each wall block or player between the
 	## explosion and a target block absorbs damage equal to its current HP.
+	## exclude_rids: physics bodies to ignore in shielding raycasts (e.g. the rocket).
 	if not multiplayer.is_server():
 		return
 
@@ -296,24 +297,27 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		if dist > blast_radius:
 			continue
 
-		# Base damage with inverse-square distance falloff
+		# Base damage with cubic distance falloff
 		var norm_dist: float = dist / blast_radius
-		var falloff: float = 1.0 / (1.0 + (norm_dist * 3.0) ** 2)
+		var falloff: float = 1.0 / (1.0 + (norm_dist * 3.0) ** 3)
 		var dmg: float = amount * falloff
 		var raw_dmg: float = dmg
 
 		# --- Flat HP shielding: raycast from explosion to this block ---
+		# Exclude the target block + any bodies passed in (e.g. the rocket)
+		var ray_excludes: Array[RID] = [block_body.get_rid()]
+		ray_excludes.append_array(exclude_rids)
 		var shield_hits: Array[Vector3] = []
 		if space_state and dist > 0.3:
 			if debug_rays:
 				var result: Array = ExplosionHelper.calc_ray_shielding_debug(
-					space_state, hit_pos, block_world_pos, [block_body.get_rid()], block_body
+					space_state, hit_pos, block_world_pos, ray_excludes, block_body
 				)
 				dmg = maxf(dmg - result[0], 0.0)
 				shield_hits = result[1]
 			else:
 				var absorbed: float = ExplosionHelper.calc_ray_shielding(
-					space_state, hit_pos, block_world_pos, [block_body.get_rid()], block_body
+					space_state, hit_pos, block_world_pos, ray_excludes, block_body
 				)
 				dmg = maxf(dmg - absorbed, 0.0)
 

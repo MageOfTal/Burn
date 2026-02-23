@@ -5,6 +5,7 @@
 [resource]
 script = ExtResource("1")
 damage = 40.0
+structure_damage = 40.0
 fire_rate = 1.7
 weapon_range = 120.0
 spread = 2.4

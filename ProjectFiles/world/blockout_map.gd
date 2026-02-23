@@ -144,7 +144,8 @@ func _on_spawn_projectile(data: Dictionary) -> Node:
 
 	# Call launch() on ALL peers so each peer has correct initial velocity
 	if projectile.has_method("launch"):
-		projectile.launch(data["dir"], data["shooter"], data["damage"])
+		var struct_dmg: float = data.get("structure_damage", -1.0)
+		projectile.launch(data["dir"], data["shooter"], data["damage"], struct_dmg)
 
 	# Pass ammo override (rocket scatter) — server-only since only server explodes
 	if data.has("ammo_scene") and data["ammo_scene"] != "" and projectile.has_method("set_ammo_override"):
@@ -157,10 +158,12 @@ func _on_spawn_projectile(data: Dictionary) -> Node:
 
 
 func spawn_projectile(scene_path: String, pos: Vector3, direction: Vector3,
-		shooter_id: int, damage: float, ammo_path: String = "") -> void:
+		shooter_id: int, damage: float, structure_damage: float = -1.0,
+		ammo_path: String = "") -> void:
 	## Server-only: spawn a projectile via the ProjectileSpawner.
 	## The spawner replicates to all clients automatically.
 	## queue_free() on server auto-removes on all clients.
+	## structure_damage: -1.0 = same as player damage.
 	if not multiplayer.is_server():
 		return
 	var data: Dictionary = {
@@ -170,6 +173,8 @@ func spawn_projectile(scene_path: String, pos: Vector3, direction: Vector3,
 		"shooter": shooter_id,
 		"damage": damage,
 	}
+	if structure_damage >= 0.0:
+		data["structure_damage"] = structure_damage
 	if ammo_path != "":
 		data["ammo_scene"] = ammo_path
 	$ProjectileSpawner.spawn(data)

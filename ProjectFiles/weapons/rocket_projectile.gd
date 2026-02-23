@@ -12,9 +12,11 @@ extends ProjectileBase
 const SPEED := 50.0
 const EXPLOSION_RADIUS := 8.0
 const MAX_LIFETIME := 5.0
+const ROCKET_HP := 5.0
 
 var _direction: Vector3 = Vector3.FORWARD
 var _has_exploded: bool = false
+var _hp: float = ROCKET_HP
 ## Deferred explosion: body_entered fires during flush_queries() before
 ## _physics_process(). Physics queries (intersect_shape/intersect_ray) in
 ## ExplosionHelper require _physics_process() context when threaded physics
@@ -30,9 +32,9 @@ func get_max_lifetime() -> float:
 	return MAX_LIFETIME
 
 
-func launch(direction: Vector3, shooter_id: int, damage: float) -> void:
+func launch(direction: Vector3, shooter_id: int, damage: float, structure_damage: float = -1.0) -> void:
 	_direction = direction.normalized()
-	super.launch(direction, shooter_id, damage)
+	super.launch(direction, shooter_id, damage, structure_damage)
 
 
 func _setup() -> void:
@@ -83,6 +85,17 @@ func _server_process(delta: float) -> void:
 				_do_explode()
 
 
+func take_damage(amount: float, attacker_id: int) -> void:
+	## Rockets can be destroyed by explosions. 5 structure damage triggers chain explosion.
+	if _has_exploded or _is_terminated:
+		return
+	_hp -= amount
+	if _hp <= 0.0:
+		_has_exploded = true
+		_is_terminated = true
+		_hit_pending = true  # Defer to _server_process for physics-safe explosion
+
+
 func _is_shooter_immune(body: Node) -> bool:
 	## Rocket: permanent self-exclude (never damages shooter via body_entered).
 	if body is Player and body.peer_id == _shooter_id:
@@ -115,6 +128,12 @@ func _on_body_hit(body: Node) -> void:
 func _do_explode() -> void:
 	var explosion_pos := global_position
 
+	# Remove rocket from physics queries BEFORE explosion raycasts fire.
+	# The rocket is on layer 1 (world geometry) and shielding raycasts mask
+	# layer 1, so without this the rocket body blocks all shielding rays.
+	collision_layer = 0
+	collision_mask = 0
+
 	# If ammo is loaded, scatter ammo projectiles instead of normal explosion
 	if has_ammo_override():
 		_scatter_ammo_projectiles(explosion_pos)
@@ -126,7 +145,7 @@ func _do_explode() -> void:
 	# --- Shielded explosion damage (flat HP absorption + multi-point raycast) ---
 	ExplosionHelper.do_explosion(
 		get_world_3d(),
-		explosion_pos, _damage, EXPLOSION_RADIUS, _shooter_id, self, 0.2
+		explosion_pos, _damage, _structure_damage, EXPLOSION_RADIUS, _shooter_id, self
 	)
 
 	# --- Create terrain crater (server deforms, then tells clients) ---
@@ -149,6 +168,7 @@ func _scatter_ammo_projectiles(explosion_pos: Vector3) -> void:
 	## Uses ProjectileSpawner so all clients see the scattered projectiles.
 	var count := _ammo_explosion_spawn_count
 	var per_projectile_damage: float = (_damage * _ammo_damage_mult) / count
+	var per_projectile_structure_damage: float = (_structure_damage * _ammo_damage_mult) / count
 
 	var map := get_tree().current_scene
 	if not map.has_method("spawn_projectile"):
@@ -174,7 +194,7 @@ func _scatter_ammo_projectiles(explosion_pos: Vector3) -> void:
 		var spawn_pos := explosion_pos + scatter_dir * 0.5  # Offset slightly outward
 		map.spawn_projectile(
 			_ammo_projectile_scene.resource_path, spawn_pos, scatter_dir,
-			_shooter_id, per_projectile_damage
+			_shooter_id, per_projectile_damage, per_projectile_structure_damage
 		)
 
 

@@ -53,7 +53,9 @@ func _fire_ammo_projectile(shooter: Player, aim_origin: Vector3, aim_direction: 
 	if is_shotgun_boosted():
 		count *= 2
 
-	var per_projectile_damage: float = (weapon_data.get_rarity_damage() * get_ammo_damage_mult()) / count
+	var ammo_mult := get_ammo_damage_mult()
+	var per_projectile_damage: float = (weapon_data.get_rarity_damage() * ammo_mult) / count
+	var per_projectile_structure_damage: float = (weapon_data.get_rarity_structure_damage() * ammo_mult) / count
 
 	var proj_scene: PackedScene = get_ammo_projectile_scene()
 	if proj_scene == null:
@@ -71,7 +73,7 @@ func _fire_ammo_projectile(shooter: Player, aim_origin: Vector3, aim_direction: 
 		var spawn_pos := aim_origin + pellet_dir * spawn_offset
 		map.spawn_projectile(
 			proj_scene.resource_path, spawn_pos, pellet_dir,
-			shooter.peer_id, per_projectile_damage
+			shooter.peer_id, per_projectile_damage, per_projectile_structure_damage
 		)
 
 	return {"shot_end": aim_origin + aim_direction * 2.0}

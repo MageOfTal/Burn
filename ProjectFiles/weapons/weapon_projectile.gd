@@ -16,10 +16,13 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 		return {}
 
 	var scaled_damage: float = weapon_data.get_rarity_damage()
+	var scaled_structure_damage: float = weapon_data.get_rarity_structure_damage()
 
 	# Apply ammo damage multiplier when ammo is slotted
 	if ammo_data:
-		scaled_damage *= get_ammo_damage_mult()
+		var mult := get_ammo_damage_mult()
+		scaled_damage *= mult
+		scaled_structure_damage *= mult
 
 	# Spawn projectile in front of the barrel, but check for walls first
 	# so the projectile doesn't clip through nearby geometry.
@@ -35,7 +38,7 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 	if map.has_method("spawn_projectile"):
 		map.spawn_projectile(
 			proj_scene.resource_path, spawn_pos, aim_direction,
-			shooter.peer_id, scaled_damage, ammo_path
+			shooter.peer_id, scaled_damage, scaled_structure_damage, ammo_path
 		)
 	else:
 		push_warning("WeaponProjectile: map has no spawn_projectile method")

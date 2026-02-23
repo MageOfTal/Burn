@@ -29,9 +29,9 @@ func get_max_lifetime() -> float:
 	return MAX_LIFETIME
 
 
-func launch(direction: Vector3, shooter_id: int, damage: float) -> void:
+func launch(direction: Vector3, shooter_id: int, damage: float, structure_damage: float = -1.0) -> void:
 	_direction = direction.normalized()
-	super.launch(direction, shooter_id, damage)
+	super.launch(direction, shooter_id, damage, structure_damage)
 
 
 func _setup() -> void:
@@ -107,7 +107,8 @@ func _on_body_hit(body: Node) -> void:
 	# Velocity-based damage: faster = more damage, minimum 20% at low speed
 	var speed := linear_velocity.length()
 	var speed_ratio := clampf(speed / LAUNCH_SPEED, 0.2, 1.0)
-	var dmg := _damage * speed_ratio
+	var base := _damage if body is Player else _structure_damage
+	var dmg := base * speed_ratio
 
 	body.take_damage(dmg, _shooter_id)
 	_already_hit.append(body)

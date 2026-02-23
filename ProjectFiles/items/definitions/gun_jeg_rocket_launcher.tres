@@ -5,7 +5,8 @@
 
 [resource]
 script = ExtResource("1")
-damage = 350.0
+damage = 70.0
+structure_damage = 350.0
 fire_rate = 1.2
 weapon_range = 200.0
 is_hitscan = false

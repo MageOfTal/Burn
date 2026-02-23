@@ -7,11 +7,16 @@ class_name WeaponData
 const RARITY_DAMAGE_BONUS := 0.15
 
 func get_rarity_damage() -> float:
-	## Returns base damage scaled by rarity tier.
+	## Returns base damage (player damage) scaled by rarity tier.
 	return damage * (1.0 + rarity * RARITY_DAMAGE_BONUS)
+
+func get_rarity_structure_damage() -> float:
+	## Returns structure damage scaled by rarity tier.
+	return structure_damage * (1.0 + rarity * RARITY_DAMAGE_BONUS)
 
 @export_group("Combat")
 @export var damage: float = 15.0
+@export var structure_damage: float = 15.0  ## Damage dealt to structures/blocks. Scales with rarity like player damage.
 @export var fire_rate: float = 0.3  ## Seconds between shots.
 ## Burn fuel cost per shot (base cost, before ammo). All guns cost fuel to fire.
 @export var burn_fuel_cost: float = 2.0

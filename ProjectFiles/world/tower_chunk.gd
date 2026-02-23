@@ -215,9 +215,11 @@ func _do_impact_explosion(contact_damage: float) -> void:
 	var impact_pos := global_position
 
 	# AoE damage via the centralized explosion system
+	# Tower chunk uses same damage for players and structures
 	ExplosionHelper.do_explosion(
 		get_world_3d(),
 		impact_pos,
+		explosion_damage,
 		explosion_damage,
 		explosion_radius,
 		attacker_id,

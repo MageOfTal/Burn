@@ -27,7 +27,8 @@ class_name ProjectileBase
 # ======================================================================
 
 var _shooter_id: int = -1
-var _damage: float = 0.0
+var _damage: float = 0.0  ## Player damage
+var _structure_damage: float = 0.0  ## Structure/block damage
 var _lifetime: float = 0.0
 var _is_terminated: bool = false
 
@@ -41,12 +42,14 @@ var _ammo_damage_mult: float = 1.0
 #  Launch interface (called by MultiplayerSpawner on ALL peers)
 # ======================================================================
 
-func launch(direction: Vector3, shooter_id: int, damage: float) -> void:
+func launch(direction: Vector3, shooter_id: int, damage: float, structure_damage: float = -1.0) -> void:
 	## Called by the ProjectileSpawner on ALL peers before adding to the scene tree.
 	## Sets initial velocity and stores shooter/damage info.
+	## If structure_damage is -1 (default), it equals player damage.
 	## Subclasses that need custom launch behavior should override and call super.
 	_shooter_id = shooter_id
 	_damage = damage
+	_structure_damage = structure_damage if structure_damage >= 0.0 else damage
 	linear_velocity = direction.normalized() * get_launch_speed()
 
 

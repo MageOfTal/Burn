@@ -870,6 +870,7 @@ func _process_combat() -> void:
 		var pellets: Array = hit_info["pellets"]
 		var pellet_count := pellets.size()
 		var rarity_damage_per_pellet: float = current_weapon.weapon_data.get_rarity_damage() / pellet_count
+		var rarity_struct_dmg_per_pellet: float = current_weapon.weapon_data.get_rarity_structure_damage() / pellet_count
 		var base_damage_per_pellet: float = current_weapon.weapon_data.damage / pellet_count
 		var total_damage_dealt: float = 0.0
 
@@ -885,12 +886,14 @@ func _process_combat() -> void:
 		for pellet in pellets:
 			var collider = pellet.get("hit_collider")
 			if collider != null and collider.has_method("take_damage"):
-				var final_damage: float = rarity_damage_per_pellet * heat_system.get_damage_multiplier()
+				var is_player_hit := collider is Player
+				var base_pellet_dmg := rarity_damage_per_pellet if is_player_hit else rarity_struct_dmg_per_pellet
+				var final_damage: float = base_pellet_dmg * heat_system.get_damage_multiplier()
 				if 11 in active_bonuses:  # Juggernaut: +10% damage
 					final_damage *= 1.10
 				collider.take_damage(final_damage, peer_id)
 				# Only generate heat from hitting players, not structures
-				if collider is Player:
+				if is_player_hit:
 					total_damage_dealt += base_damage_per_pellet
 					hit_player_ids[collider.peer_id] = true
 					combat_vfx.play_bullet_hit_sound.rpc(pellet["shot_end"])
@@ -908,12 +911,18 @@ func _process_combat() -> void:
 		var hit_player_ids: Dictionary = {}
 		var collider = hit_info.get("hit_collider")
 		if collider != null and collider.has_method("take_damage"):
-			var final_damage: float = current_weapon.weapon_data.get_rarity_damage() * heat_system.get_damage_multiplier()
+			var is_player_hit := collider is Player
+			var base_dmg: float
+			if is_player_hit:
+				base_dmg = current_weapon.weapon_data.get_rarity_damage()
+			else:
+				base_dmg = current_weapon.weapon_data.get_rarity_structure_damage()
+			var final_damage: float = base_dmg * heat_system.get_damage_multiplier()
 			if 11 in active_bonuses:  # Juggernaut: +10% damage
 				final_damage *= 1.10
 			collider.take_damage(final_damage, peer_id)
 			# Only generate heat from hitting players, not structures
-			if collider is Player:
+			if is_player_hit:
 				heat_system.on_damage_dealt(current_weapon.weapon_data.damage)
 				hit_player_ids[collider.peer_id] = true
 				combat_vfx.play_bullet_hit_sound.rpc(hit_info["shot_end"])

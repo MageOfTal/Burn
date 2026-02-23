@@ -13,6 +13,7 @@ initial_burn_time = 120.0
 burn_cost_to_extend = 1.0
 time_currency_value = 5.0
 damage = 52.5
+structure_damage = 52.5
 fire_rate = 1.40
 weapon_range = 90.0
 spread = 0.2

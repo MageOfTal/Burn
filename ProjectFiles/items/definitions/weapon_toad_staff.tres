@@ -14,6 +14,7 @@ burn_cost_to_extend = 1.5
 time_currency_value = 8.0
 mesh_color = Color(0.3, 0.75, 0.2, 1)
 damage = 0.0
+structure_damage = 0.0
 fire_rate = 1.0
 burn_fuel_cost = 0.0
 weapon_range = 3.5

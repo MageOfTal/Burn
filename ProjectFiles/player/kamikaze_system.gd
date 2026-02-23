@@ -267,9 +267,10 @@ func _explode() -> void:
 		_speed, speed_ratio, _altitude_drop_at_cap, total_drop, effective_ratio])
 
 	# --- Shielded explosion damage (flat HP absorption + multi-point raycast) ---
+	# Kamikaze uses same damage for players and structures
 	ExplosionHelper.do_explosion(
 		player.get_world_3d(),
-		explosion_pos, damage, radius, player.peer_id, player
+		explosion_pos, damage, damage, radius, player.peer_id, player
 	)
 
 	# --- Create terrain crater (scaled with speed) ---

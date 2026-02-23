@@ -37,13 +37,15 @@ static var _query_sphere := SphereShape3D.new()
 static func do_explosion(
 	world: World3D,
 	explosion_pos: Vector3,
-	base_damage: float,
+	player_damage: float,
+	structure_damage: float,
 	radius: float,
 	attacker_id: int,
 	exclude_body: Node = null,
-	player_damage_mult: float = 1.0
 ) -> void:
 	## Deal shielded explosion damage to all players and walls in radius.
+	## player_damage: base damage dealt to players (before falloff/shielding).
+	## structure_damage: base damage dealt to structures/blocks/physics objects.
 	## exclude_body: the rocket RigidBody3D or kamikaze player to skip.
 	var space_state := world.direct_space_state
 	if space_state == null:
@@ -51,6 +53,9 @@ static func do_explosion(
 
 	var already_damaged: Array[Node] = []
 	var exclude_rid: RID = exclude_body.get_rid() if exclude_body else RID()
+	var exclude_rids: Array[RID] = []
+	if exclude_rid.is_valid():
+		exclude_rids.append(exclude_rid)
 
 	# ------------------------------------------------------------------
 	#  Pass 1: Physics sphere query (catches players + rigid bodies)
@@ -80,23 +85,23 @@ static func do_explosion(
 
 		if target.has_method("take_damage_at"):
 			# Wall: let take_damage_at handle per-block shielding internally
-			target.take_damage_at(explosion_pos, base_damage, radius, attacker_id)
+			target.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids)
 			already_damaged.append(target)
 		elif target is Player and target.has_method("take_damage"):
 			# Player: multi-point raycast with flat shielding
 			var dmg := _calc_player_explosion_damage(
-				space_state, explosion_pos, base_damage * player_damage_mult, radius, target, exclude_rid
+				space_state, explosion_pos, player_damage, radius, target, exclude_rid
 			)
 			if dmg > 0.5:
 				target.take_damage(dmg, attacker_id)
 			already_damaged.append(target)
 		elif target is RigidBody3D and target.has_method("take_damage"):
-			# Destructible physics object (tower chunks, etc.) — inverse-square falloff
+			# Destructible physics object (tower chunks, etc.) — cubic falloff
 			var dist := explosion_pos.distance_to(target.global_position)
 			if dist <= radius:
 				var norm_dist := dist / radius
-				var falloff := 1.0 / (1.0 + (norm_dist * 3.0) ** 2)
-				var dmg := base_damage * falloff
+				var falloff := 1.0 / (1.0 + (norm_dist * 3.0) ** 3)
+				var dmg := structure_damage * falloff
 				if dmg > 0.5:
 					target.take_damage(dmg, attacker_id)
 			already_damaged.append(target)
@@ -118,7 +123,7 @@ static func do_explosion(
 				if dist > radius:
 					continue
 				var dmg := _calc_player_explosion_damage(
-					space_state, explosion_pos, base_damage * player_damage_mult, radius, p, exclude_rid
+					space_state, explosion_pos, player_damage, radius, p, exclude_rid
 				)
 				if dmg > 0.5:
 					p.take_damage(dmg, attacker_id)
@@ -141,7 +146,7 @@ static func do_explosion(
 					var dist := explosion_pos.distance_to(s.global_position)
 					if dist > radius + 10.0:
 						continue
-					s.take_damage_at(explosion_pos, base_damage, radius, attacker_id)
+					s.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids)
 					already_damaged.append(s)
 
 
@@ -189,12 +194,12 @@ static func _calc_player_explosion_damage(
 	var debug_ray_data: Array = []
 
 	for sample_pos in sample_points:
-		# Distance falloff from explosion to this sample point (inverse-square)
+		# Distance falloff from explosion to this sample point (cubic)
 		var dist := explosion_pos.distance_to(sample_pos)
 		if dist > radius:
 			continue  # This sample point is out of blast radius
 		var norm_dist := dist / radius
-		var falloff := 1.0 / (1.0 + (norm_dist * 3.0) ** 2)
+		var falloff := 1.0 / (1.0 + (norm_dist * 3.0) ** 3)
 		var raw_dmg := base_damage * falloff
 
 		# Sum flat shielding along this ray
@@ -267,10 +272,14 @@ static func calc_ray_shielding(
 			var key: Vector3i = hit_node.grid_key
 			if wall and is_instance_valid(wall) and wall._blocks.has(key):
 				absorbed += wall._blocks[key]["hp"]
-		else:
-			# Terrain or unknown solid — fully blocks
+		elif hit_node is StaticBody3D:
+			# Terrain (static world geometry) — fully blocks
 			absorbed += 99999.0
 			break
+		elif "_hp" in hit_node:
+			# Damageable dynamic body (rocket, etc.) — shields by its HP
+			absorbed += hit_node._hp
+		# else: unknown body without HP — skip, no absorption
 
 	return absorbed
 
@@ -371,7 +380,7 @@ static func calc_ray_shielding_debug(
 	target_body: Node
 ) -> Array:
 	var query := PhysicsRayQueryParameters3D.create(from, to)
-	query.collision_mask = 1 | 1024
+	query.collision_mask = 1 | 128 | 256 | 1024  # Terrain(1) + players(128/256) + wall blocks(1024)
 	query.exclude = exclude_rids
 	var results := space_state.intersect_ray_all(query, MAX_RAY_ITERATIONS)
 
@@ -393,10 +402,16 @@ static func calc_ray_shielding_debug(
 			if wall and is_instance_valid(wall) and wall._blocks.has(key):
 				absorbed += wall._blocks[key]["hp"]
 				hit_positions.append(hit_pos)
-		else:
+		elif hit_node is StaticBody3D:
+			# Terrain (static world geometry) — fully blocks
 			absorbed += 99999.0
 			hit_positions.append(hit_pos)
 			break
+		elif "_hp" in hit_node:
+			# Damageable dynamic body (rocket, etc.) — shields by its HP
+			absorbed += hit_node._hp
+			hit_positions.append(hit_pos)
+		# else: unknown body without HP — skip, no absorption
 
 	return [absorbed, hit_positions]
 
