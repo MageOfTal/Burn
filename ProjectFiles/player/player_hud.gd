@@ -74,6 +74,7 @@ var _compass: HUDCompass = null
 var _kill_feed: HUDKillFeed = null
 var _forfeit_ring: HUDForfeitRing = null
 var _demon_vignette: HUDDemonVignette = null
+var _zone_vignette: HUDZoneVignette = null
 var _victory_screen: HUDVictoryScreen = null
 
 
@@ -133,12 +134,20 @@ func setup(player: Player) -> void:
 
 	# --- Extracted widgets ---
 
-	# Demon vignette (added first so it renders behind everything)
+	# Zone vignette (red haze when outside fire circle — behind everything)
+	_zone_vignette = HUDZoneVignette.new()
+	_zone_vignette.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_zone_vignette.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_zone_vignette)
+	move_child(_zone_vignette, 0)
+	_zone_vignette.setup(player)
+
+	# Demon vignette (added early so it renders behind most HUD elements)
 	_demon_vignette = HUDDemonVignette.new()
 	_demon_vignette.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_demon_vignette.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(_demon_vignette)
-	move_child(_demon_vignette, 0)
+	move_child(_demon_vignette, 1)
 	_demon_vignette.setup(player)
 
 	# Compass strip
@@ -285,6 +294,8 @@ func _process(delta: float) -> void:
 		_compass.update_compass()
 	if _forfeit_ring:
 		_forfeit_ring.update_forfeit_ring()
+	if _zone_vignette:
+		_zone_vignette.update_zone_vignette()
 	if _demon_vignette:
 		_demon_vignette.update_demon_vignette()
 

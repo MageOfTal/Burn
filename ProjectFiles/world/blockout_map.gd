@@ -722,11 +722,18 @@ func _process(delta: float) -> void:
 		_zone_mesh.position.z = zm.zone_center.y
 
 		# Position fire emitters evenly around the zone circumference.
-		# Throttled: only recalculate positions every 0.5s or when radius changes significantly.
+		# During shrinking, update every frame so fire tracks the wall smoothly.
+		# When static, throttle to every 0.5s to avoid unnecessary terrain queries.
 		if _zone_fire_ring:
-			_fire_ring_update_timer -= delta
-			var radius_changed := absf(r - _fire_ring_last_radius) > 1.0
-			if _fire_ring_update_timer <= 0.0 or radius_changed:
+			var needs_update := false
+			if zm.is_shrinking:
+				needs_update = true
+			else:
+				_fire_ring_update_timer -= delta
+				var radius_changed := absf(r - _fire_ring_last_radius) > 1.0
+				if _fire_ring_update_timer <= 0.0 or radius_changed:
+					needs_update = true
+			if needs_update:
 				_fire_ring_update_timer = 0.5
 				_fire_ring_last_radius = r
 				var seed_world := get_node_or_null("SeedWorld")
@@ -742,8 +749,7 @@ func _process(delta: float) -> void:
 					if seed_world and seed_world.has_method("get_height_from_noise"):
 						ey = seed_world.get_height_from_noise(ex, ez)
 					emitter.global_position = Vector3(ex, ey, ez)
-					# Only emit if radius is reasonable
-					emitter.emitting = r > 5.0
+					emitter.emitting = r > 0.5
 
 
 # ======================================================================

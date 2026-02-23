@@ -63,7 +63,7 @@ namespace EdgeFixDiag {
 } // namespace EdgeFixDiag
 
 // === Mass-scale diagnostic counters ===
-std::atomic<bool> JoltContactListener3D::mass_scale_enabled{true};
+std::atomic<bool> JoltContactListener3D::mass_scale_enabled{false};
 
 std::atomic_int JoltContactListener3D::MassScaleDiag::calls{0};
 std::atomic_int JoltContactListener3D::MassScaleDiag::both_dynamic{0};
