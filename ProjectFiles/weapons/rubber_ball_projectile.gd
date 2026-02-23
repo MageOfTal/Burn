@@ -6,8 +6,8 @@ extends ProjectileBase
 ## Server-authoritative: server handles collision, damage, and cleanup.
 
 const LAUNCH_SPEED := 40.0
-const MAX_BOUNCES := 8
-const MAX_LIFETIME := 8.0
+const MAX_BOUNCES := 20
+const MAX_LIFETIME := 15.0
 const BALL_RADIUS := 0.05  ## Golf ball size
 
 var _direction: Vector3 = Vector3.FORWARD

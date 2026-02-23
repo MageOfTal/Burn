@@ -4,7 +4,7 @@ extends Node
 ## debris RigidBody3D nodes to prevent frame drops during intense combat.
 ## Oldest debris is culled when the cap is exceeded.
 
-const MAX_DEBRIS := 60
+const MAX_DEBRIS := 400
 
 var _active: Array[RigidBody3D] = []
 

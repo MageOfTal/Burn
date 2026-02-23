@@ -203,7 +203,7 @@ func _spawn_toads() -> void:
 		toad._floor_y = -9999.0
 
 		# Persistent toads collide with each other (add layer 7 to mask)
-		toad.collision_mask = 513 | 64  # world (1) + shadow body (512) + toad bodies (64)
+		toad.collision_mask = 2561 | 64  # world (1) + shadow body (512) + walls (2048) + toad bodies (64)
 
 		# Higher bounce so they stay lively in the bowl
 		var phys_mat := PhysicsMaterial.new()

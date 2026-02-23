@@ -6,9 +6,9 @@ extends PhysicsBodyBase
 ## Mass: 2.0 kg (1/40th of the player's 80 kg).
 ##
 ## Collision layer 7 (toad bodies), masks layer 1 (world) + layer 10 (player
-## RigidBody3D). The player is an 80 kg RigidBody3D on layers 128|512.
-## Jolt handles the collision natively — correct contact normals, edge
-## deflections, mass-weighted impulse exchange via the solver delta pattern.
+## RigidBody3D) + layer 12 (smooth wall collision). The player is an 80 kg
+## RigidBody3D on layers 128|512. Jolt handles the collision natively —
+## correct contact normals, edge deflections, mass-weighted impulse exchange.
 ##
 ## No intersect_shape polling, no manual impulse math in toad code. Toads just
 ## collide with things and Jolt does the rest. O(collisions) not O(toads).
@@ -277,10 +277,12 @@ func _on_body_entered_toad(body: Node) -> void:
 	if _has_bounced:
 		return
 
-	# Only count floor/wall collisions as a bounce (StaticBody3D = world geometry).
-	# The player is a RigidBody3D, so this check correctly excludes it —
-	# toads bounce off the player without triggering the post-bounce freeze.
+	# Only terrain/ground (layer 1) triggers the bounce-and-phase-through.
+	# Walls (layers 11/12) are solid obstacles — toads bounce off naturally.
+	# The player is a RigidBody3D, so the StaticBody3D check excludes it.
 	if not (body is StaticBody3D):
+		return
+	if (body.collision_layer & 1) == 0:
 		return
 
 	# Persistent toads (toad bowl) stay in Jolt forever — don't freeze on bounce
@@ -351,8 +353,8 @@ func restore_physics() -> void:
 
 	# Re-enable Jolt simulation
 	freeze = false
-	collision_layer = 64   # Layer 7 (toad bodies)
-	collision_mask = 513   # Layer 1 (world) | Layer 10 (player shadow body)
+	collision_layer = 64    # Layer 7 (toad bodies)
+	collision_mask = 2561   # Layer 1 (world) | Layer 10 (player push) | Layer 12 (smooth wall collision)
 	var col_shape := get_node_or_null("CollisionShape3D") as CollisionShape3D
 	if col_shape:
 		col_shape.disabled = false

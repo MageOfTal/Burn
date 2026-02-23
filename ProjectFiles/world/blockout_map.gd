@@ -618,27 +618,28 @@ func _create_zone_visual() -> void:
 	## along the base of the circle.
 	## Updated each frame in _process() to match ZoneManager.zone_radius.
 
-	# --- Red wall cylinder — tall enough that you can never fly above it ---
-	# 300m tall, bottom at y=-10 (below terrain), top at y=290 (well above kamikaze peak).
-	# Open top = looking up you see clear sky framed by the red haze ring.
+	# --- Red wall cylinder + cap ---
+	# Walls: 147m tall, bottom at y=-10 (below terrain), top at y=137.
 	var cylinder := CylinderMesh.new()
 	cylinder.top_radius = 1.0  # We'll scale via node.scale
 	cylinder.bottom_radius = 1.0
-	cylinder.height = 300.0
+	cylinder.height = 147.0
 	cylinder.radial_segments = 64
+	cylinder.cap_top = false     # Open top — player can see sky looking up
+	cylinder.cap_bottom = false  # Open bottom — no need for underground cap
 
 	_zone_material = StandardMaterial3D.new()
-	_zone_material.albedo_color = Color(0.8, 0.1, 0.0, 0.15)  # Red-orange, semi-transparent
+	_zone_material.albedo_color = Color(0.8, 0.1, 0.0, 0.25)  # Red-orange, semi-transparent
 	_zone_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	_zone_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	_zone_material.cull_mode = BaseMaterial3D.CULL_BACK  # Render front faces only — visible from OUTSIDE the zone looking in, invisible from inside the safe zone
+	_zone_material.cull_mode = BaseMaterial3D.CULL_DISABLED  # Visible from both inside and outside the zone
 	_zone_material.no_depth_test = false  # Respect depth buffer so terrain occludes the wall
 
 	_zone_mesh = MeshInstance3D.new()
 	_zone_mesh.mesh = cylinder
 	_zone_mesh.material_override = _zone_material
 	_zone_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	_zone_mesh.position.y = 140.0  # Centered: bottom at -10, top at 290
+	_zone_mesh.position.y = 63.5  # Centered: bottom at -10, top at 137
 	add_child(_zone_mesh)
 
 	# --- Fire particle ring along the base of the zone boundary ---

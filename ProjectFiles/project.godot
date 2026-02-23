@@ -148,7 +148,7 @@ forfeit={
 [physics]
 
 3d/run_on_separate_thread=true
-common/max_physics_steps_per_frame=4
+common/max_physics_steps_per_frame=256
 3d/physics_engine="Jolt Physics"
 jolt_physics_3d/simulation/velocity_steps=30
 jolt_physics_3d/simulation/position_steps=6

@@ -3,7 +3,7 @@ class_name DebrisHelper
 
 ## Static utility for spawning small cosmetic debris cubes (client-side only).
 ## Used by DestructibleBlockStructure for wall/ramp debris.
-## All debris uses collision layer 32 (layer 6) and mask 1 (world only).
+## All debris uses collision layer 32 (layer 6) and mask 2049 (world + smooth wall collision).
 ##
 ## Performance notes:
 ##   - Debris is purely cosmetic: spawned on clients, NOT on the server.
@@ -40,6 +40,9 @@ static func spawn_debris(
 	material: StandardMaterial3D,
 	config: Dictionary,
 ) -> void:
+	if GameManager.disable_debris:
+		return
+
 	var size: float = config.get("size", 0.15)
 	var impulse: float = config.get("impulse", 3.5)
 	var lifetime: float = config.get("lifetime", 5.0)
@@ -58,15 +61,11 @@ static func spawn_debris(
 	outward = outward.normalized()
 
 	for i in count:
-		# Budget check: skip if at cap (oldest already culled by manager).
-		if DebrisManager.is_at_cap():
-			return
-
 		var debris := RigidBody3D.new()
 		debris.name = debris_name
 		debris.mass = mass_val
-		debris.collision_layer = 32  # Layer 6: wall debris (no self-collision)
-		debris.collision_mask = 1    # World geometry only
+		debris.collision_layer = 32   # Layer 6: wall debris (no self-collision)
+		debris.collision_mask = 2049  # Layer 1 (world) | Layer 12 (smooth wall collision)
 		debris.contact_monitor = false
 		debris.can_sleep = true  # Let Jolt auto-sleep when velocity drops
 
@@ -88,9 +87,10 @@ static func spawn_debris(
 		)
 
 		var scatter := Vector3(randf_range(-1, 1), randf_range(0, 1), randf_range(-1, 1)).normalized()
-		var impulse_dir := (outward * 0.6 + scatter * 0.4).normalized()
-		impulse_dir.y = maxf(impulse_dir.y, 0.2)
-		debris.apply_central_impulse(impulse_dir * impulse + Vector3(0, 1.5, 0))
+		var bias := randf_range(0.75, 0.95)
+		var impulse_dir := (outward * bias + scatter * (1.0 - bias)).normalized()
+		impulse_dir.y = maxf(impulse_dir.y, 0.15)
+		debris.apply_central_impulse(impulse_dir * impulse + Vector3(0, 1.0, 0))
 		debris.apply_torque_impulse(Vector3(
 			randf_range(-2, 2), randf_range(-2, 2), randf_range(-2, 2)
 		))

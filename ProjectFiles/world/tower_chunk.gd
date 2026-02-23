@@ -21,7 +21,7 @@ const CRATER_MASS_SCALE := 0.003       ## Extra crater radius per kg of mass
 const MAX_DAMAGE_EVENTS := 3           ## Max separate damage events per chunk
 const MINI_DEBRIS_COUNT := 3           ## Small cosmetic debris on destruction
 const MINI_DEBRIS_LIFETIME := 6.0      ## Auto-cleanup for cosmetic debris (seconds)
-const DEBUG_SHOW_EXPLOSIONS := true    ## Spawn permanent transparent spheres at impact sites
+## Whether to spawn permanent transparent spheres at impact sites (toggled in pause menu)
 
 # ======================================================================
 #  Properties (set by spiral_tower.gd before adding to scene)
@@ -228,7 +228,7 @@ func _do_impact_explosion(contact_damage: float) -> void:
 		str(impact_pos), explosion_damage, explosion_radius])
 
 	# Spawn debug sphere on all clients
-	if DEBUG_SHOW_EXPLOSIONS:
+	if GameManager.debug_show_explosion_spheres:
 		_sync_debug_sphere.rpc(impact_pos, explosion_radius)
 
 

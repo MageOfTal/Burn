@@ -219,16 +219,26 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 	if block_data["hp"] <= 0.0:
 		var block_pos: Vector3 = block_body.global_position
 		var debris_count := randi_range(1, 2)
+
+		# Use the attacker's position as the blast origin so debris flies away
+		# from the shooter. Falls back to a random offset if attacker not found.
+		var blast_origin := block_pos + Vector3(randf_range(-1, 1), 0, randf_range(-1, 1)).normalized() * 0.5
+		var players_node := get_tree().current_scene.get_node_or_null("Players")
+		if players_node and _attacker_id >= 0:
+			var attacker := players_node.get_node_or_null(str(_attacker_id))
+			if attacker and is_instance_valid(attacker):
+				blast_origin = attacker.global_position
+
 		# Server: destroy block, sync to clients. Debris spawns on all peers via RPC.
 		block_body.queue_free()
 		_blocks.erase(key)
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
 		_rebuild_column(key.x, key.z)
-		_sync_block_destroyed.rpc(key, block_pos, block_pos + Vector3(0, 0, 0.5), debris_count)
+		_sync_block_destroyed.rpc(key, block_pos, blast_origin, debris_count)
 
 		# Host also spawns debris locally (RPC is call_remote, host needs it too).
-		_spawn_debris(block_pos, block_pos + Vector3(0, 0, 0.5), debris_count)
+		_spawn_debris(block_pos, blast_origin, debris_count)
 
 		if _blocks.is_empty():
 			queue_free()

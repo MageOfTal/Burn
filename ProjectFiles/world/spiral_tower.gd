@@ -693,6 +693,96 @@ func _find_weak_cross_section(visited: Dictionary, max_y_reached: int) -> float:
 	return -1.0
 
 
+func _cleanup_floating_fragments() -> void:
+	## After erasing the upper section, remove any solid voxels in the remaining
+	## base that are disconnected from ground. Prevents "floating fragment"
+	## artifacts where small pockets of solid SDF remain after the spherical erase.
+	##
+	## Uses BFS flood from ground at surface threshold (SDF < 0.0) to find
+	## everything connected to the base, then erases anything solid that the
+	## flood didn't reach.
+	if _voxel_tool == null:
+		return
+
+	var step := INTEGRITY_SAMPLE_STEP
+	var extent := OUTER_RADIUS + 2.0
+	var top := _effective_tower_top + 2.0  # Margin above current top
+
+	# Step 1: Find a solid ground voxel
+	var ground_pos := Vector3.ZERO
+	var found := false
+	var sx := -CORE_RADIUS
+	while sx <= CORE_RADIUS and not found:
+		var sz := -CORE_RADIUS
+		while sz <= CORE_RADIUS and not found:
+			if sx * sx + sz * sz <= CORE_RADIUS * CORE_RADIUS:
+				var pos := Vector3(sx, step * 0.5, sz)
+				if _voxel_tool.get_voxel_f(pos) < 0.0:
+					ground_pos = pos
+					found = true
+			sz += step
+		sx += step
+
+	if not found:
+		return  # No base left — nothing to clean
+
+	# Step 2: BFS flood from ground through all visible solid voxels.
+	# Uses SDF < 0.0 (surface threshold) rather than the structural -0.3
+	# so that thin surface fragments are properly included in connectivity.
+	var visited := {}
+	var queue: Array[Vector3i] = []
+	var start_grid := _local_to_grid(ground_pos)
+	visited[_grid_key(start_grid)] = true
+	queue.push_back(start_grid)
+
+	var iterations := 0
+	while queue.size() > 0 and iterations < BFS_MAX_ITERATIONS:
+		var current: Vector3i = queue.pop_front()
+		iterations += 1
+		for offset in _NEIGHBORS:
+			var neighbor: Vector3i = current + offset
+			var key := _grid_key(neighbor)
+			if visited.has(key):
+				continue
+			var npos := _grid_to_local(neighbor)
+			if npos.y < -1.0 or npos.y > top:
+				continue
+			if npos.x * npos.x + npos.z * npos.z > extent * extent:
+				continue
+			if _voxel_tool.get_voxel_f(npos) >= 0.0:
+				continue
+			visited[key] = true
+			queue.push_back(neighbor)
+
+	# Step 3: Scan bounding box — erase any solid voxel NOT in the flood set.
+	var erased := 0
+	var gx_min := int(floor(-extent / step))
+	var gx_max := int(ceil(extent / step))
+	var gz_min := gx_min
+	var gz_max := gx_max
+	var gy_min := int(floor(-1.0 / step))
+	var gy_max := int(ceil(top / step))
+
+	_voxel_tool.mode = VoxelTool.MODE_REMOVE
+	for gy in range(gy_min, gy_max + 1):
+		for gx in range(gx_min, gx_max + 1):
+			for gz in range(gz_min, gz_max + 1):
+				var key := _grid_key(Vector3i(gx, gy, gz))
+				if visited.has(key):
+					continue
+				var lpos := _grid_to_local(Vector3i(gx, gy, gz))
+				if lpos.x * lpos.x + lpos.z * lpos.z > extent * extent:
+					continue
+				if _voxel_tool.get_voxel_f(lpos) >= 0.0:
+					continue
+				# Disconnected solid — erase with small sphere
+				_voxel_tool.do_sphere(lpos, step)
+				erased += 1
+
+	if erased > 0:
+		print("[SpiralTower] Cleanup: erased %d disconnected fragment voxels" % erased)
+
+
 func _trigger_collapse_at_height(sever_y: float) -> void:
 	## Trigger collapse at the given local height above tower base.
 	_trigger_collapse_internal(sever_y)
@@ -755,6 +845,9 @@ func _trigger_collapse_internal(sever_y: float) -> void:
 	# Erase the upper section from the voxel terrain
 	_erase_above(sever_y)
 	_effective_tower_top = sever_y  # Tower is now shorter
+
+	# Remove any disconnected floating fragments from the remaining base
+	_cleanup_floating_fragments()
 
 	# Spawn the topple body at the section centroid in world space
 	var centroid := global_position + body_center_local
@@ -1226,6 +1319,9 @@ func _sync_collapse_start(sever_y: float, torque_dir: Vector3) -> void:
 	# Now erase the upper section visually
 	_erase_above(sever_y)
 	_effective_tower_top = sever_y
+
+	# Remove any disconnected floating fragments from the remaining base
+	_cleanup_floating_fragments()
 
 	# Spawn visual-only topple body (no contact monitoring / damage)
 	var centroid := global_position + body_center_local

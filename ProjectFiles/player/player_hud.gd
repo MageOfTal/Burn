@@ -69,6 +69,12 @@ const FPS_CAPS := [0, 120, 60, 30, 15, 10, 5]  ## 0 = unlimited
 var _fps_cap_index: int = 0
 var _f9_was_pressed: bool = false
 
+## Performance graph
+var _perf_graph: HUDPerfGraph = null
+var _graph_tps: float = 60.0       ## Smoothed TPS for graph (computed in _physics_process)
+var _prev_phys_us: int = 0         ## Wall-clock usec of previous physics tick
+var _smooth_phys_delta: float = 1.0 / 60.0  ## EMA-filtered wall-clock physics tick delta
+
 ## Extracted widgets
 var _compass: HUDCompass = null
 var _kill_feed: HUDKillFeed = null
@@ -190,6 +196,14 @@ func setup(player: Player) -> void:
 	_fps_hud_label.visible = GameManager.show_fps_hud
 	add_child(_fps_hud_label)
 
+	# Performance graph (below FPS label)
+	_perf_graph = HUDPerfGraph.new()
+	_perf_graph.set_anchors_preset(Control.PRESET_TOP_LEFT)
+	_perf_graph.offset_left = 10
+	_perf_graph.offset_top = 28
+	_perf_graph.visible = GameManager.show_fps_hud
+	add_child(_perf_graph)
+
 
 func _build_bottom_bar() -> void:
 	## Build the bottom bar: shoe box on the left, 6 weapon boxes to the right.
@@ -261,6 +275,16 @@ func _create_slot_box() -> PanelContainer:
 func _physics_process(_delta: float) -> void:
 	_physics_tick_count += 1
 	_wallclock_tick_count += 1
+
+	# Graph TPS: EMA on wall-clock delta between consecutive physics ticks.
+	# Computed entirely in _physics_process so render-frame jitter can't affect it.
+	var now_us := Time.get_ticks_usec()
+	if _prev_phys_us > 0:
+		var dt := float(now_us - _prev_phys_us) / 1_000_000.0
+		if dt > 0.0 and dt < 1.0:  # Ignore huge gaps (pause menu, loading)
+			_smooth_phys_delta = lerpf(_smooth_phys_delta, dt, 0.1)
+			_graph_tps = 1.0 / _smooth_phys_delta
+	_prev_phys_us = now_us
 
 	# Wall-clock TPS: compare ticks against monotonic clock, not _process delta
 	var now_ms: int = Time.get_ticks_msec()
@@ -490,6 +514,13 @@ func _update_fps_hud(delta: float) -> void:
 		Engine.max_fps = FPS_CAPS[_fps_cap_index]
 		print("[HUD] FPS cap: %s" % ("unlimited" if FPS_CAPS[_fps_cap_index] == 0 else str(FPS_CAPS[_fps_cap_index])))
 	_f9_was_pressed = f9_pressed
+
+	# Feed performance graph. TPS is computed entirely in _physics_process via
+	# wall-clock EMA — _process just reads the latest _graph_tps value.
+	if _perf_graph:
+		_perf_graph.visible = GameManager.show_fps_hud
+		if _perf_graph.visible and delta > 0.0:
+			_perf_graph.push_sample(minf(1.0 / delta, 1000.0), _graph_tps)
 
 	if _fps_hud_label == null:
 		return
