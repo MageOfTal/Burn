@@ -114,7 +114,7 @@ var _recharge_timer: float = 0.0      ## Time until next charge is restored
 
 ## Boost gate — must grapple for this long before release boost is allowed.
 var _grapple_time: float = 0.0        ## Seconds spent in current grapple
-const MIN_GRAPPLE_TIME_FOR_BOOST := 1.4
+const MIN_GRAPPLE_TIME_FOR_BOOST := 0.25
 
 ## Launch nudge cooldown — tracks when the last grapple was released.
 var _last_release_time: float = -999.0 ## Time.get_ticks_msec()/1000 of last release
@@ -369,6 +369,12 @@ func try_fire() -> void:
 		return
 
 	anchor_point = result.position
+
+	# When grounded, position control zeroes velocity and stores real movement
+	# in _ground_velocity. Restore it so existing momentum carries into the swing.
+	if player.is_on_floor():
+		player.velocity = player._ground_velocity
+
 	_rope_length = player.global_position.distance_to(anchor_point)
 	_anchor_collider_rid = result.get("rid", RID())
 	_low_momentum_timer = 0.0
@@ -1337,6 +1343,13 @@ func _do_release(with_boost: bool) -> void:
 	anchor_point = Vector3.ZERO
 	_rope_length = 0.0
 	_anchor_collider_rid = RID()
+
+	# When boosted on the ground, force airborne so the upward velocity
+	# component actually launches the player instead of being pinned to the floor.
+	if boosted and player.is_on_floor():
+		player._is_grounded = false
+		player._ground_velocity = player.velocity
+
 	_show_grapple_release.rpc(release_pos)
 	if boosted:
 		_play_release_woosh.rpc(release_pos)

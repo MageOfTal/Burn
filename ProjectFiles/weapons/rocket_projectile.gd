@@ -15,6 +15,11 @@ const MAX_LIFETIME := 5.0
 
 var _direction: Vector3 = Vector3.FORWARD
 var _has_exploded: bool = false
+## Deferred explosion: body_entered fires during flush_queries() before
+## _physics_process(). Physics queries (intersect_shape/intersect_ray) in
+## ExplosionHelper require _physics_process() context when threaded physics
+## is enabled. Setting this flag defers the actual explosion to _server_process().
+var _hit_pending: bool = false
 
 
 func get_launch_speed() -> float:
@@ -45,6 +50,12 @@ func _setup() -> void:
 
 
 func _server_process(delta: float) -> void:
+	# Handle deferred explosion from body_entered (see _on_body_hit).
+	if _hit_pending:
+		_hit_pending = false
+		_do_explode()
+		return
+
 	# Raycast forward to catch tunneling at high speed.
 	# The rocket moves ~0.83m per frame at 60fps — if terrain is thin or at
 	# a glancing angle, the physics engine can miss the collision.
@@ -65,9 +76,11 @@ func _server_process(delta: float) -> void:
 				query.exclude.append(shooter_node.get_rid())
 			var result := space_state.intersect_ray(query)
 			if not result.is_empty():
-				# Move to impact point and explode
+				# Move to impact point and explode (already in _physics_process context)
 				global_position = result.position
-				_explode()
+				_has_exploded = true
+				_is_terminated = true
+				_do_explode()
 
 
 func _is_shooter_immune(body: Node) -> bool:
@@ -90,16 +103,17 @@ func _find_shooter_node() -> Player:
 
 
 func _on_body_hit(body: Node) -> void:
-	_explode()
-
-
-func _explode() -> void:
-	if _has_exploded:
-		return
+	# Defer explosion to _server_process — body_entered fires during
+	# flush_queries() before _physics_process(), and ExplosionHelper's
+	# physics queries require _physics_process() context.
+	_hit_pending = true
 	_has_exploded = true
-	_is_terminated = true  # Prevent base lifetime kill from also firing
+	_is_terminated = true
+	linear_velocity = Vector3.ZERO
 
-	var explosion_pos := get_global_transform_interpolated().origin
+
+func _do_explode() -> void:
+	var explosion_pos := global_position
 
 	# If ammo is loaded, scatter ammo projectiles instead of normal explosion
 	if has_ammo_override():

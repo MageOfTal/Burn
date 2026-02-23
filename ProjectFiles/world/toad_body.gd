@@ -327,15 +327,15 @@ func set_shadows_enabled(enabled: bool) -> void:
 # ======================================================================
 
 func _create_hitbox_mesh() -> void:
-	## Add a transparent mesh matching the visual "Body" mesh exactly.
-	var body_mesh := get_node_or_null("Body") as MeshInstance3D
-	if body_mesh == null or body_mesh.mesh == null:
+	## Add a transparent mesh matching the actual CollisionShape3D.
+	var col_shape_node := get_node_or_null("CollisionShape3D") as CollisionShape3D
+	if col_shape_node == null or col_shape_node.shape == null:
 		return
 
 	# Lazy-init shared material (one allocation for all toads)
 	if _hitbox_mat == null:
 		_hitbox_mat = StandardMaterial3D.new()
-		_hitbox_mat.albedo_color = Color(1.0, 0.2, 0.2, 0.35)
+		_hitbox_mat.albedo_color = Color(0.2, 0.4, 1.0, 0.35)
 		_hitbox_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 		_hitbox_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 		_hitbox_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
@@ -343,8 +343,32 @@ func _create_hitbox_mesh() -> void:
 
 	_hitbox_mesh = MeshInstance3D.new()
 	_hitbox_mesh.name = "HitboxDebug"
-	_hitbox_mesh.mesh = body_mesh.mesh
-	_hitbox_mesh.scale = body_mesh.scale
+
+	var shape := col_shape_node.shape
+	if shape is SphereShape3D:
+		var sphere_mesh := SphereMesh.new()
+		sphere_mesh.radius = shape.radius
+		sphere_mesh.height = shape.radius * 2.0
+		_hitbox_mesh.mesh = sphere_mesh
+	elif shape is BoxShape3D:
+		var box_mesh := BoxMesh.new()
+		box_mesh.size = shape.size
+		_hitbox_mesh.mesh = box_mesh
+	elif shape is CapsuleShape3D:
+		var capsule_mesh := CapsuleMesh.new()
+		capsule_mesh.radius = shape.radius
+		capsule_mesh.height = shape.height
+		_hitbox_mesh.mesh = capsule_mesh
+	elif shape is CylinderShape3D:
+		var cyl_mesh := CylinderMesh.new()
+		cyl_mesh.top_radius = shape.radius
+		cyl_mesh.bottom_radius = shape.radius
+		cyl_mesh.height = shape.height
+		_hitbox_mesh.mesh = cyl_mesh
+	else:
+		_hitbox_mesh.mesh = shape.get_debug_mesh()
+
+	_hitbox_mesh.transform = col_shape_node.transform
 	_hitbox_mesh.material_override = _hitbox_mat
 	_hitbox_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_hitbox_mesh)

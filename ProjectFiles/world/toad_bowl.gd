@@ -184,13 +184,13 @@ func _spawn_toads() -> void:
 	for i in TOAD_COUNT:
 		var toad: RigidBody3D = _toad_body_scene.instantiate()
 
-		# Replace collision with disc (CylinderShape3D) matching the squished visual
+		# Replace collision with sphere matching the visual radius
 		var col_shape: CollisionShape3D = toad.get_node("CollisionShape3D")
 		if col_shape:
-			var disc := CylinderShape3D.new()
-			disc.radius = TOAD_SCALE
-			disc.height = TOAD_SCALE * 0.65 * 1.3  # matches visual squish
-			col_shape.shape = disc
+			var sphere := SphereShape3D.new()
+			sphere.radius = TOAD_SCALE
+			col_shape.shape = sphere
+			col_shape.scale = Vector3(1.0, 0.4225, 1.0)  # SphereMesh squish (0.65) * scale squish (0.65)
 
 		# Scale body mesh
 		var body_mesh: MeshInstance3D = toad.get_node("Body")

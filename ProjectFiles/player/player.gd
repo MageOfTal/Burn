@@ -9,12 +9,19 @@ class_name Player
 ## Jolt's rigid body solver directly. Physics objects (toads, boulders, etc.)
 ## collide with the player natively — no shadow body proxy needed.
 ##
-## Movement is computed in _physics_process: linear_velocity already contains
-## Jolt's solver output (depenetration, contact impulses). Movement logic reads
-## it as the starting velocity, modifies it, and writes it back. When touching
-## walls, movement is decomposed into wall-parallel and wall-perpendicular axes
-## so that move_toward() only steers the parallel component — preserving Jolt's
-## depenetration pushes. Jolt integrates position from the final velocity.
+## GROUNDED movement bypasses Jolt's velocity integration for POSITION, but
+## leaves velocity non-zero so Jolt's solver sees real movement speed for
+## collision impulses (pushing toads, physics objects). Position is applied
+## directly from _ground_velocity each frame. Jolt also integrates position
+## from that velocity (unwanted), so the integration is undone at the start
+## of the next _physics_process — before ground detection or movement run.
+## This gives correct collision impulses AND correct position control.
+##
+## AIRBORNE movement uses Jolt's integration normally: linear_velocity contains
+## Jolt's solver output, movement modifies it, and Jolt integrates position.
+## When touching walls, movement is decomposed into wall-parallel and
+## wall-perpendicular axes so that move_toward() only steers the parallel
+## component — preserving Jolt's depenetration pushes.
 ##
 ## Subsystems (child nodes):
 ##   SlideCrouchSystem — slide/crouch physics
@@ -51,12 +58,7 @@ var velocity: Vector3:
 	set(v): linear_velocity = v
 
 ## Floor detection constants (were CharacterBody3D scene properties)
-## NOTE: This angle is mirrored in Jolt's mass-ratio pin setting:
-##   Project Settings → physics/jolt_physics_3d/collisions/mass_ratio_vertical_pin_angle
-## That setting (default 60°) controls when a heavy body pins a lighter body
-## to infinite mass on contact. Keep both at the same angle — if you can walk
-## on a slope, you should also pin lightweight objects under you at that slope.
-const FLOOR_MAX_ANGLE: float = 1.0472  ## 60 degrees — steeper surfaces are walls
+const FLOOR_MAX_ANGLE: float = 0.8727  ## 50 degrees — steeper surfaces are walls
 const FLOOR_SNAP_MARGIN: float = 0.3  ## Extra reach below feet for slope detection
 const CAPSULE_RADIUS: float = 0.4  ## Must match CapsuleShape3D in player.tscn
 
@@ -65,6 +67,24 @@ var _is_grounded: bool = false
 var _floor_normal: Vector3 = Vector3.UP
 var _floor_y: float = -INF  ## Y position of the floor surface (feet level)
 var _was_grounded: bool = false  ## Previous frame's grounded state (for snap logic)
+
+## Grounded velocity tracking — when on the floor, we bypass Jolt's velocity
+## integration and control position directly. _ground_velocity stores the
+## movement velocity between frames so we don't read Jolt's solver output
+## (which would fight our position control and cause slope sliding).
+var _ground_velocity: Vector3 = Vector3.ZERO
+
+## Pre-solver velocity — saved at the end of each _physics_process BEFORE Jolt's
+## solver runs next tick. Used to capture clean airborne momentum on landing
+## instead of Jolt's contact-solver-contaminated velocity (which on slopes adds
+## a large phantom horizontal component from the depenetration impulse).
+var _pre_solver_velocity: Vector3 = Vector3.ZERO
+
+## When true, the previous frame used grounded position control and left velocity
+## non-zero so Jolt's solver could see real movement velocity for collision impulses
+## (e.g. pushing toads). Jolt also integrates position from that velocity, which is
+## unwanted — so we undo the integration at the start of the next _physics_process.
+var _undo_jolt_integration: bool = false
 
 ## Dynamic body contact tracking (set in _integrate_forces each tick)
 var _touching_dynamic_body: bool = false  ## True when ANY RigidBody3D contact exists
@@ -254,7 +274,7 @@ func _ready() -> void:
 	# RigidBody3D setup: physics material for contact response
 	var phys_mat := PhysicsMaterial.new()
 	phys_mat.bounce = 0.0
-	phys_mat.friction = 0.0  # Zero friction — all movement is script-driven, Jolt friction only helps edges grip the capsule
+	phys_mat.friction = 0.0  # Zero friction — all movement is script-driven
 	physics_material_override = phys_mat
 
 	# Client peers: freeze the RigidBody3D to prevent physics simulation.
@@ -402,6 +422,19 @@ func _physics_process(delta: float) -> void:
 		# Save previous frame's grounded state for snap logic
 		_was_grounded = _is_grounded
 
+		# UNDO JOLT POSITION INTEGRATION (movement component only)
+		# Position control leaves velocity non-zero so Jolt's solver computes
+		# real collision impulses (pushing toads, etc.). Jolt also integrates
+		# position from the post-solver velocity, which includes both:
+		#   (a) our movement velocity — unwanted, already applied by position control
+		#   (b) solver impulses (depenetration, collision response) — WANTED
+		# By subtracting _pre_solver_velocity (our movement velocity BEFORE the
+		# solver ran), we undo only (a) and preserve (b). This keeps collision
+		# response (player doesn't clip into boxes) while preventing double-movement.
+		if _undo_jolt_integration:
+			global_position -= _pre_solver_velocity * delta
+			_undo_jolt_integration = false
+
 		# Update floor detection (downward raycast, must run in _physics_process)
 		_update_ground_state()
 
@@ -409,73 +442,66 @@ func _physics_process(delta: float) -> void:
 		if _second_wind_timer > 0.0:
 			_second_wind_timer -= delta
 
-		# linear_velocity already includes Jolt's solver output (depenetration,
-		# contact impulses from physics objects). We read it as our starting
-		# velocity, then _server_process modifies it (gravity, movement, jump).
-		# Jolt integrates position from the final velocity we set.
-		var _dbg_pos_before := global_position
-		var _dbg_vel_before := velocity
+		# _server_process computes movement velocity from _ground_velocity (when
+		# grounded) or from Jolt's solver output (when airborne). Movement code,
+		# slope alignment, jump, and gravity all modify `velocity` as before.
 		_server_process(delta)
-		if _debug_wall and _wall_normals.size() > 0:
-			print("[WALL_DEBUG] _physics_process: pos_before=(%.3f, %.3f, %.3f)  jolt_vel=(%.2f, %.2f, %.2f)  after_move_vel=(%.2f, %.2f, %.2f)  grounded=%s  floor_y=%.3f  floor_n=(%.2f, %.2f, %.2f)" % [
-				_dbg_pos_before.x, _dbg_pos_before.y, _dbg_pos_before.z,
-				_dbg_vel_before.x, _dbg_vel_before.y, _dbg_vel_before.z,
-				velocity.x, velocity.y, velocity.z,
-				str(_is_grounded), _floor_y,
-				_floor_normal.x, _floor_normal.y, _floor_normal.z])
 
-		# Floor snap / slope stick — keeps the player glued to the ground.
+		# GROUNDED POSITION CONTROL
+		# When on the floor, we apply movement as a direct position change.
+		# Velocity is left non-zero so Jolt's solver sees real movement speed
+		# for collision impulses (pushing toads etc.), but Jolt's unwanted
+		# position integration is undone at the top of the next _physics_process.
+		# This decouples position from Jolt's contact solver (preventing slope
+		# sliding) while still allowing proper collision impulse computation.
 		#
-		# The ground raycast fires straight down from capsule center, so
-		# _floor_y is the terrain surface Y directly below center. On flat
-		# ground this matches where the capsule bottom sits, so we can
-		# safely teleport to _floor_y. On slopes the capsule's bottom
-		# hemisphere contacts the slope on the uphill side — higher than
-		# the raycast hit point — by exactly radius * (1 - cos(angle)),
-		# i.e. CAPSULE_RADIUS * (1.0 - floor_normal.y). We subtract this
-		# hemisphere offset from the raw gap so we measure the REAL gap
-		# (distance above where the capsule should actually rest), not
-		# the geometric artifact of center-ray vs hemisphere contact.
+		# XZ: moved directly by the frame's velocity.
+		# Y: estimated using the floor plane equation at the new XZ position.
+		#    Same math as slope alignment (vy = -(nx*vx + nz*vz)/ny) but applied
+		#    as a position delta from the known floor point. Exact for planar
+		#    surfaces, negligible error on smooth terrain.
 		#
-		# Flat ground (offset ≈ 0): direct position snap + zero Y velocity.
-		# Slopes (offset > 0): gentle downward velocity pull proportional
-		#   to real gap. Jolt's contact solver prevents penetration if the
-		#   pull overshoots — no clipping. Closes the gap over 1-2 frames.
-		#
-		# Skipped when rising while airborne (mid-jump).
-		# Skipped when ON TOP of a lightweight dynamic body — the terrain below
-		# the body is NOT the effective floor. Floor snap would fight Jolt's
-		# contact solver (snap to terrain → Jolt pushes back up → repeat).
-		# Side contacts (standing next to a toad) keep floor snap working.
-		var is_rising_airborne := velocity.y > 0.0 and not _is_grounded
+		# Skipped on lightweight dynamic bodies — Jolt's solver manages stacking.
+		# Skipped on first grounded frame — let Jolt handle the landing naturally.
+		# Skipped when grapple is active — grapple expects Jolt velocity integration.
 		var on_top_of_lightweight := _on_dynamic_body and _dynamic_body_ref != null \
 				and is_instance_valid(_dynamic_body_ref) and _dynamic_body_ref.mass < 20.0
-		var is_nearly_flat := _floor_normal.dot(Vector3.UP) > 0.999  # ~2.5 degree tolerance
-		# Only snap when we were grounded last frame (walking over bumps/slopes).
-		# When landing from air (_was_grounded == false), let gravity + Jolt's
-		# contact solver handle the landing naturally — the player already has
-		# downward velocity and doesn't need a hard position teleport.
-		if not is_rising_airborne and _was_grounded and _floor_y > -INF and not on_top_of_lightweight:
-			# Hemisphere offset: how much higher the capsule naturally sits
-			# above the center-ray hit point on a slope.
-			var hemi_offset := CAPSULE_RADIUS * (1.0 - _floor_normal.y)
-			var gap := global_position.y - (_floor_y + hemi_offset)
-			if gap > 0.001 and gap <= FLOOR_SNAP_MARGIN:
-				if is_nearly_flat:
-					# Flat ground: direct snap (hemi_offset ≈ 0 here).
-					global_position.y = _floor_y + hemi_offset
-					velocity.y = 0.0
-				else:
-					# Slope: pull toward surface via velocity, not position.
-					# 10 m/s per meter of gap → a 3cm gap adds ~0.3 m/s
-					# downward. Jolt's contact solver prevents penetration.
-					velocity.y -= gap * 10.0
-				_is_grounded = true
+		if is_on_floor() and _was_grounded and not on_top_of_lightweight \
+				and not grapple_system.is_active():
+			# Apply horizontal movement as position change
+			var dx := velocity.x * delta
+			var dz := velocity.z * delta
+			global_position.x += dx
+			global_position.z += dz
+			# Estimate floor Y at the new XZ using the floor plane equation.
+			# From dot(normal, point - floor_point) = 0:
+			#   ny*(y - floor_y) = -(nx*dx + nz*dz)
+			#   y = floor_y - (nx*dx + nz*dz) / ny
+			# This matches slope alignment's velocity.y formula integrated over dt.
+			if _floor_y > -INF and _floor_normal.y > 0.001:
+				var hemi_offset := CAPSULE_RADIUS * (1.0 - _floor_normal.y) / _floor_normal.y
+				var estimated_floor_y := _floor_y - (_floor_normal.x * dx + _floor_normal.z * dz) / _floor_normal.y
+				global_position.y = estimated_floor_y + hemi_offset
+			# Save movement velocity for next frame. We intentionally leave
+			# velocity NON-ZERO so Jolt's solver sees real movement speed for
+			# collision impulses (pushing toads, physics objects). Jolt will
+			# also integrate position from this velocity — the movement component
+			# is undone next frame via _pre_solver_velocity, but the solver's
+			# collision response (depenetration) is preserved.
+			_ground_velocity = velocity
+			_undo_jolt_integration = true
+		elif on_top_of_lightweight and is_on_floor():
+			# On dynamic body: Jolt handles positioning. Save velocity for
+			# ground tracking (used if player walks off the body) but don't
+			# zero it — Jolt needs to integrate position from this velocity.
+			_ground_velocity = velocity
 
-		if _debug_wall and _wall_normals.size() > 0:
-			print("[WALL_DEBUG] final: pos=(%.3f, %.3f, %.3f)  vel=(%.2f, %.2f, %.2f)" % [
-				global_position.x, global_position.y, global_position.z,
-				velocity.x, velocity.y, velocity.z])
+		# Save pre-solver velocity — Jolt's solver hasn't run yet (it runs at the
+		# start of the NEXT physics tick). This captures our clean movement velocity
+		# for use as landing momentum if the player transitions to airborne next frame.
+		# When grounded with position control, velocity is _ground_velocity here.
+		# When airborne, velocity has gravity + movement — the true airborne velocity.
+		_pre_solver_velocity = velocity
 
 		# Update sync vars AFTER all server movement (normal, grapple, kamikaze, respawn)
 		sync_position = global_position
@@ -586,15 +612,41 @@ func _server_process(delta: float) -> void:
 	# Slide cooldown
 	slide_crouch.tick_cooldown(delta)
 
-	# When grounded: zero vertical velocity before movement runs.
-	# Jolt's solver leaves residual Y on linear_velocity from depenetration
-	# impulses. Stripping it here gives movement a clean slate.
-	# _process_normal_movement() then re-adds the correct Y via slope
-	# projection (velocity follows the floor surface so the player glides
-	# up/down hills instead of ramming into them horizontally).
-	# Jump explicitly sets velocity.y = JUMP_VELOCITY after this, so it's safe.
-	if is_on_floor():
-		velocity.y = 0.0
+	# GROUNDED VELOCITY MANAGEMENT
+	# When on the floor, position control handles movement directly (see
+	# _physics_process). We restore _ground_velocity as the starting velocity
+	# for movement code — Jolt's solver output is discarded to prevent the
+	# solver from fighting our position control (which caused slope sliding).
+	# Velocity is left non-zero after position control so Jolt's solver sees
+	# real speed for collision impulses (pushing toads), but position
+	# integration is undone at the start of the next frame.
+	#
+	# Exception: on lightweight dynamic bodies, position control is skipped
+	# (Jolt manages stacking). We use Jolt's solver output as starting velocity
+	# so movement accumulates properly instead of resetting to stale data.
+	var _on_dynamic_lightweight := _on_dynamic_body and _dynamic_body_ref != null \
+			and is_instance_valid(_dynamic_body_ref) and _dynamic_body_ref.mass < 20.0
+	if is_on_floor() and not _on_dynamic_lightweight:
+		if not _was_grounded:
+			# Just landed — use PRE-SOLVER velocity (saved last frame before Jolt's
+			# solver ran). Jolt's current velocity has contact solver contamination:
+			# on a 45° slope, the solver converts landing impact into ~7.5 m/s
+			# horizontal, causing the player to slide downhill uncontrollably.
+			# The pre-solver velocity has the true airborne momentum (clean).
+			_ground_velocity = Vector3(_pre_solver_velocity.x, 0.0, _pre_solver_velocity.z)
+		# Restore our tracked velocity — movement code modifies this, not Jolt's output.
+		velocity = _ground_velocity
+	elif is_on_floor() and _on_dynamic_lightweight:
+		# On dynamic body: Jolt's solver output is the starting velocity.
+		# Clamp negative Y (grounded — don't sink into the body).
+		if velocity.y < 0.0:
+			velocity.y = 0.0
+	elif _was_grounded:
+		# Just went airborne (walked off edge, NOT jump — jump sets _is_grounded=false
+		# during _server_process, so _was_grounded is false next frame).
+		# Hand off ground velocity to Jolt for airborne physics.
+		velocity = _ground_velocity
+		_ground_velocity = Vector3.ZERO
 
 	# Gravity (skip when grounded or sliding — slide manages its own Y velocity)
 	if not is_on_floor() and not slide_crouch.is_sliding:
@@ -989,6 +1041,16 @@ func _process_normal_movement(delta: float) -> void:
 	velocity.x = horizontal.x
 	velocity.z = horizontal.y
 
+	# Velocity dead zone: when grounded with no input and near-zero speed,
+	# hard-zero velocity immediately. Prevents any tiny residual from floating
+	# point, solver contamination, or slope alignment rounding from creating
+	# persistent micro-drift on slopes.
+	if on_floor and not direction and horizontal.length_squared() < 0.01:
+		velocity.x = 0.0
+		velocity.z = 0.0
+		velocity.y = 0.0
+		return
+
 	var on_slope := _floor_normal.dot(Vector3.UP) <= 0.999  # >~2.5 degrees from flat
 	if on_floor and _floor_normal.y > 0.001 and on_slope and not _frame_jump:
 		# Slope alignment: compute the Y velocity needed to move along the
@@ -1059,17 +1121,13 @@ func _update_ground_state() -> void:
 	_floor_normal = normal
 	_floor_y = result["position"].y
 
-	# Grounded check with hysteresis to prevent flickering on slopes.
-	# Slope alignment gives the player upward Y velocity on uphills, which
-	# can lift them slightly above FLOOR_CONTACT_TOLERANCE for a frame.
-	# Without hysteresis this causes _is_grounded to flicker, breaking jumps
-	# (jump requires is_on_floor) and causes micro-stutters (gravity toggles).
-	#
-	# When already grounded: stay grounded if within FLOOR_SNAP_MARGIN (generous).
-	# When airborne: only become grounded within FLOOR_CONTACT_TOLERANCE (tight).
-	# This means landing requires close contact, but walking on slopes won't
-	# accidentally go airborne from small overshoots.
-	var feet_gap := global_position.y - _floor_y
+	# Hemisphere offset: on slopes, the capsule's bottom hemisphere contacts the
+	# surface HIGHER than where the center-down raycast hits. The correct resting
+	# height is floor_y + R*(1 - Ny)/Ny. We subtract this from feet_gap so the
+	# grounding check measures distance from the CORRECT resting position,
+	# working consistently on flat ground and steep walkable slopes alike.
+	var hemi_offset := CAPSULE_RADIUS * (1.0 - normal.y) / normal.y
+	var feet_gap := global_position.y - (_floor_y + hemi_offset)
 	if _is_grounded:
 		_is_grounded = feet_gap <= FLOOR_SNAP_MARGIN
 	else:
@@ -1373,6 +1431,10 @@ func die(killer_id: int) -> void:
 	# Zero physics state on death
 	collision_layer = 0
 	collision_mask = 0
+	velocity = Vector3.ZERO
+	_ground_velocity = Vector3.ZERO
+	_pre_solver_velocity = Vector3.ZERO
+	_undo_jolt_integration = false
 	# End slide/crouch if active
 	if slide_crouch.is_sliding:
 		slide_crouch.end_slide()
@@ -1503,9 +1565,12 @@ func _do_respawn() -> void:
 		global_position = spawn_point.global_position
 		velocity = Vector3.ZERO
 
-	# Reset air-jump counter and wall-slide state
+	# Reset air-jump counter, wall-slide state, and ground velocity
 	_air_jumps_used = 0
 	_wall_normals = []
+	_ground_velocity = Vector3.ZERO
+	_pre_solver_velocity = Vector3.ZERO
+	_undo_jolt_integration = false
 
 	# Sync input counters so presses during death don't phantom-fire on respawn
 	_last_jump = player_input.jump_count

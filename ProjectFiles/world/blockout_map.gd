@@ -960,3 +960,75 @@ func _build_ramp(ground_pos: Vector3, platform_pos: Vector3, width: float, mat: 
 	ramp_col.shape = ramp_shape
 	ramp_body.add_child(ramp_col)
 	add_child(ramp_body)
+
+
+func spawn_test_ramps() -> void:
+	## Spawn a row of test ramps at 60°, 55°, 50°, 45°, 40° near the toad bowl.
+	## Each ramp is a tilted slab on layer 1 (world geometry) so the player can
+	## walk on them. Used to test floor detection vs mass-ratio pin angles.
+	var players_node := get_node_or_null("Players")
+	if players_node == null:
+		return
+	var host_player := players_node.get_node_or_null("1")
+	if host_player == null:
+		return
+
+	var host_pos: Vector3 = host_player.global_position
+	# Place ramps to the right (+X) of the toad bowl area, at ground level
+	var base_pos := host_pos + Vector3(15.0, -1.8, 15.0)
+	var ramp_width := 3.0
+	var ramp_depth := 6.0  # How long the ramp surface is
+	var ramp_thickness := 0.3
+	var spacing := 4.0  # Center-to-center distance between ramps
+	var angles := [60, 55, 50, 45, 40]  # Degrees from horizontal
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.4, 0.6, 0.8, 1.0)
+	mat.roughness = 0.7
+
+	for i in range(angles.size()):
+		var angle_deg: int = angles[i]
+		var angle_rad: float = deg_to_rad(angle_deg)
+		var x_offset: float = i * spacing
+
+		# The ramp is a box tilted by angle_rad around the X axis.
+		# Pivot at the bottom edge so the base sits on the ground.
+		# Center of the tilted slab:
+		var center_y: float = sin(angle_rad) * ramp_depth * 0.5
+		var center_z: float = cos(angle_rad) * ramp_depth * 0.5
+		var ramp_pos := base_pos + Vector3(x_offset, center_y, center_z)
+
+		# Mesh
+		var mesh_inst := MeshInstance3D.new()
+		var box_mesh := BoxMesh.new()
+		box_mesh.size = Vector3(ramp_width, ramp_thickness, ramp_depth)
+		mesh_inst.mesh = box_mesh
+		mesh_inst.material_override = mat
+		mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		mesh_inst.position = ramp_pos
+		mesh_inst.rotation.x = angle_rad
+		add_child(mesh_inst)
+
+		# Collision (layer 1 = world geometry)
+		var body := StaticBody3D.new()
+		body.collision_layer = 1
+		body.collision_mask = 0
+		body.position = ramp_pos
+		body.rotation.x = angle_rad
+		var col := CollisionShape3D.new()
+		var shape := BoxShape3D.new()
+		shape.size = box_mesh.size
+		col.shape = shape
+		body.add_child(col)
+		add_child(body)
+
+		# 3D label above the ramp showing the angle
+		var label := Label3D.new()
+		label.text = "%d°" % angle_deg
+		label.font_size = 64
+		label.pixel_size = 0.01
+		label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		label.position = ramp_pos + Vector3(0, sin(angle_rad) * ramp_depth * 0.5 + 1.5, 0)
+		add_child(label)
+
+	print("[BlockoutMap] Spawned %d test ramps (60°–40°) at %s" % [angles.size(), str(base_pos)])

@@ -60,6 +60,9 @@ static func do_explosion(
 	var results := space_state.intersect_shape(query, 64)
 	PhysicsServer3D.free_rid(sphere_rid)
 
+	print("[EXPLOSION] pos=%s radius=%.1f damage=%.1f results=%d attacker=%d" % [
+		explosion_pos, radius, base_damage, results.size(), attacker_id])
+
 	for result in results:
 		var collider: Node = result["collider"]
 		if collider == exclude_body:
@@ -70,6 +73,7 @@ static func do_explosion(
 
 		if target.has_method("take_damage_at"):
 			# Wall: let take_damage_at handle per-block shielding internally
+			print("[EXPLOSION]   → wall '%s' take_damage_at" % target.name)
 			target.take_damage_at(explosion_pos, base_damage, radius, attacker_id)
 			already_damaged.append(target)
 		elif target is Player and target.has_method("take_damage"):
@@ -77,6 +81,7 @@ static func do_explosion(
 			var dmg := _calc_player_explosion_damage(
 				space_state, explosion_pos, base_damage, radius, target, exclude_rid
 			)
+			print("[EXPLOSION]   → player '%s' shielded_dmg=%.1f" % [target.name, dmg])
 			if dmg > 0.5:
 				target.take_damage(dmg, attacker_id)
 			already_damaged.append(target)
@@ -89,6 +94,51 @@ static func do_explosion(
 				if dmg > 0.5:
 					target.take_damage(dmg, attacker_id)
 			already_damaged.append(target)
+
+	# --- Pass 2: Direct scene scan (safety net if sphere query misses targets) ---
+	# Jolt's intersect_shape with server-created sphere shapes can silently
+	# return empty results. Iterate Players and Structures directly by distance.
+	var tree := Engine.get_main_loop() as SceneTree
+	if tree and tree.current_scene:
+		# -- Players --
+		var players_node := tree.current_scene.get_node_or_null("Players")
+		if players_node:
+			for p in players_node.get_children():
+				if not (p is Player) or p == exclude_body or p in already_damaged:
+					continue
+				if not p.is_alive:
+					continue
+				var dist := explosion_pos.distance_to(p.global_position)
+				if dist > radius:
+					continue
+				var dmg := _calc_player_explosion_damage(
+					space_state, explosion_pos, base_damage, radius, p, exclude_rid
+				)
+				print("[EXPLOSION]   → player '%s' (fallback) shielded_dmg=%.1f dist=%.1f" % [p.name, dmg, dist])
+				if dmg > 0.5:
+					p.take_damage(dmg, attacker_id)
+				already_damaged.append(p)
+
+		# -- Destructible structures (walls, ramps, OBJ structures) --
+		var seed_world := tree.current_scene.get_node_or_null("SeedWorld")
+		if seed_world == null:
+			seed_world = tree.current_scene.get_node_or_null("BlockoutMap/SeedWorld")
+		if seed_world:
+			var structures := seed_world.get_node_or_null("Structures")
+			if structures:
+				for s in structures.get_children():
+					if s in already_damaged:
+						continue
+					if not s.has_method("take_damage_at"):
+						continue
+					# Rough pre-filter: structure origin within radius + 10m
+					# (structures can be up to ~5m from their origin).
+					var dist := explosion_pos.distance_to(s.global_position)
+					if dist > radius + 10.0:
+						continue
+					print("[EXPLOSION]   → structure '%s' (fallback) take_damage_at dist=%.1f" % [s.name, dist])
+					s.take_damage_at(explosion_pos, base_damage, radius, attacker_id)
+					already_damaged.append(s)
 
 
 

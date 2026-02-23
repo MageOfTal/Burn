@@ -54,6 +54,7 @@ func _find_host_and_start() -> void:
 	_started = true
 	print("[PermtoadRain] Started — center=%s radius=%.1f height=%.1f max=%d" % [
 		str(_spawn_center), spawn_radius, spawn_height, max_toads])
+	_spawn_test_discs(host_player.global_position)
 
 
 func _physics_process(delta: float) -> void:
@@ -85,13 +86,13 @@ func _spawn_permtoad() -> void:
 
 	# --- Match toad bowl collision setup exactly ---
 
-	# Replace default sphere collision with disc (CylinderShape3D)
+	# Replace default sphere collision with sphere matching visual radius
 	var col_shape: CollisionShape3D = toad.get_node("CollisionShape3D")
 	if col_shape:
-		var disc := CylinderShape3D.new()
-		disc.radius = TOAD_SCALE
-		disc.height = TOAD_SCALE * 0.65 * 1.3  # matches visual squish
-		col_shape.shape = disc
+		var sphere := SphereShape3D.new()
+		sphere.radius = TOAD_SCALE
+		col_shape.shape = sphere
+		col_shape.scale = Vector3(1.0, 0.4225, 1.0)  # SphereMesh squish (0.65) * scale squish (0.65)
 
 	# Scale body mesh to squished toad shape
 	var body_mesh: MeshInstance3D = toad.get_node_or_null("Body")
@@ -160,3 +161,44 @@ func _setup_toad_eyes(toad: RigidBody3D, radius: float) -> void:
 	if pupil_r:
 		pupil_r.scale = Vector3(pupil_size, pupil_size * 0.78, pupil_size)
 		pupil_r.position = Vector3(-eye_offset * 0.7, radius * 0.5, -radius * 0.6 + pupil_z_offset)
+
+
+func _spawn_test_discs(host_pos: Vector3) -> void:
+	## Spawn a row of frozen toads on the ground with the OLD cylinder hitbox
+	## so the user can compare cylinder vs squished-sphere collision feel.
+	const DISC_COUNT := 5
+	const SPACING := 2.0
+	var start_pos := host_pos + Vector3(6.0, 0.5, 0.0)  # Offset from host
+
+	for i in DISC_COUNT:
+		var toad: RigidBody3D = TOAD_SCENE.instantiate()
+
+		# Old cylinder collision (the one we're replacing)
+		var col_shape: CollisionShape3D = toad.get_node("CollisionShape3D")
+		if col_shape:
+			var disc := CylinderShape3D.new()
+			disc.radius = TOAD_SCALE
+			disc.height = TOAD_SCALE * 0.65 * 1.3
+			col_shape.shape = disc
+
+		# Same visual as permatoads
+		var body_mesh: MeshInstance3D = toad.get_node_or_null("Body")
+		if body_mesh:
+			body_mesh.scale = Vector3(TOAD_SCALE, TOAD_SCALE * 0.65, TOAD_SCALE)
+
+		_setup_toad_eyes(toad, TOAD_SCALE)
+
+		toad.persistent = true
+		toad._floor_y = -9999.0
+		toad.collision_mask = 513 | 64  # world + player push + toad bodies
+
+		var phys_mat := PhysicsMaterial.new()
+		phys_mat.bounce = 0.7
+		phys_mat.friction = 0.3
+		toad.physics_material_override = phys_mat
+
+		var pos := start_pos + Vector3(i * SPACING, 0.0, 0.0)
+		_container.add_child(toad)
+		toad.global_position = pos
+
+	print("[PermtoadRain] Spawned %d test CYLINDER discs at %s" % [DISC_COUNT, str(start_pos)])

@@ -37,7 +37,6 @@ const MAX_CHAR_PUSH_SPEED := 15.0
 ## How often to check for character overlaps (seconds). 10Hz is enough for smooth
 ## depenetration without burning CPU on 100+ bubbles all polling every frame.
 const OVERLAP_CHECK_INTERVAL := 0.1
-
 # ======================================================================
 #  Internal state
 # ======================================================================

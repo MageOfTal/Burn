@@ -6,7 +6,7 @@
 [resource]
 script = ExtResource("1")
 damage = 70.0
-fire_rate = 0.03
+fire_rate = 1.2
 weapon_range = 200.0
 is_hitscan = false
 projectile_scene = ExtResource("2")
