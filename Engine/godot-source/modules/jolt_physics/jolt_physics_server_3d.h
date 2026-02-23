@@ -123,6 +123,9 @@ public:
 	void body_set_contact_inv_mass_scale(RID p_body, real_t p_scale);
 	real_t body_get_contact_inv_mass_scale(RID p_body) const;
 
+	void set_mass_scale_enabled(bool p_enabled);
+	bool get_mass_scale_enabled() const;
+
 	Dictionary edge_fix_get_stats() const;
 
 	explicit JoltPhysicsServer3D(bool p_on_separate_thread);

@@ -17,9 +17,11 @@ ProjectFiles/export/
 ProjectFiles/*.exe
 ProjectFiles/*.pck
 
-# --- Engine: ignore everything, then whitelist patched files ---
+# --- Engine: ignore everything, then whitelist patched files + binaries ---
 # Must un-ignore each directory level for negation to work.
 Engine/**
+!Engine/Godot_v4.6-stable_win64.exe
+!Engine/Godot_v4.6-stable_win64_console.exe
 !Engine/godot-source/
 Engine/godot-source/**
 !Engine/godot-source/build.bat

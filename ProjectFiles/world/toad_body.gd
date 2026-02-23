@@ -49,11 +49,58 @@ static var _hitbox_mat: StandardMaterial3D = null  ## Shared across all toads
 var _debug_prev_vel: Vector3 = Vector3.ZERO
 
 
+## Debug: frame counter for rate-limiting persistent toad ground logs
+var _debug_ground_frame: int = 0
+
 func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
+	var contact_count := state.get_contact_count()
+
+	# --- Persistent toad ground-contact diagnostics ---
+	if persistent and contact_count > 0 and GameManager.debug_toad_show_hitboxes:
+		_debug_ground_frame += 1
+		var spd := state.get_linear_velocity().length()
+		# Only log when nearly at rest, once per second (~60 physics frames)
+		if spd < 0.5 and _debug_ground_frame % 60 == 0:
+			var col_shape_node := get_node_or_null("CollisionShape3D") as CollisionShape3D
+			var col_scale_y: float = col_shape_node.scale.y if col_shape_node else 1.0
+			var shape_radius: float = 0.0
+			if col_shape_node and col_shape_node.shape is SphereShape3D:
+				shape_radius = col_shape_node.shape.radius
+			var y_half_extent: float = shape_radius * col_scale_y
+
+			# Compute the lowest point of the scaled ellipsoid in world space.
+			# Semi-axes in local space: (shape_radius, y_half_extent, shape_radius)
+			# Support point toward world DOWN, transformed into local space:
+			var local_down: Vector3 = state.get_transform().basis.inverse() * Vector3.DOWN
+			var semi := Vector3(shape_radius, y_half_extent, shape_radius)
+			# Ellipsoid support: s_i = semi_i^2 * d_i / |semi * d|
+			var scaled_d := semi * local_down  # component-wise
+			var denom := scaled_d.length()
+			var support_local := Vector3.ZERO
+			if denom > 0.001:
+				support_local = (semi * scaled_d) / denom  # semi_i * (semi_i * d_i) / |semi*d|
+			var support_world: Vector3 = state.get_transform() * support_local
+			var lowest_y: float = support_world.y
+
+			print("[TOAD_GROUND %s] center_y=%.4f lowest_ellipsoid_y=%.4f gap_above_0=%.4f y_half=%.4f col_scale_y=%.4f rot=(%.2f,%.2f,%.2f) spd=%.3f" % [
+				name, global_position.y, lowest_y, lowest_y,
+				y_half_extent, col_scale_y,
+				rotation_degrees.x, rotation_degrees.y, rotation_degrees.z, spd])
+
+			for i in contact_count:
+				var collider := state.get_contact_collider_object(i)
+				if collider is StaticBody3D or collider is AnimatableBody3D:
+					var c_pos: Vector3 = state.get_contact_collider_position(i)
+					var c_local: Vector3 = state.get_contact_local_position(i)
+					var c_normal: Vector3 = state.get_contact_local_normal(i)
+					print("  [GROUND_CONTACT %d] world_pos=(%.4f,%.4f,%.4f) local_pos=(%.4f,%.4f,%.4f) normal=(%.3f,%.3f,%.3f) n.y=%.3f" % [
+						i, c_pos.x, c_pos.y, c_pos.z,
+						c_local.x, c_local.y, c_local.z,
+						c_normal.x, c_normal.y, c_normal.z, c_normal.y])
+
 	if not GameManager.debug_toad_contacts:
 		return
 
-	var contact_count := state.get_contact_count()
 	if contact_count == 0:
 		return
 
@@ -368,10 +415,11 @@ func _create_hitbox_mesh() -> void:
 	else:
 		_hitbox_mesh.mesh = shape.get_debug_mesh()
 
-	_hitbox_mesh.transform = col_shape_node.transform
 	_hitbox_mesh.material_override = _hitbox_mat
 	_hitbox_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	add_child(_hitbox_mesh)
+	# Add as child of CollisionShape3D so it inherits runtime scale changes
+	# (e.g. permatoad spawners set col_shape.scale after _ready)
+	col_shape_node.add_child(_hitbox_mesh)
 
 
 func set_hitbox_visible(visible: bool) -> void:

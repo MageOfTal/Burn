@@ -19,14 +19,7 @@ var _grapple_debug_visuals_button: CheckButton = null
 var _grapple_horiz_nudge_button: CheckButton = null
 var _velocity_iter_slider: HSlider = null
 var _velocity_iter_label: Label = null
-var _bubble_no_ccd_button: CheckButton = null
-var _bubble_no_push_query_button: CheckButton = null
-var _bubble_one_contact_button: CheckButton = null
-var _bubble_freeze_settled_button: CheckButton = null
-var _bubble_no_contact_monitor_button: CheckButton = null
-var _bubble_no_collision_button: CheckButton = null
-var _bubble_no_separation_button: CheckButton = null
-var _hide_bubbles_button: CheckButton = null
+var _mass_pin_button: CheckButton = null
 var _toad_density_input: LineEdit = null
 var _toad_fog_density_input: LineEdit = null
 var _toad_mass_input: LineEdit = null
@@ -209,39 +202,8 @@ func _build_main_panel() -> void:
 	_velocity_iter_label = vi_row[1]
 	_velocity_iter_slider.value_changed.connect(_on_velocity_iter_changed)
 
-	_hide_bubbles_button = _add_check("Hide Bubble Visuals", false, vbox)
-	_hide_bubbles_button.toggled.connect(_on_hide_bubbles_toggled)
-
-	# --- Bubble Physics Toggles ---
-	var bubble_title := Label.new()
-	bubble_title.text = "Bubble Physics"
-	bubble_title.add_theme_font_size_override("font_size", 16)
-	bubble_title.add_theme_color_override("font_color", Color(0.6, 0.85, 1.0))
-	vbox.add_child(bubble_title)
-
-	_bubble_no_ccd_button = _add_check("Disable Bubble CCD", false, vbox)
-	_bubble_no_ccd_button.toggled.connect(_on_bubble_no_ccd_toggled)
-
-	_bubble_no_push_query_button = _add_check("Disable Bubble Push Query", false, vbox)
-	_bubble_no_push_query_button.toggled.connect(_on_bubble_no_push_query_toggled)
-
-	_bubble_one_contact_button = _add_check("Bubble 1-Contact Limit", false, vbox)
-	_bubble_one_contact_button.toggled.connect(_on_bubble_one_contact_toggled)
-
-	_bubble_freeze_settled_button = _add_check("Freeze Settled Bubbles", false, vbox)
-	_bubble_freeze_settled_button.toggled.connect(_on_bubble_freeze_settled_toggled)
-
-	_bubble_no_contact_monitor_button = _add_check("Disable Bubble Contact Monitor", false, vbox)
-	_bubble_no_contact_monitor_button.toggled.connect(_on_bubble_no_contact_monitor_toggled)
-
-	_bubble_no_collision_button = _add_check("Disable ALL Bubble Collision", false, vbox)
-	_bubble_no_collision_button.toggled.connect(_on_bubble_no_collision_toggled)
-
-	_bubble_no_separation_button = _add_check("Disable Bubble Separation Manager", false, vbox)
-	_bubble_no_separation_button.toggled.connect(_on_bubble_no_separation_toggled)
-
-	var no_processing_button := _add_check("Disable ALL Bubble Processing", false, vbox)
-	no_processing_button.toggled.connect(_on_bubble_no_processing_toggled)
+	_mass_pin_button = _add_check("Disable Mass-Ratio Pin", false, vbox)
+	_mass_pin_button.toggled.connect(_on_mass_pin_toggled)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -838,15 +800,6 @@ func _on_grapple_horiz_nudge_toggled(pressed: bool) -> void:
 	print("[PauseMenu] Grapple horizontal nudge: %s" % ("ON" if pressed else "OFF"))
 
 
-func _on_hide_bubbles_toggled(pressed: bool) -> void:
-	GameManager.debug_hide_bubbles = pressed
-	for node in get_tree().get_nodes_in_group("bubbles"):
-		var mesh := node.get_node_or_null("MeshInstance3D")
-		if mesh:
-			mesh.visible = not pressed
-	print("[PauseMenu] Hide bubble visuals: %s" % ("ON" if pressed else "OFF"))
-
-
 func _on_velocity_iter_changed(value: float) -> void:
 	var iters := int(value)
 	_velocity_iter_label.text = "%d" % iters
@@ -856,65 +809,9 @@ func _on_velocity_iter_changed(value: float) -> void:
 	print("[PauseMenu] Physics solver iterations: %d" % iters)
 
 
-func _on_bubble_no_ccd_toggled(pressed: bool) -> void:
-	GameManager.debug_bubble_no_ccd = pressed
-	for node in get_tree().get_nodes_in_group("bubbles"):
-		if node is RigidBody3D:
-			node.continuous_cd = not pressed
-	print("[PauseMenu] Bubble CCD disabled: %s" % ("ON" if pressed else "OFF"))
-
-
-func _on_bubble_no_push_query_toggled(pressed: bool) -> void:
-	GameManager.debug_bubble_no_push_query = pressed
-	print("[PauseMenu] Bubble push query disabled: %s" % ("ON" if pressed else "OFF"))
-
-
-func _on_bubble_no_collision_toggled(pressed: bool) -> void:
-	GameManager.debug_bubble_no_collision = pressed
-	for node in get_tree().get_nodes_in_group("bubbles"):
-		if node is RigidBody3D:
-			if pressed:
-				node.collision_layer = 4
-				node.collision_mask = 0
-			else:
-				node.collision_layer = 4
-				node.collision_mask = 1
-	print("[PauseMenu] Bubble ALL collision disabled: %s" % ("ON" if pressed else "OFF"))
-
-
-func _on_bubble_one_contact_toggled(pressed: bool) -> void:
-	GameManager.debug_bubble_one_contact = pressed
-	for node in get_tree().get_nodes_in_group("bubbles"):
-		if node is RigidBody3D:
-			node.max_contacts_reported = 1 if pressed else 4
-	print("[PauseMenu] Bubble 1-contact limit: %s" % ("ON" if pressed else "OFF"))
-
-
-func _on_bubble_freeze_settled_toggled(pressed: bool) -> void:
-	GameManager.debug_bubble_freeze_settled = pressed
-	if not pressed:
-		for node in get_tree().get_nodes_in_group("bubbles"):
-			if node is RigidBody3D and node.freeze:
-				node.freeze = false
-	print("[PauseMenu] Freeze settled bubbles: %s" % ("ON" if pressed else "OFF"))
-
-
-func _on_bubble_no_contact_monitor_toggled(pressed: bool) -> void:
-	GameManager.debug_bubble_no_contact_monitor = pressed
-	for node in get_tree().get_nodes_in_group("bubbles"):
-		if node is RigidBody3D:
-			node.contact_monitor = not pressed
-	print("[PauseMenu] Bubble contact monitor disabled: %s" % ("ON" if pressed else "OFF"))
-
-
-func _on_bubble_no_separation_toggled(pressed: bool) -> void:
-	GameManager.debug_bubble_no_separation = pressed
-	print("[PauseMenu] Bubble separation manager disabled: %s" % ("ON" if pressed else "OFF"))
-
-
-func _on_bubble_no_processing_toggled(pressed: bool) -> void:
-	GameManager.debug_bubble_no_processing = pressed
-	print("[PauseMenu] Bubble ALL processing disabled: %s" % ("ON" if pressed else "OFF"))
+func _on_mass_pin_toggled(pressed: bool) -> void:
+	PhysicsServer3D.call("set_mass_scale_enabled", not pressed)
+	print("[PauseMenu] Mass-ratio pin: %s" % ("DISABLED" if pressed else "ENABLED"))
 
 
 func _on_toad_density_submitted(text: String) -> void:

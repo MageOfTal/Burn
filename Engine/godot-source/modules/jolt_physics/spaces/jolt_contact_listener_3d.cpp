@@ -63,6 +63,8 @@ namespace EdgeFixDiag {
 } // namespace EdgeFixDiag
 
 // === Mass-scale diagnostic counters ===
+std::atomic<bool> JoltContactListener3D::mass_scale_enabled{true};
+
 std::atomic_int JoltContactListener3D::MassScaleDiag::calls{0};
 std::atomic_int JoltContactListener3D::MassScaleDiag::both_dynamic{0};
 std::atomic_int JoltContactListener3D::MassScaleDiag::ratio_triggered{0};
@@ -190,7 +192,7 @@ void JoltContactListener3D::_apply_contact_mass_scale(const JPH::Body &p_jolt_bo
 	constexpr float MASS_RATIO_THRESHOLD = 0.25f;    // 4:1 ratio triggers scaling
 	constexpr float VERTICAL_THRESHOLD = 0.9687f;     // matches observed flat-top contact angle
 
-	if (p_jolt_body1.IsDynamic() && p_jolt_body2.IsDynamic()) {
+	if (mass_scale_enabled.load(std::memory_order_relaxed) && p_jolt_body1.IsDynamic() && p_jolt_body2.IsDynamic()) {
 		MassScaleDiag::both_dynamic.fetch_add(1, std::memory_order_relaxed);
 		const float inv_mass1 = p_jolt_body1.GetMotionProperties()->GetInverseMass();
 		const float inv_mass2 = p_jolt_body2.GetMotionProperties()->GetInverseMass();

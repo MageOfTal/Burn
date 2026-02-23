@@ -736,6 +736,14 @@ real_t JoltPhysicsServer3D::body_get_contact_inv_mass_scale(RID p_body) const {
 	return (real_t)body->get_contact_inv_mass_scale();
 }
 
+void JoltPhysicsServer3D::set_mass_scale_enabled(bool p_enabled) {
+	JoltContactListener3D::set_mass_scale_enabled(p_enabled);
+}
+
+bool JoltPhysicsServer3D::get_mass_scale_enabled() const {
+	return JoltContactListener3D::get_mass_scale_enabled();
+}
+
 Dictionary JoltPhysicsServer3D::edge_fix_get_stats() const {
 	return JoltContactListener3D::get_edge_fix_stats();
 }
@@ -743,6 +751,8 @@ Dictionary JoltPhysicsServer3D::edge_fix_get_stats() const {
 void JoltPhysicsServer3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("body_set_contact_inv_mass_scale", "body", "scale"), &JoltPhysicsServer3D::body_set_contact_inv_mass_scale);
 	ClassDB::bind_method(D_METHOD("body_get_contact_inv_mass_scale", "body"), &JoltPhysicsServer3D::body_get_contact_inv_mass_scale);
+	ClassDB::bind_method(D_METHOD("set_mass_scale_enabled", "enabled"), &JoltPhysicsServer3D::set_mass_scale_enabled);
+	ClassDB::bind_method(D_METHOD("get_mass_scale_enabled"), &JoltPhysicsServer3D::get_mass_scale_enabled);
 	ClassDB::bind_method(D_METHOD("edge_fix_get_stats"), &JoltPhysicsServer3D::edge_fix_get_stats);
 }
 

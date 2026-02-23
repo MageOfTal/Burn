@@ -158,6 +158,12 @@ public:
 
 	static void reset_mass_scale_diag();
 
+	// Global toggle for the ratio-based mass-scale stabilization (sandwich pin).
+	// Readable/writable from any thread. Default: enabled.
+	static std::atomic<bool> mass_scale_enabled;
+	static void set_mass_scale_enabled(bool p_enabled) { mass_scale_enabled.store(p_enabled, std::memory_order_relaxed); }
+	static bool get_mass_scale_enabled() { return mass_scale_enabled.load(std::memory_order_relaxed); }
+
 #ifdef DEBUG_ENABLED
 	const PackedVector3Array &get_debug_contacts() const { return debug_contacts; }
 	int get_debug_contact_count() const { return debug_contact_count.load(std::memory_order_acquire); }
