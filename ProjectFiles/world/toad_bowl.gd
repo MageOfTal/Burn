@@ -13,7 +13,8 @@ const RING_COUNT: int = 6           ## Latitude rings from bottom pole to equato
 const SEGMENTS_PER_RING: int = 24   ## Panels around each ring
 const PANEL_THICKNESS: float = 0.4  ## Collision panel thickness
 const TOAD_COUNT: int = 60          ## Number of persistent toads
-const TOAD_SCALE: float = 0.35      ## Collision sphere radius
+const TOAD_SCALE: float = 0.35      ## Collision radius
+const _ToadBody := preload("res://world/toad_body.gd")
 const SPAWN_HEIGHT: float = 4.0     ## How high above the bowl bottom to spawn toads
 
 var _toad_body_scene: PackedScene = null
@@ -187,10 +188,7 @@ func _spawn_toads() -> void:
 		# Replace collision with sphere matching the visual radius
 		var col_shape: CollisionShape3D = toad.get_node("CollisionShape3D")
 		if col_shape:
-			var sphere := SphereShape3D.new()
-			sphere.radius = TOAD_SCALE
-			col_shape.shape = sphere
-			col_shape.scale = Vector3(1.0, 0.4225, 1.0)  # SphereMesh squish (0.65) * scale squish (0.65)
+			col_shape.shape = _ToadBody.create_ellipsoid_shape(TOAD_SCALE, TOAD_SCALE * _ToadBody.ELLIPSOID_Y_RATIO)
 
 		# Scale body mesh
 		var body_mesh: MeshInstance3D = toad.get_node("Body")

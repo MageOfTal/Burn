@@ -1717,6 +1717,18 @@ int JoltPhysicsServer3D::get_process_info(ProcessInfo p_process_info) {
 	if (info == 107) {
 		return JoltContactListener3D::MassScaleDiag::angled_scale.load(std::memory_order_relaxed);
 	}
+	// 1000 = disable mass-ratio pin, 1001 = enable, 1002 = query state
+	if (info == 1000) {
+		JoltContactListener3D::set_mass_scale_enabled(false);
+		return 0;
+	}
+	if (info == 1001) {
+		JoltContactListener3D::set_mass_scale_enabled(true);
+		return 1;
+	}
+	if (info == 1002) {
+		return JoltContactListener3D::get_mass_scale_enabled() ? 1 : 0;
+	}
 	return 0;
 }
 

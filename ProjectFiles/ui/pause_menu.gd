@@ -810,7 +810,8 @@ func _on_velocity_iter_changed(value: float) -> void:
 
 
 func _on_mass_pin_toggled(pressed: bool) -> void:
-	PhysicsServer3D.call("set_mass_scale_enabled", not pressed)
+	# 1000 = disable mass-ratio pin, 1001 = enable (via custom get_process_info codes)
+	PhysicsServer3D.get_process_info(1000 if pressed else 1001)
 	print("[PauseMenu] Mass-ratio pin: %s" % ("DISABLED" if pressed else "ENABLED"))
 
 

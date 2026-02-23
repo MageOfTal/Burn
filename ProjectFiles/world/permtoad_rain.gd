@@ -7,7 +7,8 @@ extends Node3D
 ## eyes, toad-to-toad collision, high bounce. They never despawn or freeze.
 
 const TOAD_SCENE: PackedScene = preload("res://world/toad_body.tscn")
-const TOAD_SCALE: float = 0.35         ## Collision cylinder radius (matches toad bowl)
+const _ToadBody := preload("res://world/toad_body.gd")
+const TOAD_SCALE: float = 0.35         ## Collision radius (matches toad bowl)
 
 ## Offset from host player position to place the rain center.
 ## Toad bowl is at (+0, +8, +15). This places rain beside it.
@@ -89,10 +90,7 @@ func _spawn_permtoad() -> void:
 	# Replace default sphere collision with sphere matching visual radius
 	var col_shape: CollisionShape3D = toad.get_node("CollisionShape3D")
 	if col_shape:
-		var sphere := SphereShape3D.new()
-		sphere.radius = TOAD_SCALE
-		col_shape.shape = sphere
-		col_shape.scale = Vector3(1.0, 0.4225, 1.0)  # SphereMesh squish (0.65) * scale squish (0.65)
+		col_shape.shape = _ToadBody.create_ellipsoid_shape(TOAD_SCALE, TOAD_SCALE * _ToadBody.ELLIPSOID_Y_RATIO)
 
 	# Scale body mesh to squished toad shape
 	var body_mesh: MeshInstance3D = toad.get_node_or_null("Body")

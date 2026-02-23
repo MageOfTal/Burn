@@ -60,14 +60,14 @@ var _toad_body_scene: PackedScene = null
 const TOAD_SCALE_MIN: float = 0.2
 const TOAD_SCALE_MAX: float = 0.4
 const TOAD_SHAPE_BUCKETS: int = 5
-var _shared_shapes: Array[SphereShape3D] = []
+var _shared_shapes: Array[ConvexPolygonShape3D] = []
+const _ToadBody := preload("res://world/toad_body.gd")
 
-func _get_shared_shape(body_scale: float) -> SphereShape3D:
+func _get_shared_shape(body_scale: float) -> ConvexPolygonShape3D:
 	if _shared_shapes.is_empty():
 		for i in range(TOAD_SHAPE_BUCKETS):
 			var radius: float = TOAD_SCALE_MIN + (TOAD_SCALE_MAX - TOAD_SCALE_MIN) * float(i) / float(TOAD_SHAPE_BUCKETS - 1)
-			var shape := SphereShape3D.new()
-			shape.radius = radius
+			var shape := _ToadBody.create_ellipsoid_shape(radius, radius * _ToadBody.ELLIPSOID_Y_RATIO)
 			_shared_shapes.append(shape)
 	# Snap to nearest bucket
 	var t: float = clampf((body_scale - TOAD_SCALE_MIN) / (TOAD_SCALE_MAX - TOAD_SCALE_MIN), 0.0, 1.0)

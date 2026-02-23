@@ -48,6 +48,30 @@ static var _hitbox_mat: StandardMaterial3D = null  ## Shared across all toads
 ## Debug: previous frame velocity for delta tracking
 var _debug_prev_vel: Vector3 = Vector3.ZERO
 
+## Y squish factor for the toad ellipsoid (visual mesh height / radius).
+## SphereMesh(radius=1.0, height=1.3) has built-in 0.65 Y ratio;
+## body_mesh.scale.y = body_scale * 0.65 → total Y extent = radius * 0.65 * 0.65 = radius * 0.4225.
+const ELLIPSOID_Y_RATIO: float = 0.4225
+
+## Create a ConvexPolygonShape3D approximating an oblate ellipsoid.
+## Jolt cannot non-uniformly scale SphereShape3D, so we bake the squish into vertices.
+static func create_ellipsoid_shape(radius_xz: float, radius_y: float, num_rings: int = 6, num_segments: int = 8) -> ConvexPolygonShape3D:
+	var points := PackedVector3Array()
+	# Poles
+	points.append(Vector3(0.0, radius_y, 0.0))
+	points.append(Vector3(0.0, -radius_y, 0.0))
+	# Intermediate rings
+	for ring in range(1, num_rings):
+		var phi: float = PI * float(ring) / float(num_rings)
+		var y: float = radius_y * cos(phi)
+		var r: float = radius_xz * sin(phi)
+		for seg in range(num_segments):
+			var theta: float = TAU * float(seg) / float(num_segments)
+			points.append(Vector3(r * cos(theta), y, r * sin(theta)))
+	var shape := ConvexPolygonShape3D.new()
+	shape.points = points
+	return shape
+
 
 ## Debug: frame counter for rate-limiting persistent toad ground logs
 var _debug_ground_frame: int = 0
@@ -62,29 +86,14 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 		# Only log when nearly at rest, once per second (~60 physics frames)
 		if spd < 0.5 and _debug_ground_frame % 60 == 0:
 			var col_shape_node := get_node_or_null("CollisionShape3D") as CollisionShape3D
-			var col_scale_y: float = col_shape_node.scale.y if col_shape_node else 1.0
-			var shape_radius: float = 0.0
-			if col_shape_node and col_shape_node.shape is SphereShape3D:
-				shape_radius = col_shape_node.shape.radius
-			var y_half_extent: float = shape_radius * col_scale_y
+			var y_half_extent: float = 0.0
+			if col_shape_node and col_shape_node.shape:
+				# ConvexPolygonShape3D — get Y extent from AABB
+				var aabb := col_shape_node.shape.get_debug_mesh().get_aabb()
+				y_half_extent = aabb.size.y * 0.5
 
-			# Compute the lowest point of the scaled ellipsoid in world space.
-			# Semi-axes in local space: (shape_radius, y_half_extent, shape_radius)
-			# Support point toward world DOWN, transformed into local space:
-			var local_down: Vector3 = state.get_transform().basis.inverse() * Vector3.DOWN
-			var semi := Vector3(shape_radius, y_half_extent, shape_radius)
-			# Ellipsoid support: s_i = semi_i^2 * d_i / |semi * d|
-			var scaled_d := semi * local_down  # component-wise
-			var denom := scaled_d.length()
-			var support_local := Vector3.ZERO
-			if denom > 0.001:
-				support_local = (semi * scaled_d) / denom  # semi_i * (semi_i * d_i) / |semi*d|
-			var support_world: Vector3 = state.get_transform() * support_local
-			var lowest_y: float = support_world.y
-
-			print("[TOAD_GROUND %s] center_y=%.4f lowest_ellipsoid_y=%.4f gap_above_0=%.4f y_half=%.4f col_scale_y=%.4f rot=(%.2f,%.2f,%.2f) spd=%.3f" % [
-				name, global_position.y, lowest_y, lowest_y,
-				y_half_extent, col_scale_y,
+			print("[TOAD_GROUND %s] center_y=%.4f y_half=%.4f rot=(%.2f,%.2f,%.2f) spd=%.3f" % [
+				name, global_position.y, y_half_extent,
 				rotation_degrees.x, rotation_degrees.y, rotation_degrees.z, spd])
 
 			for i in contact_count:
