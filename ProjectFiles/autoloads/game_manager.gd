@@ -17,6 +17,7 @@ var debug_disable_burn_timers: bool = true
 var debug_disable_demon: bool = true
 var debug_disable_zone_damage: bool = true
 var debug_skip_structures: bool = false
+var debug_disable_falling_clusters: bool = false
 var debug_disable_bots: bool = true          # Don't spawn bots on host
 var debug_free_firing: bool = false          # No burn fuel cost when firing weapons
 var debug_shotgun_boost: bool = false        # Double barrel: halved fire rate, doubled pellets
@@ -48,6 +49,12 @@ var debug_toad_no_shadows: bool = false   # Disable shadow casting on toad rain 
 var debug_toad_show_hitboxes: bool = false  # Show collision shape wireframe on toad bodies
 var debug_toad_contacts: bool = false      # Log toad-side contact details (F10 toggles player-side, F11 toggles toad-side)
 var debug_toad_mass: float = 4.0           # Runtime-adjustable toad mass (kg), default matches TOAD_MASS
+
+# Structure collision tuning (set from pause menu, all default to 1.0 base ratio)
+var structure_momentum_damage_scale: float = 1.0    # Multiplier on momentum → structure damage
+var structure_explosion_radius_scale: float = 1.0    # Multiplier on breakthrough explosion radius
+var structure_explosion_damage_scale: float = 1.0    # Multiplier on breakthrough explosion damage
+var structure_resistance_scale: float = 1.0          # Multiplier on HP-based slowdown (how much blocks resist)
 
 signal game_state_changed(new_state: GameState)
 signal match_started

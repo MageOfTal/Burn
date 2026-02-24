@@ -17,8 +17,10 @@ const PLAYER_TOP_Y := 1.7
 const PLAYER_BOTTOM_Y := 0.1
 const PLAYER_SIDE_OFFSET := 0.35  ## Half-width at capsule center height
 
-## Max hits per shielding raycast (controls intersect_ray_all max_results)
-const MAX_RAY_ITERATIONS := 8
+## Max hits per shielding raycast (controls intersect_ray_all max_results).
+## Must match the C++ JoltQueryCollectorAll<CastRayCollector, 32> capacity
+## so that the debug and production paths see the same shielding bodies.
+const MAX_RAY_ITERATIONS := 32
 
 ## Debug ray auto-delete time (seconds)
 const DEBUG_RAY_LIFETIME := 4.0
@@ -47,6 +49,7 @@ static func do_explosion(
 	## player_damage: base damage dealt to players (before falloff/shielding).
 	## structure_damage: base damage dealt to structures/blocks/physics objects.
 	## exclude_body: the rocket RigidBody3D or kamikaze player to skip.
+	var t_explosion_total := Time.get_ticks_usec()
 	var space_state := world.direct_space_state
 	if space_state == null:
 		return
@@ -57,9 +60,12 @@ static func do_explosion(
 	if exclude_rid.is_valid():
 		exclude_rids.append(exclude_rid)
 
+	var _dbg_pass1_structures: Array[String] = []
+
 	# ------------------------------------------------------------------
 	#  Pass 1: Physics sphere query (catches players + rigid bodies)
 	# ------------------------------------------------------------------
+	var t_sphere := Time.get_ticks_usec()
 	var query := PhysicsShapeQueryParameters3D.new()
 	# Reuse persistent sphere shape — see _query_sphere comment above.
 	# The radius set here is deferred (threaded physics), so on the FIRST
@@ -74,7 +80,12 @@ static func do_explosion(
 	query.collide_with_areas = true
 
 	var results := space_state.intersect_shape(query, 64)
+	var t_sphere_end := Time.get_ticks_usec()
 
+	var t_pass1_process := Time.get_ticks_usec()
+	var pass1_players := 0
+	var pass1_structures := 0
+	var pass1_objects := 0
 	for result in results:
 		var collider: Node = result["collider"]
 		if collider == exclude_body:
@@ -85,8 +96,10 @@ static func do_explosion(
 
 		if target.has_method("take_damage_at"):
 			# Wall: let take_damage_at handle per-block shielding internally
+			_dbg_pass1_structures.append(target.name)
 			target.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids)
 			already_damaged.append(target)
+			pass1_structures += 1
 		elif target is Player and target.has_method("take_damage"):
 			# Player: multi-point raycast with flat shielding
 			var dmg := _calc_player_explosion_damage(
@@ -95,8 +108,9 @@ static func do_explosion(
 			if dmg > 0.5:
 				target.take_damage(dmg, attacker_id)
 			already_damaged.append(target)
-		elif target is RigidBody3D and target.has_method("take_damage"):
-			# Destructible physics object (tower chunks, etc.) — cubic falloff
+			pass1_players += 1
+		elif target.has_method("take_damage"):
+			# Any damageable object (physics bodies, target dummies, etc.) — cubic falloff
 			var dist := explosion_pos.distance_to(target.global_position)
 			if dist <= radius:
 				var norm_dist := dist / radius
@@ -105,10 +119,14 @@ static func do_explosion(
 				if dmg > 0.5:
 					target.take_damage(dmg, attacker_id)
 			already_damaged.append(target)
+			pass1_objects += 1
+	var t_pass1_process_end := Time.get_ticks_usec()
 
 	# --- Pass 2: Direct scene scan (safety net if sphere query misses targets) ---
 	# Jolt's intersect_shape with server-created sphere shapes can silently
 	# return empty results. Iterate Players and Structures directly by distance.
+	var t_pass2_players := Time.get_ticks_usec()
+	var pass2_players := 0
 	var tree := Engine.get_main_loop() as SceneTree
 	if tree and tree.current_scene:
 		# -- Players --
@@ -128,26 +146,58 @@ static func do_explosion(
 				if dmg > 0.5:
 					p.take_damage(dmg, attacker_id)
 				already_damaged.append(p)
+				pass2_players += 1
+	var t_pass2_players_end := Time.get_ticks_usec()
 
-		# -- Destructible structures (walls, ramps, OBJ structures) --
+	# -- Destructible structures (walls, ramps, OBJ structures) --
+	var t_pass2_structures := Time.get_ticks_usec()
+	var pass2_structures := 0
+	var pass2_scanned := 0
+	var pass2_skipped := 0
+	if tree and tree.current_scene:
 		var seed_world := tree.current_scene.get_node_or_null("SeedWorld")
 		if seed_world == null:
 			seed_world = tree.current_scene.get_node_or_null("BlockoutMap/SeedWorld")
 		if seed_world:
 			var structures := seed_world.get_node_or_null("Structures")
 			if structures:
+				var _dbg_pass2_structures: Array[String] = []
+				var _dbg_pass2_skipped: Array[String] = []
 				for s in structures.get_children():
+					pass2_scanned += 1
 					if s in already_damaged:
 						continue
 					if not s.has_method("take_damage_at"):
 						continue
-					# Rough pre-filter: structure origin within radius + 10m
-					# (structures can be up to ~5m from their origin).
+					# Pre-filter: check if any block could be within blast radius.
+					# Use structure_size half-diagonal as the margin so tall/large
+					# OBJ structures aren't skipped when the explosion is near their
+					# edge but far from their center.
+					var margin := 10.0
+					if "structure_size" in s:
+						margin = maxf(s.structure_size.length() * 0.5, 10.0)
 					var dist := explosion_pos.distance_to(s.global_position)
-					if dist > radius + 10.0:
+					if dist > radius + margin:
+						pass2_skipped += 1
 						continue
+					_dbg_pass2_structures.append(s.name)
 					s.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids)
 					already_damaged.append(s)
+					pass2_structures += 1
+
+				if not _dbg_pass2_structures.is_empty() or not _dbg_pass2_skipped.is_empty():
+					print("[Explosion] pass1_structures=%s  pass2_structures=%s" % [
+						str(_dbg_pass1_structures), str(_dbg_pass2_structures)])
+	var t_pass2_structures_end := Time.get_ticks_usec()
+
+	var t_explosion_total_end := Time.get_ticks_usec()
+	print("[DoExplosion] sphere_query=%dus(%d results)  pass1=%dus(players=%d structs=%d objs=%d)  pass2_players=%dus(%d)  pass2_structs=%dus(scanned=%d skipped=%d hit=%d)  total=%dus" % [
+		t_sphere_end - t_sphere, results.size(),
+		t_pass1_process_end - t_pass1_process, pass1_players, pass1_structures, pass1_objects,
+		t_pass2_players_end - t_pass2_players, pass2_players,
+		t_pass2_structures_end - t_pass2_structures, pass2_scanned, pass2_skipped, pass2_structures,
+		t_explosion_total_end - t_explosion_total,
+	])
 
 
 # ======================================================================
@@ -193,14 +243,13 @@ static func _calc_player_explosion_damage(
 	var debug_rays := GameManager.debug_show_explosion_rays
 	var debug_ray_data: Array = []
 
-	# Reuse a single query object across all 5 sample rays (non-debug path).
-	var query: PhysicsRayQueryParameters3D = null
-	if not debug_rays:
-		query = PhysicsRayQueryParameters3D.new()
-		query.collision_mask = 1 | 128 | 256 | 1024
-		query.exclude = exclude_rids_base
+	# Reuse a single query object across all 5 sample rays.
+	var query := PhysicsRayQueryParameters3D.new()
+	query.collision_mask = 1 | 128 | 256 | 1024
+	query.exclude = exclude_rids_base
 
-	for sample_pos in sample_points:
+	for i_sample in sample_points.size():
+		var sample_pos: Vector3 = sample_points[i_sample]
 		# Distance falloff from explosion to this sample point (cubic)
 		var dist := explosion_pos.distance_to(sample_pos)
 		if dist > radius:
@@ -209,20 +258,11 @@ static func _calc_player_explosion_damage(
 		var falloff := 1.0 / (1.0 + (norm_dist * 3.0) ** 3)
 		var raw_dmg := base_damage * falloff
 
-		# Sum flat shielding along this ray
-		var final_dmg: float
-		var shield_hits: Array[Vector3] = []
-		if debug_rays:
-			var result: Array = calc_ray_shielding_debug(
-				space_state, explosion_pos, sample_pos, exclude_rids_base.duplicate(), null
-			)
-			final_dmg = maxf(raw_dmg - result[0], 0.0)
-			shield_hits = result[1]
-		else:
-			query.from = explosion_pos
-			query.to = sample_pos
-			var absorbed := space_state.calc_ray_shielding(query, RID(), raw_dmg)
-			final_dmg = maxf(raw_dmg - absorbed, 0.0)
+		# Always use C++ shielding — debug flag only controls ray visualization.
+		query.from = explosion_pos
+		query.to = sample_pos
+		var absorbed_cpp := space_state.calc_ray_shielding(query, RID(), raw_dmg)
+		var final_dmg := maxf(raw_dmg - absorbed_cpp, 0.0)
 
 		total_damage += final_dmg
 
@@ -230,7 +270,7 @@ static func _calc_player_explosion_damage(
 			debug_ray_data.append({
 				"from": explosion_pos, "to": sample_pos,
 				"raw_dmg": raw_dmg, "final_dmg": final_dmg,
-				"hits": shield_hits,
+				"hits": [],
 			})
 
 	if debug_rays and not debug_ray_data.is_empty():
@@ -389,29 +429,40 @@ static func calc_ray_shielding_debug(
 
 	var absorbed := 0.0
 	var hit_positions: Array[Vector3] = []
+	var last_collider: Node = null  # Deduplicate same-body hits (front/back face)
 	for result in results:
 		var hit_node: Node = result["collider"]
 		if hit_node == target_body:
 			break
 
+		# Skip duplicate hits on same body (front face + back face of convex shapes).
+		# With hit_back_faces=true, a ray through a box produces 2 hits on the
+		# same collider. Without this, each block double-counts its HP as shielding.
+		if hit_node == last_collider:
+			continue
+
 		var hit_pos: Vector3 = result["position"]
 
 		if hit_node is Player and hit_node.has_method("take_damage"):
+			last_collider = hit_node
 			absorbed += hit_node.health
 			hit_positions.append(hit_pos)
 		elif _is_wall_block(hit_node):
 			var wall = hit_node.parent_wall
 			var key: Vector3i = hit_node.grid_key
 			if wall and is_instance_valid(wall) and wall._blocks.has(key):
+				last_collider = hit_node
 				absorbed += wall._blocks[key]["hp"]
 				hit_positions.append(hit_pos)
 		elif hit_node is StaticBody3D:
 			# Terrain (static world geometry) — fully blocks
+			last_collider = hit_node
 			absorbed += 99999.0
 			hit_positions.append(hit_pos)
 			break
 		elif "_hp" in hit_node:
 			# Damageable dynamic body (rocket, etc.) — shields by its HP
+			last_collider = hit_node
 			absorbed += hit_node._hp
 			hit_positions.append(hit_pos)
 		# else: unknown body without HP — skip, no absorption

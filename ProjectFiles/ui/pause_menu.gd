@@ -30,6 +30,10 @@ var _toad_no_shadows_button: CheckButton = null
 var _toad_show_hitboxes_button: CheckButton = null
 var _quit_btn: Button = null
 var _box_mass_input: LineEdit = null
+var _momentum_damage_input: LineEdit = null
+var _explosion_radius_input: LineEdit = null
+var _explosion_damage_input: LineEdit = null
+var _resistance_scale_input: LineEdit = null
 
 # ── Video Settings panel UI refs ─────────────────────────────────────────
 var _video_panel: PanelContainer = null
@@ -61,6 +65,7 @@ var _fog_button: CheckButton = null
 var _volumetric_fog_button: CheckButton = null
 var _fps_hud_button: CheckButton = null
 var _debris_button: CheckButton = null
+var _falling_clusters_button: CheckButton = null
 
 
 func _ready() -> void:
@@ -130,9 +135,16 @@ func _build_main_panel() -> void:
 
 	_main_panel.add_theme_stylebox_override("panel", _make_panel_style())
 
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_main_panel.add_child(scroll)
+
 	var vbox := VBoxContainer.new()
 	vbox.add_theme_constant_override("separation", 12)
-	_main_panel.add_child(vbox)
+	vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(vbox)
 
 	# Title
 	var title := Label.new()
@@ -285,6 +297,9 @@ func _build_main_panel() -> void:
 	_debris_button = _add_check("Disable Debris", GameManager.disable_debris, vbox)
 	_debris_button.toggled.connect(_on_debris_toggled)
 
+	_falling_clusters_button = _add_check("Disable Falling Clusters", GameManager.debug_disable_falling_clusters, vbox)
+	_falling_clusters_button.toggled.connect(_on_falling_clusters_toggled)
+
 	# Separator
 	vbox.add_child(HSeparator.new())
 
@@ -308,6 +323,28 @@ func _build_main_panel() -> void:
 	_box_mass_input.focus_exited.connect(_on_box_mass_focus_lost)
 	box_mass_hbox.add_child(_box_mass_input)
 	vbox.add_child(box_mass_hbox)
+
+	# Separator
+	vbox.add_child(HSeparator.new())
+
+	# ── Structure Collision ─────────────────────────────────────────────
+	_add_section_header("Structure Collision", vbox)
+
+	_momentum_damage_input = _add_scale_input("Momentum Damage Scale",
+		GameManager.structure_momentum_damage_scale,
+		_on_momentum_damage_submitted, _on_momentum_damage_focus_lost, vbox)
+
+	_explosion_radius_input = _add_scale_input("Explosion Radius Scale",
+		GameManager.structure_explosion_radius_scale,
+		_on_explosion_radius_submitted, _on_explosion_radius_focus_lost, vbox)
+
+	_explosion_damage_input = _add_scale_input("Explosion Damage Scale",
+		GameManager.structure_explosion_damage_scale,
+		_on_explosion_damage_submitted, _on_explosion_damage_focus_lost, vbox)
+
+	_resistance_scale_input = _add_scale_input("Resistance Scale",
+		GameManager.structure_resistance_scale,
+		_on_resistance_scale_submitted, _on_resistance_scale_focus_lost, vbox)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -741,6 +778,11 @@ func _on_debris_toggled(pressed: bool) -> void:
 	GameManager.disable_debris = pressed
 
 
+func _on_falling_clusters_toggled(pressed: bool) -> void:
+	GameManager.debug_disable_falling_clusters = pressed
+	print("[PauseMenu] Falling clusters: %s" % ("DISABLED" if pressed else "ENABLED"))
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # PRESET UI REFRESH
 # ══════════════════════════════════════════════════════════════════════════
@@ -964,6 +1006,73 @@ func _on_box_mass_focus_lost() -> void:
 	if _box_mass_input == null:
 		return
 	_on_box_mass_submitted(_box_mass_input.text)
+
+
+# ── Structure collision scale helpers ────────────────────────────────────
+
+func _add_scale_input(label_text: String, initial_value: float,
+		submit_callback: Callable, focus_callback: Callable,
+		parent: Control) -> LineEdit:
+	## Build a labeled LineEdit row for a float scale value. Returns the LineEdit.
+	var hbox := HBoxContainer.new()
+	hbox.add_theme_constant_override("separation", 8)
+	var label := Label.new()
+	label.text = label_text
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hbox.add_child(label)
+	var input := LineEdit.new()
+	input.custom_minimum_size = Vector2(80, 0)
+	input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	input.text = "%.1f" % initial_value
+	input.text_submitted.connect(submit_callback)
+	input.focus_exited.connect(focus_callback)
+	hbox.add_child(input)
+	parent.add_child(hbox)
+	return input
+
+
+func _on_momentum_damage_submitted(text: String) -> void:
+	var val := clampf(text.to_float(), 0.0, 10.0)
+	GameManager.structure_momentum_damage_scale = val
+	_momentum_damage_input.text = "%.1f" % val
+	print("[PauseMenu] Momentum damage scale set to %.1f" % val)
+
+func _on_momentum_damage_focus_lost() -> void:
+	if _momentum_damage_input:
+		_on_momentum_damage_submitted(_momentum_damage_input.text)
+
+
+func _on_explosion_radius_submitted(text: String) -> void:
+	var val := clampf(text.to_float(), 0.0, 10.0)
+	GameManager.structure_explosion_radius_scale = val
+	_explosion_radius_input.text = "%.1f" % val
+	print("[PauseMenu] Explosion radius scale set to %.1f" % val)
+
+func _on_explosion_radius_focus_lost() -> void:
+	if _explosion_radius_input:
+		_on_explosion_radius_submitted(_explosion_radius_input.text)
+
+
+func _on_explosion_damage_submitted(text: String) -> void:
+	var val := clampf(text.to_float(), 0.0, 10.0)
+	GameManager.structure_explosion_damage_scale = val
+	_explosion_damage_input.text = "%.1f" % val
+	print("[PauseMenu] Explosion damage scale set to %.1f" % val)
+
+func _on_explosion_damage_focus_lost() -> void:
+	if _explosion_damage_input:
+		_on_explosion_damage_submitted(_explosion_damage_input.text)
+
+
+func _on_resistance_scale_submitted(text: String) -> void:
+	var val := clampf(text.to_float(), 0.0, 10.0)
+	GameManager.structure_resistance_scale = val
+	_resistance_scale_input.text = "%.1f" % val
+	print("[PauseMenu] Resistance scale set to %.1f" % val)
+
+func _on_resistance_scale_focus_lost() -> void:
+	if _resistance_scale_input:
+		_on_resistance_scale_submitted(_resistance_scale_input.text)
 
 
 func _update_quit_button() -> void:

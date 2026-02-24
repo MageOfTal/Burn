@@ -132,8 +132,8 @@ func setup(player: Player) -> void:
 	_zone_label.add_theme_font_size_override("font_size", 16)
 	_zone_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_zone_label.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
-	_zone_label.offset_top = -(BOTTOM_MARGIN + BOX_HEIGHT + 30)
-	_zone_label.offset_bottom = -(BOTTOM_MARGIN + BOX_HEIGHT + 10)
+	_zone_label.offset_top = -(BOTTOM_MARGIN + BOX_HEIGHT + 62)
+	_zone_label.offset_bottom = -(BOTTOM_MARGIN + BOX_HEIGHT + 40)
 	_zone_label.offset_left = -250
 	_zone_label.offset_right = 250
 	add_child(_zone_label)
@@ -242,14 +242,14 @@ func _build_bottom_bar() -> void:
 
 	# --- Keybind hint label (centered above the bottom bar) ---
 	_hint_label = Label.new()
-	_hint_label.text = "E: pickup  |  F: extend  |  X: scrap ground  |  O: scrap equipped  |  TAB: inventory"
-	_hint_label.add_theme_font_size_override("font_size", 11)
-	_hint_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6, 0.7))
+	_hint_label.text = "F: extend  |  O: scrap equipped  |  TAB: inventory"
+	_hint_label.add_theme_font_size_override("font_size", 22)
+	_hint_label.add_theme_color_override("font_color", Color.WHITE)
 	_hint_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_hint_label.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
 	_hint_label.offset_left = -total_width / 2.0
 	_hint_label.offset_right = total_width / 2.0
-	_hint_label.offset_top = -(BOTTOM_MARGIN + BOX_HEIGHT + 18)
+	_hint_label.offset_top = -(BOTTOM_MARGIN + BOX_HEIGHT + 35)
 	_hint_label.offset_bottom = -(BOTTOM_MARGIN + BOX_HEIGHT + 2)
 	add_child(_hint_label)
 

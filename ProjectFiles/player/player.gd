@@ -250,6 +250,9 @@ func _ready() -> void:
 			global_position = sync_position
 		rotation.y = sync_rotation_y
 
+	# Tag for fast C++ shielding classification (tag 2 = PLAYER).
+	PhysicsServer3D.body_set_shielding_tag(get_rid(), 2)
+
 	# Duplicate collision shape so runtime resize doesn't affect other players
 	var col_shape := $CollisionShape3D
 	if col_shape.shape:
@@ -892,18 +895,24 @@ func _process_combat() -> void:
 		var hit_player_ids: Dictionary = {}  # peer_id -> true, to avoid duplicate whiz on hit targets
 		for pellet in pellets:
 			var collider = pellet.get("hit_collider")
-			if collider != null and collider.has_method("take_damage"):
-				var is_player_hit := collider is Player
-				var base_pellet_dmg := rarity_damage_per_pellet if is_player_hit else rarity_struct_dmg_per_pellet
-				var final_damage: float = base_pellet_dmg * heat_system.get_damage_multiplier()
-				if 11 in active_bonuses:  # Juggernaut: +10% damage
-					final_damage *= 1.10
+			if collider == null:
+				continue
+			var is_player_hit := collider is Player
+			var base_pellet_dmg := rarity_damage_per_pellet if is_player_hit else rarity_struct_dmg_per_pellet
+			var final_damage: float = base_pellet_dmg * heat_system.get_damage_multiplier()
+			if 11 in active_bonuses:  # Juggernaut: +10% damage
+				final_damage *= 1.10
+			if not is_player_hit and collider.has_method("take_damage_at"):
+				# Per-block positional damage (clusters, structures hit directly)
+				var hit_pos: Vector3 = pellet.get("hit_position", collider.global_position)
+				collider.take_damage_at(hit_pos, final_damage, 0.5, peer_id)
+			elif collider.has_method("take_damage"):
 				collider.take_damage(final_damage, peer_id)
-				# Only generate heat from hitting players, not structures
-				if is_player_hit:
-					total_damage_dealt += base_damage_per_pellet
-					hit_player_ids[collider.peer_id] = true
-					combat_vfx.play_bullet_hit_sound.rpc(pellet["shot_end"])
+			# Only generate heat from hitting players, not structures
+			if is_player_hit:
+				total_damage_dealt += base_damage_per_pellet
+				hit_player_ids[collider.peer_id] = true
+				combat_vfx.play_bullet_hit_sound.rpc(pellet["shot_end"])
 
 		if total_damage_dealt > 0.0:
 			heat_system.on_damage_dealt(total_damage_dealt)
@@ -917,7 +926,7 @@ func _process_combat() -> void:
 
 		var hit_player_ids: Dictionary = {}
 		var collider = hit_info.get("hit_collider")
-		if collider != null and collider.has_method("take_damage"):
+		if collider != null:
 			var is_player_hit := collider is Player
 			var base_dmg: float
 			if is_player_hit:
@@ -927,7 +936,12 @@ func _process_combat() -> void:
 			var final_damage: float = base_dmg * heat_system.get_damage_multiplier()
 			if 11 in active_bonuses:  # Juggernaut: +10% damage
 				final_damage *= 1.10
-			collider.take_damage(final_damage, peer_id)
+			if not is_player_hit and collider.has_method("take_damage_at"):
+				# Per-block positional damage (clusters, structures hit directly)
+				var hit_pos: Vector3 = hit_info.get("hit_position", collider.global_position)
+				collider.take_damage_at(hit_pos, final_damage, 0.5, peer_id)
+			elif collider.has_method("take_damage"):
+				collider.take_damage(final_damage, peer_id)
 			# Only generate heat from hitting players, not structures
 			if is_player_hit:
 				heat_system.on_damage_dealt(current_weapon.weapon_data.damage)

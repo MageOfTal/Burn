@@ -736,6 +736,30 @@ real_t JoltPhysicsServer3D::body_get_contact_inv_mass_scale(RID p_body) const {
 	return (real_t)body->get_contact_inv_mass_scale();
 }
 
+void JoltPhysicsServer3D::body_set_shielding_tag(RID p_body, int p_tag) {
+	JoltBody3D *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->set_shielding_tag((uint8_t)p_tag);
+}
+
+int JoltPhysicsServer3D::body_get_shielding_tag(RID p_body) const {
+	const JoltBody3D *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return (int)body->get_shielding_tag();
+}
+
+void JoltPhysicsServer3D::body_set_shielding_hp(RID p_body, real_t p_hp) {
+	JoltBody3D *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->set_shielding_hp((float)p_hp);
+}
+
+real_t JoltPhysicsServer3D::body_get_shielding_hp(RID p_body) const {
+	const JoltBody3D *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0.0);
+	return (real_t)body->get_shielding_hp();
+}
+
 void JoltPhysicsServer3D::set_mass_scale_enabled(bool p_enabled) {
 	JoltContactListener3D::set_mass_scale_enabled(p_enabled);
 }
@@ -751,6 +775,7 @@ Dictionary JoltPhysicsServer3D::edge_fix_get_stats() const {
 void JoltPhysicsServer3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("body_set_contact_inv_mass_scale", "body", "scale"), &JoltPhysicsServer3D::body_set_contact_inv_mass_scale);
 	ClassDB::bind_method(D_METHOD("body_get_contact_inv_mass_scale", "body"), &JoltPhysicsServer3D::body_get_contact_inv_mass_scale);
+	// body_set/get_shielding_tag/hp are bound on base PhysicsServer3D — virtual dispatch calls our overrides.
 	ClassDB::bind_method(D_METHOD("set_mass_scale_enabled", "enabled"), &JoltPhysicsServer3D::set_mass_scale_enabled);
 	ClassDB::bind_method(D_METHOD("get_mass_scale_enabled"), &JoltPhysicsServer3D::get_mass_scale_enabled);
 	ClassDB::bind_method(D_METHOD("edge_fix_get_stats"), &JoltPhysicsServer3D::edge_fix_get_stats);

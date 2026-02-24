@@ -123,6 +123,11 @@ public:
 	void body_set_contact_inv_mass_scale(RID p_body, real_t p_scale);
 	real_t body_get_contact_inv_mass_scale(RID p_body) const;
 
+	void body_set_shielding_tag(RID p_body, int p_tag) override;
+	int body_get_shielding_tag(RID p_body) const override;
+	void body_set_shielding_hp(RID p_body, real_t p_hp) override;
+	real_t body_get_shielding_hp(RID p_body) const override;
+
 	void set_mass_scale_enabled(bool p_enabled);
 	bool get_mass_scale_enabled() const;
 

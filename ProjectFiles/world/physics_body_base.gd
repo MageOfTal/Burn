@@ -25,6 +25,22 @@ class_name PhysicsBodyBase
 #  Constants
 # ======================================================================
 
+## Default collision mask for solid physics objects (tower chunks, falling
+## clusters, slabs, etc.). Covers: world terrain (1), significant items (2),
+## bubbles (4), rubber balls (8), player physics push (512), smooth wall
+## collision (2048). Excludes cosmetic layers (debris 32, toad bodies 64)
+## and query-only layers (player targeting 128/256, wall block raycasts 1024).
+## Spawners can add or remove layers as needed (e.g. | 32 for debris collision).
+const DEFAULT_PHYSICS_MASK := 1 | 2 | 4 | 8 | 512 | 2048  # = 2575
+
+## Collision mask for projectiles and projectile-like objects (rockets, rubber
+## balls, bubbles, toads). Covers: world terrain (1), bubbles (4), player
+## physics push (512), smooth wall collision (2048). Deliberately excludes
+## debris (32), significant items (2), rubber balls (8), toad bodies (64),
+## and all query-only layers. Individual projectiles add layers as needed
+## (e.g. rubber ball adds | 2 for significant items).
+const PROJECTILE_PHYSICS_MASK := 1 | 4 | 512 | 2048  # = 2565
+
 ## Assumed mass of a CharacterBody3D (player) for the reduced-mass formula.
 const CHAR_EFFECTIVE_MASS := 80.0
 ## Coefficient of restitution: 0 = perfectly inelastic, 1 = perfectly elastic.

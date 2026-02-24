@@ -95,6 +95,9 @@ private:
 	float gravity_scale = 1.0f;
 	float collision_priority = 1.0f;
 	float contact_inv_mass_scale = 1.0f;
+	float shielding_hp = 0.0f;
+
+	uint8_t shielding_tag = 0; // 0=none, 1=wall_block, 2=player, 3=terrain, 4=damageable
 
 	int contact_count = 0;
 
@@ -296,6 +299,11 @@ public:
 
 	float get_contact_inv_mass_scale() const { return contact_inv_mass_scale; }
 	void set_contact_inv_mass_scale(float p_scale) { contact_inv_mass_scale = p_scale; }
+
+	uint8_t get_shielding_tag() const { return shielding_tag; }
+	void set_shielding_tag(uint8_t p_tag) { shielding_tag = p_tag; }
+	float get_shielding_hp() const { return shielding_hp; }
+	void set_shielding_hp(float p_hp) { shielding_hp = p_hp; }
 
 	DampMode get_linear_damp_mode() const { return linear_damp_mode; }
 	void set_linear_damp_mode(DampMode p_mode);
