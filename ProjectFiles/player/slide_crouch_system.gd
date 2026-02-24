@@ -135,6 +135,7 @@ func process_slide(delta: float) -> void:
 		player.velocity.z = _slide_velocity.z
 		player.velocity.y = player.JUMP_VELOCITY
 		player._is_grounded = false  # Override hysteresis — airborne now
+		player._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
 		# End slide directly — bypass end_slide() which would transition to crouch
 		# since we're still on_floor and holding shift
 		is_sliding = false
@@ -369,6 +370,7 @@ func process_post_slide_window(delta: float) -> bool:
 		player.velocity.z = _post_slide_dir.z * _post_slide_speed
 		player.velocity.y = player.JUMP_VELOCITY
 		player._is_grounded = false  # Override hysteresis — airborne now
+		player._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
 		_post_slide_timer = 0.0
 		_post_slide_speed = 0.0
 		_post_slide_dir = Vector3.ZERO
@@ -425,6 +427,7 @@ func process_crouch(delta: float) -> void:
 		end_crouch()
 		player.velocity.y = player.JUMP_VELOCITY
 		player._is_grounded = false  # Override hysteresis — airborne now
+		player._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
 		return
 
 	# Crouched movement — slower, same acceleration feel (only when grounded)

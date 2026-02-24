@@ -139,6 +139,11 @@ var _frame_jump := false
 var _wall_normals: Array[Vector2] = []
 ## Air-jump tracking for trinket-granted double jump. Reset on landing.
 var _air_jumps_used: int = 0
+## Post-jump rising suppression: prevents floor detection from re-grounding
+## the player while still rising from a jump. On uphill slopes the terrain
+## rises nearly as fast as the player, putting feet_gap within tolerance and
+## zeroing jump velocity on the very next frame. Cleared when velocity.y <= 0.
+var _post_jump_rising: bool = false
 
 ## DEBUG: wall-slide diagnostics (toggle with F9)
 var _debug_wall := false
@@ -672,6 +677,7 @@ func _server_process(delta: float) -> void:
 			if _frame_jump and is_on_floor():
 				velocity.y = JUMP_VELOCITY
 				_is_grounded = false  # Override hysteresis — we're airborne now
+				_post_jump_rising = true  # Suppress grounding while rising (uphill fix)
 				slide_crouch.clear_slide_on_land()
 			elif _frame_jump and not is_on_floor():
 				# Air-jump (trinket-granted) — only if shoe has an extra-jump trinket
@@ -680,6 +686,7 @@ func _server_process(delta: float) -> void:
 				if _air_jumps_used < extra_jumps:
 					velocity.y = JUMP_VELOCITY * 1.5
 					_air_jumps_used += 1
+					_post_jump_rising = true
 
 			# While airborne, queue/cancel slide for when we land
 			if not is_on_floor():
@@ -1145,6 +1152,18 @@ func _update_ground_state() -> void:
 	else:
 		_is_grounded = feet_gap <= FLOOR_CONTACT_TOLERANCE
 
+	# Post-jump rising suppression: on uphill slopes, the terrain rises nearly
+	# as fast as the player after a jump, putting feet_gap within tolerance and
+	# killing the jump on the very next frame. While still rising from a jump,
+	# suppress grounding entirely. Once velocity.y reaches 0 (jump peak) or
+	# goes negative (ceiling hit, explosion knockback, etc.), clear the flag
+	# and resume normal grounding.
+	if _post_jump_rising:
+		if velocity.y > 0.0:
+			_is_grounded = false
+		else:
+			_post_jump_rising = false
+
 	# When ON TOP of a lightweight dynamic body (contact normal.y > 0.7),
 	# force grounded. The terrain raycast hits through/under the body, so
 	# terrain-based grounding is wrong — use contact-based grounding instead.
@@ -1447,6 +1466,7 @@ func die(killer_id: int) -> void:
 	_ground_velocity = Vector3.ZERO
 	_pre_solver_velocity = Vector3.ZERO
 	_undo_jolt_integration = false
+	_post_jump_rising = false
 	# End slide/crouch if active
 	if slide_crouch.is_sliding:
 		slide_crouch.end_slide()
@@ -1532,6 +1552,7 @@ func reset_movement_states() -> void:
 	_was_grounded = false
 	_floor_normal = Vector3.UP
 	_floor_y = -INF
+	_post_jump_rising = false
 
 
 func _do_respawn() -> void:

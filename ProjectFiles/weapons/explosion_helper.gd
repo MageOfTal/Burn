@@ -266,6 +266,28 @@ static func calc_ray_shielding(
 
 
 # ======================================================================
+#  Batch ray shielding: N rays from a shared origin, parallelized in C++
+# ======================================================================
+
+static func calc_ray_shielding_batch(
+	space_state: PhysicsDirectSpaceState3D,
+	from: Vector3,
+	to_points: PackedVector3Array,
+	target_rids: Array[RID],
+	max_absorptions: PackedFloat32Array,
+	exclude_rids: Array[RID],
+) -> PackedFloat32Array:
+	## Batch N independent shielding raycasts from a shared origin.
+	## Uses WorkerThreadPool parallelization in C++ (Jolt CastRay is thread-safe).
+	## Returns PackedFloat32Array where result[i] = total absorption for ray i.
+	var query := PhysicsRayQueryParameters3D.new()
+	query.from = from
+	query.collision_mask = 1 | 128 | 256 | 1024  # Terrain(1) + players(128/256) + wall blocks(1024)
+	query.exclude = exclude_rids
+	return space_state.calc_ray_shielding_batch(query, to_points, target_rids, max_absorptions)
+
+
+# ======================================================================
 #  Debug ray visualization
 # ======================================================================
 
@@ -415,6 +437,16 @@ static func _find_damageable(node: Node) -> Node:
 			first_damageable = current
 		current = current.get_parent()
 	return first_damageable
+
+
+static func _make_shielding_query(from: Vector3, exclude_rids: Array[RID]) -> PhysicsRayQueryParameters3D:
+	## Create a configured PhysicsRayQueryParameters3D for shielding raycasts.
+	## Used by both single-ray and batch-ray shielding paths.
+	var query := PhysicsRayQueryParameters3D.new()
+	query.from = from
+	query.collision_mask = 1 | 128 | 256 | 1024  # Terrain(1) + players(128/256) + wall blocks(1024)
+	query.exclude = exclude_rids
+	return query
 
 
 static func _is_wall_block(node: Node) -> bool:

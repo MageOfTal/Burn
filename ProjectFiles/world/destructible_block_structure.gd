@@ -284,14 +284,15 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	# for later blocks, which caused directional bias in single-pass.
 	var damage_map: Dictionary = {}  # Vector3i -> float
 
-	# Reuse a single query object across all blocks (non-debug path).
-	# Avoids ~1700 PhysicsRayQueryParameters3D allocations per explosion.
-	var shielding_query: PhysicsRayQueryParameters3D = null
-	if not debug_rays:
-		shielding_query = PhysicsRayQueryParameters3D.new()
-		shielding_query.collision_mask = 1 | 128 | 256 | 1024
+	var t_total_start := Time.get_ticks_usec()
 
 	# --- Pass 1: Compute damage for all blocks (read-only) ---
+	# Phase A: Collect all blocks in range (cheap math, no physics).
+	var block_keys: Array[Vector3i] = []
+	var to_points := PackedVector3Array()
+	var target_rids: Array[RID] = []
+	var raw_damages := PackedFloat32Array()
+
 	for key: Vector3i in _blocks:
 		var block_data: Dictionary = _blocks[key]
 		var block_body: StaticBody3D = block_data["body"]
@@ -301,48 +302,57 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		var block_world_pos: Vector3 = block_body.global_position
 		var dist: float = hit_pos.distance_to(block_world_pos)
 
-		if dist > blast_radius:
+		if dist > blast_radius or dist <= 0.3:
 			continue
 
 		# Base damage with cubic distance falloff
 		var norm_dist: float = dist / blast_radius
 		var falloff: float = 1.0 / (1.0 + (norm_dist * 3.0) ** 3)
 		var dmg: float = amount * falloff
-		var raw_dmg: float = dmg
 
-		# --- Flat HP shielding: raycast from explosion to this block ---
-		# Exclude the target block + any bodies passed in (e.g. the rocket)
-		var shield_hits: Array[Vector3] = []
-		if space_state and dist > 0.3:
-			if debug_rays:
-				var ray_excludes: Array[RID] = [block_body.get_rid()]
+		block_keys.append(key)
+		to_points.append(block_world_pos)
+		target_rids.append(block_body.get_rid())
+		raw_damages.append(dmg)
+
+	var t_collect := Time.get_ticks_usec()
+
+	# Phase B: Batch shielding (parallelized in C++ via WorkerThreadPool).
+	if not to_points.is_empty() and space_state:
+		if debug_rays:
+			# Debug path: sequential with per-ray intersect_ray_all for hit positions.
+			for i in block_keys.size():
+				var ray_excludes: Array[RID] = [target_rids[i]]
 				ray_excludes.append_array(exclude_rids)
 				var result: Array = ExplosionHelper.calc_ray_shielding_debug(
-					space_state, hit_pos, block_world_pos, ray_excludes, block_body
+					space_state, hit_pos, to_points[i], ray_excludes, null
 				)
-				dmg = maxf(dmg - result[0], 0.0)
-				shield_hits = result[1]
-			else:
-				# Reuse query — update from/to/exclude per block.
-				shielding_query.from = hit_pos
-				shielding_query.to = block_world_pos
-				var ray_excludes: Array[RID] = [block_body.get_rid()]
-				ray_excludes.append_array(exclude_rids)
-				shielding_query.exclude = ray_excludes
-				var absorbed: float = space_state.calc_ray_shielding(
-					shielding_query, block_body.get_rid(), dmg
-				)
-				dmg = maxf(dmg - absorbed, 0.0)
+				var final_dmg := maxf(raw_damages[i] - result[0], 0.0)
+				debug_ray_data.append({
+					"from": hit_pos, "to": to_points[i],
+					"raw_dmg": raw_damages[i], "final_dmg": final_dmg,
+					"hits": result[1],
+				})
+				if final_dmg >= 0.5:
+					damage_map[block_keys[i]] = final_dmg
+		else:
+			# Production path: single C++ call, parallelized across worker threads.
+			var absorptions := space_state.calc_ray_shielding_batch(
+				ExplosionHelper._make_shielding_query(hit_pos, exclude_rids),
+				to_points, target_rids, raw_damages
+			)
+			for i in absorptions.size():
+				var final_dmg := maxf(raw_damages[i] - absorptions[i], 0.0)
+				if final_dmg >= 0.5:
+					damage_map[block_keys[i]] = final_dmg
 
-		if debug_rays:
-			debug_ray_data.append({
-				"from": hit_pos, "to": block_world_pos,
-				"raw_dmg": raw_dmg, "final_dmg": dmg,
-				"hits": shield_hits,
-			})
-
-		if dmg >= 0.5:
-			damage_map[key] = dmg
+	var t_batch := Time.get_ticks_usec()
+	print("[take_damage_at] blocks=%d  in_range=%d  collect=%dus  batch=%dus  total_pass1=%dus" % [
+		_blocks.size(), to_points.size(),
+		t_collect - t_total_start,
+		t_batch - t_collect,
+		t_batch - t_total_start,
+	])
 
 	# --- Pass 2: Apply all damage simultaneously ---
 	for key: Vector3i in damage_map:
