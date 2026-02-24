@@ -193,6 +193,13 @@ static func _calc_player_explosion_damage(
 	var debug_rays := GameManager.debug_show_explosion_rays
 	var debug_ray_data: Array = []
 
+	# Reuse a single query object across all 5 sample rays (non-debug path).
+	var query: PhysicsRayQueryParameters3D = null
+	if not debug_rays:
+		query = PhysicsRayQueryParameters3D.new()
+		query.collision_mask = 1 | 128 | 256 | 1024
+		query.exclude = exclude_rids_base
+
 	for sample_pos in sample_points:
 		# Distance falloff from explosion to this sample point (cubic)
 		var dist := explosion_pos.distance_to(sample_pos)
@@ -212,9 +219,9 @@ static func _calc_player_explosion_damage(
 			final_dmg = maxf(raw_dmg - result[0], 0.0)
 			shield_hits = result[1]
 		else:
-			var absorbed := calc_ray_shielding(
-				space_state, explosion_pos, sample_pos, exclude_rids_base.duplicate(), null
-			)
+			query.from = explosion_pos
+			query.to = sample_pos
+			var absorbed := space_state.calc_ray_shielding(query, RID(), raw_dmg)
 			final_dmg = maxf(raw_dmg - absorbed, 0.0)
 
 		total_damage += final_dmg
@@ -242,46 +249,20 @@ static func calc_ray_shielding(
 	from: Vector3,
 	to: Vector3,
 	exclude_rids: Array[RID],
-	target_body: Node
+	target_body: Node,
+	max_absorption: float = 99999.0
 ) -> float:
 	## Single multi-hit raycast from→to, summing flat HP absorption of
 	## everything in the path. Returns total damage absorbed.
 	##
-	## Uses intersect_ray_all (Jolt AllHitCollector) — one engine call
-	## returns all hits sorted by distance, replacing the old iterative loop.
-	##
-	## - Wall blocks contribute their current block HP
-	## - Players contribute their current health
-	## - Terrain blocks the ray completely (infinite absorption)
+	## Delegates to C++ calc_ray_shielding (Jolt AllHitCollector + inline
+	## classification + early-out). No Dictionary allocations, no GDScript
+	## iteration — returns one float.
+	var target_rid: RID = target_body.get_rid() if target_body else RID()
 	var query := PhysicsRayQueryParameters3D.create(from, to)
 	query.collision_mask = 1 | 128 | 256 | 1024  # Terrain(1) + players(128/256) + wall blocks(1024)
 	query.exclude = exclude_rids
-	var results := space_state.intersect_ray_all(query, MAX_RAY_ITERATIONS)
-
-	var absorbed := 0.0
-	for result in results:
-		var hit_node: Node = result["collider"]
-		if hit_node == target_body:
-			break  # Reached the target itself
-
-		# Identify what we hit and add its HP as absorption
-		if hit_node is Player and hit_node.has_method("take_damage"):
-			absorbed += hit_node.health
-		elif _is_wall_block(hit_node):
-			var wall = hit_node.parent_wall
-			var key: Vector3i = hit_node.grid_key
-			if wall and is_instance_valid(wall) and wall._blocks.has(key):
-				absorbed += wall._blocks[key]["hp"]
-		elif hit_node is StaticBody3D:
-			# Terrain (static world geometry) — fully blocks
-			absorbed += 99999.0
-			break
-		elif "_hp" in hit_node:
-			# Damageable dynamic body (rocket, etc.) — shields by its HP
-			absorbed += hit_node._hp
-		# else: unknown body without HP — skip, no absorption
-
-	return absorbed
+	return space_state.calc_ray_shielding(query, target_rid, max_absorption)
 
 
 # ======================================================================

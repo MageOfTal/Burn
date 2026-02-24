@@ -284,6 +284,13 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	# for later blocks, which caused directional bias in single-pass.
 	var damage_map: Dictionary = {}  # Vector3i -> float
 
+	# Reuse a single query object across all blocks (non-debug path).
+	# Avoids ~1700 PhysicsRayQueryParameters3D allocations per explosion.
+	var shielding_query: PhysicsRayQueryParameters3D = null
+	if not debug_rays:
+		shielding_query = PhysicsRayQueryParameters3D.new()
+		shielding_query.collision_mask = 1 | 128 | 256 | 1024
+
 	# --- Pass 1: Compute damage for all blocks (read-only) ---
 	for key: Vector3i in _blocks:
 		var block_data: Dictionary = _blocks[key]
@@ -305,19 +312,25 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 
 		# --- Flat HP shielding: raycast from explosion to this block ---
 		# Exclude the target block + any bodies passed in (e.g. the rocket)
-		var ray_excludes: Array[RID] = [block_body.get_rid()]
-		ray_excludes.append_array(exclude_rids)
 		var shield_hits: Array[Vector3] = []
 		if space_state and dist > 0.3:
 			if debug_rays:
+				var ray_excludes: Array[RID] = [block_body.get_rid()]
+				ray_excludes.append_array(exclude_rids)
 				var result: Array = ExplosionHelper.calc_ray_shielding_debug(
 					space_state, hit_pos, block_world_pos, ray_excludes, block_body
 				)
 				dmg = maxf(dmg - result[0], 0.0)
 				shield_hits = result[1]
 			else:
-				var absorbed: float = ExplosionHelper.calc_ray_shielding(
-					space_state, hit_pos, block_world_pos, ray_excludes, block_body
+				# Reuse query — update from/to/exclude per block.
+				shielding_query.from = hit_pos
+				shielding_query.to = block_world_pos
+				var ray_excludes: Array[RID] = [block_body.get_rid()]
+				ray_excludes.append_array(exclude_rids)
+				shielding_query.exclude = ray_excludes
+				var absorbed: float = space_state.calc_ray_shielding(
+					shielding_query, block_body.get_rid(), dmg
 				)
 				dmg = maxf(dmg - absorbed, 0.0)
 
