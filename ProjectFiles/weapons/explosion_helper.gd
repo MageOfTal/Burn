@@ -285,31 +285,6 @@ static func _calc_player_explosion_damage(
 	return total_damage / 5.0
 
 
-# ======================================================================
-#  Ray shielding: single multi-hit raycast summing flat HP absorption
-# ======================================================================
-
-static func calc_ray_shielding(
-	space_state: PhysicsDirectSpaceState3D,
-	from: Vector3,
-	to: Vector3,
-	exclude_rids: Array[RID],
-	target_body: Node,
-	max_absorption: float = 99999.0
-) -> float:
-	## Single multi-hit raycast from→to, summing flat HP absorption of
-	## everything in the path. Returns total damage absorbed.
-	##
-	## Delegates to C++ calc_ray_shielding (Jolt AllHitCollector + inline
-	## classification + early-out). No Dictionary allocations, no GDScript
-	## iteration — returns one float.
-	var target_rid: RID = target_body.get_rid() if target_body else RID()
-	var query := PhysicsRayQueryParameters3D.create(from, to)
-	query.collision_mask = 1 | 128 | 256 | 1024  # Terrain(1) + players(128/256) + wall blocks(1024)
-	query.exclude = exclude_rids
-	return space_state.calc_ray_shielding(query, target_rid, max_absorption)
-
-
 
 # ======================================================================
 #  Debug ray visualization

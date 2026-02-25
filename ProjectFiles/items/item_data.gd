@@ -35,7 +35,3 @@ func get_source_path() -> String:
 		return _original_resource_path
 	return resource_path
 
-## Visual (placeholder for now)
-@export_group("Visual")
-@export var icon: Texture2D = null
-@export var mesh_color: Color = Color.WHITE
