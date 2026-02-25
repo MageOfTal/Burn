@@ -5,16 +5,17 @@ class_name PhysicsBodyBase
 ##
 ## Push interactions with players use one of two paths:
 ##
-## 1. **Shadow body path (preferred):** If this body's collision_mask includes layer 10
-##    (512, the player's shadow body), Jolt handles the collision natively — correct
-##    contact normals, edge deflections, mass ratios, restitution. The shadow body
-##    transfers the solver impulse to the player automatically. No manual math needed.
+## 1. **Native Jolt collision (preferred):** If this body's collision_mask includes
+##    layer 10 (512, the player's physics push layer), Jolt handles the collision
+##    natively — correct contact normals, edge deflections, mass ratios, restitution.
+##    The player is an 80 kg RigidBody3D on layer 10; Jolt resolves contact impulses
+##    directly. No manual math needed.
 ##
 ## 2. **Polling fallback:** If this body does NOT mask layer 10, the base class polls
-##    for CharacterBody3D overlaps every 0.1s and applies the reduced-mass formula:
+##    for Player (RigidBody3D) overlaps every 0.1s and applies the reduced-mass formula:
 ##      reduced_mass = (m_rigid * m_char) / (m_rigid + m_char)
 ##      impulse = (1 + restitution) * closing_speed * reduced_mass
-##    This is a legacy path for objects that can't use the shadow body for some reason.
+##    This is a legacy path for objects that can't mask layer 10 for some reason.
 ##
 ## Objects that mask layer 10 automatically skip the polling path to avoid double-push.
 ##
@@ -41,7 +42,7 @@ const DEFAULT_PHYSICS_MASK := 1 | 2 | 4 | 8 | 512 | 2048  # = 2575
 ## (e.g. rubber ball adds | 2 for significant items).
 const PROJECTILE_PHYSICS_MASK := 1 | 4 | 512 | 2048  # = 2565
 
-## Assumed mass of a CharacterBody3D (player) for the reduced-mass formula.
+## Assumed mass of a Player (80 kg RigidBody3D) for the reduced-mass formula.
 const CHAR_EFFECTIVE_MASS := 80.0
 ## Coefficient of restitution: 0 = perfectly inelastic, 1 = perfectly elastic.
 ## 0.5 gives a moderate bounce — player is pushed but not launched to orbit.
@@ -70,9 +71,9 @@ func _physics_process(delta: float) -> void:
 	if not multiplayer.is_server():
 		return
 
-	# If this body masks layer 10 (shadow body), Jolt handles push transfer
-	# natively via the shadow body's solver-delta mechanism. Skip manual polling
-	# to avoid double-pushing the player.
+	# If this body masks layer 10 (player physics push layer), Jolt handles push
+	# transfer natively via its contact solver. Skip manual polling to avoid
+	# double-pushing the player.
 	if collision_mask & 512:
 		return
 
@@ -85,7 +86,7 @@ func _physics_process(delta: float) -> void:
 
 
 func _check_character_overlaps() -> void:
-	## Find all CharacterBody3D nodes whose collision shapes overlap this body's
+	## Find all Player (RigidBody3D) nodes whose collision shapes overlap this body's
 	## shape and apply mass-weighted push forces.
 	## Uses Jolt's PhysicsDirectSpaceState3D.intersect_shape() — the actual hitbox
 	## geometry determines overlap, not an arbitrary radius.

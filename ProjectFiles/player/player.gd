@@ -7,7 +7,7 @@ class_name Player
 ##
 ## Uses RigidBody3D with custom_integrator=true so the player participates in
 ## Jolt's rigid body solver directly. Physics objects (toads, boulders, etc.)
-## collide with the player natively — no shadow body proxy needed.
+## collide with the player natively via layer 10 (physics push layer).
 ##
 ## GROUNDED movement bypasses Jolt's velocity integration for POSITION, but
 ## leaves velocity non-zero so Jolt's solver sees real movement speed for
@@ -35,6 +35,7 @@ class_name Player
 
 const WeaponProjectileScript = preload("res://weapons/weapon_projectile.gd")
 const WeaponMeleeScript = preload("res://weapons/weapon_melee.gd")
+const WeaponLaggerScript = preload("res://weapons/weapon_lagger.gd")
 
 const SPEED := 9.1
 const JUMP_VELOCITY := 10.5
@@ -51,18 +52,18 @@ const AIR_DECELERATION := 0.0        # No air friction — full momentum preserv
 ## so Jolt doesn't double-apply). Subsystems (slide_crouch, etc.) also read this.
 var gravity: float = 17.5
 
-## Velocity alias — bridges CharacterBody3D → RigidBody3D API.
-## All subsystems continue to read/write player.velocity; this maps to linear_velocity.
+## Velocity alias — maps to RigidBody3D.linear_velocity for convenience.
+## All subsystems read/write player.velocity; this maps to linear_velocity.
 var velocity: Vector3:
 	get: return linear_velocity
 	set(v): linear_velocity = v
 
-## Floor detection constants (were CharacterBody3D scene properties)
+## Floor detection constants (custom raycast-based, not from CharacterBody3D)
 const FLOOR_MAX_ANGLE: float = 0.8727  ## 50 degrees — steeper surfaces are walls
 const FLOOR_SNAP_MARGIN: float = 0.3  ## Extra reach below feet for slope detection
 const CAPSULE_RADIUS: float = 0.4  ## Must match CapsuleShape3D in player.tscn
 
-## Floor detection state (replaces CharacterBody3D is_on_floor / get_floor_normal)
+## Floor detection state (raycast-based replacement for CharacterBody3D methods)
 var _is_grounded: bool = false
 var _floor_normal: Vector3 = Vector3.UP
 var _floor_y: float = -INF  ## Y position of the floor surface (feet level)
@@ -106,8 +107,8 @@ var is_bot: bool = false
 ## True when player is inside the Toad Dimension (immune to fall death).
 var in_toad_dimension: bool = false
 
-## Layer 10 (bit 512) — physics push layer (was shadow body, now on the player directly).
-const SHADOW_BODY_LAYER: int = 512
+## Layer 10 (bit 512) — physics push layer (directly on the player RigidBody3D).
+const PLAYER_PUSH_LAYER: int = 512
 
 ## Combat state (synced via ServerSync)
 var health: float = MAX_HEALTH
@@ -381,7 +382,7 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 			_touching_dynamic_body = true
 			_dynamic_body_ref = collider
 			# On top when contact normal is mostly upward (same threshold as
-			# CharacterBody3D floor detection: ~45° from vertical)
+			# floor detection threshold: ~45° from vertical)
 			if normal.y > 0.7:
 				_on_dynamic_body = true
 		if normal.angle_to(Vector3.UP) > wall_angle_threshold:
@@ -419,6 +420,8 @@ func _physics_process(delta: float) -> void:
 	var freecam_frozen: bool = GameManager.debug_freecam_active and peer_id == multiplayer.get_unique_id()
 
 	if multiplayer.is_server() and not freecam_frozen:
+		var _t_tick_player := Time.get_ticks_usec()
+
 		# --- JUMP DEBUG: track position for 30 frames after a jump ---
 		if _frame_jump:
 			_jump_debug_frames = 30
@@ -514,6 +517,8 @@ func _physics_process(delta: float) -> void:
 		# Update sync vars AFTER all server movement (normal, grapple, kamikaze, respawn)
 		sync_position = global_position
 		sync_rotation_y = rotation.y
+
+		GameManager.tick_add("player", Time.get_ticks_usec() - _t_tick_player)
 
 	# --- Client-side interpolation (all players on non-server peers) ---
 	# Server runs physics directly via _server_process(); clients apply the
@@ -1091,7 +1096,7 @@ func _process_normal_movement(delta: float) -> void:
 		# as the movement system computed — no direction change, no sideways
 		# deflection. Only the vertical component is added so the player
 		# glides up/down hills at constant horizontal speed, matching
-		# CharacterBody3D move_and_slide() with floor_constant_speed.
+		# floor_constant_speed behavior (slope alignment).
 		#
 		# From the plane equation dot(velocity, normal) = 0:
 		#   nx*vx + ny*vy + nz*vz = 0  →  vy = -(nx*vx + nz*vz) / ny
@@ -1099,13 +1104,13 @@ func _process_normal_movement(delta: float) -> void:
 
 
 func is_on_floor() -> bool:
-	## Floor detection — replaces CharacterBody3D.is_on_floor().
+	## Floor detection — raycast-based is_on_floor().
 	## Updated each physics tick by _update_ground_state().
 	return _is_grounded
 
 
 func get_floor_normal() -> Vector3:
-	## Floor normal — replaces CharacterBody3D.get_floor_normal().
+	## Floor normal — raycast-based get_floor_normal().
 	return _floor_normal
 
 
@@ -1119,7 +1124,7 @@ func _update_ground_state() -> void:
 	##
 	## Two thresholds:
 	##   FLOOR_CONTACT_TOLERANCE (0.05m) — tight check for _is_grounded (drives
-	##     movement: acceleration, gravity, jump). Matches CharacterBody3D which
+	##     movement: acceleration, gravity, jump). Tight threshold ensures
 	##     only reported is_on_floor() on actual contact.
 	##   FLOOR_SNAP_MARGIN (0.3m) — extended reach for _floor_y (snap-to-floor
 	##     mechanism that keeps the player grounded over bumps and slopes).
@@ -1668,7 +1673,9 @@ func equip_weapon(weapon_data: WeaponData) -> void:
 	if current_weapon != null:
 		current_weapon.queue_free()
 
-	if weapon_data.is_hitscan:
+	if weapon_data.is_debug_lagger:
+		current_weapon = WeaponLaggerScript.new()
+	elif weapon_data.is_hitscan:
 		current_weapon = WeaponHitscan.new()
 	elif weapon_data.projectile_scene != null:
 		current_weapon = WeaponProjectileScript.new()

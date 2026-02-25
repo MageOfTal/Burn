@@ -1467,7 +1467,7 @@ func _spawn_slab_fragments(body_transform: Transform3D, is_server: bool,
 		slab.gravity_scale = 1.0
 		slab.angular_damp = 1.5
 		slab.collision_layer = 2  # Tower debris layer
-		slab.collision_mask = 15 | 512 | 2048  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + shadow body(512) + smooth walls(2048)
+		slab.collision_mask = 15 | 512 | 2048  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + player push(512) + smooth walls(2048)
 
 		if is_server:
 			slab.contact_monitor = true
@@ -1560,7 +1560,7 @@ func _spawn_rock_chunks_legacy(impact_pos: Vector3, chunk_count: int,
 		chunk.gravity_scale = 1.0
 		chunk.angular_damp = 2.0
 		chunk.collision_layer = 2  # Tower debris layer
-		chunk.collision_mask = 15 | 512 | 2048  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + shadow body(512) + smooth walls(2048)
+		chunk.collision_mask = 15 | 512 | 2048  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + player push(512) + smooth walls(2048)
 
 		if is_server:
 			chunk.contact_monitor = true

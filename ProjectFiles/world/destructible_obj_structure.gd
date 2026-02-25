@@ -21,6 +21,12 @@ var _occupied_set: Dictionary = {}
 
 
 func _ready() -> void:
+	# When spawning from detach data, skip structure_data setup entirely —
+	# the base class _init_from_detach path handles block spawning directly.
+	if not _init_from_detach.is_empty():
+		super._ready()
+		return
+
 	if structure_data == null:
 		push_error("DestructibleObjStructure: no structure_data assigned!")
 		queue_free()

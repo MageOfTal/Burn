@@ -68,7 +68,7 @@ func _fire_toad() -> void:
 	# Override gravity — we want the toad to fly in a straight line (rail cannon)
 	toad.gravity_scale = 0.0
 
-	# CCD prevents tunneling at 100 m/s through thin bodies (shadow body, walls)
+	# CCD prevents tunneling at 100 m/s through thin bodies (players, walls)
 	toad.continuous_cd = true
 
 	# Add to scene tree FIRST, then set world-space properties.

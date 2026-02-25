@@ -3,7 +3,7 @@ extends PhysicsBodyBase
 ## A single toad rain body — a physics-simulated frog that falls from the sky,
 ## bounces once off the floor, then phases through the ground and despawns.
 ##
-## Mass: 2.0 kg (1/40th of the player's 80 kg).
+## Mass: 4.0 kg (1/20th of the player's 80 kg).
 ##
 ## Collision layer 7 (toad bodies), masks layer 1 (world) + layer 10 (player
 ## RigidBody3D) + layer 12 (smooth wall collision). The player is an 80 kg
@@ -218,7 +218,7 @@ func _ready() -> void:
 	mass = GameManager.debug_toad_mass
 	gravity_scale = 2.0  ## 2x gravity (matches original TOAD_GRAVITY = 19.6)
 	lock_rotation = false
-	continuous_cd = true  ## Prevent tunneling through ground when hit by heavy shadow body
+	continuous_cd = true  ## Prevent tunneling through ground at high speeds
 	# PhysicsMaterial (bounce=0.3, friction=0.5) is set in toad_body.tscn
 
 	# Wire collision signal for bounce detection (server only)
@@ -245,8 +245,8 @@ func _physics_process(delta: float) -> void:
 		return
 
 	# NOTE: We intentionally do NOT call super._physics_process(delta) here.
-	# Toad → player push is handled entirely by Jolt's native solver via the
-	# shadow body. No intersect_shape polling needed.
+	# Toad → player push is handled entirely by Jolt's native solver via
+	# layer 10 collision. No intersect_shape polling needed.
 
 	if not multiplayer.is_server():
 		return

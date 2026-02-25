@@ -20,7 +20,7 @@ extends Node
 ## Toad bodies are full RigidBody3D physics objects (toad_body.tscn).
 ## Each toad bounces once off the floor, then phases through the ground
 ## and despawns when it falls far enough below. Toads push players on
-## contact via PhysicsBodyBase (mass = 2 kg, 1/40th of player mass).
+## contact via PhysicsBodyBase (mass = 4 kg, 1/20th of player mass).
 
 const DIMENSION_Y: float = -500.0        ## Arena floor Y
 const FLOOR_SIZE: float = 500.0          ## Collision floor size (players can't reach the edge)
@@ -618,7 +618,7 @@ func _spawn_initial_toads() -> void:
 
 		# Pre-populated toads are visual-only: no Jolt collision. If they had
 		# physics enabled, dozens of high-velocity toads near the floor would
-		# all slam into the shadow body on the first few frames, creating a
+		# all slam into the player on the first few frames, creating a
 		# massive combined impulse that launches the player. Instead, we put
 		# them straight into physics-disabled mode with manual velocity so
 		# they fall visually, pass through the floor, and despawn — identical

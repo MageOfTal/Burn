@@ -63,6 +63,22 @@ var _debris_name: String = "Debris"
 ## falling clusters spawned by structural integrity failure.
 var _last_attacker_id: int = -1
 
+## When set before adding to scene, _ready() will skip the triple-loop and
+## only spawn blocks from this data.  Used by the "disable falling clusters"
+## debug toggle to split unsupported blocks into a new structure instance.
+## Keys: "block_keys": Array[Vector3i], "block_hps": Dictionary[Vector3i→float]
+var _init_from_detach: Dictionary = {}
+
+## True for structures created via _spawn_detached_structure().  These have
+## no y=0 ground blocks, so _check_structural_integrity() must not cascade
+## (it would re-detach ALL blocks every time a single block is destroyed).
+var _is_detached_structure: bool = false
+
+## Falling state for detached structures (gravity simulation)
+var _is_falling: bool = false
+var _fall_velocity: float = 0.0
+var _fall_ray_local: Vector3 = Vector3.ZERO  ## Bottom-center of blocks in local space
+
 
 # ======================================================================
 #  Virtual methods — subclasses MUST override these
@@ -121,8 +137,22 @@ func _get_block_mass() -> float:
 # ======================================================================
 
 func _ready() -> void:
-	var tier_info: Dictionary = _get_tier_info()
-	_block_hp = tier_info["block_hp"]
+	# When spawning from detach data, use the pre-computed material and block_hp
+	# from the parent structure. This avoids relying on subclass exports (which
+	# default to wrong values on bare new() instances).
+	var is_detach := not _init_from_detach.is_empty()
+
+	if is_detach:
+		_is_detached_structure = true
+		_block_hp = _init_from_detach["block_hp"]
+		_structure_material = _init_from_detach.get("material")
+		if _structure_material == null:
+			_structure_material = StandardMaterial3D.new()
+			_structure_material.albedo_color = Color.MAGENTA  # Fallback
+	else:
+		var tier_info: Dictionary = _get_tier_info()
+		_block_hp = tier_info["block_hp"]
+		_structure_material = _create_structure_material(tier_info)
 
 	var debris_cfg: Dictionary = _get_debris_config()
 	_debris_size = debris_cfg["size"]
@@ -137,19 +167,30 @@ func _ready() -> void:
 	_block_shape = BoxShape3D.new()
 	_block_shape.size = Vector3.ONE * BLOCK_SIZE
 
-	_structure_material = _create_structure_material(tier_info)
-
 	# Calculate grid dimensions
 	_num_x = maxi(int(structure_size.x / BLOCK_SIZE), 1)
 	_num_y = maxi(int(structure_size.y / BLOCK_SIZE), 1)
 	_num_z = maxi(int(structure_size.z / BLOCK_SIZE), 1)
 
 	# Build block grid (collision only — no per-block meshes)
-	for bx in _num_x:
-		for by in _num_y:
-			for bz in _num_z:
-				if _should_spawn_block(bx, by, bz):
-					_spawn_block(bx, by, bz)
+	if is_detach:
+		# Detached structure: spawn only the provided blocks with their HPs
+		var detach_keys: Array = _init_from_detach["block_keys"]
+		var detach_hps: Dictionary = _init_from_detach["block_hps"]
+		for key: Vector3i in detach_keys:
+			_spawn_block(key.x, key.y, key.z)
+			if _blocks.has(key):
+				var hp: float = detach_hps.get(key, _block_hp)
+				_blocks[key]["hp"] = hp
+				PhysicsServer3D.body_set_shielding_hp(
+					_blocks[key]["body"].get_rid(), hp)
+		_init_from_detach = {}  # Clear to free references
+	else:
+		for bx in _num_x:
+			for by in _num_y:
+				for bz in _num_z:
+					if _should_spawn_block(bx, by, bz):
+						_spawn_block(bx, by, bz)
 
 	# Build single greedy-meshed visual
 	_mesh_instance = MeshInstance3D.new()
@@ -160,6 +201,25 @@ func _ready() -> void:
 
 	# Build smooth collision shell for player physics (no seam bouncing)
 	_build_smooth_collision()
+
+	# Detached structures: compute bottom-center for ground raycast and start falling
+	if is_detach and not _blocks.is_empty():
+		_is_falling = true
+		var sum_x := 0.0
+		var sum_z := 0.0
+		var min_y := INF
+		for key: Vector3i in _blocks:
+			var body: StaticBody3D = _blocks[key]["body"]
+			if is_instance_valid(body):
+				sum_x += body.position.x
+				sum_z += body.position.z
+				var bottom_y := body.position.y - BLOCK_SIZE * 0.5
+				if bottom_y < min_y:
+					min_y = bottom_y
+		var count := float(_blocks.size())
+		_fall_ray_local = Vector3(sum_x / count, min_y, sum_z / count)
+
+	set_physics_process(_is_falling)
 
 	# Disable per-frame processing — only needed when _mesh_dirty is set
 	set_process(false)
@@ -172,8 +232,45 @@ func _process(_delta: float) -> void:
 		var t_mesh := Time.get_ticks_usec()
 		_rebuild_greedy_mesh()
 		var t_mesh_end := Time.get_ticks_usec()
-		print("[GreedyMesh] %s  blocks=%d  time=%dus" % [name, _blocks.size(), t_mesh_end - t_mesh])
+		var _mesh_us := t_mesh_end - t_mesh
+		print("[GreedyMesh] %s  blocks=%d  time=%dus" % [name, _blocks.size(), _mesh_us])
+		GameManager.frame_add("greedy_mesh", _mesh_us)
 		set_process(false)
+
+
+const DETACH_FALL_GRAVITY := 17.5  ## Same as player gravity (m/s²)
+
+func _physics_process(delta: float) -> void:
+	if not _is_falling:
+		set_physics_process(false)
+		return
+
+	_fall_velocity += DETACH_FALL_GRAVITY * delta
+	var move_dist := _fall_velocity * delta
+
+	# Cast ray downward from bottom-center to detect ground (layer 1 = terrain)
+	var bottom_world := to_global(_fall_ray_local)
+	var space_state := get_world_3d().direct_space_state
+	var params := PhysicsRayQueryParameters3D.new()
+	params.from = bottom_world
+	params.to = bottom_world + Vector3(0, -(move_dist + 0.05), 0)
+	params.collision_mask = 1  # World geometry / terrain
+
+	var result := space_state.intersect_ray(params)
+	if result:
+		# Hit ground — snap bottom to surface and stop falling
+		var hit_y: float = result["position"].y
+		var overshoot := bottom_world.y - hit_y
+		if overshoot > 0:
+			global_position.y -= overshoot
+		_is_falling = false
+		_fall_velocity = 0.0
+		set_physics_process(false)
+	else:
+		global_position.y -= move_dist
+		# Kill if fallen out of the world
+		if global_position.y < -200:
+			queue_free()
 
 
 # ======================================================================
@@ -300,6 +397,8 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	## Shielding uses flat HP absorption: each wall block or player between the
 	## explosion and a target block absorbs damage equal to its current HP.
 	## exclude_rids: physics bodies to ignore in shielding raycasts (e.g. the rocket).
+	print("[TakeDamageAt-ENTRY] %s  blocks=%d  is_server=%s  hit_pos=%s  global_pos=%s" % [
+		name, _blocks.size(), str(multiplayer.is_server()), str(hit_pos), str(global_position)])
 	if not multiplayer.is_server():
 		return
 
@@ -325,10 +424,12 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		# C++ production path: single call does collection + distance filter +
 		# falloff + multi-threaded shielding raycasts. Returns Dictionary[Vector3i -> float].
 		var query := ExplosionHelper._make_shielding_query(hit_pos, exclude_rids)
-		damage_map = space_state.calc_structure_explosion(
-			query, _blocks, global_transform, BLOCK_SIZE,
-			_num_x, _num_y, _num_z, blast_radius, amount
-		)
+		var repeat_count := 2000 if GameManager.debug_explosion_repeat else 1
+		for _i in repeat_count:
+			damage_map = space_state.calc_structure_explosion(
+				query, _blocks, global_transform, BLOCK_SIZE,
+				_num_x, _num_y, _num_z, blast_radius, amount
+			)
 
 		# Draw debug rays if enabled (visualize C++ results without changing behavior).
 		if debug_rays:
@@ -418,6 +519,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	var t_integrity_end := Time.get_ticks_usec()
 
 	var t_total_end := Time.get_ticks_usec()
+	var _total_us := t_total_end - t_total
 	print("[TakeDamageAt] %s  blocks=%d  pass1=%dus  pass2=%dus  debug_rays=%dus  debris=%dus(rpcs=%d spawned=%d)  columns=%dus(%d)  integrity=%dus  destroyed=%d  total=%dus" % [
 		name, _blocks.size(),
 		t_pass1_end - t_pass1,
@@ -427,8 +529,9 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		t_columns_end - t_columns, num_columns_rebuilt,
 		t_integrity_end - t_integrity,
 		destroyed_keys.size(),
-		t_total_end - t_total,
+		_total_us,
 	])
+	GameManager.tick_add("take_damage_at", _total_us)
 
 	# If all blocks gone, remove the structure node entirely
 	if _blocks.is_empty():
@@ -543,6 +646,12 @@ func _check_structural_integrity() -> void:
 		return
 	if _blocks.is_empty():
 		return
+	# Detached structures have no y=0 ground blocks by definition.  Skip the
+	# integrity cascade — otherwise every single block destruction would
+	# re-detach ALL remaining blocks into yet another new structure, creating
+	# an infinite chain of ephemeral objects.
+	if _is_detached_structure:
+		return
 
 	var t_si_total := Time.get_ticks_usec()
 
@@ -555,8 +664,6 @@ func _check_structural_integrity() -> void:
 
 	# If no ground blocks exist, ALL remaining blocks are unsupported
 	if ground_seeds.is_empty():
-		if GameManager.debug_disable_falling_clusters:
-			return
 		var all_keys: Array[Vector3i] = []
 		for key: Vector3i in _blocks:
 			all_keys.append(key)
@@ -568,13 +675,15 @@ func _check_structural_integrity() -> void:
 		for component in components:
 			_detach_cluster(component)
 		var t_detach_end := Time.get_ticks_usec()
+		var si_us := Time.get_ticks_usec() - t_si_total
 		print("[StructuralIntegrity] %s  blocks=%d  ground=0(all floating)  bfs=%dus  components=%dus(%d)  detach=%dus(%d blocks)  total=%dus" % [
 			name, _blocks.size(),
 			t_bfs_end - t_bfs,
 			t_comp_end - t_comp, components.size(),
 			t_detach_end - t_detach, all_keys.size(),
-			Time.get_ticks_usec() - t_si_total,
+			si_us,
 		])
+		GameManager.tick_add("structural_integrity", si_us)
 		return
 
 	# Multi-source BFS from all ground blocks simultaneously
@@ -609,11 +718,6 @@ func _check_structural_integrity() -> void:
 		])
 		return
 
-	# When falling clusters are disabled, keep unsupported blocks in-place
-	# as normal structure blocks (they retain shielding, debris, explosion behavior).
-	if GameManager.debug_disable_falling_clusters:
-		return
-
 	# Group unsupported blocks into connected components, each becomes a cluster
 	var t_comp := Time.get_ticks_usec()
 	var components := _find_connected_components(unsupported)
@@ -624,13 +728,15 @@ func _check_structural_integrity() -> void:
 		_detach_cluster(component)
 	var t_detach_end := Time.get_ticks_usec()
 
+	var si_us := Time.get_ticks_usec() - t_si_total
 	print("[StructuralIntegrity] %s  blocks=%d  ground=%d  unsupported=%d  bfs=%dus  components=%dus(%d)  detach=%dus  total=%dus" % [
 		name, _blocks.size(), ground_seeds.size(), unsupported.size(),
 		t_bfs_end - t_bfs,
 		t_comp_end - t_comp, components.size(),
 		t_detach_end - t_detach,
-		Time.get_ticks_usec() - t_si_total,
+		si_us,
 	])
+	GameManager.tick_add("structural_integrity", si_us)
 
 
 func _find_connected_components(keys: Array[Vector3i]) -> Array:
@@ -766,15 +872,70 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 				rebuilt_columns[col_key] = true
 				_rebuild_column(key.x, key.z)
 
-	# Build the FallingBlockCluster on all peers
 	var typed_keys: Array[Vector3i] = []
 	var typed_hps: Array[float] = []
 	for i in block_keys.size():
 		typed_keys.append(block_keys[i] as Vector3i)
 		typed_hps.append(float(block_hps[i]))
 
-	_spawn_falling_cluster(typed_keys, typed_hps, spawn_pos, cluster_mass,
-		attacker_id, grid_num_x, grid_num_y, grid_num_z, mass_per_block)
+	if not GameManager.debug_disable_detached_structures:
+		# Default: spawn a new static structure from the detached blocks
+		_spawn_detached_structure(typed_keys, typed_hps)
+
+
+func _spawn_detached_structure(block_keys: Array[Vector3i],
+		block_hps: Array[float]) -> void:
+	## Spawn a new structure instance from detached blocks (debug: no falling).
+	## The new structure is the same class as self, placed at the same transform,
+	## with only the given blocks populated at their current HPs.
+	var scene_root := get_tree().current_scene
+	if scene_root == null:
+		return
+
+	# Build HP dictionary for init
+	var hp_dict: Dictionary = {}
+	for i in block_keys.size():
+		hp_dict[block_keys[i]] = block_hps[i]
+
+	# Create a new instance of the same concrete class.
+	# Pass pre-computed material and block_hp so _ready() doesn't need to
+	# derive them from subclass exports (which default to wrong values on
+	# bare new() instances, and OBJ structures would queue_free immediately).
+	var new_structure: DestructibleBlockStructure = get_script().new()
+	new_structure.name = "%s_detached_%d" % [name, randi() % 10000]
+	new_structure.structure_size = structure_size
+	new_structure._init_from_detach = {
+		"block_keys": block_keys,
+		"block_hps": hp_dict,
+		"block_hp": _block_hp,
+		"material": _structure_material.duplicate() if _structure_material else null,
+	}
+
+	# Add under the same parent (Structures node) so explosion scans find it.
+	# Set transform BEFORE add_child so _ready() creates block physics bodies
+	# at the correct global positions (avoids a deferred transform update).
+	var structures_node := get_parent()
+	if structures_node:
+		# Same parent as self → local transform is correct
+		new_structure.transform = transform
+		structures_node.add_child(new_structure)
+	else:
+		# Fallback: different parent → use global_transform after add
+		scene_root.add_child(new_structure)
+		new_structure.global_transform = global_transform
+
+	# Diagnostic: print creation details + first block's global position
+	var sample_block_pos := "N/A"
+	if not new_structure._blocks.is_empty():
+		var first_key: Vector3i = new_structure._blocks.keys()[0]
+		var first_body: StaticBody3D = new_structure._blocks[first_key]["body"]
+		if is_instance_valid(first_body):
+			sample_block_pos = str(first_body.global_position)
+	print("[SpawnDetachedStructure] name=%s  blocks=%d  parent=%s  struct_pos=%s  sample_block_pos=%s  script=%s" % [
+		new_structure.name, new_structure._blocks.size(),
+		new_structure.get_parent().name if new_structure.get_parent() else "null",
+		str(new_structure.global_position), sample_block_pos,
+		str(new_structure.get_script().resource_path)])
 
 
 func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float],

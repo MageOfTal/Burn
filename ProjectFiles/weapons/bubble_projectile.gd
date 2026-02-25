@@ -12,7 +12,7 @@ extends ProjectileBase
 ##   - Player overlap via distance check (_check_player_overlap)
 ##
 ## Collision layers:
-##   Layer 3 (bit 4): bubble body. Walls (1) and tower debris (2) stop them.
+##   Layer 3 (bit 4): bubble body. World (1) and smooth wall collision (2048) stop them.
 ##   Hitscan raycasts include layer 3 in their mask, so they hit bubbles.
 ##
 ## Pop condition: kinetic energy (0.5*m*v^2) exceeds threshold.

@@ -107,14 +107,18 @@ func _process(_delta: float) -> void:
 	## Deferred mesh/shape rebuild after block destruction.
 	if _mesh_dirty:
 		_mesh_dirty = false
+		var _t0 := Time.get_ticks_usec()
 		_rebuild_visuals()
+		GameManager.frame_add("cluster_mesh", Time.get_ticks_usec() - _t0)
 		set_process(false)
 
 
 func _physics_process(delta: float) -> void:
+	var _t0 := Time.get_ticks_usec()
 	super._physics_process(delta)
 
 	if not multiplayer.is_server():
+		GameManager.tick_add("cluster_tick", Time.get_ticks_usec() - _t0)
 		return
 
 	# Freeze on settle: if moving slowly for long enough, stop simulating
@@ -124,6 +128,8 @@ func _physics_process(delta: float) -> void:
 			freeze = true
 	else:
 		_settle_timer = 0.0
+
+	GameManager.tick_add("cluster_tick", Time.get_ticks_usec() - _t0)
 
 
 # ======================================================================
@@ -271,21 +277,26 @@ func _on_body_entered(body: Node) -> void:
 	if not multiplayer.is_server():
 		return
 
+	var _t_contact := Time.get_ticks_usec()
+
 	# --- Cluster-vs-cluster: only higher instance_id processes to avoid double ---
 	if body is FallingBlockCluster:
 		if get_instance_id() < body.get_instance_id():
 			return
 		_handle_cluster_vs_cluster(body)
+		GameManager.tick_add("cluster_contact", Time.get_ticks_usec() - _t_contact)
 		return
 
 	# --- Structure damage (momentum carving) ---
 	var target_structure := _find_structure(body)
 	if target_structure:
 		_handle_structure_hit(body, target_structure)
+		GameManager.tick_add("cluster_contact", Time.get_ticks_usec() - _t_contact)
 		return
 
 	# --- Generic damageable body (player, etc.) — momentum-based structure damage ---
 	_handle_generic_hit(body)
+	GameManager.tick_add("cluster_contact", Time.get_ticks_usec() - _t_contact)
 
 
 func _compute_impact(body: Node, other_velocity: Vector3 = Vector3.ZERO) -> Dictionary:

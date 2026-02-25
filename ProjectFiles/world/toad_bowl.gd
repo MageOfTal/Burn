@@ -2,7 +2,7 @@ extends Node3D
 
 ## Debug toad bowl — a concave hemisphere near the host player filled with 60
 ## persistent toads that bounce around forever, never despawning.
-## Used to test shadow body physics push without needing the toad dimension.
+## Used to test player push physics without needing the toad dimension.
 ##
 ## The bowl is an actual semi-sphere built from rings of angled collision panels
 ## that approximate a smooth concave interior. Toads bounce off the curved walls
@@ -203,7 +203,7 @@ func _spawn_toads() -> void:
 		toad._floor_y = -9999.0
 
 		# Persistent toads collide with each other (add layer 7 to mask)
-		toad.collision_mask = 2561 | 64  # world (1) + shadow body (512) + walls (2048) + toad bodies (64)
+		toad.collision_mask = 2561 | 64  # world (1) + player push (512) + walls (2048) + toad bodies (64)
 
 		# Higher bounce so they stay lively in the bowl
 		var phys_mat := PhysicsMaterial.new()

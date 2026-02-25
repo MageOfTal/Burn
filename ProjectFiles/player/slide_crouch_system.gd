@@ -475,7 +475,7 @@ func track_pre_land_velocity() -> void:
 
 
 func process_landing(delta: float) -> void:
-	## Process slide-on-land after move_and_slide. Call from player._server_process.
+	## Process slide-on-land after movement. Call from player._server_process.
 	var was_airborne := not _was_on_floor
 	_was_on_floor = player.is_on_floor()
 

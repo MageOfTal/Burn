@@ -5,7 +5,7 @@ extends RefCounted
 
 const DEFAULT_PORT := 7777
 const MAX_PLAYERS := 40
-const SERVER_TICK_RATE := 240
+const SERVER_TICK_RATE := 60
 
 ## Game version — must match between server and client to connect.
 ## Bump this whenever you make changes that break compatibility.

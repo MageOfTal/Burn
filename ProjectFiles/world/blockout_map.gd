@@ -43,6 +43,7 @@ const DEMO_SPAWN_TABLE: Array[Dictionary] = [
 	{ "path": "res://items/definitions/gadget_grappling_hook.tres",       "offset": Vector3(-4, 0, 0) },
 	{ "path": "res://items/definitions/consumable_medkit.tres",          "offset": Vector3(5, 0, 0) },
 	{ "path": "res://items/definitions/gun_jeg_double_barrel_shotgun.tres", "offset": Vector3(-5, 0, 0) },
+	{ "path": "res://items/definitions/debug_lagger.tres", "offset": Vector3(0, 0, -4) },
 ]
 
 ## Zone visual
@@ -776,7 +777,7 @@ func _place_world_item(item_data: ItemData, pos: Vector3) -> void:
 
 func spawn_toad_bowl() -> void:
 	## Spawn a toad bowl near the host player: a circular arena filled with 30
-	## persistent bouncing toads for testing shadow body push physics.
+	## persistent bouncing toads for testing player push physics.
 	var players_node := get_node_or_null("Players")
 	if players_node == null:
 		return

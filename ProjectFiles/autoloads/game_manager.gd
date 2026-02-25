@@ -17,7 +17,7 @@ var debug_disable_burn_timers: bool = true
 var debug_disable_demon: bool = true
 var debug_disable_zone_damage: bool = true
 var debug_skip_structures: bool = false
-var debug_disable_falling_clusters: bool = false
+var debug_disable_detached_structures: bool = false
 var debug_disable_bots: bool = true          # Don't spawn bots on host
 var debug_free_firing: bool = false          # No burn fuel cost when firing weapons
 var debug_shotgun_boost: bool = false        # Double barrel: halved fire rate, doubled pellets
@@ -27,6 +27,7 @@ var debug_grapple_visuals: bool = false     # Show pill, angle display, spheres,
 var debug_grapple_horiz_nudge: bool = true # Launch nudge includes horizontal component toward anchor
 var show_fps_hud: bool = true                # Show FPS counter on gameplay HUD
 var debug_freecam_active: bool = false      # Set by DebugFreecam autoload
+var frame_advance_start_us: int = 0        # Timestamp when frame advance unpaused (0 = not advancing)
 
 # Bubble / physics debug toggles (set from pause menu)
 var debug_hide_bubbles: bool = false
@@ -42,6 +43,9 @@ var debug_velocity_iterations: int = 10
 var debug_show_explosion_spheres: bool = false  # Show tower rubble explosion radii
 var debug_show_explosion_rays: bool = false     # Show explosion raycast lines to wall blocks
 var disable_debris: bool = false                 # Skip spawning cosmetic wall debris
+var debug_lagger_delay_ms: float = 2.0           # Lagger weapon: ms to stall per tick/shot
+var debug_lagger_overhead_mode: bool = true      # true = stall every tick, false = stall on fire only
+var debug_explosion_repeat: bool = false         # Run C++ shielding calc 4x for perf testing
 
 # Toad dimension debug toggles (set from pause menu)
 var debug_toad_no_physics: bool = false   # Disable all physics for toad rain bodies
@@ -61,6 +65,55 @@ signal match_started
 signal match_ended
 signal player_usernames_changed
 signal god_mode_changed(enabled: bool)
+
+# ── Physics tick profiler ────────────────────────────────────────────────
+# Always-on: tick_add() accumulates a fast running total (_tick_total_us)
+# every tick. At the start of each tick, the previous total is published
+# to last_tick_gdscript_us (read by HUDPerfGraph for the pink line).
+#
+# Per-subsystem Dictionary breakdown only records when _tick_profile_remaining > 0
+# (triggered by start_tick_profile). This keeps always-on overhead minimal.
+var _tick_profile_remaining: int = 0
+var _tick_timing_us: Dictionary = {}     # subsystem -> total us this tick
+var _tick_timing_count: Dictionary = {}  # subsystem -> call count this tick
+var _frame_timing_us: Dictionary = {}    # subsystem -> total us (from _process)
+var _frame_timing_count: Dictionary = {} # subsystem -> call count (from _process)
+var _tick_number: int = 0
+
+# Always-on fast accumulator for the graph (no Dictionary overhead)
+var _tick_total_us: int = 0              # Running total for current tick
+var last_tick_gdscript_us: int = 0       # Total from previous tick (read by HUD)
+
+
+func _ready() -> void:
+	process_physics_priority = -100  # Run before all game nodes
+
+
+func start_tick_profile(num_ticks: int) -> void:
+	_tick_profile_remaining = num_ticks
+	_tick_number = 0
+	_tick_timing_us.clear()
+	_tick_timing_count.clear()
+	_frame_timing_us.clear()
+	_frame_timing_count.clear()
+	print("[TickProfile] Started: profiling next %d ticks" % num_ticks)
+
+
+func tick_add(subsystem: String, us: int) -> void:
+	## Call from _physics_process or body_entered handlers to record subsystem time.
+	## Always accumulates the fast total; per-subsystem breakdown only when profiling.
+	_tick_total_us += us
+	if _tick_profile_remaining > 0:
+		_tick_timing_us[subsystem] = _tick_timing_us.get(subsystem, 0) + us
+		_tick_timing_count[subsystem] = _tick_timing_count.get(subsystem, 0) + 1
+
+
+func frame_add(subsystem: String, us: int) -> void:
+	## Call from _process to record per-frame subsystem time (e.g. greedy mesh).
+	if _tick_profile_remaining <= 0:
+		return
+	_frame_timing_us[subsystem] = _frame_timing_us.get(subsystem, 0) + us
+	_frame_timing_count[subsystem] = _frame_timing_count.get(subsystem, 0) + 1
 
 
 func set_god_mode(enabled: bool) -> void:
@@ -97,6 +150,51 @@ func get_username(peer_id: int) -> String:
 func clear_usernames() -> void:
 	player_usernames.clear()
 	player_usernames_changed.emit()
+
+
+func _physics_process(_delta: float) -> void:
+	# Always publish previous tick's total for the HUD graph (pink line)
+	last_tick_gdscript_us = _tick_total_us
+	_tick_total_us = 0
+
+	# Per-subsystem console profiling (only when explicitly triggered)
+	if _tick_profile_remaining <= 0:
+		return
+
+	# Print PREVIOUS tick's data (collected during that tick's callbacks)
+	if _tick_number > 0 and (not _tick_timing_us.is_empty() or not _frame_timing_us.is_empty()):
+		var parts: PackedStringArray = []
+		var total_us := 0
+
+		# Sort physics-tick timings by time descending
+		var sorted_keys := _tick_timing_us.keys()
+		sorted_keys.sort_custom(func(a, b): return _tick_timing_us[a] > _tick_timing_us[b])
+		for key in sorted_keys:
+			var us: int = _tick_timing_us[key]
+			var count: int = _tick_timing_count.get(key, 1)
+			total_us += us
+			if count > 1:
+				parts.append("%s=%dus(x%d)" % [key, us, count])
+			else:
+				parts.append("%s=%dus" % [key, us])
+
+		# Frame timings (from _process, marked with pipes)
+		for key in _frame_timing_us:
+			var us: int = _frame_timing_us[key]
+			var count: int = _frame_timing_count.get(key, 1)
+			if count > 1:
+				parts.append("|%s=%dus(x%d)|" % [key, us, count])
+			else:
+				parts.append("|%s=%dus|" % [key, us])
+
+		print("[TickProfile #%d] gdscript=%dus  %s" % [_tick_number, total_us, "  ".join(parts)])
+
+	_tick_timing_us.clear()
+	_tick_timing_count.clear()
+	_frame_timing_us.clear()
+	_frame_timing_count.clear()
+	_tick_number += 1
+	_tick_profile_remaining -= 1
 
 
 func _process(delta: float) -> void:

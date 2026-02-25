@@ -22,6 +22,9 @@ var _velocity_iter_label: Label = null
 var _mass_pin_button: CheckButton = null
 var _explosion_spheres_button: CheckButton = null
 var _explosion_rays_button: CheckButton = null
+var _lagger_delay_input: LineEdit = null
+var _lagger_overhead_button: CheckButton = null
+var _explosion_repeat_button: CheckButton = null
 var _toad_density_input: LineEdit = null
 var _toad_fog_density_input: LineEdit = null
 var _toad_mass_input: LineEdit = null
@@ -65,7 +68,7 @@ var _fog_button: CheckButton = null
 var _volumetric_fog_button: CheckButton = null
 var _fps_hud_button: CheckButton = null
 var _debris_button: CheckButton = null
-var _falling_clusters_button: CheckButton = null
+var _detached_structures_button: CheckButton = null
 
 
 func _ready() -> void:
@@ -226,6 +229,16 @@ func _build_main_panel() -> void:
 	_explosion_rays_button = _add_check("Show Explosion Rays (Wall Blocks)", false, vbox)
 	_explosion_rays_button.toggled.connect(_on_explosion_rays_toggled)
 
+	_lagger_delay_input = _add_scale_input("Lagger Delay (ms)",
+		GameManager.debug_lagger_delay_ms,
+		_on_lagger_delay_submitted, _on_lagger_delay_focus_lost, vbox)
+
+	_lagger_overhead_button = _add_check("Lagger: Overhead Mode", GameManager.debug_lagger_overhead_mode, vbox)
+	_lagger_overhead_button.toggled.connect(_on_lagger_overhead_toggled)
+
+	_explosion_repeat_button = _add_check("Explosion Shielding 2000x Repeat", GameManager.debug_explosion_repeat, vbox)
+	_explosion_repeat_button.toggled.connect(_on_explosion_repeat_toggled)
+
 	# Separator
 	vbox.add_child(HSeparator.new())
 
@@ -297,8 +310,8 @@ func _build_main_panel() -> void:
 	_debris_button = _add_check("Disable Debris", GameManager.disable_debris, vbox)
 	_debris_button.toggled.connect(_on_debris_toggled)
 
-	_falling_clusters_button = _add_check("Disable Falling Clusters", GameManager.debug_disable_falling_clusters, vbox)
-	_falling_clusters_button.toggled.connect(_on_falling_clusters_toggled)
+	_detached_structures_button = _add_check("Disable Detached Structures", GameManager.debug_disable_detached_structures, vbox)
+	_detached_structures_button.toggled.connect(_on_detached_structures_toggled)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -778,9 +791,9 @@ func _on_debris_toggled(pressed: bool) -> void:
 	GameManager.disable_debris = pressed
 
 
-func _on_falling_clusters_toggled(pressed: bool) -> void:
-	GameManager.debug_disable_falling_clusters = pressed
-	print("[PauseMenu] Falling clusters: %s" % ("DISABLED" if pressed else "ENABLED"))
+func _on_detached_structures_toggled(pressed: bool) -> void:
+	GameManager.debug_disable_detached_structures = pressed
+	print("[PauseMenu] Detached structures: %s" % ("DISABLED" if pressed else "ENABLED"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -887,6 +900,29 @@ func _on_explosion_spheres_toggled(pressed: bool) -> void:
 func _on_explosion_rays_toggled(pressed: bool) -> void:
 	GameManager.debug_show_explosion_rays = pressed
 	print("[PauseMenu] Explosion rays: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_lagger_delay_submitted(text: String) -> void:
+	var val := clampf(text.to_float(), 0.0, 1000.0)
+	GameManager.debug_lagger_delay_ms = val
+	_lagger_delay_input.text = "%.1f" % val
+	_lagger_delay_input.release_focus()
+	print("[PauseMenu] Lagger delay set to %.1f ms" % val)
+
+
+func _on_lagger_delay_focus_lost() -> void:
+	_on_lagger_delay_submitted(_lagger_delay_input.text)
+
+
+func _on_lagger_overhead_toggled(pressed: bool) -> void:
+	GameManager.debug_lagger_overhead_mode = pressed
+	var mode := "overhead (every tick)" if pressed else "one-off (on fire)"
+	print("[PauseMenu] Lagger mode: %s" % mode)
+
+
+func _on_explosion_repeat_toggled(pressed: bool) -> void:
+	GameManager.debug_explosion_repeat = pressed
+	print("[PauseMenu] Explosion shielding 2000x repeat: %s" % ("ON" if pressed else "OFF"))
 
 
 func _on_toad_density_submitted(text: String) -> void:

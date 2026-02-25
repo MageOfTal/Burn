@@ -526,17 +526,38 @@ func _update_fps_hud(delta: float) -> void:
 
 	# Feed performance graph. _graph_tps is computed in _physics_process
 	# (exact tick count over a 500 ms wall-clock window, no smoothing).
+	# During freecam pause (time_scale=0), delta=0 — skip updates to preserve
+	# the last real values on screen. During frame advance, fa_start > 0 and
+	# we use real elapsed computation time.
+	var frame_ms: float
+	var effective_delta: float
+	var fa_start := GameManager.frame_advance_start_us
+	if fa_start > 0:
+		frame_ms = float(Time.get_ticks_usec() - fa_start) / 1000.0
+		effective_delta = frame_ms / 1000.0
+	else:
+		effective_delta = delta
+		frame_ms = delta * 1000.0
+
+	# When frozen (time_scale=0, delta=0, no frame advance), skip all updates
+	# so the HUD keeps showing the last real values instead of zeros.
+	if effective_delta < 0.001:
+		if _perf_graph:
+			_perf_graph.visible = GameManager.show_fps_hud
+		return
+
 	if _perf_graph:
 		_perf_graph.visible = GameManager.show_fps_hud
-		if _perf_graph.visible and delta > 0.0:
-			_perf_graph.push_sample(minf(1.0 / delta, 1000.0), _graph_tps)
+		if _perf_graph.visible:
+			var tick_ms: float = GameManager.last_tick_gdscript_us / 1000.0
+			_perf_graph.push_sample(minf(1.0 / effective_delta, 1000.0), _graph_tps, tick_ms, frame_ms)
 
 	if _fps_hud_label == null:
 		return
 	_fps_hud_label.visible = GameManager.show_fps_hud
 	if not _fps_hud_label.visible:
 		return
-	_fps_hud_timer += delta
+	_fps_hud_timer += effective_delta
 	if _fps_hud_timer >= 1.0:
 		# Scale tick count to exactly 1 second to compensate for timer overshoot
 		var elapsed: float = _fps_hud_timer
@@ -545,8 +566,13 @@ func _update_fps_hud(delta: float) -> void:
 		_fps_hud_timer = 0.0  # Hard reset — carry-remainder drifts under heavy load
 
 	var cap_str: String = "" if _fps_cap_index == 0 else " | CAP: %d" % FPS_CAPS[_fps_cap_index]
-	_fps_hud_label.text = "FPS: %d | TPS: %d/%d%s" % [
+	var tick_ms: float = GameManager.last_tick_gdscript_us / 1000.0
+	var other_ms: float = maxf(frame_ms - tick_ms, 0.0)
+	_fps_hud_label.text = "FPS: %d | TPS: %d/%d | Tick: %.1f + Other: %.1f = Frame: %.1fms%s" % [
 		Engine.get_frames_per_second(),
 		_wallclock_tps,
 		Engine.physics_ticks_per_second,
+		tick_ms,
+		other_ms,
+		frame_ms,
 		cap_str]

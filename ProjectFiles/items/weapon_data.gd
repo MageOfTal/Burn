@@ -64,3 +64,7 @@ func get_rarity_structure_damage() -> float:
 @export var gun_model_path: String = ""
 ## Path to the fire sound .ogg (res:// path).
 @export var fire_sound_path: String = ""
+
+@export_group("Debug")
+## If true, this weapon uses WeaponLagger (physics tick stall for lag testing).
+@export var is_debug_lagger: bool = false

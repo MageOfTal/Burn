@@ -3,15 +3,17 @@ extends Node
 ## Debug free camera — toggled with F3.
 ##
 ## When active:
-##   - Sets GameManager.debug_freecam_active = true (player skips physics)
+##   - Freezes game via Engine.time_scale = 0.0 (NOT tree pause)
 ##   - Spawns a Camera3D at the player camera's position
 ##   - WASD + mouse to fly, Space = up, Ctrl = down, Shift = fast
-##   - Grapple rope + pill visuals keep rendering (frozen state)
-##   - Right Arrow = advance simulation by one physics tick
+##   - Right Arrow = advance simulation by one full frame with normal timing
 ##
-## When deactivated:
-##   - Restores player camera
-##   - Sets flag back to false so player resumes normal play
+## Uses Engine.time_scale instead of get_tree().paused so that frame advance
+## gets correct deltas (~16ms). Tree pause accumulates wall-clock time during
+## the pause, giving tweens/timers a multi-second delta on resume — causing
+## them to complete instantly instead of advancing frame-by-frame.
+## With time_scale = 0.0, delta is always 0 while paused. Setting
+## time_scale = 1.0 for one frame gives everything a natural ~16ms delta.
 
 const FLY_SPEED := 15.0
 const FLY_SPEED_FAST := 45.0
@@ -26,9 +28,15 @@ var _mouse_delta := Vector2.ZERO
 ## HUD label shown while freecam is active
 var _label: Label = null
 
-## Tick-stepping: when > 0, the game is temporarily unpaused to advance physics.
-## The counter decrements each _physics_process; when it hits 0 we re-pause.
-var _step_ticks_remaining := 0
+## Frame advance: true while waiting for the advance frame to execute.
+## Set in _input (frame N). Godot reads time_scale before _input, so the
+## actual advance runs on frame N+1 when time_scale=1.0 takes effect.
+var _advance_pending := false
+var _saved_max_physics_steps := 8
+
+## Manual real-time delta for camera movement.
+## Engine.time_scale = 0.0 zeroes all deltas, so the camera computes its own.
+var _last_cam_us: int = 0
 
 
 func _ready() -> void:
@@ -42,8 +50,8 @@ func _input(event: InputEvent) -> void:
 			_toggle()
 			get_viewport().set_input_as_handled()
 			return
-		# Right Arrow = advance one physics tick while paused
-		if is_active and event.physical_keycode == KEY_RIGHT and _step_ticks_remaining == 0:
+		# Right Arrow = advance one full frame while paused
+		if is_active and event.physical_keycode == KEY_RIGHT and not _advance_pending:
 			_begin_tick_step()
 			get_viewport().set_input_as_handled()
 			return
@@ -54,17 +62,34 @@ func _input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 
 
-func _physics_process(delta: float) -> void:
+func _physics_process(_delta: float) -> void:
+	# With time_scale = 0.0, _physics_process never fires (no accumulated time).
+	# It only fires during frame advance (time_scale = 1.0).
+	# Record the start time here for accurate frame-time measurement.
+	if _advance_pending:
+		GameManager.frame_advance_start_us = Time.get_ticks_usec()
+
+
+func _process(delta: float) -> void:
 	if not is_active or _cam == null:
 		return
 
-	# Tick-stepping: we unpaused last tick to let the game advance one frame.
-	# Now re-pause and restore the freecam flag.
-	if _step_ticks_remaining > 0:
-		_step_ticks_remaining -= 1
-		if _step_ticks_remaining == 0:
-			get_tree().paused = true
-			GameManager.debug_freecam_active = true
+	# Real-time delta for camera movement (unaffected by Engine.time_scale).
+	var now_us := Time.get_ticks_usec()
+	var cam_delta: float
+	if _last_cam_us > 0:
+		cam_delta = clampf(float(now_us - _last_cam_us) / 1000000.0, 0.0, 0.1)
+	else:
+		cam_delta = 0.016
+	_last_cam_us = now_us
+
+	# Frame advance: detect the advance frame.
+	# On frame N (when _begin_tick_step was called), delta is still 0 because
+	# Godot computed it with the old time_scale before _input ran.
+	# On frame N+1, time_scale = 1.0 is in effect so delta > 0.
+	if _advance_pending and delta > 0.001:
+		_advance_pending = false
+		_do_repause.call_deferred()
 
 	# Mouse look
 	_yaw -= _mouse_delta.x * MOUSE_SENSITIVITY
@@ -74,7 +99,7 @@ func _physics_process(delta: float) -> void:
 
 	_cam.rotation = Vector3(_pitch, _yaw, 0.0)
 
-	# WASD + Space/Ctrl movement
+	# WASD + Space/Ctrl movement (uses real delta, not engine-scaled delta)
 	var forward := -_cam.global_transform.basis.z
 	var right := _cam.global_transform.basis.x
 	var up := Vector3.UP
@@ -97,18 +122,37 @@ func _physics_process(delta: float) -> void:
 
 	if move.length() > 0.001:
 		move = move.normalized()
-	_cam.global_position += move * speed * delta
+	_cam.global_position += move * speed * cam_delta
+
+
+func _do_repause() -> void:
+	Engine.time_scale = 0.0
+	GameManager.debug_freecam_active = true
+	GameManager.frame_advance_start_us = 0
+	Engine.max_physics_steps_per_frame = _saved_max_physics_steps
 
 
 func _begin_tick_step() -> void:
-	# Temporarily unfreeze the player and unpause so the game advances one tick.
-	# We need 2 here because autoloads process BEFORE the scene tree in each tick.
-	# Tick 1: we decrement 2→1, game nodes run (unpaused, freecam flag cleared).
-	# Tick 2: we decrement 1→0 and re-pause BEFORE game nodes would run again.
-	# Result: the game advances exactly one physics tick.
-	_step_ticks_remaining = 2
+	# Set time_scale = 1.0 so the next frame gets a real delta (~16ms).
+	# max_physics_steps = 1 prevents catch-up ticks from residual accumulator time.
+	#
+	# Timeline:
+	#   Frame N (_input runs here):
+	#     Delta was already computed with time_scale=0 → delta=0.
+	#     We set time_scale=1.0, but this frame still uses delta=0.
+	#     No physics ticks fire. _process(0.0) runs; _advance_pending true
+	#     but delta ≤ 0.001 so no repause yet.
+	#   Frame N+1:
+	#     Delta computed with time_scale=1.0 → delta≈16ms.
+	#     Physics: 1 tick fires (max_steps=1). Game nodes process. ✓
+	#     _process: autoload detects delta>0.001, defers repause.
+	#              Game nodes' _process runs normally. Tweens advance. ✓
+	#     Deferred: _do_repause() → time_scale=0. ✓
+	#     Render. ✓
+	_advance_pending = true
+	Engine.max_physics_steps_per_frame = 1
 	GameManager.debug_freecam_active = false
-	get_tree().paused = false
+	Engine.time_scale = 1.0
 
 
 func _toggle() -> void:
@@ -127,6 +171,8 @@ func _activate() -> void:
 
 	is_active = true
 	GameManager.debug_freecam_active = true
+	_saved_max_physics_steps = Engine.max_physics_steps_per_frame
+	_last_cam_us = Time.get_ticks_usec()
 
 	# Spawn camera at player camera position/rotation
 	var player_cam: Camera3D = local_player.camera
@@ -150,12 +196,13 @@ func _activate() -> void:
 	# Ensure mouse is captured for camera control
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
-	# Pause the game so physics freeze — lets you inspect collisions
-	get_tree().paused = true
+	# Freeze game time. Uses time_scale instead of tree pause so frame advance
+	# gets correct deltas (tweens/particles advance naturally per step).
+	Engine.time_scale = 0.0
 
 	# Show HUD label
 	_label = Label.new()
-	_label.text = "FREECAM [PAUSED] (F3 to exit) — WASD fly, Space up, Ctrl down, Shift fast, Right Arrow = step 1 tick"
+	_label.text = "FREECAM [PAUSED] (F3 to exit) — WASD fly, Space up, Ctrl down, Shift fast, Right Arrow = step 1 frame"
 	_label.add_theme_font_size_override("font_size", 18)
 	_label.add_theme_color_override("font_color", Color(1.0, 0.9, 0.3))
 	_label.position = Vector2(20, 20)
@@ -173,11 +220,13 @@ func _activate() -> void:
 
 func _deactivate() -> void:
 	is_active = false
-	_step_ticks_remaining = 0
+	_advance_pending = false
 	GameManager.debug_freecam_active = false
+	GameManager.frame_advance_start_us = 0
 
-	# Unpause the game
-	get_tree().paused = false
+	# Restore normal time
+	Engine.time_scale = 1.0
+	Engine.max_physics_steps_per_frame = _saved_max_physics_steps
 
 	# Restore player camera
 	var local_player := _find_local_player()

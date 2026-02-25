@@ -1,0 +1,205 @@
+The great audit prompt:
+Your objective is this: I want you to go through your memory.md file, and all of the entire code and all its
+  functionalities, including the c++, custom engine code, and Jolt. As you go, add descriptions and chain of execution
+  descriptions to a document detailing all the different functions and systems. If a single program is too long to
+  read all of, break it up into chunks so you can still read it all for a comprehensive understanding. This new file
+  should be thorough and detailed enough to serve as a new memory.md file moving forward, with all the info another
+  instance of Claude could need to work smoothly. After the first pass, go back through all the code, and fix any code
+  comments that are innacurate, confusing, or outdated, and then perform the process of going through your memory.md
+  and all the code again to create a new file, which after completing, will replace your current memory.md,
+  synthesizing it with any crucial details in the original.
+
+
+
+
+
+
+by the way, the contacts for breaking shouldn't be exclusive to ground--walls and ramps should count too. the idea is this--if it hits a player, the player is forced out of the way because its heavier--that doesn't mean it doesn't impact the velocity, just that it doesn't impact it much. when it hits an object, the amount of health that structure has determines how much it "stops" the object. a lot of stopping in a short period of time breaks it. and of course, the ground doesn't have any health, it just stops it.  there shouldn't be any other methods of breaking the tower other than contact.
+
+
+also, if explosions cant penetrate through harder (more healthy objects) the same logic should apply to explosions hitting the tower. furthermore, this means that explosions on impact should damage the fragments of the tower that made them.
+
+
+
+make sure that explosion shielding properly implements structure vs regular damage--how much does a player shield a structure from if they take less damage from something structure-damage based? for example, if a drill projectile does high structure damage, but low player damage, how much should it penetrate? the clear answer is none--something fully absorbed by the player should be fully absorbed by the player. but for explosions, this seems odd.
+
+
+if collisions between structures cause them to break, then make it so that it applies the break before any structure on structure damage, so it doesn't count the momentum of the full unbroken object for the damage.
+
+make sure that features like the lag gun or freecam pausing are totally disabled for normal play so hackers cant exploit them--same for any debugging toggles in the pause menu!
+
+songs: (implement with rhythm gun?)
+
+collab with thai McGrath or the guy who makes the fan sonic songs (like up 2 speed)
+
+ (kinda rappy, CG5?) baby, burn
+
+burn,
+baby burn, baby burn, baby burn
+knock em dead, take their heads make em turn
+baby bury, baby burn, baby burn
+
+caramelldansen
+
+sorta country rock song:
+
+(later part of chorus)
+see the flowers bloom in spring, 
+watch the colors change in fall
+
+it don't get much better than this
+if it does get better at all
+
+yeah this is the life
+yeah this is the good life
+(epic guitar solo)
+
+
+add toad for toad soccer in lobby? also jukebox would be nice for accustoming players to lyrics (sing along moments in game!)
+
+
+
+
+CONSIDER:
+5. Damageable interface / base class
+Every destructible object implements take_damage(amount, attacker_id) but there's no formal interface. Objects that should share this:
+
+Tower slabs/chunks
+Destructible walls/ramps (also take_damage_at for spatial)
+Target dummies
+Players (health system)
+A Damageable base (or even just a documented interface contract) would let ExplosionHelper and weapon code treat all damageable things uniformly without type-checking.
+
+
+
+
+
+
+
+
+
+3. Proximity UI Pattern → ProximityInteractable base or mixin
+
+Three scripts duplicate the same cached-player-lookup + distance-check + Label3D pattern:
+
+
+
+
+
+world_item.gd — "[E] PICKUP" / "[X] SCRAP"
+
+
+
+loot_chest.gd — "[E] OPEN" / "EMPTY"
+
+
+
+Tower chunks could use this too
+
+All use _cached_local_player, a 1-second cache interval, and distance-based label visibility. A ProximityInteractable base would provide the cached lookup, distance check, and label management — subclasses just define the prompt text and interaction behavior.
+
+Strong Candidates (Shared patterns, moderate refactoring)
+
+4. Projectile Base Class → ProjectileBase
+
+BubbleProjectile, RubberBallProjectile, and RocketProjectile all share:
+
+
+
+
+
+launch(direction, speed, shooter_id, damage) entry point
+
+
+
+Lifetime timer + queue_free()
+
+
+
+Collision handling with damage dealing
+
+
+
+Server-authoritative physics
+
+
+
+Ammo override system
+
+
+
+VFX on destruction (pop/explosion/bounce effects)
+
+Currently Bubble and RubberBall extend PhysicsBodyBase (for mass-weighted push), but Rocket extends raw RigidBody3D. A ProjectileBase that extends PhysicsBodyBase could unify the launch interface, lifetime management, damage dealing, and destruction VFX pattern. Each subclass would override behavior (float, bounce, fly straight).
+
+5. Damageable interface / base class
+
+Every destructible object implements take_damage(amount, attacker_id) but there's no formal interface. Objects that should share this:
+
+
+
+
+
+Tower slabs/chunks
+
+
+
+Destructible walls/ramps (also take_damage_at for spatial)
+
+
+
+Target dummies
+
+
+
+Players (health system)
+
+A Damageable base (or even just a documented interface contract) would let ExplosionHelper and weapon code treat all damageable things uniformly without type-checking.
+
+6. Player Subsystem Base → PlayerSubsystem
+
+All player subsystems (HeatSystem, DemonSystem, KamikazeSystem, GrappleSystem, SlideCrouchSystem) follow the same pattern:
+
+
+
+
+
+Extend Node with a class_name
+
+
+
+setup(player: CharacterBody3D) storing a player reference
+
+
+
+Server-side processing + client-side visual processing
+
+
+
+Reset/deactivation methods
+
+
+
+Synced state via ServerSync
+
+A PlayerSubsystem base would formalize this contract with virtual methods like _server_process(delta), _client_process(delta), and reset(). This also makes it easier to add new subsystems consistently.
+
+Nice-to-Have (Would clean things up)
+
+7. Rarity Damage Bonus (duplicated calculation)
+
+The +15% per rarity tier damage bonus is calculated separately in player.gd (for hitscan combat) and weapon_projectile.gd (for projectile spawning). Should live in one place — either on WeaponData as a method (get_damage_with_rarity() → float) or on WeaponBase.
+
+8. Wall-Check Spawn Offset (duplicated)
+
+The wall-proximity raycast that prevents projectiles from spawning inside walls is duplicated between WeaponProjectile (normal fire) and WeaponHitscan (ammo-override fire path). Could be a shared method on WeaponBase.
+
+9. HUD Widget Extraction
+
+player_hud.gd is 806 lines with multiple _create_*() / _update_*() pairs for compass, kill feed, forfeit ring, heat display, etc. These could each be their own class extending a HUDWidget base, making the HUD more modular and each widget independently testable.
+
+10. Screen Overlay Base
+
+FlashbangOverlay, the scope overlay, and the demon vignette all do the same thing: full-screen ColorRect with MOUSE_FILTER_IGNORE, alpha fade-in/out, intensity/duration parameters. A ScreenOverlayBase would standardize this. 
+
+please double check that your changes don't break any external references to the object or mechanic you change.

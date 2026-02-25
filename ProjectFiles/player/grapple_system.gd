@@ -9,7 +9,7 @@ class_name GrappleSystem
 ## velocity from the corrected position.  The outward radial velocity is
 ## automatically eliminated; what remains is tangential (the swing).
 ##
-## On the ground, move_and_slide() blocks the downward component of the
+## On the ground, Jolt's floor contact blocks the downward component of the
 ## derived velocity, so the constraint correction becomes horizontal — the
 ## player glides forward.  In the air, the full 3D correction applies.
 ## There is no ground/air branching — the transition is seamless.
@@ -475,9 +475,9 @@ func process(delta: float) -> void:
 	## 4. Predict test_pos = position + velocity * delta
 	## 5. If test_pos overshoots rope length, snap onto sphere surface
 	## 6. Derive velocity = (snapped_pos - position) / delta
-	## 7. move_and_slide() — floor/wall collisions
+	## 7. Jolt integrates velocity — floor/wall collisions handled natively
 	##
-	## On the ground, move_and_slide() blocks the downward velocity from
+	## On the ground, Jolt's floor contact blocks the downward velocity from
 	## the derived result, so the player glides horizontally.  Going over
 	## a cliff, the floor stops blocking — but the velocity was derived
 	## from the SAME constraint correction, so there's no speed change.

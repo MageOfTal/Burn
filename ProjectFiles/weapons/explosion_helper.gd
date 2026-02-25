@@ -191,13 +191,18 @@ static func do_explosion(
 	var t_pass2_structures_end := Time.get_ticks_usec()
 
 	var t_explosion_total_end := Time.get_ticks_usec()
+	var explosion_us := t_explosion_total_end - t_explosion_total
 	print("[DoExplosion] sphere_query=%dus(%d results)  pass1=%dus(players=%d structs=%d objs=%d)  pass2_players=%dus(%d)  pass2_structs=%dus(scanned=%d skipped=%d hit=%d)  total=%dus" % [
 		t_sphere_end - t_sphere, results.size(),
 		t_pass1_process_end - t_pass1_process, pass1_players, pass1_structures, pass1_objects,
 		t_pass2_players_end - t_pass2_players, pass2_players,
 		t_pass2_structures_end - t_pass2_structures, pass2_scanned, pass2_skipped, pass2_structures,
-		t_explosion_total_end - t_explosion_total,
+		explosion_us,
 	])
+	GameManager.tick_add("do_explosion", explosion_us)
+
+	# Profile the next 60 ticks (~1 second) to see post-explosion aftermath costs
+	GameManager.start_tick_profile(60)
 
 
 # ======================================================================
