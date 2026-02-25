@@ -47,21 +47,6 @@
 
 #include <atomic>
 
-// === Diagnostic counters (atomics — safe from any thread, read from GDScript) ===
-namespace EdgeFixDiag {
-	static std::atomic<int> total_calls{0};
-	static std::atomic<int> box_hits{0};
-	static std::atomic<int> snap_count{0};
-	static std::atomic<int> wall_contacts{0};
-	static std::atomic<int> perp_detected{0};
-	static std::atomic<int> sensor_set{0};
-	static std::atomic<int> parallel_count{0};
-	static std::atomic<int> non_dynamic_static{0};
-	static std::atomic<int> non_box{0};
-	static std::atomic<int> non_wall{0};
-	static std::atomic<int> step_count{0};
-} // namespace EdgeFixDiag
-
 // === Mass-scale diagnostic counters ===
 std::atomic<bool> JoltContactListener3D::mass_scale_enabled{false};
 
@@ -79,24 +64,7 @@ void JoltContactListener3D::reset_mass_scale_diag() {
 	MassScaleDiag::angled_scale.store(0, std::memory_order_relaxed);
 }
 
-Dictionary JoltContactListener3D::get_edge_fix_stats() {
-	Dictionary d;
-	d["step_count"] = EdgeFixDiag::step_count.load(std::memory_order_relaxed);
-	d["total_calls"] = EdgeFixDiag::total_calls.load(std::memory_order_relaxed);
-	d["box_hits"] = EdgeFixDiag::box_hits.load(std::memory_order_relaxed);
-	d["snap_count"] = EdgeFixDiag::snap_count.load(std::memory_order_relaxed);
-	d["wall_contacts"] = EdgeFixDiag::wall_contacts.load(std::memory_order_relaxed);
-	d["perp_detected"] = EdgeFixDiag::perp_detected.load(std::memory_order_relaxed);
-	d["sensor_set"] = EdgeFixDiag::sensor_set.load(std::memory_order_relaxed);
-	d["parallel_count"] = EdgeFixDiag::parallel_count.load(std::memory_order_relaxed);
-	d["non_dynamic_static"] = EdgeFixDiag::non_dynamic_static.load(std::memory_order_relaxed);
-	d["non_box"] = EdgeFixDiag::non_box.load(std::memory_order_relaxed);
-	d["non_wall"] = EdgeFixDiag::non_wall.load(std::memory_order_relaxed);
-	return d;
-}
-
 void JoltContactListener3D::OnContactAdded(const JPH::Body &p_body1, const JPH::Body &p_body2, JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings) {
-	//_try_fix_ghost_edge_normal(p_body1, p_body2, p_manifold, p_settings); // TEMP DISABLED FOR TESTING
 	_try_override_collision_response(p_body1, p_body2, p_settings);
 	_apply_contact_mass_scale(p_body1, p_body2, p_manifold, p_settings);
 	_try_apply_surface_velocities(p_body1, p_body2, p_settings);
@@ -109,7 +77,6 @@ void JoltContactListener3D::OnContactAdded(const JPH::Body &p_body1, const JPH::
 }
 
 void JoltContactListener3D::OnContactPersisted(const JPH::Body &p_body1, const JPH::Body &p_body2, JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings) {
-	//_try_fix_ghost_edge_normal(p_body1, p_body2, p_manifold, p_settings); // TEMP DISABLED FOR TESTING
 	_try_override_collision_response(p_body1, p_body2, p_settings);
 	_apply_contact_mass_scale(p_body1, p_body2, p_manifold, p_settings);
 	_try_apply_surface_velocities(p_body1, p_body2, p_settings);
@@ -240,34 +207,7 @@ void JoltContactListener3D::_apply_contact_mass_scale(const JPH::Body &p_jolt_bo
 					p_settings.mCombinedRestitution = 0.0f;
 				}
 
-				// DEBUG: Log ratio-triggered contacts with velocities and penetration
-				{
-					const JPH::Vec3 n = p_manifold.mWorldSpaceNormal;
-					const JPH::Vec3 v1 = p_jolt_body1.GetLinearVelocity();
-					const JPH::Vec3 v2 = p_jolt_body2.GetLinearVelocity();
-					const float depth = p_manifold.mPenetrationDepth;
-					const bool body1_lighter = (mass1 < mass2);
-					const bool l_below = (body1_lighter && dot_up > 0.0f) || (!body1_lighter && dot_up < 0.0f);
-					const char *branch_str = (abs_dot > VERTICAL_THRESHOLD)
-						? (l_below ? "VERT_PIN_SANDWICH" : "VERT_SKIP_ON_TOP")
-						: "ANGLED";
-					char buf[512];
-					snprintf(buf, sizeof(buf),
-						"[MASS_SCALE] abs_dot=%.4f branch=%s scale=%.2f masses=(%.1f,%.1f) "
-						"normal=(%.3f,%.3f,%.3f) depth=%.4f "
-						"vel1=(%.2f,%.2f,%.2f) vel2=(%.2f,%.2f,%.2f)",
-						abs_dot,
-						branch_str,
-						final_scale,
-						mass1, mass2,
-						(double)n.GetX(), (double)n.GetY(), (double)n.GetZ(),
-						(double)depth,
-						(double)v1.GetX(), (double)v1.GetY(), (double)v1.GetZ(),
-						(double)v2.GetX(), (double)v2.GetY(), (double)v2.GetZ());
-					print_line(String(buf));
-				}
-
-				if (final_scale < 1.0f) {
+					if (final_scale < 1.0f) {
 					if (mass1 < mass2) {
 						p_settings.mInvMassScale1 *= final_scale;
 						p_settings.mInvInertiaScale1 *= final_scale;
@@ -323,162 +263,6 @@ bool JoltContactListener3D::_try_override_collision_response(const JPH::Body &p_
 	}
 
 	return true;
-}
-
-void JoltContactListener3D::_try_fix_ghost_edge_normal(const JPH::Body &p_jolt_body1, const JPH::Body &p_jolt_body2, JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings) {
-	// --- Convex wall-edge fix: prevent phantom concave corners ---
-	//
-	// When a dynamic body slides along a convex wall edge (two adjacent box
-	// StaticBody3D nodes), both blocks report perpendicular face normals
-	// simultaneously. Jolt's solver treats this as a concave corner and
-	// constrains against BOTH normals, zeroing velocity → stutter.
-	//
-	// Fix: (1) Snap edge normals to the nearest box face normal.
-	//      (2) Track wall normals per dynamic body per step. If a second
-	//          perpendicular wall normal arrives, neutralize it via
-	//          mIsSensor = true so Jolt doesn't create a constraint for it.
-	//
-	// Strategy: The DEEPEST wall contact is the real wall the player is pressing
-	// against. Any perpendicular wall contact is the phantom edge artifact.
-	// We always neutralize the current contact when it's perpendicular to a
-	// deeper existing one. If the current is deeper, we update tracking to it
-	// and still neutralize it THIS step (the old shallow one is committed) —
-	// but NEXT step the deeper normal will be the tracked winner and the
-	// shallow perpendicular one will be properly neutralized.
-
-	EdgeFixDiag::total_calls.fetch_add(1, std::memory_order_relaxed);
-
-	// We need exactly one dynamic and one static/kinematic body.
-	const JPH::Body *dynamic_body = nullptr;
-	const JPH::Body *static_body = nullptr;
-
-	if (p_jolt_body1.IsDynamic() && !p_jolt_body2.IsDynamic()) {
-		dynamic_body = &p_jolt_body1;
-		static_body = &p_jolt_body2;
-	} else if (p_jolt_body2.IsDynamic() && !p_jolt_body1.IsDynamic()) {
-		dynamic_body = &p_jolt_body2;
-		static_body = &p_jolt_body1;
-	} else {
-		EdgeFixDiag::non_dynamic_static.fetch_add(1, std::memory_order_relaxed);
-		return;
-	}
-
-	// Unwrap decorated shapes (UserData, RotatedTranslated, Scaled, etc.)
-	const JPH::Shape *shape = static_body->GetShape();
-	JPH::Quat sub_shape_rotation = JPH::Quat::sIdentity();
-	while (shape != nullptr && shape->GetType() == JPH::EShapeType::Decorated) {
-		if (shape->GetSubType() == JPH::EShapeSubType::RotatedTranslated) {
-			sub_shape_rotation = sub_shape_rotation * static_cast<const JPH::RotatedTranslatedShape *>(shape)->GetRotation();
-		}
-		shape = static_cast<const JPH::DecoratedShape *>(shape)->GetInnerShape();
-	}
-
-	if (shape == nullptr || shape->GetSubType() != JPH::EShapeSubType::Box) {
-		EdgeFixDiag::non_box.fetch_add(1, std::memory_order_relaxed);
-		return;
-	}
-
-	EdgeFixDiag::box_hits.fetch_add(1, std::memory_order_relaxed);
-
-	// --- Part 1: Snap edge normals to nearest box face ---
-	const JPH::Quat rot = static_body->GetRotation() * sub_shape_rotation;
-	const JPH::Vec3 face_normals[6] = {
-		rot.RotateAxisX(), -rot.RotateAxisX(),
-		rot.RotateAxisY(), -rot.RotateAxisY(),
-		rot.RotateAxisZ(), -rot.RotateAxisZ(),
-	};
-
-	JPH::Vec3 contact_normal = p_manifold.mWorldSpaceNormal;
-
-	float best_dot = -1.0f;
-	int best_face = -1;
-	for (int i = 0; i < 6; i++) {
-		float d = contact_normal.Dot(face_normals[i]);
-		if (d > best_dot) {
-			best_dot = d;
-			best_face = i;
-		}
-	}
-
-	constexpr float FACE_ALIGNMENT_THRESHOLD = 0.55f; // ~56° — snap edge normals to nearest face (catches coplanar seams at ~45°)
-	if (best_dot < FACE_ALIGNMENT_THRESHOLD && best_face >= 0) {
-		p_manifold.mWorldSpaceNormal = face_normals[best_face];
-		contact_normal = face_normals[best_face];
-		EdgeFixDiag::snap_count.fetch_add(1, std::memory_order_relaxed);
-	}
-
-	// --- Part 2: Deduplicate perpendicular wall normals ---
-	// Only consider horizontal (wall) contacts, not floor/ceiling.
-	const float abs_y = (contact_normal.GetY() >= 0.0f) ? contact_normal.GetY() : -contact_normal.GetY();
-	constexpr float WALL_NORMAL_Y_MAX = 0.3f; // ~17° from horizontal
-	if (abs_y > WALL_NORMAL_Y_MAX) {
-		EdgeFixDiag::non_wall.fetch_add(1, std::memory_order_relaxed);
-		return;
-	}
-
-	EdgeFixDiag::wall_contacts.fetch_add(1, std::memory_order_relaxed);
-
-	const uint32_t body_key = dynamic_body->GetID().GetIndexAndSequenceNumber();
-	const float current_depth = p_manifold.mPenetrationDepth;
-
-	wall_normal_mutex.lock();
-
-	auto *existing = wall_normal_tracking.getptr(body_key);
-	if (existing == nullptr) {
-		// First wall contact for this body this step — just track it.
-		WallNormalEntry entry;
-		entry.normal = contact_normal;
-		entry.depth = current_depth;
-		wall_normal_tracking.insert(body_key, entry);
-		wall_normal_mutex.unlock();
-		return;
-	}
-
-	const JPH::Vec3 prev_normal = existing->normal;
-	const float prev_depth = existing->depth;
-	const float dot = contact_normal.Dot(prev_normal);
-	const float abs_dot = (dot >= 0.0f) ? dot : -dot;
-
-	// Perpendicular threshold: two wall normals are "perpendicular" (phantom
-	// corner) if |dot| < 0.3 (~73°..107°). True perpendicular boxes give
-	// dot ≈ 0.  Threshold 0.3 gives margin for imprecise edge normals that
-	// survived snapping.
-	constexpr float PERPENDICULAR_THRESHOLD = 0.3f;
-
-	if (abs_dot >= PERPENDICULAR_THRESHOLD) {
-		// Roughly parallel — same wall or opposite face. Keep the deepest.
-		if (current_depth > existing->depth) {
-			existing->normal = contact_normal;
-			existing->depth = current_depth;
-		}
-		EdgeFixDiag::parallel_count.fetch_add(1, std::memory_order_relaxed);
-		wall_normal_mutex.unlock();
-		return;
-	}
-
-	// --- Perpendicular corner detected! ---
-	EdgeFixDiag::perp_detected.fetch_add(1, std::memory_order_relaxed);
-
-	// Always neutralize the CURRENT (second-arriving) contact. Meanwhile,
-	// keep tracking updated to the DEEPEST normal so that on subsequent
-	// steps the deeper wall wins and the shallow phantom gets neutralized.
-	if (current_depth > prev_depth) {
-		// Current is deeper — it's probably the real wall. Update tracking
-		// to it so future perpendicular contacts are compared against this.
-		// We still neutralize it THIS step (the shallow one is committed
-		// and we can't retroactively fix it). Next step the tracked deeper
-		// normal will correctly identify the shallow one as the phantom.
-		existing->normal = contact_normal;
-		existing->depth = current_depth;
-	}
-	// If current is shallower or equal, keep existing tracking — it's the
-	// real wall. The current shallow perpendicular is the phantom.
-
-	wall_normal_mutex.unlock();
-
-	// Neutralize: tell Jolt to treat this contact as a sensor (no constraint).
-	p_settings.mIsSensor = true;
-	EdgeFixDiag::sensor_set.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool JoltContactListener3D::_try_apply_surface_velocities(const JPH::Body &p_jolt_body1, const JPH::Body &p_jolt_body2, JPH::ContactSettings &p_settings) {
@@ -852,21 +636,7 @@ void JoltContactListener3D::_flush_area_exits() {
 	area_exits.clear();
 }
 
-// Global counter readable from GDScript via _physics_process.
-// Incremented in pre_step() on physics thread, read from main thread.
-static std::atomic<int> g_edge_fix_step_count{0};
-
-int JoltContactListener3D::get_edge_fix_step_count() {
-	return g_edge_fix_step_count.load(std::memory_order_relaxed);
-}
-
 void JoltContactListener3D::pre_step() {
-	// Clear per-step wall normal tracking for convex edge fix.
-	wall_normal_tracking.clear();
-
-	g_edge_fix_step_count.fetch_add(1, std::memory_order_relaxed);
-	EdgeFixDiag::step_count.fetch_add(1, std::memory_order_relaxed);
-
 	// Reset mass-scale counters each step so they reflect per-frame values.
 	reset_mass_scale_diag();
 

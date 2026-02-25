@@ -310,27 +310,6 @@ static func calc_ray_shielding(
 	return space_state.calc_ray_shielding(query, target_rid, max_absorption)
 
 
-# ======================================================================
-#  Batch ray shielding: N rays from a shared origin, parallelized in C++
-# ======================================================================
-
-static func calc_ray_shielding_batch(
-	space_state: PhysicsDirectSpaceState3D,
-	from: Vector3,
-	to_points: PackedVector3Array,
-	target_rids: Array[RID],
-	max_absorptions: PackedFloat32Array,
-	exclude_rids: Array[RID],
-) -> PackedFloat32Array:
-	## Batch N independent shielding raycasts from a shared origin.
-	## Uses WorkerThreadPool parallelization in C++ (Jolt CastRay is thread-safe).
-	## Returns PackedFloat32Array where result[i] = total absorption for ray i.
-	var query := PhysicsRayQueryParameters3D.new()
-	query.from = from
-	query.collision_mask = 1 | 128 | 256 | 1024  # Terrain(1) + players(128/256) + wall blocks(1024)
-	query.exclude = exclude_rids
-	return space_state.calc_ray_shielding_batch(query, to_points, target_rids, max_absorptions)
-
 
 # ======================================================================
 #  Debug ray visualization
@@ -418,62 +397,6 @@ static func draw_debug_rays(ray_data: Array) -> void:
 	)
 
 
-## Variant of calc_ray_shielding that also collects hit positions for debug drawing.
-## Returns [absorbed: float, hit_positions: Array[Vector3]].
-static func calc_ray_shielding_debug(
-	space_state: PhysicsDirectSpaceState3D,
-	from: Vector3,
-	to: Vector3,
-	exclude_rids: Array[RID],
-	target_body: Node
-) -> Array:
-	var query := PhysicsRayQueryParameters3D.create(from, to)
-	query.collision_mask = 1 | 128 | 256 | 1024  # Terrain(1) + players(128/256) + wall blocks(1024)
-	query.exclude = exclude_rids
-	var results := space_state.intersect_ray_all(query, MAX_RAY_ITERATIONS)
-
-	var absorbed := 0.0
-	var hit_positions: Array[Vector3] = []
-	var last_collider: Node = null  # Deduplicate same-body hits (front/back face)
-	for result in results:
-		var hit_node: Node = result["collider"]
-		if hit_node == target_body:
-			break
-
-		# Skip duplicate hits on same body (front face + back face of convex shapes).
-		# With hit_back_faces=true, a ray through a box produces 2 hits on the
-		# same collider. Without this, each block double-counts its HP as shielding.
-		if hit_node == last_collider:
-			continue
-
-		var hit_pos: Vector3 = result["position"]
-
-		if hit_node is Player and hit_node.has_method("take_damage"):
-			last_collider = hit_node
-			absorbed += hit_node.health
-			hit_positions.append(hit_pos)
-		elif _is_wall_block(hit_node):
-			var wall = hit_node.parent_wall
-			var key: Vector3i = hit_node.grid_key
-			if wall and is_instance_valid(wall) and wall._blocks.has(key):
-				last_collider = hit_node
-				absorbed += wall._blocks[key]["hp"]
-				hit_positions.append(hit_pos)
-		elif hit_node is StaticBody3D:
-			# Terrain (static world geometry) — fully blocks
-			last_collider = hit_node
-			absorbed += 99999.0
-			hit_positions.append(hit_pos)
-			break
-		elif "_hp" in hit_node:
-			# Damageable dynamic body (rocket, etc.) — shields by its HP
-			last_collider = hit_node
-			absorbed += hit_node._hp
-			hit_positions.append(hit_pos)
-		# else: unknown body without HP — skip, no absorption
-
-	return [absorbed, hit_positions]
-
 
 # ======================================================================
 #  Utility
@@ -505,6 +428,3 @@ static func _make_shielding_query(from: Vector3, exclude_rids: Array[RID]) -> Ph
 	return query
 
 
-static func _is_wall_block(node: Node) -> bool:
-	## Check if a node is a wall block (has grid_key and parent_wall).
-	return node is StaticBody3D and "grid_key" in node and "parent_wall" in node

@@ -768,17 +768,12 @@ bool JoltPhysicsServer3D::get_mass_scale_enabled() const {
 	return JoltContactListener3D::get_mass_scale_enabled();
 }
 
-Dictionary JoltPhysicsServer3D::edge_fix_get_stats() const {
-	return JoltContactListener3D::get_edge_fix_stats();
-}
-
 void JoltPhysicsServer3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("body_set_contact_inv_mass_scale", "body", "scale"), &JoltPhysicsServer3D::body_set_contact_inv_mass_scale);
 	ClassDB::bind_method(D_METHOD("body_get_contact_inv_mass_scale", "body"), &JoltPhysicsServer3D::body_get_contact_inv_mass_scale);
 	// body_set/get_shielding_tag/hp are bound on base PhysicsServer3D — virtual dispatch calls our overrides.
 	ClassDB::bind_method(D_METHOD("set_mass_scale_enabled", "enabled"), &JoltPhysicsServer3D::set_mass_scale_enabled);
 	ClassDB::bind_method(D_METHOD("get_mass_scale_enabled"), &JoltPhysicsServer3D::get_mass_scale_enabled);
-	ClassDB::bind_method(D_METHOD("edge_fix_get_stats"), &JoltPhysicsServer3D::edge_fix_get_stats);
 }
 
 void JoltPhysicsServer3D::body_set_user_flags(RID p_body, uint32_t p_flags) {
@@ -1722,10 +1717,6 @@ bool JoltPhysicsServer3D::is_flushing_queries() const {
 int JoltPhysicsServer3D::get_process_info(ProcessInfo p_process_info) {
 	int info = (int)p_process_info;
 	// Custom diagnostic codes (accessible from GDScript via PhysicsServer3D.get_process_info(N)):
-	// 100 = edge fix step count (increments each physics step in contact_listener pre_step)
-	if (info == 100) {
-		return JoltContactListener3D::get_edge_fix_step_count();
-	}
 	// 103-107 = mass-scale diagnostic counters (per physics step)
 	if (info == 103) {
 		return JoltContactListener3D::MassScaleDiag::calls.load(std::memory_order_relaxed);

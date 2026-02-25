@@ -131,8 +131,6 @@ public:
 	void set_mass_scale_enabled(bool p_enabled);
 	bool get_mass_scale_enabled() const;
 
-	Dictionary edge_fix_get_stats() const;
-
 	explicit JoltPhysicsServer3D(bool p_on_separate_thread);
 	~JoltPhysicsServer3D();
 

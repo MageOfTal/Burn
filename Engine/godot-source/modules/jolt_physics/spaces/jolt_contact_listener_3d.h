@@ -57,15 +57,6 @@ class JoltContactListener3D final
 		static uint32_t hash(const JPH::BodyID &p_id) { return hash_fmix32(p_id.GetIndexAndSequenceNumber()); }
 	};
 
-	// Per-step tracking of wall normals per dynamic body, used to detect and
-	// neutralize phantom concave corners at convex wall edges.
-	struct WallNormalEntry {
-		JPH::Vec3 normal;        // The deepest horizontal wall normal seen this step
-		float depth;             // Penetration depth of the tracked contact
-	};
-	HashMap<uint32_t, WallNormalEntry> wall_normal_tracking;
-	Mutex wall_normal_mutex;
-
 	struct ShapePairHasher {
 		static uint32_t hash(const JPH::SubShapeIDPair &p_pair) {
 			uint32_t hash = hash_murmur3_one_32(p_pair.GetBody1ID().GetIndexAndSequenceNumber());
@@ -118,7 +109,6 @@ class JoltContactListener3D final
 	bool _try_override_collision_response(const JPH::Body &p_jolt_body1, const JPH::Body &p_jolt_body2, JPH::ContactSettings &p_settings);
 	bool _try_override_collision_response(const JPH::Body &p_jolt_soft_body, const JPH::Body &p_jolt_other_body, JPH::SoftBodyContactSettings &p_settings);
 	void _apply_contact_mass_scale(const JPH::Body &p_jolt_body1, const JPH::Body &p_jolt_body2, const JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings);
-	void _try_fix_ghost_edge_normal(const JPH::Body &p_jolt_body1, const JPH::Body &p_jolt_body2, JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings);
 	bool _try_apply_surface_velocities(const JPH::Body &p_jolt_body1, const JPH::Body &p_jolt_body2, JPH::ContactSettings &p_settings);
 	bool _try_add_contacts(const JPH::Body &p_jolt_body1, const JPH::Body &p_jolt_body2, const JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings);
 	bool _try_evaluate_area_overlap(const JPH::Body &p_body1, const JPH::Body &p_body2, const JPH::ContactManifold &p_manifold);
@@ -140,12 +130,6 @@ public:
 
 	void pre_step();
 	void post_step();
-
-	// Returns edge fix diagnostic counters as a Dictionary (readable from GDScript).
-	static Dictionary get_edge_fix_stats();
-
-	// Returns the pre_step() call count. If > 0, the contact listener is running.
-	static int get_edge_fix_step_count();
 
 	// Mass-scale diagnostic counters (reset each physics step in pre_step).
 	struct MassScaleDiag {

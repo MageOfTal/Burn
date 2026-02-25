@@ -96,7 +96,6 @@ func _check_character_overlaps() -> void:
 	if _cached_shape == null:
 		_cached_shape = _get_first_shape()
 	if _cached_shape == null:
-		print("[PhysicsBodyBase] %s: NO cached shape — skipping overlap check" % name)
 		return
 
 	var space_state := get_world_3d().direct_space_state
@@ -113,14 +112,9 @@ func _check_character_overlaps() -> void:
 
 	var results := space_state.intersect_shape(query, 8)  # Up to 8 overlapping bodies
 
-	if results.size() > 0:
-		print("[PhysicsBodyBase] %s: intersect_shape found %d hit(s) at pos=%s vel=%s" % [
-			name, results.size(), global_position, linear_velocity])
-
 	for result in results:
 		var collider = result.get("collider")
 		if collider == null or not collider is Player:
-			print("[PhysicsBodyBase] %s: skipping non-Player collider: %s" % [name, collider])
 			continue
 		if not is_instance_valid(collider):
 			continue
@@ -138,9 +132,6 @@ func _check_character_overlaps() -> void:
 		# Player capsule radius ≈ 0.4, so at dist=0 they're fully inside.
 		# This is used as a depenetration pseudo-velocity for stationary overlaps.
 		var overlap_depth: float = maxf(0.4 - dist * 0.3, 0.0)
-
-		print("[PhysicsBodyBase] %s → %s: dist=%.2f overlap=%.3f closing_speed will be computed" % [
-			name, collider.name, dist, overlap_depth])
 
 		_apply_character_push(collider, contact_normal, overlap_depth)
 
@@ -175,8 +166,6 @@ func _apply_character_push(char_body: Player, contact_normal: Vector3,
 		closing_speed = maxf(closing_speed, overlap_depth * 5.0)
 
 	if closing_speed < MIN_CLOSING_SPEED:
-		print("[PhysicsBodyBase] %s → %s: REJECTED — closing_speed=%.2f < %.2f (rigid_vel=%s char_vel=%s)" % [
-			name, char_body.name, closing_speed, MIN_CLOSING_SPEED, linear_velocity, char_body.velocity])
 		return
 
 	var mass_rigid: float = mass
@@ -192,6 +181,3 @@ func _apply_character_push(char_body: Player, contact_normal: Vector3,
 	if char_push.length() > MAX_CHAR_PUSH_SPEED:
 		char_push = char_push.normalized() * MAX_CHAR_PUSH_SPEED
 	char_body.velocity += char_push
-
-	print("[PhysicsBodyBase] %s → %s: PUSHED closing=%.2f impulse=%.1f push=%s (mass=%.1f)" % [
-		name, char_body.name, closing_speed, impulse_magnitude, char_push, mass_rigid])

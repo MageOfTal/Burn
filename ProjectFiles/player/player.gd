@@ -1819,11 +1819,6 @@ func rpc_slot_ammo(ammo_index: int, weapon_index: int) -> void:
 	inventory.remove_item(ammo_index)
 
 
-@rpc("any_peer", "call_local", "reliable")
-func rpc_unslot_ammo(_weapon_index: int) -> void:
-	## Ammo merging is permanent — this RPC is now a no-op.
-	pass
-
 
 # ======================================================================
 #  Trinket slot/unslot (shoe trinkets)

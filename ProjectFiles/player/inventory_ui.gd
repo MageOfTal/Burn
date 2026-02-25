@@ -425,13 +425,6 @@ func _on_slot_ammo(weapon_index: int) -> void:
 	_dirty = true  # Rebuild to reflect the change
 
 
-func _on_unslot_ammo(weapon_index: int) -> void:
-	## Remove ammo from this weapon's ammo slot.
-	if _player and _player.has_method("rpc_unslot_ammo"):
-		_player.rpc_unslot_ammo.rpc_id(1, weapon_index)
-	_selected_ammo_index = -1
-	_dirty = true  # Rebuild to reflect the change
-
 
 # ======================================================================
 #  Trinket UI

@@ -9,8 +9,6 @@ var _flash_intensity: float = 0.0
 var _flash_duration: float = 0.0
 var _flash_timer: float = 0.0
 
-## Ear ringing sound (2D so it plays at full volume regardless of position)
-var _ring_player: AudioStreamPlayer = null
 
 
 func _ready() -> void:
@@ -18,14 +16,6 @@ func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
 	color = Color(1.0, 1.0, 1.0, 0.0)
 	visible = false
-
-	# Pre-load the ring sound
-	_ring_player = AudioStreamPlayer.new()
-	var ring_stream: AudioStream = load("res://assets/audio/sfx/ring.ogg")
-	if ring_stream:
-		_ring_player.stream = ring_stream
-	_ring_player.volume_db = 0.0
-	add_child(_ring_player)
 
 
 func apply_flash(intensity: float, duration: float) -> void:
@@ -37,11 +27,6 @@ func apply_flash(intensity: float, duration: float) -> void:
 	_flash_timer = duration
 	color.a = _flash_intensity
 	visible = true
-
-	# Play ear ringing sound scaled by intensity (disabled)
-	#if _ring_player and _ring_player.stream:
-	#	_ring_player.volume_db = lerpf(-20.0, 0.0, intensity)
-	#	_ring_player.play()
 
 
 func _process(delta: float) -> void:
