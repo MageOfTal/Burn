@@ -86,8 +86,8 @@ func _sync_chunk_destroyed(pos: Vector3, frag_mass: float) -> void:
 	for i in MINI_DEBRIS_COUNT:
 		var debris := RigidBody3D.new()
 		debris.name = "TowerMiniDebris_%d" % i
-		debris.collision_layer = 32  # Layer 6: wall debris
-		debris.collision_mask = 1    # Collide with world only
+		debris.collision_layer = CollisionLayers.DEBRIS
+		debris.collision_mask = CollisionLayers.WORLD
 		var debris_size := rng.randf_range(0.3, 0.8)
 		debris.mass = frag_mass * 0.05
 

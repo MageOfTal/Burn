@@ -105,7 +105,7 @@ func _spawn_permtoad() -> void:
 	toad._floor_y = -9999.0
 
 	# Toad-to-toad collision (add layer 7 to mask)
-	toad.collision_mask = 513 | 64  # world (1) + player push (512) + toad bodies (64)
+	toad.collision_mask = CollisionLayers.WORLD | CollisionLayers.PLAYERS_PUSH | CollisionLayers.TOAD_RAIN  # world (1) + player push (512) + toad bodies (64)
 
 	# Higher bounce to stay lively (matches toad bowl)
 	var phys_mat := PhysicsMaterial.new()
@@ -188,7 +188,7 @@ func _spawn_test_discs(host_pos: Vector3) -> void:
 
 		toad.persistent = true
 		toad._floor_y = -9999.0
-		toad.collision_mask = 513 | 64  # world + player push + toad bodies
+		toad.collision_mask = CollisionLayers.WORLD | CollisionLayers.PLAYERS_PUSH | CollisionLayers.TOAD_RAIN  # world + player push + toad bodies
 
 		var phys_mat := PhysicsMaterial.new()
 		phys_mat.bounce = 0.7

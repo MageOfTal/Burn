@@ -63,7 +63,6 @@ func _get_debris_config() -> Dictionary:
 	return {
 		"size": 0.12,
 		"per_block": 2,
-		"impulse": 3.0,
 		"lifetime": 5.0,
 		"max_total": 40,
 		"mass": 0.4,

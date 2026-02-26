@@ -907,7 +907,7 @@ func _build_static_platform(center: Vector3, size: Vector3, mat: StandardMateria
 	add_child(mesh_inst)
 
 	var body := StaticBody3D.new()
-	body.collision_layer = 1  # World geometry
+	body.collision_layer = CollisionLayers.WORLD
 	body.collision_mask = 0
 	body.position = mesh_inst.position
 	var col := CollisionShape3D.new()
@@ -963,7 +963,7 @@ func _build_ramp(ground_pos: Vector3, platform_pos: Vector3, width: float, mat: 
 	add_child(ramp_mesh)
 
 	var ramp_body := StaticBody3D.new()
-	ramp_body.collision_layer = 1
+	ramp_body.collision_layer = CollisionLayers.WORLD
 	ramp_body.collision_mask = 0
 	ramp_body.position = ramp_center
 	ramp_body.rotation = Vector3(ramp_angle, y_rot, 0)
@@ -1024,7 +1024,7 @@ func spawn_test_ramps() -> void:
 
 		# Collision (layer 1 = world geometry)
 		var body := StaticBody3D.new()
-		body.collision_layer = 1
+		body.collision_layer = CollisionLayers.WORLD
 		body.collision_mask = 0
 		body.position = ramp_pos
 		body.rotation.x = angle_rad
@@ -1045,3 +1045,137 @@ func spawn_test_ramps() -> void:
 		add_child(label)
 
 	print("[BlockoutMap] Spawned %d test ramps (60°–40°) at %s" % [angles.size(), str(base_pos)])
+
+	# --- Large curved ramp (smooth arc mesh) next to the degree ramps ---
+	var curve_radius := 15.0
+	var curve_max_deg := 75.0
+	var curve_segments := 48
+	var curve_width := 6.0
+	var curve_thickness := 0.3
+	var curve_x_offset: float = angles.size() * spacing + 6.0
+
+	var curve_mat := StandardMaterial3D.new()
+	curve_mat.albedo_color = Color(0.8, 0.5, 0.3, 1.0)
+	curve_mat.roughness = 0.7
+	curve_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+
+	var curve_base := base_pos + Vector3(curve_x_offset, 0.0, 0.0)
+	var max_rad := deg_to_rad(curve_max_deg)
+	var half_w := curve_width * 0.5
+	var r_in := curve_radius                     # walkable (inner) surface
+	var r_out := curve_radius + curve_thickness  # underside (outer) surface
+
+	# Arc center sits at local (0, r_in, 0). At angle theta from downward vertical:
+	#   inner: (x, r_in*(1 - cos θ),  r_in*sin θ)
+	#   outer: (x, r_in - r_out*cos θ, r_out*sin θ)
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+
+	for seg_i in range(curve_segments):
+		var t0: float = (float(seg_i) / curve_segments) * max_rad
+		var t1: float = (float(seg_i + 1) / curve_segments) * max_rad
+
+		var il0 := Vector3(-half_w, r_in * (1.0 - cos(t0)), r_in * sin(t0))
+		var ir0 := Vector3( half_w, r_in * (1.0 - cos(t0)), r_in * sin(t0))
+		var il1 := Vector3(-half_w, r_in * (1.0 - cos(t1)), r_in * sin(t1))
+		var ir1 := Vector3( half_w, r_in * (1.0 - cos(t1)), r_in * sin(t1))
+
+		var ol0 := Vector3(-half_w, r_in - r_out * cos(t0), r_out * sin(t0))
+		var or0 := Vector3( half_w, r_in - r_out * cos(t0), r_out * sin(t0))
+		var ol1 := Vector3(-half_w, r_in - r_out * cos(t1), r_out * sin(t1))
+		var or1 := Vector3( half_w, r_in - r_out * cos(t1), r_out * sin(t1))
+
+		var tn0 := Vector3(0, cos(t0), -sin(t0))
+		var tn1 := Vector3(0, cos(t1), -sin(t1))
+		var bn0 := Vector3(0, -cos(t0), sin(t0))
+		var bn1 := Vector3(0, -cos(t1), sin(t1))
+
+		# Top (walkable) surface
+		st.set_normal(tn0); st.add_vertex(il0)
+		st.set_normal(tn1); st.add_vertex(il1)
+		st.set_normal(tn1); st.add_vertex(ir1)
+		st.set_normal(tn0); st.add_vertex(il0)
+		st.set_normal(tn1); st.add_vertex(ir1)
+		st.set_normal(tn0); st.add_vertex(ir0)
+
+		# Bottom (underside) surface
+		st.set_normal(bn1); st.add_vertex(or1)
+		st.set_normal(bn1); st.add_vertex(ol1)
+		st.set_normal(bn0); st.add_vertex(ol0)
+		st.set_normal(bn0); st.add_vertex(ol0)
+		st.set_normal(bn0); st.add_vertex(or0)
+		st.set_normal(bn1); st.add_vertex(or1)
+
+		# Left wall
+		var nl := Vector3(-1, 0, 0)
+		st.set_normal(nl); st.add_vertex(ol0)
+		st.set_normal(nl); st.add_vertex(ol1)
+		st.set_normal(nl); st.add_vertex(il1)
+		st.set_normal(nl); st.add_vertex(ol0)
+		st.set_normal(nl); st.add_vertex(il1)
+		st.set_normal(nl); st.add_vertex(il0)
+
+		# Right wall
+		var nr := Vector3(1, 0, 0)
+		st.set_normal(nr); st.add_vertex(ir0)
+		st.set_normal(nr); st.add_vertex(ir1)
+		st.set_normal(nr); st.add_vertex(or1)
+		st.set_normal(nr); st.add_vertex(ir0)
+		st.set_normal(nr); st.add_vertex(or1)
+		st.set_normal(nr); st.add_vertex(or0)
+
+	# Front cap (theta = 0)
+	var fc_il := Vector3(-half_w, 0.0, 0.0)
+	var fc_ir := Vector3( half_w, 0.0, 0.0)
+	var fc_ol := Vector3(-half_w, -curve_thickness, 0.0)
+	var fc_or := Vector3( half_w, -curve_thickness, 0.0)
+	var fc_n := Vector3(0, 0, -1)
+	st.set_normal(fc_n); st.add_vertex(fc_il)
+	st.set_normal(fc_n); st.add_vertex(fc_ol)
+	st.set_normal(fc_n); st.add_vertex(fc_or)
+	st.set_normal(fc_n); st.add_vertex(fc_il)
+	st.set_normal(fc_n); st.add_vertex(fc_or)
+	st.set_normal(fc_n); st.add_vertex(fc_ir)
+
+	# Back cap (theta = max)
+	var bc_il := Vector3(-half_w, r_in * (1.0 - cos(max_rad)), r_in * sin(max_rad))
+	var bc_ir := Vector3( half_w, r_in * (1.0 - cos(max_rad)), r_in * sin(max_rad))
+	var bc_ol := Vector3(-half_w, r_in - r_out * cos(max_rad), r_out * sin(max_rad))
+	var bc_or := Vector3( half_w, r_in - r_out * cos(max_rad), r_out * sin(max_rad))
+	var bc_n := Vector3(0, sin(max_rad), cos(max_rad))
+	st.set_normal(bc_n); st.add_vertex(bc_ir)
+	st.set_normal(bc_n); st.add_vertex(bc_or)
+	st.set_normal(bc_n); st.add_vertex(bc_ol)
+	st.set_normal(bc_n); st.add_vertex(bc_ir)
+	st.set_normal(bc_n); st.add_vertex(bc_ol)
+	st.set_normal(bc_n); st.add_vertex(bc_il)
+
+	var curve_mesh: ArrayMesh = st.commit()
+
+	var curve_inst := MeshInstance3D.new()
+	curve_inst.mesh = curve_mesh
+	curve_inst.material_override = curve_mat
+	curve_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	curve_inst.position = curve_base
+	add_child(curve_inst)
+
+	var curve_body := StaticBody3D.new()
+	curve_body.collision_layer = CollisionLayers.WORLD
+	curve_body.collision_mask = 0
+	curve_body.position = curve_base
+	var curve_col := CollisionShape3D.new()
+	curve_col.shape = curve_mesh.create_trimesh_shape()
+	curve_body.add_child(curve_col)
+	add_child(curve_body)
+
+	var curve_label := Label3D.new()
+	curve_label.text = "Curved 0°–%d°" % int(curve_max_deg)
+	curve_label.font_size = 64
+	curve_label.pixel_size = 0.01
+	curve_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	var arc_top_y: float = r_in * (1.0 - cos(max_rad))
+	curve_label.position = curve_base + Vector3(0.0, arc_top_y + 1.5, 0.0)
+	add_child(curve_label)
+
+	print("[BlockoutMap] Spawned curved test ramp (0°–%d°, R=%.0fm) at %s" % [
+		int(curve_max_deg), curve_radius, str(curve_base)])

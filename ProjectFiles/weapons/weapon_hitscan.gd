@@ -15,8 +15,7 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 	if is_shotgun_boosted():
 		count *= 2
 
-	# Toad dimension players are on layer 9 (256) instead of layer 8 (128)
-	var player_bit: int = 256 if shooter.get("in_toad_dimension") else 128
+	var player_bit: int = CollisionLayers.player_bit(shooter.get("in_toad_dimension"))
 
 	var pellets: Array[Dictionary] = []
 	for i in count:
@@ -25,7 +24,7 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 
 		var query := PhysicsRayQueryParameters3D.create(aim_origin, end_point)
 		query.exclude = [shooter.get_rid()]
-		query.collision_mask = 1 | 2 | 4 | 8 | 16 | 1024 | player_bit  # All gameplay layers + block detection (excludes debris/toad bodies)
+		query.collision_mask = CollisionLayers.WORLD | CollisionLayers.ITEMS | CollisionLayers.BUBBLES | CollisionLayers.RUBBER_BALLS | CollisionLayers.TOAD_WALLS | CollisionLayers.WALL_BLOCKS | player_bit
 
 		var result := space_state.intersect_ray(query)
 

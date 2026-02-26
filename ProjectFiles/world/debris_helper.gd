@@ -13,16 +13,24 @@ class_name DebrisHelper
 ##   - Freezes when velocity drops below threshold (removes from solver).
 ##   - Global budget cap via DebrisManager autoload.
 
-## Spawn small debris cubes flying outward from a destruction point.
+## Base max debris launch speed (m/s). Hitscans cap here with no overkill.
+const MAX_DEBRIS_SPEED := 8.0
+## Absolute max when overkill_frac = 1.0 (excess damage = full block HP).
+const OVERKILL_MAX_SPEED := 15.0
+## Fraction of impact speed transferred to debris.
+const SPEED_TRANSFER := 0.7
+
+## Spawn small debris cubes flying toward the shot origin.
 ## Parameters:
 ##   parent_node: Node to add debris children to
 ##   block_pos: world position of the destroyed block
-##   blast_center: world position of the explosion (debris flies away from this)
+##   blast_center: world position of the shot origin (debris flies TOWARD this)
 ##   count: number of debris cubes to spawn
 ##   material: StandardMaterial3D to apply to debris meshes
+##   impact_speed: speed of the projectile that hit (m/s). INF = hitscan (caps to max).
+##   overkill_frac: 0.0–1.0, how much excess damage beyond block HP. Raises cap from 8→15 m/s.
 ##   config: Dictionary with keys:
 ##     "size"     (float)  — cube edge length
-##     "impulse"  (float)  — outward impulse strength
 ##     "lifetime" (float)  — seconds before auto-delete
 ##     "mass"     (float)  — RigidBody3D mass
 ##     "name"     (String) — node name for the debris
@@ -38,16 +46,22 @@ static func spawn_debris(
 	blast_center: Vector3,
 	count: int,
 	material: StandardMaterial3D,
+	impact_speed: float,
+	overkill_frac: float,
 	config: Dictionary,
 ) -> void:
 	if GameManager.disable_debris:
 		return
 
 	var size: float = config.get("size", 0.15)
-	var impulse: float = config.get("impulse", 3.5)
 	var lifetime: float = config.get("lifetime", 5.0)
 	var mass_val: float = config.get("mass", 0.5)
 	var debris_name: String = config.get("name", "Debris")
+
+	# Debris speed = impact_speed * 0.7, capped at 8 m/s base (up to 15 with overkill).
+	var effective_max: float = lerpf(MAX_DEBRIS_SPEED, OVERKILL_MAX_SPEED, clampf(overkill_frac, 0.0, 1.0))
+	var debris_speed: float = minf(impact_speed * SPEED_TRANSFER, effective_max)
+	var impulse: float = debris_speed * mass_val
 
 	var debris_mesh := BoxMesh.new()
 	debris_mesh.size = Vector3.ONE * size
@@ -55,17 +69,20 @@ static func spawn_debris(
 	var debris_shape := BoxShape3D.new()
 	debris_shape.size = Vector3.ONE * size
 
-	var outward := (block_pos - blast_center)
-	if outward.length() < 0.1:
-		outward = Vector3(randf_range(-1, 1), 1, randf_range(-1, 1))
-	outward = outward.normalized()
+	# Debris launches TOWARD the shot origin, scattered within 35 degrees.
+	var toward := (blast_center - block_pos)
+	if toward.length() < 0.1:
+		toward = Vector3(randf_range(-1, 1), 1, randf_range(-1, 1))
+	toward = toward.normalized()
+
+	var cone_cos := cos(deg_to_rad(35.0))
 
 	for i in count:
 		var debris := RigidBody3D.new()
 		debris.name = debris_name
 		debris.mass = mass_val
-		debris.collision_layer = 32   # Layer 6: wall debris (no self-collision)
-		debris.collision_mask = 2049  # Layer 1 (world) | Layer 12 (smooth wall collision)
+		debris.collision_layer = CollisionLayers.DEBRIS
+		debris.collision_mask = CollisionLayers.SURFACE
 		debris.contact_monitor = false
 		debris.can_sleep = true  # Let Jolt auto-sleep when velocity drops
 
@@ -86,11 +103,11 @@ static func spawn_debris(
 			randf_range(-0.2, 0.2),
 		)
 
-		var scatter := Vector3(randf_range(-1, 1), randf_range(0, 1), randf_range(-1, 1)).normalized()
-		var bias := randf_range(0.75, 0.95)
-		var impulse_dir := (outward * bias + scatter * (1.0 - bias)).normalized()
+		# Random direction within a 35-degree cone toward the shot origin.
+		var scatter := Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)).normalized()
+		var impulse_dir := (toward + scatter * (1.0 - cone_cos)).normalized()
 		impulse_dir.y = maxf(impulse_dir.y, 0.15)
-		debris.apply_central_impulse(impulse_dir * impulse + Vector3(0, 1.0, 0))
+		debris.apply_central_impulse(impulse_dir * impulse)
 		debris.apply_torque_impulse(Vector3(
 			randf_range(-2, 2), randf_range(-2, 2), randf_range(-2, 2)
 		))

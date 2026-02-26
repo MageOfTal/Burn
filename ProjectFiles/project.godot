@@ -14,6 +14,10 @@ config/name="Burn Royale"
 run/main_scene="res://ui/main_menu.tscn"
 config/features=PackedStringArray("4.6", "Forward Plus")
 
+[audio]
+
+driver/mix_rate=48000
+
 [autoload]
 
 GameManager="*res://autoloads/game_manager.gd"

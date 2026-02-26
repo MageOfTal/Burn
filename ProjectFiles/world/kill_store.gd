@@ -37,8 +37,8 @@ var _prompt_proximity: ProximityLabel = null
 
 
 func _ready() -> void:
-	collision_layer = 1    # World geometry
-	collision_mask = 0     # Does not detect anything
+	collision_layer = CollisionLayers.WORLD
+	collision_mask = 0
 	_build_visuals()
 
 

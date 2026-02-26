@@ -33,20 +33,9 @@ class_name Player
 ##   GrappleSystem — grappling hook swing physics
 ##   DemonSystem — per-player demon stalker (spawns on first death)
 
-const WeaponProjectileScript = preload("res://weapons/weapon_projectile.gd")
-const WeaponMeleeScript = preload("res://weapons/weapon_melee.gd")
-const WeaponLaggerScript = preload("res://weapons/weapon_lagger.gd")
 
-const SPEED := 9.1
-const JUMP_VELOCITY := 10.5
 const MAX_HEALTH := 100.0
 const RESPAWN_DELAY := 3.0
-
-## Movement acceleration/deceleration
-const ACCELERATION := 45.0         # ~0.16s to full speed — snappy
-const DECELERATION := 30.0         # ~0.23s to stop — slight momentum
-const AIR_ACCELERATION := 15.0
-const AIR_DECELERATION := 0.0        # No air friction — full momentum preservation
 
 ## Gravity applied manually in _server_process (gravity_scale=0 on the RigidBody3D
 ## so Jolt doesn't double-apply). Subsystems (slide_crouch, etc.) also read this.
@@ -58,47 +47,6 @@ var velocity: Vector3:
 	get: return linear_velocity
 	set(v): linear_velocity = v
 
-## Floor detection constants (custom raycast-based, not from CharacterBody3D)
-const FLOOR_MAX_ANGLE: float = 0.8727  ## 50 degrees — steeper surfaces are walls
-const FLOOR_SNAP_MARGIN: float = 0.3  ## Extra reach below feet for slope detection
-const CAPSULE_RADIUS: float = 0.4  ## Must match CapsuleShape3D in player.tscn
-
-## Floor detection state (raycast-based replacement for CharacterBody3D methods)
-var _is_grounded: bool = false
-var _floor_normal: Vector3 = Vector3.UP
-var _floor_y: float = -INF  ## Y position of the floor surface (feet level)
-var _was_grounded: bool = false  ## Previous frame's grounded state (for snap logic)
-
-## Grounded velocity tracking — when on the floor, we bypass Jolt's velocity
-## integration and control position directly. _ground_velocity stores the
-## movement velocity between frames so we don't read Jolt's solver output
-## (which would fight our position control and cause slope sliding).
-var _ground_velocity: Vector3 = Vector3.ZERO
-
-## Pre-solver velocity — saved at the end of each _physics_process BEFORE Jolt's
-## solver runs next tick. Used to capture clean airborne momentum on landing
-## instead of Jolt's contact-solver-contaminated velocity (which on slopes adds
-## a large phantom horizontal component from the depenetration impulse).
-var _pre_solver_velocity: Vector3 = Vector3.ZERO
-
-## When true, the previous frame used grounded position control and left velocity
-## non-zero so Jolt's solver could see real movement velocity for collision impulses
-## (e.g. pushing toads). Jolt also integrates position from that velocity, which is
-## unwanted — so we undo the integration at the start of the next _physics_process.
-var _undo_jolt_integration: bool = false
-
-## Dynamic body contact tracking (set in _integrate_forces each tick)
-var _touching_dynamic_body: bool = false  ## True when ANY RigidBody3D contact exists
-var _on_dynamic_body: bool = false  ## True when a RigidBody3D contact supports us from below (normal.y > 0.7)
-var _dynamic_body_ref: RigidBody3D = null  ## The dynamic body we're touching
-
-## Contact tolerance for is_on_floor() — true when capsule feet are within
-## this distance of the floor surface. Must be large enough to absorb Jolt's
-## solver depenetration (a few cm) without flickering, but small enough that
-## a jump (10.5 m/s → ~0.175m after one 60Hz frame) registers as airborne
-## on the very next physics tick.
-const FLOOR_CONTACT_TOLERANCE: float = 0.1  ## 10cm — covers depenetration jitter
-
 
 ## The peer ID that owns this player. Set by NetworkManager on spawn.
 var peer_id: int = 1
@@ -107,8 +55,8 @@ var is_bot: bool = false
 ## True when player is inside the Toad Dimension (immune to fall death).
 var in_toad_dimension: bool = false
 
-## Layer 10 (bit 512) — physics push layer (directly on the player RigidBody3D).
-const PLAYER_PUSH_LAYER: int = 512
+## Layer 10 — physics push layer (directly on the player RigidBody3D).
+const PLAYER_PUSH_LAYER: int = CollisionLayers.PLAYERS_PUSH
 
 ## Combat state (synced via ServerSync)
 var health: float = MAX_HEALTH
@@ -132,19 +80,6 @@ var _last_slot := 0
 ## Frame-local flag: true if jump was pressed this frame. Set at the top of
 ## _server_process() and read by subsystems (slide_crouch_system, etc.)
 var _frame_jump := false
-## Wall-slide: individual 2D normals of steep surfaces the player is touching,
-## sampled from Jolt's contact solver via _integrate_forces(). The movement
-## code picks the most relevant normal based on input direction, rather than
-## averaging — averaging produces an unstable diagonal at corners where the
-## capsule contacts two perpendicular faces.
-var _wall_normals: Array[Vector2] = []
-## Air-jump tracking for trinket-granted double jump. Reset on landing.
-var _air_jumps_used: int = 0
-## Post-jump rising suppression: prevents floor detection from re-grounding
-## the player while still rising from a jump. On uphill slopes the terrain
-## rises nearly as fast as the player, putting feet_gap within tolerance and
-## zeroing jump velocity on the very next frame. Cleared when velocity.y <= 0.
-var _post_jump_rising: bool = false
 
 ## DEBUG: wall-slide diagnostics (toggle with F9)
 var _debug_wall := false
@@ -202,10 +137,12 @@ var _original_mesh_scale_y: float = 1.0
 @onready var store_ui: Control = $HUDLayer/StoreUI
 
 ## Player collision layers — on both layer 8 (player targeting) and layer 10 (physics push).
-const PLAYER_COLLISION_LAYER: int = 640   ## 128 | 512
-const PLAYER_COLLISION_MASK: int = 2271   ## 1|2|4|8|16|64|128|2048
+const PLAYER_COLLISION_LAYER: int = CollisionLayers.PLAYER_LAYER
+const PLAYER_COLLISION_MASK: int = CollisionLayers.PLAYER_MASK
 
 ## Subsystem references
+@onready var movement: PlayerMovement = $PlayerMovement
+@onready var combat: PlayerCombat = $PlayerCombat
 @onready var slide_crouch: SlideCrouchSystem = $SlideCrouchSystem
 @onready var kamikaze_system: KamikazeSystem = $KamikazeSystem
 @onready var combat_vfx: CombatVFX = $CombatVFX
@@ -264,6 +201,8 @@ func _ready() -> void:
 	_original_mesh_scale_y = body_mesh.scale.y
 
 	# Setup subsystems
+	movement.setup(self)
+	combat.setup(self)
 	heat_system.setup(self)
 	slide_crouch.setup(self)
 	kamikaze_system.setup(self)
@@ -354,49 +293,10 @@ func _ready() -> void:
 
 
 func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
-	## Called each physics tick. With custom_integrator=true, Jolt skips its own
-	## gravity/damping but still integrates position from velocity during its step.
-	## We DON'T call state.integrate_forces() — gravity is applied manually in
-	## _physics_process(). We only sample contact normals for wall-slide detection.
+	## Delegates to PlayerMovement for wall-slide and dynamic body tracking.
 	if not multiplayer.is_server():
 		return
-
-	# Track dynamic body contacts (for floor snap / grounding override)
-	_touching_dynamic_body = false
-	_on_dynamic_body = false
-	_dynamic_body_ref = null
-
-	# When airborne, use a tighter angle threshold for wall normals so that
-	# edge contacts (~40-50° from vertical) are treated as walls. This prevents
-	# the capsule from catching on wall top corners — without this, edge
-	# contacts slip through the 60° floor threshold, the movement code applies
-	# full horizontal input into the edge, and friction/reaction forces create
-	# an equilibrium that holds the player on the corner.
-	var wall_angle_threshold := FLOOR_MAX_ANGLE if _is_grounded else deg_to_rad(30.0)
-
-	var normals: Array[Vector2] = []
-	for i in state.get_contact_count():
-		var normal: Vector3 = state.get_contact_local_normal(i)
-		var collider := state.get_contact_collider_object(i)
-		if collider is RigidBody3D:
-			_touching_dynamic_body = true
-			_dynamic_body_ref = collider
-			# On top when contact normal is mostly upward (same threshold as
-			# floor detection threshold: ~45° from vertical)
-			if normal.y > 0.7:
-				_on_dynamic_body = true
-		if normal.angle_to(Vector3.UP) > wall_angle_threshold:
-			if collider is RigidBody3D:
-				continue
-			var n2 := Vector2(normal.x, normal.z).normalized()
-			var is_dup := false
-			for existing in normals:
-				if n2.dot(existing) > 0.966:
-					is_dup = true
-					break
-			if not is_dup:
-				normals.append(n2)
-	_wall_normals = normals
+	movement.on_integrate_forces(state)
 
 
 func _physics_process(delta: float) -> void:
@@ -427,94 +327,23 @@ func _physics_process(delta: float) -> void:
 			_jump_debug_frames = 30
 		if _jump_debug_frames > 0 and peer_id == 1:
 			print("[JUMP DBG %02d] pos_y=%.4f vel_y=%.3f grounded=%s floor_y=%.3f linvel_y=%.3f" % [
-				30 - _jump_debug_frames, global_position.y, velocity.y, str(_is_grounded), _floor_y, linear_velocity.y])
+				30 - _jump_debug_frames, global_position.y, velocity.y, str(movement._is_grounded), movement._floor_y, linear_velocity.y])
 			_jump_debug_frames -= 1
 
-		# Save previous frame's grounded state for snap logic
-		_was_grounded = _is_grounded
-
-		# UNDO JOLT POSITION INTEGRATION (movement component only)
-		# Position control leaves velocity non-zero so Jolt's solver computes
-		# real collision impulses (pushing toads, etc.). Jolt also integrates
-		# position from the post-solver velocity, which includes both:
-		#   (a) our movement velocity — unwanted, already applied by position control
-		#   (b) solver impulses (depenetration, collision response) — WANTED
-		# By subtracting _pre_solver_velocity (our movement velocity BEFORE the
-		# solver ran), we undo only (a) and preserve (b). This keeps collision
-		# response (player doesn't clip into boxes) while preventing double-movement.
-		if _undo_jolt_integration:
-			global_position -= _pre_solver_velocity * delta
-			_undo_jolt_integration = false
-
-		# Update floor detection (downward raycast, must run in _physics_process)
-		_update_ground_state()
+		# Undo Jolt integration and update floor detection
+		movement.pre_physics_step(delta)
 
 		# Tick Second Wind timer
 		if _second_wind_timer > 0.0:
 			_second_wind_timer -= delta
 
-		# _server_process computes movement velocity from _ground_velocity (when
-		# grounded) or from Jolt's solver output (when airborne). Movement code,
-		# slope alignment, jump, and gravity all modify `velocity` as before.
+		# Server game logic (input, movement, combat, subsystems)
 		_server_process(delta)
 
-		# GROUNDED POSITION CONTROL
-		# When on the floor, we apply movement as a direct position change.
-		# Velocity is left non-zero so Jolt's solver sees real movement speed
-		# for collision impulses (pushing toads etc.), but Jolt's unwanted
-		# position integration is undone at the top of the next _physics_process.
-		# This decouples position from Jolt's contact solver (preventing slope
-		# sliding) while still allowing proper collision impulse computation.
-		#
-		# XZ: moved directly by the frame's velocity.
-		# Y: estimated using the floor plane equation at the new XZ position.
-		#    Same math as slope alignment (vy = -(nx*vx + nz*vz)/ny) but applied
-		#    as a position delta from the known floor point. Exact for planar
-		#    surfaces, negligible error on smooth terrain.
-		#
-		# Skipped on lightweight dynamic bodies — Jolt's solver manages stacking.
-		# Skipped on first grounded frame — let Jolt handle the landing naturally.
-		# Skipped when grapple is active — grapple expects Jolt velocity integration.
-		var on_top_of_lightweight := _on_dynamic_body and _dynamic_body_ref != null \
-				and is_instance_valid(_dynamic_body_ref) and _dynamic_body_ref.mass < 20.0
-		if is_on_floor() and _was_grounded and not on_top_of_lightweight \
-				and not grapple_system.is_active():
-			# Apply horizontal movement as position change
-			var dx := velocity.x * delta
-			var dz := velocity.z * delta
-			global_position.x += dx
-			global_position.z += dz
-			# Estimate floor Y at the new XZ using the floor plane equation.
-			# From dot(normal, point - floor_point) = 0:
-			#   ny*(y - floor_y) = -(nx*dx + nz*dz)
-			#   y = floor_y - (nx*dx + nz*dz) / ny
-			# This matches slope alignment's velocity.y formula integrated over dt.
-			if _floor_y > -INF and _floor_normal.y > 0.001:
-				var hemi_offset := CAPSULE_RADIUS * (1.0 - _floor_normal.y) / _floor_normal.y
-				var estimated_floor_y := _floor_y - (_floor_normal.x * dx + _floor_normal.z * dz) / _floor_normal.y
-				global_position.y = estimated_floor_y + hemi_offset
-			# Save movement velocity for next frame. We intentionally leave
-			# velocity NON-ZERO so Jolt's solver sees real movement speed for
-			# collision impulses (pushing toads, physics objects). Jolt will
-			# also integrate position from this velocity — the movement component
-			# is undone next frame via _pre_solver_velocity, but the solver's
-			# collision response (depenetration) is preserved.
-			_ground_velocity = velocity
-			_undo_jolt_integration = true
-		elif on_top_of_lightweight and is_on_floor():
-			# On dynamic body: Jolt handles positioning. Save velocity for
-			# ground tracking (used if player walks off the body) but don't
-			# zero it — Jolt needs to integrate position from this velocity.
-			_ground_velocity = velocity
+		# Grounded position control + pre-solver velocity save
+		movement.post_physics_step(delta, grapple_system.is_active())
 
-		# Save pre-solver velocity — Jolt's solver hasn't run yet (it runs at the
-		# start of the NEXT physics tick). This captures our clean movement velocity
-		# for use as landing momentum if the player transitions to airborne next frame.
-		# When grounded with position control, velocity is _ground_velocity here.
-		# When airborne, velocity has gravity + movement — the true airborne velocity.
-		_pre_solver_velocity = velocity
-
-		# Update sync vars AFTER all server movement (normal, grapple, kamikaze, respawn)
+		# Update sync vars AFTER all server movement
 		sync_position = global_position
 		sync_rotation_y = rotation.y
 
@@ -625,53 +454,13 @@ func _server_process(delta: float) -> void:
 	# Slide cooldown
 	slide_crouch.tick_cooldown(delta)
 
-	# GROUNDED VELOCITY MANAGEMENT
-	# When on the floor, position control handles movement directly (see
-	# _physics_process). We restore _ground_velocity as the starting velocity
-	# for movement code — Jolt's solver output is discarded to prevent the
-	# solver from fighting our position control (which caused slope sliding).
-	# Velocity is left non-zero after position control so Jolt's solver sees
-	# real speed for collision impulses (pushing toads), but position
-	# integration is undone at the start of the next frame.
-	#
-	# Exception: on lightweight dynamic bodies, position control is skipped
-	# (Jolt manages stacking). We use Jolt's solver output as starting velocity
-	# so movement accumulates properly instead of resetting to stale data.
-	var _on_dynamic_lightweight := _on_dynamic_body and _dynamic_body_ref != null \
-			and is_instance_valid(_dynamic_body_ref) and _dynamic_body_ref.mass < 20.0
-	if is_on_floor() and not _on_dynamic_lightweight:
-		if not _was_grounded:
-			# Just landed — use PRE-SOLVER velocity (saved last frame before Jolt's
-			# solver ran). Jolt's current velocity has contact solver contamination:
-			# on a 45° slope, the solver converts landing impact into ~7.5 m/s
-			# horizontal, causing the player to slide downhill uncontrollably.
-			# The pre-solver velocity has the true airborne momentum (clean).
-			_ground_velocity = Vector3(_pre_solver_velocity.x, 0.0, _pre_solver_velocity.z)
-		# Restore our tracked velocity — movement code modifies this, not Jolt's output.
-		velocity = _ground_velocity
-	elif is_on_floor() and _on_dynamic_lightweight:
-		# On dynamic body: Jolt's solver output is the starting velocity.
-		# Clamp negative Y (grounded — don't sink into the body).
-		if velocity.y < 0.0:
-			velocity.y = 0.0
-	elif _was_grounded:
-		# Just went airborne (walked off edge, NOT jump — jump sets _is_grounded=false
-		# during _server_process, so _was_grounded is false next frame).
-		# Hand off ground velocity to Jolt for airborne physics.
-		velocity = _ground_velocity
-		_ground_velocity = Vector3.ZERO
-
-	# Gravity (skip when grounded or sliding — slide manages its own Y velocity)
-	if not is_on_floor() and not slide_crouch.is_sliding:
-		velocity.y -= gravity * delta
+	# Grounded velocity management + gravity (delegated to PlayerMovement)
+	movement.begin_movement(delta)
+	movement.apply_gravity(delta)
 
 	# Rotation from look input
 	rotation.y = player_input.look_yaw
 	camera_pivot.rotation.x = player_input.look_pitch
-
-	# Reset air-jump counter on landing (trinket-granted double jump)
-	if is_on_floor():
-		_air_jumps_used = 0
 
 	# Slide / crouch / normal movement
 	if slide_crouch.is_sliding:
@@ -683,18 +472,9 @@ func _server_process(delta: float) -> void:
 		if not slide_crouch.process_post_slide_window(delta):
 			# Jump (slide-jump is handled in process_slide; crouch-jump in process_crouch)
 			if _frame_jump and is_on_floor():
-				velocity.y = JUMP_VELOCITY
-				_is_grounded = false  # Override hysteresis — we're airborne now
-				_post_jump_rising = true  # Suppress grounding while rising (uphill fix)
-				slide_crouch.clear_slide_on_land()
+				movement.do_jump()
 			elif _frame_jump and not is_on_floor():
-				# Air-jump (trinket-granted) — only if shoe has an extra-jump trinket
-				# 50% stronger than a ground jump to reward the trinket investment
-				var extra_jumps: int = inventory.get_shoe_extra_jumps() if inventory else 0
-				if _air_jumps_used < extra_jumps:
-					velocity.y = JUMP_VELOCITY * 1.5
-					_air_jumps_used += 1
-					_post_jump_rising = true
+				movement.do_air_jump()
 
 			# While airborne, queue/cancel slide for when we land
 			if not is_on_floor():
@@ -711,7 +491,7 @@ func _server_process(delta: float) -> void:
 				slide_crouch.start_crouch()
 				slide_crouch.process_crouch(delta)
 			else:
-				_process_normal_movement(delta)
+				movement.process_normal_movement(delta)
 
 	# Track pre-land velocity for slide-on-land momentum transfer
 	slide_crouch.track_pre_land_velocity()
@@ -790,418 +570,28 @@ func _server_process(delta: float) -> void:
 					kamikaze_system.activate()
 					inventory.remove_item(inventory.equipped_index)
 				elif cons_data.consumable_effect == 1:  # MEDKIT
-					_process_medkit_heal()
+					combat.process_medkit_heal()
 
-	# ADS state: server tracks whether the player is aiming
-	var w_data: WeaponData = current_weapon.weapon_data if current_weapon else null
-	is_aiming = player_input.action_aim and w_data != null and w_data.ads_fov > 0.0
-
-	# Combat: shooting (damage scaled by heat)
+	# ADS + combat (delegated to PlayerCombat)
+	combat.update_ads_state()
 	if player_input.action_shoot and current_weapon != null and current_weapon.can_fire():
-		_process_combat()
+		combat.process_combat()
 
 
-func _process_medkit_heal() -> void:
-	## Server-only: heal 1 HP per frame, costing 5 fuel per frame.
-	if heat_system == null or inventory == null:
-		return
-	var effective_max_hp: float = get_max_health()
-	if health >= effective_max_hp:
-		return
-	if not inventory.spend_fuel_silent(5.0):
-		return
-	health = minf(health + 1.0, effective_max_hp)
 
 
-func _process_combat() -> void:
-	## Server-only: handle weapon firing, damage, and VFX dispatch.
-	# Calculate fuel cost (skip if free firing debug is on)
-	var equipped_stack: ItemStack = null
-	if inventory and inventory.equipped_index >= 0 and inventory.equipped_index < inventory.items.size() and inventory.items[inventory.equipped_index] != null:
-		equipped_stack = inventory.items[inventory.equipped_index]
-
-	if not GameManager.debug_free_firing and not is_bot:
-		var fuel_cost: float = current_weapon.weapon_data.burn_fuel_cost
-		if equipped_stack and equipped_stack.slotted_ammo:
-			fuel_cost += equipped_stack.slotted_ammo.ammo_burn_cost_per_shot
-
-		if not inventory.has_fuel(fuel_cost):
-			return
-
-		inventory.spend_fuel(fuel_cost)
-
-	# Set ammo context on weapon before firing
-	if equipped_stack and equipped_stack.slotted_ammo:
-		current_weapon.ammo_data = equipped_stack.slotted_ammo
-	else:
-		current_weapon.ammo_data = null
-
-	# Third-person aiming: ray from camera through crosshair
-	var cam_origin := camera.global_position
-	var cam_forward := -camera.global_transform.basis.z
-	var aim_target := _get_camera_aim_target(cam_origin, cam_forward)
-
-	var is_melee: bool = current_weapon is WeaponMelee
-	var muzzle_pos: Vector3
-	if is_melee:
-		muzzle_pos = global_position + Vector3(0, 1.2, 0)
-	else:
-		muzzle_pos = _get_barrel_position()
-	var aim_direction := (aim_target - muzzle_pos).normalized()
-
-	# Reduce spread (Steady Hand bonus + ADS)
-	var saved_spread: float = current_weapon.weapon_data.spread
-	if 1 in active_bonuses:  # Steady Hand: -15% spread
-		current_weapon.weapon_data.spread *= 0.85
-	if is_aiming:
-		current_weapon.weapon_data.spread *= current_weapon.weapon_data.ads_spread_mult
-
-	var hit_info := current_weapon.try_fire(self, muzzle_pos, aim_direction)
-
-	# Quick Hands bonus: -20% fire rate cooldown
-	if 4 in active_bonuses and current_weapon:
-		current_weapon.cooldown_remaining *= 0.80
-
-	# Restore original spread
-	current_weapon.weapon_data.spread = saved_spread
-
-	if hit_info.has("melee_hit") or hit_info.has("melee_miss"):
-		combat_vfx.show_melee_swing_fx.rpc(muzzle_pos, aim_direction)
-
-		if hit_info.has("melee_hit"):
-			var melee_target = hit_info.get("hit_collider")
-			print("[Melee] HIT collider=%s is_Player=%s has_take_damage=%s" % [
-				str(melee_target), str(melee_target is Player),
-				str(melee_target.has_method("take_damage") if melee_target else false)])
-			if melee_target is Player and melee_target.has_method("take_damage"):
-				if has_node("/root/ToadDimension"):
-					get_node("/root/ToadDimension").enter(self, melee_target)
-				heat_system.on_damage_dealt(10.0)
-		else:
-			print("[Melee] MISS")
-
-	elif hit_info.has("pellets"):
-		# Multi-pellet weapon (shotgun)
-		var pellets: Array = hit_info["pellets"]
-		var pellet_count := pellets.size()
-		var rarity_damage_per_pellet: float = current_weapon.weapon_data.get_rarity_damage() / pellet_count
-		var rarity_struct_dmg_per_pellet: float = current_weapon.weapon_data.get_rarity_structure_damage() / pellet_count
-		var base_damage_per_pellet: float = current_weapon.weapon_data.damage / pellet_count
-		var total_damage_dealt: float = 0.0
-
-		var shot_ends: Array[Vector3] = []
-		for pellet in pellets:
-			if pellet.has("shot_end"):
-				shot_ends.append(pellet["shot_end"])
-
-		if shot_ends.size() > 0:
-			combat_vfx.show_shotgun_fx.rpc(muzzle_pos, shot_ends)
-
-		var hit_player_ids: Dictionary = {}  # peer_id -> true, to avoid duplicate whiz on hit targets
-		for pellet in pellets:
-			var collider = pellet.get("hit_collider")
-			if collider == null:
-				continue
-			var is_player_hit := collider is Player
-			var base_pellet_dmg := rarity_damage_per_pellet if is_player_hit else rarity_struct_dmg_per_pellet
-			var final_damage: float = base_pellet_dmg * heat_system.get_damage_multiplier()
-			if 11 in active_bonuses:  # Juggernaut: +10% damage
-				final_damage *= 1.10
-			if not is_player_hit and collider.has_method("take_damage_at"):
-				# Per-block positional damage (clusters, structures hit directly)
-				var hit_pos: Vector3 = pellet.get("hit_position", collider.global_position)
-				collider.take_damage_at(hit_pos, final_damage, 0.5, peer_id)
-			elif collider.has_method("take_damage"):
-				collider.take_damage(final_damage, peer_id)
-			# Only generate heat from hitting players, not structures
-			if is_player_hit:
-				total_damage_dealt += base_damage_per_pellet
-				hit_player_ids[collider.peer_id] = true
-				combat_vfx.play_bullet_hit_sound.rpc(pellet["shot_end"])
-
-		if total_damage_dealt > 0.0:
-			heat_system.on_damage_dealt(total_damage_dealt)
-
-		# Bullet whiz-by for shotgun: check each pellet ray against nearby players
-		_dispatch_bullet_whiz(muzzle_pos, shot_ends, hit_player_ids)
-
-	elif hit_info.has("shot_end"):
-		# Single-pellet weapon
-		combat_vfx.show_shot_fx.rpc(muzzle_pos, hit_info["shot_end"])
-
-		var hit_player_ids: Dictionary = {}
-		var collider = hit_info.get("hit_collider")
-		if collider != null:
-			var is_player_hit := collider is Player
-			var base_dmg: float
-			if is_player_hit:
-				base_dmg = current_weapon.weapon_data.get_rarity_damage()
-			else:
-				base_dmg = current_weapon.weapon_data.get_rarity_structure_damage()
-			var final_damage: float = base_dmg * heat_system.get_damage_multiplier()
-			if 11 in active_bonuses:  # Juggernaut: +10% damage
-				final_damage *= 1.10
-			if not is_player_hit and collider.has_method("take_damage_at"):
-				# Per-block positional damage (clusters, structures hit directly)
-				var hit_pos: Vector3 = hit_info.get("hit_position", collider.global_position)
-				collider.take_damage_at(hit_pos, final_damage, 0.5, peer_id)
-			elif collider.has_method("take_damage"):
-				collider.take_damage(final_damage, peer_id)
-			# Only generate heat from hitting players, not structures
-			if is_player_hit:
-				heat_system.on_damage_dealt(current_weapon.weapon_data.damage)
-				hit_player_ids[collider.peer_id] = true
-				combat_vfx.play_bullet_hit_sound.rpc(hit_info["shot_end"])
-
-		# Bullet whiz-by for single shot
-		_dispatch_bullet_whiz(muzzle_pos, [hit_info["shot_end"]], hit_player_ids)
-
-
-func _dispatch_bullet_whiz(muzzle_pos: Vector3, shot_ends: Array, hit_player_ids: Dictionary) -> void:
-	## Server-only: check all other players for bullet close-miss and send whiz sounds.
-	## Uses point-to-line-segment distance from each player's head to each bullet ray.
-	var whiz_dist_sq := CombatVFX.BULLET_WHIZ_DISTANCE * CombatVFX.BULLET_WHIZ_DISTANCE
-	var notified: Dictionary = {}  # peer_id -> true, one whiz per player per volley
-
-	for other_peer_id in NetworkManager.players:
-		if other_peer_id == peer_id:
-			continue  # Don't whiz the shooter
-		if hit_player_ids.has(other_peer_id):
-			continue  # Already hit — they get the hit sound, not whiz
-		if notified.has(other_peer_id):
-			continue
-
-		var other_player: Player = NetworkManager.players[other_peer_id]
-		if other_player == null or not is_instance_valid(other_player):
-			continue
-		if other_player.get("is_dead") == true:
-			continue
-
-		var other_pos: Vector3 = other_player.global_position + Vector3(0, 1.0, 0)  # Approximate head
-		var best_dist_sq := INF
-		var best_closest_point := Vector3.ZERO
-
-		for shot_end in shot_ends:
-			var closest := _closest_point_on_segment(muzzle_pos, shot_end, other_pos)
-			var d_sq := closest.distance_squared_to(other_pos)
-			if d_sq < best_dist_sq:
-				best_dist_sq = d_sq
-				best_closest_point = closest
-
-		if best_dist_sq <= whiz_dist_sq:
-			notified[other_peer_id] = true
-			# Bots don't have clients to receive RPCs
-			if other_peer_id >= 9000:
-				continue
-			other_player.combat_vfx.play_bullet_whiz_sound.rpc_id(other_peer_id, best_closest_point)
-
-
-static func _closest_point_on_segment(a: Vector3, b: Vector3, p: Vector3) -> Vector3:
-	## Returns the closest point on line segment AB to point P.
-	var ab := b - a
-	var ab_len_sq := ab.length_squared()
-	if ab_len_sq < 0.0001:
-		return a
-	var t := clampf((p - a).dot(ab) / ab_len_sq, 0.0, 1.0)
-	return a + ab * t
-
-
-func _process_normal_movement(delta: float) -> void:
-	## Acceleration-based horizontal movement. Uses different rates on ground vs air.
-	var shoe_bonus: float = inventory.get_shoe_speed_bonus() if inventory else 0.0
-	var bonus_speed: float = 0.0
-	if 5 in active_bonuses:   # Adrenaline Rush: +10% speed
-		bonus_speed += 0.10
-	if _second_wind_timer > 0.0:  # Second Wind: +50% speed
-		bonus_speed += 0.50
-	var current_speed := SPEED * (heat_system.get_speed_multiplier() + shoe_bonus + bonus_speed)
-	var input_dir: Vector2 = player_input.input_direction
-	var direction := (transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized()
-
-	var horizontal := Vector2(velocity.x, velocity.z)
-	var on_floor := is_on_floor()
-
-	# --- Wall-slide projection ---
-	# _wall_normals contains per-face normals from Jolt's contact solver.
-	# When touching multiple walls (e.g. a corner), we must project the
-	# target velocity against ALL walls the player pushes into — not just
-	# one. Otherwise sliding along wall A produces velocity that drives
-	# into wall B, and Jolt's solver zeroes it out next frame (stutter).
-	#
-	# After projecting the target, velocity is decomposed into wall-parallel
-	# and wall-perpendicular axes. move_toward() only steers the parallel
-	# component; perpendicular (Jolt's depenetration push) is preserved.
-
-	if direction:
-		var target := Vector2(direction.x, direction.z) * current_speed
-
-		var best_normal := Vector2.ZERO
-		var best_dot := 0.0
-		for wn in _wall_normals:
-			var d := target.dot(wn)
-			if d < best_dot:
-				best_dot = d
-				best_normal = wn
-
-		if best_normal != Vector2.ZERO:
-			target -= best_normal * target.dot(best_normal)
-
-			var wall_tang := Vector2(-best_normal.y, best_normal.x)
-			var perp_speed := horizontal.dot(best_normal)
-			var para_speed := horizontal.dot(wall_tang)
-			var target_para := target.dot(wall_tang)
-
-			var accel := ACCELERATION if on_floor else AIR_ACCELERATION
-			para_speed = move_toward(para_speed, target_para, accel * delta)
-
-			var perp_out := maxf(perp_speed, 0.0)
-
-			horizontal = wall_tang * para_speed + best_normal * perp_out
-
-			for wn in _wall_normals:
-				var d := horizontal.dot(wn)
-				if d < 0.0:
-					horizontal -= wn * d
-		else:
-			# No wall contact or not pushing into any wall — normal acceleration
-			if on_floor:
-				horizontal = horizontal.move_toward(target, ACCELERATION * delta)
-			else:
-				var current_mag := horizontal.length()
-				var input_dot := horizontal.normalized().dot(target.normalized()) if current_mag > 0.1 else 1.0
-				horizontal = horizontal.move_toward(target, AIR_ACCELERATION * delta)
-				if horizontal.length() < current_mag and input_dot > 0.0:
-					horizontal = horizontal.normalized() * current_mag
-	else:
-		var decel := DECELERATION if on_floor else AIR_DECELERATION
-		horizontal = horizontal.move_toward(Vector2.ZERO, decel * delta)
-
-	velocity.x = horizontal.x
-	velocity.z = horizontal.y
-
-	# Velocity dead zone: when grounded with no input and near-zero speed,
-	# hard-zero velocity immediately. Prevents any tiny residual from floating
-	# point, solver contamination, or slope alignment rounding from creating
-	# persistent micro-drift on slopes.
-	if on_floor and not direction and horizontal.length_squared() < 0.01:
-		velocity.x = 0.0
-		velocity.z = 0.0
-		velocity.y = 0.0
-		return
-
-	var on_slope := _floor_normal.dot(Vector3.UP) <= 0.999  # >~2.5 degrees from flat
-	if on_floor and _floor_normal.y > 0.001 and on_slope and not _frame_jump:
-		# Slope alignment: compute the Y velocity needed to move along the
-		# floor surface instead of horizontally into it. X and Z stay exactly
-		# as the movement system computed — no direction change, no sideways
-		# deflection. Only the vertical component is added so the player
-		# glides up/down hills at constant horizontal speed, matching
-		# floor_constant_speed behavior (slope alignment).
-		#
-		# From the plane equation dot(velocity, normal) = 0:
-		#   nx*vx + ny*vy + nz*vz = 0  →  vy = -(nx*vx + nz*vz) / ny
-		velocity.y = -(_floor_normal.x * velocity.x + _floor_normal.z * velocity.z) / _floor_normal.y
 
 
 func is_on_floor() -> bool:
-	## Floor detection — raycast-based is_on_floor().
-	## Updated each physics tick by _update_ground_state().
-	return _is_grounded
+	## Proxy to PlayerMovement floor detection.
+	return movement.is_on_floor()
 
 
 func get_floor_normal() -> Vector3:
-	## Floor normal — raycast-based get_floor_normal().
-	return _floor_normal
+	## Proxy to PlayerMovement floor normal.
+	return movement.get_floor_normal()
 
 
-func _update_ground_state() -> void:
-	## Downward raycast for floor detection. Must be called from _physics_process()
-	## (threaded physics requires all queries in the physics tick).
-	##
-	## Casts from capsule center (Y=0.9) downward to FLOOR_SNAP_MARGIN below feet.
-	## The capsule bottom is at Y=0.0 (center 0.9, radius 0.4, half-height 0.9-0.4=0.5,
-	## so bottom = 0.9-0.5-0.4=0.0).
-	##
-	## Two thresholds:
-	##   FLOOR_CONTACT_TOLERANCE (0.05m) — tight check for _is_grounded (drives
-	##     movement: acceleration, gravity, jump). Tight threshold ensures
-	##     only reported is_on_floor() on actual contact.
-	##   FLOOR_SNAP_MARGIN (0.3m) — extended reach for _floor_y (snap-to-floor
-	##     mechanism that keeps the player grounded over bumps and slopes).
-	var space := get_world_3d().direct_space_state
-	if space == null:
-		_is_grounded = false
-		_floor_y = -INF
-		return
-
-	var origin := global_position + Vector3(0, 0.9, 0)  # Capsule center
-	var end := origin + Vector3(0, -(0.9 + FLOOR_SNAP_MARGIN), 0)  # Below feet + snap margin
-	var query := PhysicsRayQueryParameters3D.create(origin, end)
-	query.collision_mask = 1 | 2 | 16 | 64 | 2048  # World + items + toad walls + toad bodies + smooth walls (layer 12)
-	query.exclude = [get_rid()]
-
-	var result := space.intersect_ray(query)
-	if result.is_empty():
-		_is_grounded = false
-		_floor_normal = Vector3.UP
-		_floor_y = -INF
-		return
-
-	var normal: Vector3 = result["normal"]
-	if normal.angle_to(Vector3.UP) > FLOOR_MAX_ANGLE:
-		# Too steep — treat as a wall, not a floor
-		_is_grounded = false
-		_floor_normal = Vector3.UP
-		_floor_y = -INF
-		return
-
-	# Floor surface found — always record for snap logic
-	_floor_normal = normal
-	_floor_y = result["position"].y
-
-	# Hemisphere offset: on slopes, the capsule's bottom hemisphere contacts the
-	# surface HIGHER than where the center-down raycast hits. The correct resting
-	# height is floor_y + R*(1 - Ny)/Ny. We subtract this from feet_gap so the
-	# grounding check measures distance from the CORRECT resting position,
-	# working consistently on flat ground and steep walkable slopes alike.
-	var hemi_offset := CAPSULE_RADIUS * (1.0 - normal.y) / normal.y
-	var feet_gap := global_position.y - (_floor_y + hemi_offset)
-	if _is_grounded:
-		_is_grounded = feet_gap <= FLOOR_SNAP_MARGIN
-	else:
-		_is_grounded = feet_gap <= FLOOR_CONTACT_TOLERANCE
-
-	# Post-jump rising suppression: on uphill slopes, the terrain rises nearly
-	# as fast as the player after a jump, putting feet_gap within tolerance and
-	# killing the jump on the very next frame. While still rising from a jump,
-	# suppress grounding entirely. Once velocity.y reaches 0 (jump peak) or
-	# goes negative (ceiling hit, explosion knockback, etc.), clear the flag
-	# and resume normal grounding.
-	if _post_jump_rising:
-		if velocity.y > 0.0:
-			_is_grounded = false
-		else:
-			_post_jump_rising = false
-
-	# When ON TOP of a lightweight dynamic body (contact normal.y > 0.7),
-	# force grounded. The terrain raycast hits through/under the body, so
-	# terrain-based grounding is wrong — use contact-based grounding instead.
-	# No gravity → no force pushing into sphere → no sliding.
-	# Floor snap (below) is also skipped when on top.
-	#
-	# When touching from the SIDE (not on top), keep terrain-based grounding
-	# unchanged — the player may be standing on the ground next to the body
-	# and needs to jump/walk normally.
-	#
-	# Skip when rising (velocity.y > 0) — the player just jumped off the body.
-	# Without this check, the contact persists for 1-2 frames after liftoff,
-	# forcing _is_grounded = true, which makes _server_process() zero velocity.y
-	# and kills the jump.
-	if _on_dynamic_body and _dynamic_body_ref != null \
-			and is_instance_valid(_dynamic_body_ref) \
-			and _dynamic_body_ref.mass < 20.0 \
-			and velocity.y <= 0.0:
-		_is_grounded = true
 
 
 ## ======================================================================
@@ -1276,27 +666,6 @@ func _client_process(delta: float) -> void:
 ##  Utility functions
 ## ======================================================================
 
-func _get_barrel_position() -> Vector3:
-	## Returns the world-space position of the gun barrel tip.
-	if current_weapon and current_weapon.weapon_data:
-		var offset: Vector3 = current_weapon.weapon_data.barrel_offset
-		return weapon_mount.global_transform * offset
-	return camera_pivot.global_position
-
-
-func _get_camera_aim_target(cam_origin: Vector3, cam_forward: Vector3) -> Vector3:
-	## Raycast from the camera through screen-center to find the aim target.
-	var space_state := get_world_3d().direct_space_state
-	var far_point := cam_origin + cam_forward * 1000.0
-	# Toad dimension players are on layer 9 (256) instead of layer 8 (128)
-	var player_bit: int = 256 if in_toad_dimension else 128
-	var query := PhysicsRayQueryParameters3D.create(cam_origin, far_point)
-	query.exclude = [get_rid()]
-	query.collision_mask = 1 | 2 | 4 | 8 | 16 | player_bit  # All gameplay layers (excludes debris/toad bodies)
-	var result := space_state.intersect_ray(query)
-	if not result.is_empty():
-		return result.position
-	return far_point
 
 
 ## ======================================================================
@@ -1482,10 +851,7 @@ func die(killer_id: int) -> void:
 	collision_layer = 0
 	collision_mask = 0
 	velocity = Vector3.ZERO
-	_ground_velocity = Vector3.ZERO
-	_pre_solver_velocity = Vector3.ZERO
-	_undo_jolt_integration = false
-	_post_jump_rising = false
+	movement.reset_movement()
 	# End slide/crouch if active
 	if slide_crouch.is_sliding:
 		slide_crouch.end_slide()
@@ -1567,11 +933,7 @@ func reset_movement_states() -> void:
 	if grapple_system.is_active():
 		grapple_system.reset_state()
 	velocity = Vector3.ZERO
-	_is_grounded = false
-	_was_grounded = false
-	_floor_normal = Vector3.UP
-	_floor_y = -INF
-	_post_jump_rising = false
+	movement.reset_movement()
 
 
 func _do_respawn() -> void:
@@ -1617,12 +979,8 @@ func _do_respawn() -> void:
 		global_position = spawn_point.global_position
 		velocity = Vector3.ZERO
 
-	# Reset air-jump counter, wall-slide state, and ground velocity
-	_air_jumps_used = 0
-	_wall_normals = []
-	_ground_velocity = Vector3.ZERO
-	_pre_solver_velocity = Vector3.ZERO
-	_undo_jolt_integration = false
+	# Reset movement state (air jumps, wall-slide, ground velocity, etc.)
+	movement.reset_movement()
 
 	# Sync input counters so presses during death don't phantom-fire on respawn
 	_last_jump = player_input.jump_count
@@ -1673,16 +1031,7 @@ func equip_weapon(weapon_data: WeaponData) -> void:
 	if current_weapon != null:
 		current_weapon.queue_free()
 
-	if weapon_data.is_debug_lagger:
-		current_weapon = WeaponLaggerScript.new()
-	elif weapon_data.is_hitscan:
-		current_weapon = WeaponHitscan.new()
-	elif weapon_data.projectile_scene != null:
-		current_weapon = WeaponProjectileScript.new()
-	else:
-		current_weapon = WeaponMeleeScript.new()
-
-	current_weapon.setup(weapon_data)
+	current_weapon = WeaponFactory.create_weapon(weapon_data)
 	add_child(current_weapon)
 
 	equipped_gun_model_path = weapon_data.gun_model_path

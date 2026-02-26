@@ -89,8 +89,8 @@ func _ready() -> void:
 	_voxel_terrain.mesh_block_size = 16
 	_voxel_terrain.max_view_distance = 256
 	_voxel_terrain.generate_collisions = true
-	_voxel_terrain.collision_layer = 1   # Layer 1 — world geometry
-	_voxel_terrain.collision_mask = 0    # Static terrain doesn't collide with anything itself
+	_voxel_terrain.collision_layer = CollisionLayers.WORLD
+	_voxel_terrain.collision_mask = 0
 
 	# Constrain terrain to our map area (prevent infinite generation).
 	# Bounds AABB is in data-block coordinates (each block = mesh_block_size voxels).
@@ -287,7 +287,7 @@ func get_height_at(world_x: float, world_z: float) -> float:
 	var from := Vector3(world_x, 100.0, world_z)
 	var to := Vector3(world_x, -100.0, world_z)
 	var query := PhysicsRayQueryParameters3D.create(from, to)
-	query.collision_mask = 1  # World geometry only
+	query.collision_mask = CollisionLayers.WORLD
 	var result := space_state.intersect_ray(query)
 	if not result.is_empty():
 		return result.position.y

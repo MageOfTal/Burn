@@ -133,9 +133,9 @@ func process_slide(delta: float) -> void:
 	if player._frame_jump and on_floor:
 		player.velocity.x = _slide_velocity.x
 		player.velocity.z = _slide_velocity.z
-		player.velocity.y = player.JUMP_VELOCITY
-		player._is_grounded = false  # Override hysteresis — airborne now
-		player._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
+		player.velocity.y = player.movement.slope_compensated_jump_y()
+		player.movement._is_grounded = false  # Override hysteresis — airborne now
+		player.movement._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
 		# End slide directly — bypass end_slide() which would transition to crouch
 		# since we're still on_floor and holding shift
 		is_sliding = false
@@ -336,7 +336,7 @@ func end_slide() -> void:
 		var input_dir: Vector2 = player.player_input.input_direction
 		if input_dir.length() > 0.1:
 			var shoe_bonus: float = player.inventory.get_shoe_speed_bonus() if player.inventory else 0.0
-			var crouch_speed: float = player.SPEED * (player.heat_system.get_speed_multiplier() + shoe_bonus) * CROUCH_SPEED_MULT
+			var crouch_speed: float = player.movement.SPEED * (player.heat_system.get_speed_multiplier() + shoe_bonus) * CROUCH_SPEED_MULT
 			var direction := (player.transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized()
 			player.velocity.x = direction.x * crouch_speed
 			player.velocity.z = direction.z * crouch_speed
@@ -368,9 +368,9 @@ func process_post_slide_window(delta: float) -> bool:
 	if player._frame_jump and player.is_on_floor():
 		player.velocity.x = _post_slide_dir.x * _post_slide_speed
 		player.velocity.z = _post_slide_dir.z * _post_slide_speed
-		player.velocity.y = player.JUMP_VELOCITY
-		player._is_grounded = false  # Override hysteresis — airborne now
-		player._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
+		player.velocity.y = player.movement.slope_compensated_jump_y()
+		player.movement._is_grounded = false  # Override hysteresis — airborne now
+		player.movement._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
 		_post_slide_timer = 0.0
 		_post_slide_speed = 0.0
 		_post_slide_dir = Vector3.ZERO
@@ -378,7 +378,7 @@ func process_post_slide_window(delta: float) -> bool:
 
 	# Rapidly decelerate during the window
 	var horiz := Vector2(player.velocity.x, player.velocity.z)
-	var walk_speed: float = player.SPEED
+	var walk_speed: float = player.movement.SPEED
 	if horiz.length() > walk_speed:
 		horiz = horiz.move_toward(horiz.normalized() * walk_speed, POST_SLIDE_DECEL * delta)
 		player.velocity.x = horiz.x
@@ -425,9 +425,9 @@ func process_crouch(delta: float) -> void:
 	# Allow jumping out of crouch (must actually be on floor, not just in grace)
 	if player._frame_jump and on_floor and has_headroom():
 		end_crouch()
-		player.velocity.y = player.JUMP_VELOCITY
-		player._is_grounded = false  # Override hysteresis — airborne now
-		player._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
+		player.velocity.y = player.movement.slope_compensated_jump_y()
+		player.movement._is_grounded = false  # Override hysteresis — airborne now
+		player.movement._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
 		return
 
 	# Crouched movement — slower, same acceleration feel (only when grounded)
@@ -435,16 +435,16 @@ func process_crouch(delta: float) -> void:
 		return
 
 	var shoe_bonus: float = player.inventory.get_shoe_speed_bonus() if player.inventory else 0.0
-	var current_speed: float = player.SPEED * (player.heat_system.get_speed_multiplier() + shoe_bonus) * CROUCH_SPEED_MULT
+	var current_speed: float = player.movement.SPEED * (player.heat_system.get_speed_multiplier() + shoe_bonus) * CROUCH_SPEED_MULT
 	var input_dir: Vector2 = player.player_input.input_direction
 	var direction := (player.transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized()
 
 	var horizontal := Vector2(player.velocity.x, player.velocity.z)
 	if direction:
 		var target: Vector2 = Vector2(direction.x, direction.z) * current_speed
-		horizontal = horizontal.move_toward(target, player.ACCELERATION * delta)
+		horizontal = horizontal.move_toward(target, player.movement.ACCELERATION * delta)
 	else:
-		horizontal = horizontal.move_toward(Vector2.ZERO, player.DECELERATION * delta)
+		horizontal = horizontal.move_toward(Vector2.ZERO, player.movement.DECELERATION * delta)
 
 	player.velocity.x = horizontal.x
 	player.velocity.z = horizontal.y

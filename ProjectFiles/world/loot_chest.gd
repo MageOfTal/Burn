@@ -30,7 +30,7 @@ var _prompt_proximity: ProximityLabel = null
 
 
 func _ready() -> void:
-	collision_layer = 1
+	collision_layer = CollisionLayers.WORLD
 	collision_mask = 0
 
 	_build_visuals()

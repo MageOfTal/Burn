@@ -40,7 +40,21 @@ Engine/godot-source/modules/jolt_physics/objects/**
 Engine/godot-source/modules/jolt_physics/spaces/**
 !Engine/godot-source/modules/jolt_physics/spaces/jolt_contact_listener_3d.h
 !Engine/godot-source/modules/jolt_physics/spaces/jolt_contact_listener_3d.cpp
+!Engine/godot-source/modules/jolt_physics/spaces/jolt_physics_direct_space_state_3d.h
+!Engine/godot-source/modules/jolt_physics/spaces/jolt_physics_direct_space_state_3d.cpp
 !Engine/godot-source/modules/jolt_physics/spaces/jolt_space_3d.cpp
+!Engine/godot-source/modules/godot_physics_3d/
+Engine/godot-source/modules/godot_physics_3d/**
+!Engine/godot-source/modules/godot_physics_3d/godot_space_3d.h
+!Engine/godot-source/modules/godot_physics_3d/godot_space_3d.cpp
+!Engine/godot-source/servers/
+Engine/godot-source/servers/**
+!Engine/godot-source/servers/physics_3d/
+Engine/godot-source/servers/physics_3d/**
+!Engine/godot-source/servers/physics_3d/physics_server_3d.h
+!Engine/godot-source/servers/physics_3d/physics_server_3d.cpp
+!Engine/godot-source/servers/physics_3d/physics_server_3d_extension.h
+!Engine/godot-source/servers/physics_3d/physics_server_3d_dummy.h
 
 # --- OS junk ---
 .DS_Store

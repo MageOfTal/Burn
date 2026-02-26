@@ -27,20 +27,12 @@ class_name PhysicsBodyBase
 # ======================================================================
 
 ## Default collision mask for solid physics objects (tower chunks, falling
-## clusters, slabs, etc.). Covers: world terrain (1), significant items (2),
-## bubbles (4), rubber balls (8), player physics push (512), smooth wall
-## collision (2048). Excludes cosmetic layers (debris 32, toad bodies 64)
-## and query-only layers (player targeting 128/256, wall block raycasts 1024).
-## Spawners can add or remove layers as needed (e.g. | 32 for debris collision).
-const DEFAULT_PHYSICS_MASK := 1 | 2 | 4 | 8 | 512 | 2048  # = 2575
+## clusters, slabs, etc.). See CollisionLayers.DEFAULT_PHYSICS.
+const DEFAULT_PHYSICS_MASK := CollisionLayers.DEFAULT_PHYSICS
 
 ## Collision mask for projectiles and projectile-like objects (rockets, rubber
-## balls, bubbles, toads). Covers: world terrain (1), bubbles (4), player
-## physics push (512), smooth wall collision (2048). Deliberately excludes
-## debris (32), significant items (2), rubber balls (8), toad bodies (64),
-## and all query-only layers. Individual projectiles add layers as needed
-## (e.g. rubber ball adds | 2 for significant items).
-const PROJECTILE_PHYSICS_MASK := 1 | 4 | 512 | 2048  # = 2565
+## balls, bubbles, toads). See CollisionLayers.PROJECTILE_PHYSICS.
+const PROJECTILE_PHYSICS_MASK := CollisionLayers.PROJECTILE_PHYSICS
 
 ## Assumed mass of a Player (80 kg RigidBody3D) for the reduced-mass formula.
 const CHAR_EFFECTIVE_MASS := 80.0
@@ -54,6 +46,31 @@ const MAX_CHAR_PUSH_SPEED := 15.0
 ## How often to check for character overlaps (seconds). 10Hz is enough for smooth
 ## depenetration without burning CPU on 100+ bubbles all polling every frame.
 const OVERLAP_CHECK_INTERVAL := 0.1
+
+# ======================================================================
+#  Impact damage (opt-in)
+# ======================================================================
+
+## Set true on subclasses to enable base-class impact damage processing.
+## Subclasses with specialized impact logic (falling_block_cluster, tower_chunk)
+## should keep this false and handle their own _on_body_entered() callbacks.
+@export var impact_damage_enabled := false
+
+## Minimum speed (m/s) to trigger impact damage.
+@export var impact_min_speed := 5.0
+
+## Damage = impact_speed * sqrt(mass) * impact_damage_mult
+@export var impact_damage_mult := 1.5
+
+## Maximum impact damage events before this body stops dealing impact damage.
+@export var impact_max_events := 3
+
+## Seconds between impacts (prevents rapid repeated damage from the same contact).
+const IMPACT_COOLDOWN := 0.2
+
+var _impact_cooldown_timer: float = 0.0
+var _impact_events_used: int = 0
+
 # ======================================================================
 #  Internal state
 # ======================================================================
@@ -71,10 +88,14 @@ func _physics_process(delta: float) -> void:
 	if not multiplayer.is_server():
 		return
 
+	# Tick impact cooldown
+	if _impact_cooldown_timer > 0.0:
+		_impact_cooldown_timer -= delta
+
 	# If this body masks layer 10 (player physics push layer), Jolt handles push
 	# transfer natively via its contact solver. Skip manual polling to avoid
 	# double-pushing the player.
-	if collision_mask & 512:
+	if collision_mask & CollisionLayers.PLAYERS_PUSH:
 		return
 
 	_push_check_timer -= delta
@@ -106,7 +127,7 @@ func _check_character_overlaps() -> void:
 	var query := PhysicsShapeQueryParameters3D.new()
 	query.shape = _cached_shape
 	query.transform = global_transform
-	query.collision_mask = 128 | 256  # Layer 8 (overworld) + layer 9 (toad dimension) players
+	query.collision_mask = CollisionLayers.ALL_PLAYERS
 	query.exclude = [get_rid()]  # Don't detect self
 	query.collide_with_bodies = true
 
@@ -181,3 +202,38 @@ func _apply_character_push(char_body: Player, contact_normal: Vector3,
 	if char_push.length() > MAX_CHAR_PUSH_SPEED:
 		char_push = char_push.normalized() * MAX_CHAR_PUSH_SPEED
 	char_body.velocity += char_push
+
+
+# ======================================================================
+#  Impact damage — opt-in body_entered handler
+# ======================================================================
+
+func _on_impact_body_entered(body: Node) -> void:
+	## Generic impact damage callback. Connect to body_entered signal on subclasses
+	## that set impact_damage_enabled = true. Requires contact_monitor = true.
+	##
+	## Damage formula: impact_speed * sqrt(mass) * impact_damage_mult
+	## Same formula used by tower_chunk.gd for consistency.
+	if not impact_damage_enabled or not multiplayer.is_server():
+		return
+	if _impact_cooldown_timer > 0.0:
+		return
+	if _impact_events_used >= impact_max_events:
+		return
+
+	var impact_speed := linear_velocity.length()
+	if body is RigidBody3D:
+		impact_speed = (linear_velocity - body.linear_velocity).length()
+
+	if impact_speed < impact_min_speed:
+		return
+
+	var base_damage: float = impact_speed * sqrt(mass) * impact_damage_mult
+	_impact_cooldown_timer = IMPACT_COOLDOWN
+	_impact_events_used += 1
+
+	# Deal damage to the target
+	if body.has_method("take_damage_at"):
+		body.take_damage_at(global_position, base_damage, 0.5, -1)
+	elif body.has_method("take_damage"):
+		body.take_damage(base_damage, -1)

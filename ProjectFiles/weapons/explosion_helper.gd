@@ -44,11 +44,13 @@ static func do_explosion(
 	radius: float,
 	attacker_id: int,
 	exclude_body: Node = null,
+	impact_speed: float = INF,
 ) -> void:
 	## Deal shielded explosion damage to all players and walls in radius.
 	## player_damage: base damage dealt to players (before falloff/shielding).
 	## structure_damage: base damage dealt to structures/blocks/physics objects.
 	## exclude_body: the rocket RigidBody3D or kamikaze player to skip.
+	## impact_speed: speed of the projectile at detonation (m/s). Passed to debris.
 	var t_explosion_total := Time.get_ticks_usec()
 	var space_state := world.direct_space_state
 	if space_state == null:
@@ -75,7 +77,7 @@ static func do_explosion(
 	_query_sphere.radius = radius
 	query.shape = _query_sphere
 	query.transform = Transform3D(Basis(), explosion_pos)
-	query.collision_mask = 1 | 2 | 4 | 128 | 256 | 1024  # World(1) + items(2) + bubbles(4) + players(128/256) + blocks(1024)
+	query.collision_mask = CollisionLayers.WORLD | CollisionLayers.ITEMS | CollisionLayers.BUBBLES | CollisionLayers.ALL_PLAYERS | CollisionLayers.WALL_BLOCKS
 	query.collide_with_bodies = true
 	query.collide_with_areas = true
 
@@ -97,7 +99,7 @@ static func do_explosion(
 		if target.has_method("take_damage_at"):
 			# Wall: let take_damage_at handle per-block shielding internally
 			_dbg_pass1_structures.append(target.name)
-			target.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids)
+			target.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids, impact_speed)
 			already_damaged.append(target)
 			pass1_structures += 1
 		elif target is Player and target.has_method("take_damage"):
@@ -181,7 +183,7 @@ static func do_explosion(
 						pass2_skipped += 1
 						continue
 					_dbg_pass2_structures.append(s.name)
-					s.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids)
+					s.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids, impact_speed)
 					already_damaged.append(s)
 					pass2_structures += 1
 
@@ -250,7 +252,7 @@ static func _calc_player_explosion_damage(
 
 	# Reuse a single query object across all 5 sample rays.
 	var query := PhysicsRayQueryParameters3D.new()
-	query.collision_mask = 1 | 128 | 256 | 1024
+	query.collision_mask = CollisionLayers.SHIELDING
 	query.exclude = exclude_rids_base
 
 	for i_sample in sample_points.size():
@@ -398,8 +400,6 @@ static func _make_shielding_query(from: Vector3, exclude_rids: Array[RID]) -> Ph
 	## Used by both single-ray and batch-ray shielding paths.
 	var query := PhysicsRayQueryParameters3D.new()
 	query.from = from
-	query.collision_mask = 1 | 128 | 256 | 1024  # Terrain(1) + players(128/256) + wall blocks(1024)
+	query.collision_mask = CollisionLayers.SHIELDING  # Terrain(1) + players(128/256) + wall blocks(1024)
 	query.exclude = exclude_rids
 	return query
-
-

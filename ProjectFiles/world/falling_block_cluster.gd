@@ -159,7 +159,7 @@ func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
 
 
 func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
-		_attacker_id: int, _exclude_rids: Array[RID] = []) -> void:
+		_attacker_id: int, _exclude_rids: Array[RID] = [], _impact_speed: float = INF) -> void:
 	## AoE per-block damage from explosions. Same cubic falloff as structures.
 	## No shielding raycasts (clusters are small, shielding is negligible).
 	if not multiplayer.is_server():
@@ -189,7 +189,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 
 
 func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
-		_attckr_id: int) -> Dictionary:
+		_attckr_id: int, _impact_speed: float = INF) -> Dictionary:
 	## Targeted single-block damage from momentum carving.
 	## Finds nearest block, damages it. Breakthrough explosions are handled by
 	## the caller using per-block momentum at remaining speed.
@@ -336,7 +336,7 @@ func _handle_generic_hit(body: Node) -> void:
 
 	# Mutual damage — the collision damages this cluster too
 	var contact_point: Vector3 = impact["contact_point"]
-	take_momentum_damage_at(contact_point, impact["base_damage"], -1)
+	take_momentum_damage_at(contact_point, impact["base_damage"], -1, impact["impact_speed"])
 
 	print("[FallingCluster] Hit %s for %.1f structure damage (speed=%.1f mass=%.1f)" % [
 		body.name, impact["base_damage"], impact["impact_speed"], cluster_mass])
@@ -355,7 +355,7 @@ func _handle_structure_hit(body: Node, target_structure: DestructibleBlockStruct
 
 	# Damage target structure at the contact point
 	var target_result: Dictionary = target_structure.take_momentum_damage_at(
-		contact_point, base_damage, attacker_id
+		contact_point, base_damage, attacker_id, impact_speed
 	)
 	var target_absorbed: float = target_result.get("absorbed", 0.0)
 
@@ -375,10 +375,10 @@ func _handle_structure_hit(body: Node, target_structure: DestructibleBlockStruct
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = target_result.get("block_pos", contact_point)
 		if expl_damage > 0.5 and expl_radius > 0.1:
-			target_structure.take_damage_at(block_pos, expl_damage, expl_radius, attacker_id)
+			target_structure.take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], remaining_speed)
 
 	# Mutual damage — same collision, same damage to this cluster
-	var self_result: Dictionary = take_momentum_damage_at(contact_point, base_damage, -1)
+	var self_result: Dictionary = take_momentum_damage_at(contact_point, base_damage, -1, impact_speed)
 
 	# Breakthrough explosion on SELF — per-block momentum at remaining speed
 	if self_result.get("block_destroyed", false) and remaining_speed > MIN_DAMAGE_SPEED:
@@ -387,7 +387,7 @@ func _handle_structure_hit(body: Node, target_structure: DestructibleBlockStruct
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = self_result.get("block_pos", contact_point)
 		if expl_damage > 0.5 and not _cluster_blocks.is_empty():
-			take_damage_at(block_pos, expl_damage, expl_radius, attacker_id)
+			take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], remaining_speed)
 
 	print("[FallingCluster] Carve into %s: dmg=%.1f absorbed=%.1f remaining_speed=%.1f" % [
 		target_structure.name, base_damage, target_absorbed, remaining_speed])
@@ -421,11 +421,11 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 
 	# This cluster damages the other
 	var other_result: Dictionary = other.take_momentum_damage_at(
-		contact_midpoint, my_damage, attacker_id)
+		contact_midpoint, my_damage, attacker_id, impact_speed)
 
 	# Other cluster damages this one
 	var self_result: Dictionary = take_momentum_damage_at(
-		contact_midpoint, other_damage, other.attacker_id)
+		contact_midpoint, other_damage, other.attacker_id, impact_speed)
 
 	# Breakthrough on the other cluster (from this cluster's remaining momentum)
 	if other_result.get("block_destroyed", false) and impact_speed > MIN_DAMAGE_SPEED:
@@ -434,7 +434,7 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = other_result.get("block_pos", contact_midpoint)
 		if expl_damage > 0.5 and not other._cluster_blocks.is_empty():
-			other.take_damage_at(block_pos, expl_damage, expl_radius, attacker_id)
+			other.take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], impact_speed)
 
 	# Breakthrough on this cluster (from other cluster's remaining momentum)
 	if self_result.get("block_destroyed", false) and impact_speed > MIN_DAMAGE_SPEED:
@@ -443,7 +443,7 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = self_result.get("block_pos", contact_midpoint)
 		if expl_damage > 0.5 and not _cluster_blocks.is_empty():
-			take_damage_at(block_pos, expl_damage, expl_radius, attacker_id)
+			take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], impact_speed)
 
 	print("[FallingCluster] Cluster vs cluster: %s(%.1fkg) vs %s(%.1fkg) speed=%.1f" % [
 		name, cluster_mass, other.name, other.cluster_mass, impact_speed])

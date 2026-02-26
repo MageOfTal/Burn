@@ -93,11 +93,11 @@ func _setup() -> void:
 	physics_material_override = phys_mat
 
 	if GameManager.debug_bubble_no_collision:
-		collision_layer = 4  # Keep layer so Area3D sensors still detect it
-		collision_mask = 0   # Don't collide with anything
+		collision_layer = CollisionLayers.BUBBLES
+		collision_mask = 0
 	else:
-		collision_layer = 4  # Layer 3: bubbles
-		collision_mask = 1 | 2048   # World(1) + smooth walls(2048) — bubble overlap detected via intersect_shape query
+		collision_layer = CollisionLayers.BUBBLES
+		collision_mask = CollisionLayers.SURFACE
 	if GameManager.debug_bubble_no_ccd:
 		continuous_cd = false
 	if GameManager.debug_bubble_no_contact_monitor:
@@ -113,7 +113,7 @@ func _setup() -> void:
 		PhysicsServer3D.shape_set_data(_overlap_shape_rid, BUBBLE_RADIUS)
 		_overlap_query = PhysicsShapeQueryParameters3D.new()
 		_overlap_query.shape_rid = _overlap_shape_rid
-		_overlap_query.collision_mask = 4  # Layer 3 (bubbles) only
+		_overlap_query.collision_mask = CollisionLayers.BUBBLES
 		_overlap_query.collide_with_bodies = true
 		_overlap_query.collide_with_areas = false
 		_overlap_query.exclude = [get_rid()]

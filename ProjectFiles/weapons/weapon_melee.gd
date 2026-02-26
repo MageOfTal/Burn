@@ -25,13 +25,12 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 
 	var reach: float = weapon_data.weapon_range if weapon_data else 3.5
 
-	# Toad dimension players are on layer 9 (256) instead of layer 8 (128)
-	var player_bit: int = 256 if shooter.get("in_toad_dimension") else 128
+	var player_bit: int = CollisionLayers.player_bit(shooter.get("in_toad_dimension"))
 
 	var params := PhysicsShapeQueryParameters3D.new()
 	params.shape = _query_sphere
 	params.exclude = [shooter.get_rid()]
-	params.collision_mask = 1 | 2 | 1024 | player_bit  # World(1) + items(2) + blocks(1024) + players
+	params.collision_mask = CollisionLayers.WORLD | CollisionLayers.ITEMS | CollisionLayers.WALL_BLOCKS | player_bit
 	params.motion = Vector3.ZERO
 
 	# Sweep across a 120-degree arc (matching the visual swing effect)

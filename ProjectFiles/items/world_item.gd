@@ -328,7 +328,7 @@ func _ensure_above_ground() -> void:
 	var ray_start := global_position + Vector3(0, 5.0, 0)
 	var ray_end := global_position - Vector3(0, 10.0, 0)
 	var query := PhysicsRayQueryParameters3D.create(ray_start, ray_end)
-	query.collision_mask = 1
+	query.collision_mask = CollisionLayers.WORLD
 	query.collide_with_areas = false
 
 	var result := space_state.intersect_ray(query)

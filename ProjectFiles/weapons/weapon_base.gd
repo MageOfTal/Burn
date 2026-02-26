@@ -9,6 +9,9 @@ var cooldown_remaining: float = 0.0
 ## Set by player before firing. If non-null, overrides the weapon's projectile.
 var ammo_data: WeaponData = null
 
+## Active modifiers attached to this weapon instance.
+var modifiers: Array[ModifierBase] = []
+
 
 func setup(data: WeaponData) -> void:
 	weapon_data = data
@@ -43,6 +46,77 @@ func _do_fire(_shooter: Player, _aim_origin: Vector3, _aim_direction: Vector3) -
 func _physics_process(delta: float) -> void:
 	if cooldown_remaining > 0.0:
 		cooldown_remaining -= delta
+	for mod in modifiers:
+		mod.on_tick(delta)
+
+
+## --- Modifier management ---
+
+func add_modifier(data: ModifierData) -> bool:
+	## Attach a modifier to this weapon. Returns false if at capacity or incompatible.
+	if weapon_data == null:
+		return false
+	if modifiers.size() >= weapon_data.modifier_slots:
+		return false
+	if data.modifier_script == null:
+		return false
+	# Check compatibility
+	var is_hitscan := weapon_data.is_hitscan
+	var is_projectile := weapon_data.projectile_scene != null
+	var is_melee := not is_hitscan and not is_projectile
+	if is_hitscan and not data.compatible_hitscan:
+		return false
+	if is_projectile and not data.compatible_projectile:
+		return false
+	if is_melee and not data.compatible_melee:
+		return false
+	# Check for duplicate
+	for existing in modifiers:
+		if existing.modifier_data.modifier_id == data.modifier_id:
+			return false
+	# Create and attach
+	var mod: ModifierBase = data.modifier_script.new()
+	mod.setup(data, self)
+	modifiers.append(mod)
+	mod.on_attach()
+	return true
+
+
+func remove_modifier(id: StringName) -> bool:
+	## Remove a modifier by its ID. Returns false if not found.
+	for i in modifiers.size():
+		if modifiers[i].modifier_data.modifier_id == id:
+			modifiers[i].on_detach()
+			modifiers.remove_at(i)
+			return true
+	return false
+
+
+func clear_modifiers() -> void:
+	## Remove all modifiers (e.g., on weapon unequip).
+	for mod in modifiers:
+		mod.on_detach()
+	modifiers.clear()
+
+
+func call_on_fire(params: Dictionary) -> Dictionary:
+	## Chain on_fire hooks through all modifiers.
+	for mod in modifiers:
+		params = mod.on_fire(params)
+	return params
+
+
+func call_on_hit(target: Node3D, damage: float, hit_position: Vector3) -> float:
+	## Chain on_hit hooks through all modifiers.
+	for mod in modifiers:
+		damage = mod.on_hit(target, damage, hit_position)
+	return damage
+
+
+func call_on_projectile_launch(projectile: Node3D) -> void:
+	## Call on_projectile_launch on all modifiers.
+	for mod in modifiers:
+		mod.on_projectile_launch(projectile)
 
 
 ## --- Projectile spawn helper ---
@@ -56,7 +130,7 @@ func get_safe_spawn_offset(shooter: Player, origin: Vector3, direction: Vector3,
 			origin, origin + direction * base_offset
 		)
 		ray_query.exclude = [shooter.get_rid()]
-		ray_query.collision_mask = 1 | 2048  # Terrain(1) + smooth wall(2048)
+		ray_query.collision_mask = CollisionLayers.SURFACE
 		var ray_result := space_state.intersect_ray(ray_query)
 		if not ray_result.is_empty():
 			return maxf(origin.distance_to(ray_result.position) - 0.1, 0.2)

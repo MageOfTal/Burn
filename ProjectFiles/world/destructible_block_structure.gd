@@ -32,6 +32,10 @@ var _blocks: Dictionary = {}
 var _num_x: int = 0
 var _num_y: int = 0
 var _num_z: int = 0
+
+## Flat occupancy grid: 1 = block exists, 0 = empty. Indexed via _grid_idx().
+## Avoids Dictionary hashing in BFS inner loops (~20x faster than _blocks.has()).
+var _block_grid: PackedByteArray = PackedByteArray()
 var _block_hp: float = 35.0
 var _structure_material: StandardMaterial3D = null
 
@@ -53,7 +57,6 @@ var _col_shapes: Dictionary = {}
 ## Cached debris config from subclass (populated in _ready)
 var _debris_size: float = 0.15
 var _debris_per_block: int = 2
-var _debris_impulse: float = 3.5
 var _debris_lifetime: float = 5.0
 var _debris_max_total: int = 40
 var _debris_mass: float = 0.5
@@ -92,10 +95,10 @@ func _get_tier_info() -> Dictionary:
 
 func _get_debris_config() -> Dictionary:
 	## Return debris parameters for this structure type.
-	## Keys: "size", "per_block", "impulse", "lifetime", "max_total", "mass", "name"
+	## Keys: "size", "per_block", "lifetime", "max_total", "mass", "name"
 	push_error("DestructibleBlockStructure._get_debris_config() not overridden!")
 	return {
-		"size": 0.15, "per_block": 2, "impulse": 3.5,
+		"size": 0.15, "per_block": 2,
 		"lifetime": 5.0, "max_total": 40, "mass": 0.5, "name": "Debris",
 	}
 
@@ -132,6 +135,11 @@ func _get_block_mass() -> float:
 	return _block_hp * MASS_PER_HP
 
 
+func _grid_idx(bx: int, by: int, bz: int) -> int:
+	## Flat index into _block_grid for grid coordinate (bx, by, bz).
+	return bx * _num_y * _num_z + by * _num_z + bz
+
+
 # ======================================================================
 #  Lifecycle
 # ======================================================================
@@ -157,7 +165,6 @@ func _ready() -> void:
 	var debris_cfg: Dictionary = _get_debris_config()
 	_debris_size = debris_cfg["size"]
 	_debris_per_block = debris_cfg["per_block"]
-	_debris_impulse = debris_cfg["impulse"]
 	_debris_lifetime = debris_cfg["lifetime"]
 	_debris_max_total = debris_cfg["max_total"]
 	_debris_mass = debris_cfg["mass"]
@@ -172,7 +179,12 @@ func _ready() -> void:
 	_num_y = maxi(int(structure_size.y / BLOCK_SIZE), 1)
 	_num_z = maxi(int(structure_size.z / BLOCK_SIZE), 1)
 
+	# Initialize flat occupancy grid (used by BFS and column scanning)
+	_block_grid.resize(_num_x * _num_y * _num_z)
+	_block_grid.fill(0)
+
 	# Build block grid (collision only — no per-block meshes)
+	var t_blocks := Time.get_ticks_usec()
 	if is_detach:
 		# Detached structure: spawn only the provided blocks with their HPs
 		var detach_keys: Array = _init_from_detach["block_keys"]
@@ -191,16 +203,32 @@ func _ready() -> void:
 				for bz in _num_z:
 					if _should_spawn_block(bx, by, bz):
 						_spawn_block(bx, by, bz)
+	var t_blocks_end := Time.get_ticks_usec()
 
 	# Build single greedy-meshed visual
+	var t_mesh := Time.get_ticks_usec()
 	_mesh_instance = MeshInstance3D.new()
 	_mesh_instance.material_override = _structure_material
 	_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	add_child(_mesh_instance)
 	_rebuild_greedy_mesh()
+	var t_mesh_end := Time.get_ticks_usec()
 
 	# Build smooth collision shell for player physics (no seam bouncing)
+	var t_smooth := Time.get_ticks_usec()
 	_build_smooth_collision()
+	var t_smooth_end := Time.get_ticks_usec()
+
+	var ready_total := Time.get_ticks_usec() - t_blocks
+	if ready_total > 5000:
+		print("[StructureReady] %s  blocks=%d  spawn_blocks=%dus  greedy_mesh=%dus  smooth_col=%dus  total=%dus%s" % [
+			name, _blocks.size(),
+			t_blocks_end - t_blocks,
+			t_mesh_end - t_mesh,
+			t_smooth_end - t_smooth,
+			ready_total,
+			"  (detach)" if is_detach else "",
+		])
 
 	# Detached structures: compute bottom-center for ground raycast and start falling
 	if is_detach and not _blocks.is_empty():
@@ -254,7 +282,7 @@ func _physics_process(delta: float) -> void:
 	var params := PhysicsRayQueryParameters3D.new()
 	params.from = bottom_world
 	params.to = bottom_world + Vector3(0, -(move_dist + 0.05), 0)
-	params.collision_mask = 1  # World geometry / terrain
+	params.collision_mask = CollisionLayers.WORLD
 
 	var result := space_state.intersect_ray(params)
 	if result:
@@ -286,7 +314,7 @@ func _spawn_block(bx: int, by: int, bz: int) -> void:
 	block_body.name = "Block_%d_%d_%d" % [bx, by, bz]
 	block_body.grid_key = Vector3i(bx, by, bz)
 	block_body.parent_wall = self
-	block_body.collision_layer = 1024  # Layer 11: block detection (weapons only)
+	block_body.collision_layer = CollisionLayers.WALL_BLOCKS
 	block_body.collision_mask = 0
 
 	# Position relative to structure center (local space)
@@ -313,6 +341,7 @@ func _spawn_block(bx: int, by: int, bz: int) -> void:
 		"body": block_body,
 		"hp": _block_hp,
 	}
+	_block_grid[_grid_idx(bx, by, bz)] = 1
 
 
 # ======================================================================
@@ -337,6 +366,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 	var block_body: StaticBody3D = block_data["body"]
 	if not is_instance_valid(block_body):
 		_blocks.erase(key)
+		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		return
 
 	_last_attacker_id = _attacker_id
@@ -345,6 +375,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 	if block_data["hp"] <= 0.0:
 		var block_pos: Vector3 = block_body.global_position
 		var debris_count := randi_range(1, 2)
+		var ok_frac := clampf(-block_data["hp"] / _block_hp, 0.0, 1.0)
 
 		# Use the attacker's position as the blast origin so debris flies away
 		# from the shooter. Falls back to a random offset if attacker not found.
@@ -358,13 +389,14 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		# Server: destroy block, sync to clients. Debris spawns on all peers via RPC.
 		block_body.queue_free()
 		_blocks.erase(key)
+		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
 		_rebuild_column(key.x, key.z)
-		_sync_block_destroyed.rpc(key, block_pos, blast_origin, debris_count)
+		_sync_block_destroyed.rpc(key, block_pos, blast_origin, debris_count, INF, ok_frac)
 
 		# Host also spawns debris locally (RPC is call_remote, host needs it too).
-		_spawn_debris(block_pos, blast_origin, debris_count)
+		_spawn_debris(block_pos, blast_origin, debris_count, INF, ok_frac)
 
 		# Check if destroying this block left floating islands
 		_check_structural_integrity()
@@ -375,7 +407,8 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 
 @rpc("authority", "call_remote", "reliable")
 func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
-		blast_center: Vector3 = Vector3.ZERO, debris_count: int = 0) -> void:
+		blast_center: Vector3 = Vector3.ZERO, debris_count: int = 0,
+		impact_speed: float = INF, overkill_frac: float = 0.0) -> void:
 	## Client-side: remove a destroyed block, rebuild mesh, and spawn cosmetic debris.
 	if _blocks.has(key):
 		var block_data: Dictionary = _blocks[key]
@@ -383,16 +416,17 @@ func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 		if is_instance_valid(block_body):
 			block_body.queue_free()
 		_blocks.erase(key)
+		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)
 		_rebuild_column(key.x, key.z)
 
 	# Spawn cosmetic debris on the client.
 	if debris_count > 0:
-		_spawn_debris(block_pos, blast_center, debris_count)
+		_spawn_debris(block_pos, blast_center, debris_count, impact_speed, overkill_frac)
 
 
-func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attacker_id: int, exclude_rids: Array[RID] = []) -> void:
+func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attacker_id: int, exclude_rids: Array[RID] = [], impact_speed: float = INF) -> void:
 	## Damage blocks within blast_radius of hit_pos. Only blocks in range take damage.
 	## Shielding uses flat HP absorption: each wall block or player between the
 	## explosion and a target block absorbs damage equal to its current HP.
@@ -411,6 +445,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	var debris_spawned := 0
 	var destroyed_keys: Array[Vector3i] = []
 	var destroyed_positions: Array[Vector3] = []
+	var destroyed_overkill: Array[float] = []
 	var debug_ray_data: Array = []
 
 	# Two-pass damage: compute all damage first (read-only), then apply.
@@ -465,6 +500,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		if block_data["hp"] <= 0.0:
 			destroyed_keys.append(key)
 			destroyed_positions.append(block_body.global_position)
+			destroyed_overkill.append(clampf(-block_data["hp"] / _block_hp, 0.0, 1.0))
 			block_body.queue_free()
 	var t_pass2_end := Time.get_ticks_usec()
 
@@ -481,7 +517,9 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	for i in destroyed_keys.size():
 		var key := destroyed_keys[i]
 		var block_pos := destroyed_positions[i]
+		var ok_frac := destroyed_overkill[i]
 		_blocks.erase(key)
+		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 
 		# Determine debris count for this block.
 		var to_spawn := 0
@@ -490,10 +528,14 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 			debris_spawned += to_spawn
 
 		# Sync to clients (they spawn debris). Host spawns debris locally.
-		_sync_block_destroyed.rpc(key, block_pos, hit_pos, to_spawn)
+		# Mirror the explosion center through the block so debris flies OUTWARD
+		# from the blast, not into it. blast_center semantics = "where debris
+		# should fly toward", so we reflect hit_pos to the far side.
+		var debris_origin := block_pos + (block_pos - hit_pos)
+		_sync_block_destroyed.rpc(key, block_pos, debris_origin, to_spawn, impact_speed, ok_frac)
 		rpc_count += 1
 		if to_spawn > 0:
-			_spawn_debris(block_pos, hit_pos, to_spawn)
+			_spawn_debris(block_pos, debris_origin, to_spawn, impact_speed, ok_frac)
 			debris_spawn_count += to_spawn
 	var t_debris_end := Time.get_ticks_usec()
 
@@ -543,7 +585,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 # ======================================================================
 
 func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
-		p_attacker_id: int) -> Dictionary:
+		p_attacker_id: int, impact_speed: float = INF) -> Dictionary:
 	## Damage the block nearest to hit_world_pos via momentum carving.
 	## Unlike take_damage_at() (AoE with shielding), this targets a SINGLE block.
 	## Breakthrough explosions are handled by the caller using per-block momentum.
@@ -596,16 +638,18 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 
 	# Block destroyed
 	var block_pos: Vector3 = block_body.global_position
+	var ok_frac := clampf(-block_data["hp"] / _block_hp, 0.0, 1.0)
 	block_body.queue_free()
 	_blocks.erase(target_key)
+	_block_grid[_grid_idx(target_key.x, target_key.y, target_key.z)] = 0
 	_mesh_dirty = true
 	set_process(true)
 	_rebuild_column(target_key.x, target_key.z)
 
 	# Sync destruction + debris to clients
 	var debris_count := randi_range(1, 2)
-	_sync_block_destroyed.rpc(target_key, block_pos, hit_world_pos, debris_count)
-	_spawn_debris(block_pos, hit_world_pos, debris_count)
+	_sync_block_destroyed.rpc(target_key, block_pos, hit_world_pos, debris_count, impact_speed, ok_frac)
+	_spawn_debris(block_pos, hit_world_pos, debris_count, impact_speed, ok_frac)
 
 	# Structural integrity check (may detach more blocks)
 	if not _blocks.is_empty():
@@ -621,11 +665,13 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 #  Debris (delegates to DebrisHelper static utility)
 # ======================================================================
 
-func _spawn_debris(block_pos: Vector3, blast_center: Vector3, count: int) -> void:
+func _spawn_debris(block_pos: Vector3, blast_center: Vector3, count: int,
+		impact_speed: float = INF, overkill_frac: float = 0.0) -> void:
 	DebrisHelper.spawn_debris(
 		get_parent(), block_pos, blast_center, count, _structure_material,
+		impact_speed, overkill_frac,
 		{
-			"size": _debris_size, "impulse": _debris_impulse,
+			"size": _debris_size,
 			"lifetime": _debris_lifetime, "mass": _debris_mass,
 			"name": _debris_name,
 		}
@@ -655,68 +701,25 @@ func _check_structural_integrity() -> void:
 
 	var t_si_total := Time.get_ticks_usec()
 
-	# Collect all ground (y=0) blocks as BFS seeds
-	var t_bfs := Time.get_ticks_usec()
-	var ground_seeds: Array[Vector3i] = []
-	for key: Vector3i in _blocks:
-		if key.y == 0:
-			ground_seeds.append(key)
+	# C++ BFS: returns PackedInt32Array of (bx,by,bz) triplets for unsupported blocks.
+	# Handles ground seed collection, BFS expansion, early exit, and result gathering
+	# entirely in native code with raw pointer access (~20-40x faster than GDScript).
+	var space_state := get_world_3d().direct_space_state
+	var result := space_state.calc_structural_integrity(
+		_block_grid, _num_x, _num_y, _num_z, _blocks.size())
 
-	# If no ground blocks exist, ALL remaining blocks are unsupported
-	if ground_seeds.is_empty():
-		var all_keys: Array[Vector3i] = []
-		for key: Vector3i in _blocks:
-			all_keys.append(key)
-		var t_bfs_end := Time.get_ticks_usec()
-		var t_comp := Time.get_ticks_usec()
-		var components := _find_connected_components(all_keys)
-		var t_comp_end := Time.get_ticks_usec()
-		var t_detach := Time.get_ticks_usec()
-		for component in components:
-			_detach_cluster(component)
-		var t_detach_end := Time.get_ticks_usec()
-		var si_us := Time.get_ticks_usec() - t_si_total
-		print("[StructuralIntegrity] %s  blocks=%d  ground=0(all floating)  bfs=%dus  components=%dus(%d)  detach=%dus(%d blocks)  total=%dus" % [
-			name, _blocks.size(),
-			t_bfs_end - t_bfs,
-			t_comp_end - t_comp, components.size(),
-			t_detach_end - t_detach, all_keys.size(),
-			si_us,
-		])
-		GameManager.tick_add("structural_integrity", si_us)
+	# Early exit: no unsupported blocks (C++ already logged BFS timing)
+	if result.is_empty():
+		GameManager.tick_add("structural_integrity", Time.get_ticks_usec() - t_si_total)
 		return
 
-	# Multi-source BFS from all ground blocks simultaneously
-	var supported: Dictionary = {}  # Vector3i -> true
-	var queue: Array[Vector3i] = []
-
-	for seed_key in ground_seeds:
-		supported[seed_key] = true
-		queue.append(seed_key)
-
-	var head := 0
-	while head < queue.size():
-		var current: Vector3i = queue[head]
-		head += 1
-		for offset in NEIGHBOR_OFFSETS:
-			var neighbor: Vector3i = current + offset
-			if _blocks.has(neighbor) and not supported.has(neighbor):
-				supported[neighbor] = true
-				queue.append(neighbor)
-
-	# Find all unsupported blocks
+	# Parse triplets into Vector3i array
 	var unsupported: Array[Vector3i] = []
-	for key: Vector3i in _blocks:
-		if not supported.has(key):
-			unsupported.append(key)
-	var t_bfs_end := Time.get_ticks_usec()
-
-	if unsupported.is_empty():
-		print("[StructuralIntegrity] %s  blocks=%d  ground=%d  unsupported=0  bfs=%dus" % [
-			name, _blocks.size(), ground_seeds.size(),
-			t_bfs_end - t_bfs,
-		])
-		return
+	var count := result.size() / 3
+	unsupported.resize(count)
+	for i in count:
+		var base := i * 3
+		unsupported[i] = Vector3i(result[base], result[base + 1], result[base + 2])
 
 	# Group unsupported blocks into connected components, each becomes a cluster
 	var t_comp := Time.get_ticks_usec()
@@ -729,9 +732,8 @@ func _check_structural_integrity() -> void:
 	var t_detach_end := Time.get_ticks_usec()
 
 	var si_us := Time.get_ticks_usec() - t_si_total
-	print("[StructuralIntegrity] %s  blocks=%d  ground=%d  unsupported=%d  bfs=%dus  components=%dus(%d)  detach=%dus  total=%dus" % [
-		name, _blocks.size(), ground_seeds.size(), unsupported.size(),
-		t_bfs_end - t_bfs,
+	print("[StructuralIntegrity] %s  blocks=%d  unsupported=%d  components=%dus(%d)  detach=%dus  total=%dus" % [
+		name, _blocks.size(), unsupported.size(),
 		t_comp_end - t_comp, components.size(),
 		t_detach_end - t_detach,
 		si_us,
@@ -813,6 +815,7 @@ func _detach_cluster(block_keys: Array[Vector3i]) -> void:
 			if is_instance_valid(block_body):
 				block_body.queue_free()
 			_blocks.erase(key)
+			_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 	var t_erase_end := Time.get_ticks_usec()
 
 	# Rebuild visuals and smooth collision for affected columns
@@ -850,8 +853,10 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 		cluster_mass: float, attacker_id: int, grid_num_x: int, grid_num_y: int,
 		grid_num_z: int, mass_per_block: float) -> void:
 	## All peers: remove detached blocks (clients only) and create the falling cluster.
+	var t_sync_total := Time.get_ticks_usec()
 
 	# Clients: remove blocks from local _blocks + rebuild mesh/collision
+	var t_client_cleanup := Time.get_ticks_usec()
 	if not multiplayer.is_server():
 		for key_variant in block_keys:
 			var key: Vector3i = key_variant
@@ -861,6 +866,7 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 				if is_instance_valid(block_body):
 					block_body.queue_free()
 				_blocks.erase(key)
+				_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 
 		_mesh_dirty = true
 		set_process(true)
@@ -871,16 +877,31 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 			if not rebuilt_columns.has(col_key):
 				rebuilt_columns[col_key] = true
 				_rebuild_column(key.x, key.z)
+	var t_client_cleanup_end := Time.get_ticks_usec()
 
+	var t_type_convert := Time.get_ticks_usec()
 	var typed_keys: Array[Vector3i] = []
 	var typed_hps: Array[float] = []
 	for i in block_keys.size():
 		typed_keys.append(block_keys[i] as Vector3i)
 		typed_hps.append(float(block_hps[i]))
+	var t_type_convert_end := Time.get_ticks_usec()
 
+	var t_spawn := Time.get_ticks_usec()
 	if not GameManager.debug_disable_detached_structures:
 		# Default: spawn a new static structure from the detached blocks
 		_spawn_detached_structure(typed_keys, typed_hps)
+	var t_spawn_end := Time.get_ticks_usec()
+
+	var sync_total := Time.get_ticks_usec() - t_sync_total
+	if sync_total > 5000:
+		print("[SyncClusterDetach] %s  keys=%d  client_cleanup=%dus  type_convert=%dus  spawn_structure=%dus  total=%dus" % [
+			name, block_keys.size(),
+			t_client_cleanup_end - t_client_cleanup,
+			t_type_convert_end - t_type_convert,
+			t_spawn_end - t_spawn,
+			sync_total,
+		])
 
 
 func _spawn_detached_structure(block_keys: Array[Vector3i],
@@ -973,8 +994,8 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 	cluster.mass = cluster_mass
 	cluster.cluster_mass = cluster_mass
 	cluster.attacker_id = attacker_id
-	cluster.collision_layer = 2 | 2048   # Layer 2 (significant items) + layer 12 (smooth wall collision)
-	cluster.collision_mask = PhysicsBodyBase.DEFAULT_PHYSICS_MASK | 32  # Default + debris (layer 6)
+	cluster.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_SMOOTH
+	cluster.collision_mask = CollisionLayers.DEFAULT_PHYSICS | CollisionLayers.DEBRIS
 	cluster.contact_monitor = true
 	cluster.max_contacts_reported = 4
 	cluster.gravity_scale = 1.0
@@ -1193,7 +1214,7 @@ func _build_smooth_collision() -> void:
 	## Create the smooth collision body and populate all column shapes.
 	_collision_body = StaticBody3D.new()
 	_collision_body.name = "SmoothCollision"
-	_collision_body.collision_layer = 2048  # Layer 12: smooth wall collision
+	_collision_body.collision_layer = CollisionLayers.WALL_SMOOTH
 	_collision_body.collision_mask = 0
 	add_child(_collision_body)
 
@@ -1225,10 +1246,11 @@ func _build_column_shapes(bx: int, bz: int) -> void:
 	var col_key := Vector2i(bx, bz)
 	var shapes: Array = []
 
-	# Collect which Y indices still have blocks in this column
+	# Collect which Y indices still have blocks in this column (flat array lookup)
 	var y_present: Array[int] = []
+	var base_idx := bx * _num_y * _num_z + bz
 	for by in _num_y:
-		if _blocks.has(Vector3i(bx, by, bz)):
+		if _block_grid[base_idx + by * _num_z] == 1:
 			y_present.append(by)
 
 	if y_present.is_empty():

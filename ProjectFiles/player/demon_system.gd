@@ -206,7 +206,7 @@ func _begin_catch_animation() -> void:
 		var ray_to := player.global_position - Vector3(0, 200.0, 0)
 		var query := PhysicsRayQueryParameters3D.create(ray_from, ray_to)
 		query.exclude = [player.get_rid()]
-		query.collision_mask = 1  # World geometry only
+		query.collision_mask = CollisionLayers.WORLD
 		var result := space_state.intersect_ray(query)
 		if not result.is_empty():
 			ground_y = result.position.y

@@ -105,7 +105,7 @@ func _build_hemisphere() -> void:
 			var py: float = ring_y
 
 			var body := StaticBody3D.new()
-			body.collision_layer = 1
+			body.collision_layer = CollisionLayers.WORLD
 			body.collision_mask = 0
 
 			var col := CollisionShape3D.new()
@@ -139,7 +139,7 @@ func _build_ramp() -> void:
 	var ramp_thickness: float = 0.3
 
 	var body := StaticBody3D.new()
-	body.collision_layer = 1
+	body.collision_layer = CollisionLayers.WORLD
 	body.collision_mask = 0
 	body.name = "Ramp"
 
@@ -203,7 +203,7 @@ func _spawn_toads() -> void:
 		toad._floor_y = -9999.0
 
 		# Persistent toads collide with each other (add layer 7 to mask)
-		toad.collision_mask = 2561 | 64  # world (1) + player push (512) + walls (2048) + toad bodies (64)
+		toad.collision_mask = CollisionLayers.PHYSICS_PUSH | CollisionLayers.TOAD_RAIN
 
 		# Higher bounce so they stay lively in the bowl
 		var phys_mat := PhysicsMaterial.new()

@@ -44,8 +44,8 @@ const TOAD_MAX: int = 100000               ## Maximum toad bodies alive at once
 ## (toad floor/ceiling), toad walls, toad rain, and other toad players.
 ## Overworld hitscan masks (1|2|4|8|16|128) don't include 256, so
 ## toad players are completely invisible to overworld weapons.
-const TOAD_COLLISION_LAYER: int = 256 | 512   ## Layer 9 (toad dimension players) + layer 10 (physics push)
-const TOAD_COLLISION_MASK: int = 1 | 16 | 64 | 256  ## World + toad walls + toad rain + toad players
+const TOAD_COLLISION_LAYER: int = CollisionLayers.TOAD_PLAYER_LAYER
+const TOAD_COLLISION_MASK: int = CollisionLayers.TOAD_PLAYER_MASK
 
 ## Render (visibility) layer for toad dimension meshes.
 ## Overworld uses default layer 1 (bit 0). Toad dimension uses layer 2 (bit 1).
@@ -814,7 +814,7 @@ func _build_floor() -> void:
 	var floor_body := StaticBody3D.new()
 	floor_body.name = "ToadFloor"
 	floor_body.position = Vector3(0, DIMENSION_Y, 0)
-	floor_body.collision_layer = 1
+	floor_body.collision_layer = CollisionLayers.WORLD
 	floor_body.collision_mask = 0
 	_arena_node.add_child(floor_body)
 
@@ -840,7 +840,7 @@ func _build_ceiling() -> void:
 	var ceil_body := StaticBody3D.new()
 	ceil_body.name = "ToadCeiling"
 	ceil_body.position = Vector3(0, DIMENSION_Y + CEILING_HEIGHT, 0)
-	ceil_body.collision_layer = 1
+	ceil_body.collision_layer = CollisionLayers.WORLD
 	ceil_body.collision_mask = 0
 	_arena_node.add_child(ceil_body)
 	var ceil_col := CollisionShape3D.new()
@@ -877,7 +877,7 @@ func _build_cylindrical_barrier() -> void:
 		var mid_angle: float = (angle + next_angle) * 0.5
 
 		var wall := StaticBody3D.new()
-		wall.collision_layer = 16  # Layer 5 — player collides but grapple ignores
+		wall.collision_layer = CollisionLayers.TOAD_WALLS
 		wall.collision_mask = 0
 		var wall_x: float = cos(mid_angle) * barrier_radius
 		var wall_z: float = sin(mid_angle) * barrier_radius

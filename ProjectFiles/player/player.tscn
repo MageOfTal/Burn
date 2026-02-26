@@ -1,4 +1,4 @@
-[gd_scene load_steps=21 format=3 uid="uid://player001"]
+[gd_scene load_steps=23 format=3 uid="uid://player001"]
 
 [ext_resource type="Script" path="res://player/player.gd" id="1_player"]
 [ext_resource type="Script" path="res://player/player_camera.gd" id="2_camera"]
@@ -14,6 +14,8 @@
 [ext_resource type="Script" path="res://player/item_manager.gd" id="12_item_mgr"]
 [ext_resource type="Script" path="res://player/grapple_system.gd" id="13_grapple"]
 [ext_resource type="Script" path="res://player/demon_system.gd" id="14_demon"]
+[ext_resource type="Script" path="res://player/player_movement.gd" id="15_movement"]
+[ext_resource type="Script" path="res://player/player_combat.gd" id="17_combat"]
 [ext_resource type="Shader" path="res://player/player_dissolve.gdshader" id="15_dissolve"]
 [ext_resource type="PackedScene" path="res://player/store_ui.tscn" id="16_store_ui"]
 
@@ -214,6 +216,12 @@ script = ExtResource("4_inventory")
 
 [node name="BurnTimerManager" type="Node" parent="."]
 script = ExtResource("5_burn_timer")
+
+[node name="PlayerMovement" type="Node" parent="."]
+script = ExtResource("15_movement")
+
+[node name="PlayerCombat" type="Node" parent="."]
+script = ExtResource("17_combat")
 
 [node name="SlideCrouchSystem" type="Node" parent="."]
 script = ExtResource("9_slide")

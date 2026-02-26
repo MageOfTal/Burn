@@ -141,8 +141,8 @@ func _build_tower() -> void:
 	_voxel_terrain.mesh_block_size = 16
 	_voxel_terrain.max_view_distance = 128
 	_voxel_terrain.generate_collisions = true
-	_voxel_terrain.collision_layer = 1   # World geometry
-	_voxel_terrain.collision_mask = 0    # Static — doesn't collide with anything itself
+	_voxel_terrain.collision_layer = CollisionLayers.WORLD
+	_voxel_terrain.collision_mask = 0
 
 	# Bounds: VoxelTerrain bounds are in voxel coordinates (1:1 with world units).
 	# Since do_sphere() uses local coords (relative to the VoxelTerrain), bounds
@@ -1177,8 +1177,8 @@ func _spawn_topple_body(centroid: Vector3, baked_mesh: Mesh, mesh_offset: Vector
 	# don't collide with each other. Mask world(1) + player layer 10 (512) for
 	# impact/push. The player RigidBody3D is on layers 128|512 — masking 512
 	# gives Jolt native collision with correct mass ratios.
-	topple.collision_layer = 2
-	topple.collision_mask = 1 | 512 | 2048
+	topple.collision_layer = CollisionLayers.ITEMS
+	topple.collision_mask = CollisionLayers.PHYSICS_PUSH
 
 	# Set custom properties BEFORE adding to tree (these are simple vars, not transforms)
 	topple.section_height = section_height
@@ -1348,8 +1348,8 @@ func _sync_collapse_start(sever_y: float, torque_dir: Vector3) -> void:
 	topple.continuous_cd = true
 	topple.gravity_scale = 1.0
 	# Use dedicated collision layer 2 for tower debris (matches server topple body)
-	topple.collision_layer = 2
-	topple.collision_mask = 1 | 512 | 2048
+	topple.collision_layer = CollisionLayers.ITEMS
+	topple.collision_mask = CollisionLayers.PHYSICS_PUSH
 
 	# Set position BEFORE adding to tree so there's no 1-frame flash at (0,0,0)
 	topple.position = centroid
@@ -1466,8 +1466,8 @@ func _spawn_slab_fragments(body_transform: Transform3D, is_server: bool,
 		slab.mass = maxf(mass_per_slab, 50.0)
 		slab.gravity_scale = 1.0
 		slab.angular_damp = 1.5
-		slab.collision_layer = 2  # Tower debris layer
-		slab.collision_mask = 15 | 512 | 2048  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + player push(512) + smooth walls(2048)
+		slab.collision_layer = CollisionLayers.ITEMS
+		slab.collision_mask = CollisionLayers.DEFAULT_PHYSICS
 
 		if is_server:
 			slab.contact_monitor = true
@@ -1559,8 +1559,8 @@ func _spawn_rock_chunks_legacy(impact_pos: Vector3, chunk_count: int,
 		chunk.mass = chunk_size * chunk_size * chunk_size * 50.0
 		chunk.gravity_scale = 1.0
 		chunk.angular_damp = 2.0
-		chunk.collision_layer = 2  # Tower debris layer
-		chunk.collision_mask = 15 | 512 | 2048  # World(1) + tower debris(2) + bubbles(4) + rubber balls(8) + player push(512) + smooth walls(2048)
+		chunk.collision_layer = CollisionLayers.ITEMS
+		chunk.collision_mask = CollisionLayers.DEFAULT_PHYSICS
 
 		if is_server:
 			chunk.contact_monitor = true

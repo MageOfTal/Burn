@@ -282,7 +282,7 @@ func _on_body_entered_toad(body: Node) -> void:
 	# The player is a RigidBody3D, so the StaticBody3D check excludes it.
 	if not (body is StaticBody3D):
 		return
-	if (body.collision_layer & 1) == 0:
+	if (body.collision_layer & CollisionLayers.WORLD) == 0:
 		return
 
 	# Persistent toads (toad bowl) stay in Jolt forever — don't freeze on bounce
@@ -353,8 +353,8 @@ func restore_physics() -> void:
 
 	# Re-enable Jolt simulation
 	freeze = false
-	collision_layer = 64    # Layer 7 (toad bodies)
-	collision_mask = 2561   # Layer 1 (world) | Layer 10 (player push) | Layer 12 (smooth wall collision)
+	collision_layer = CollisionLayers.TOAD_RAIN
+	collision_mask = CollisionLayers.PHYSICS_PUSH
 	var col_shape := get_node_or_null("CollisionShape3D") as CollisionShape3D
 	if col_shape:
 		col_shape.disabled = false

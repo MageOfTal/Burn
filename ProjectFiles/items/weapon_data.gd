@@ -59,6 +59,12 @@ func get_rarity_structure_damage() -> float:
 ## How many projectiles to scatter when used as ammo in an explosion weapon (e.g. rocket).
 @export var ammo_explosion_spawn_count: int = 10
 
+@export_group("Modifiers")
+## Number of modifier slots available on this weapon (0 = no modifiers allowed).
+@export var modifier_slots: int = 0
+## Modifiers currently attached to this weapon (serialized for inventory sync).
+@export var attached_modifiers: Array[ModifierData] = []
+
 @export_group("Visuals")
 ## Path to the .glb gun model (res:// path).
 @export var gun_model_path: String = ""
