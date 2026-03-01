@@ -174,6 +174,8 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 	if _cluster_blocks.is_empty():
 		return
 
+	var _t_take_damage_at := Time.get_ticks_usec()
+
 	var space_state: PhysicsDirectSpaceState3D = null
 	var w3d := get_world_3d()
 	if w3d:
@@ -197,6 +199,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 	var dbg_blocks_hit := 0
 	var dbg_total_raw := 0.0
 	var dbg_total_absorbed := 0.0
+	var _t_raycast_total := 0
 
 	for key: Vector3i in _cluster_blocks:
 		var block_world: Vector3 = _block_world_pos(key)
@@ -211,7 +214,9 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 		var absorbed := 0.0
 		if query:
 			query.to = block_world
+			var _t_ray := Time.get_ticks_usec()
 			absorbed = space_state.calc_ray_shielding(query, RID(), raw_dmg)
+			_t_raycast_total += Time.get_ticks_usec() - _t_ray
 		var dmg := maxf(raw_dmg - absorbed, 0.0)
 
 		dbg_blocks_hit += 1
@@ -251,7 +256,17 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 	if not destroyed_keys.is_empty():
 		for key in destroyed_keys:
 			_cluster_blocks.erase(key)
+		var _t_abd := Time.get_ticks_usec()
 		_after_blocks_destroyed(destroyed_keys)
+		var _t_abd_us := Time.get_ticks_usec() - _t_abd
+		var total_us := Time.get_ticks_usec() - _t_take_damage_at
+		print("[ClusterPerf] take_damage_at %s: %d blocks hit, %d destroyed, raycasts=%dus after_destroyed=%dus total=%dus" % [
+			name, dbg_blocks_hit, destroyed_keys.size(), _t_raycast_total, _t_abd_us, total_us])
+	else:
+		var total_us := Time.get_ticks_usec() - _t_take_damage_at
+		if total_us > 500:
+			print("[ClusterPerf] take_damage_at %s (no destroys): %d blocks hit, raycasts=%dus total=%dus" % [
+				name, dbg_blocks_hit, _t_raycast_total, total_us])
 
 
 func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
@@ -304,6 +319,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 	## Shared cleanup after blocks are destroyed. Updates mass, syncs to
 	## clients, and schedules visual rebuild.
+	var _t_abd_start := Time.get_ticks_usec()
 
 	# Wake up frozen/settled clusters so they (and any fragments) fall properly.
 	# Without this, a settled cluster that gets split stays frozen in mid-air.
@@ -326,7 +342,13 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 		return
 
 	# Check if remaining blocks split into disconnected groups
+	var _t_integrity := Time.get_ticks_usec()
 	_check_cluster_integrity()
+	var _t_integrity_us := Time.get_ticks_usec() - _t_integrity
+	var total_us := Time.get_ticks_usec() - _t_abd_start
+	if total_us > 500:
+		print("[ClusterPerf] _after_blocks_destroyed %s: %d keys destroyed, %d remaining, integrity=%dus total=%dus" % [
+			name, destroyed_keys.size(), _cluster_blocks.size(), _t_integrity_us, total_us])
 
 
 func _update_mass() -> void:
@@ -363,6 +385,8 @@ func _check_cluster_integrity() -> void:
 	if _cluster_blocks.size() < 2:
 		return
 
+	var _t_integrity_start := Time.get_ticks_usec()
+
 	# BFS to find connected components
 	var visited: Dictionary = {}
 	var components: Array = []
@@ -385,6 +409,8 @@ func _check_cluster_integrity() -> void:
 					queue.append(neighbor)
 		components.append(component)
 
+	var _t_bfs_us := Time.get_ticks_usec() - _t_integrity_start
+
 	if components.size() <= 1:
 		return
 
@@ -394,6 +420,8 @@ func _check_cluster_integrity() -> void:
 		if components[i].size() > components[largest_idx].size():
 			largest_idx = i
 
+	var _t_splits := Time.get_ticks_usec()
+	var split_count := 0
 	for i in components.size():
 		if i == largest_idx:
 			continue
@@ -401,6 +429,10 @@ func _check_cluster_integrity() -> void:
 		for key in components[i]:
 			keys_variant.append(key)
 		_sync_fragment_split.rpc(keys_variant)
+		split_count += 1
+	var _t_splits_us := Time.get_ticks_usec() - _t_splits
+	print("[ClusterPerf] _check_cluster_integrity %s: %d blocks, %d components, %d splits, bfs=%dus splits=%dus" % [
+		name, _cluster_blocks.size(), components.size(), split_count, _t_bfs_us, _t_splits_us])
 
 
 @rpc("authority", "call_local", "reliable")
@@ -432,6 +464,7 @@ func _sync_fragment_split(block_keys_variant: Array) -> void:
 
 func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 	## Create a new FallingBlockCluster from split-off blocks on all peers.
+	var _t_spawn := Time.get_ticks_usec()
 	var scene_root := get_tree().current_scene
 	if scene_root == null:
 		return
@@ -481,15 +514,19 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 	child.init_cluster_blocks(block_hp_dict, _grid_num_x, _grid_num_y, _grid_num_z,
 		_mass_per_block)
 	# Build mesh + collision shapes before entering tree
+	var _t_rebuild := Time.get_ticks_usec()
 	child._rebuild_visuals()
+	var _t_rebuild_us := Time.get_ticks_usec() - _t_rebuild
 
 	# Add to scene
+	var _t_addchild := Time.get_ticks_usec()
 	var parent_node := get_parent()
 	if parent_node:
 		parent_node.add_child(child)
 	else:
 		scene_root.add_child(child)
 	child.global_transform = Transform3D(global_transform.basis, spawn_pos)
+	var _t_addchild_us := Time.get_ticks_usec() - _t_addchild
 
 	# Server: inherit velocity and register shielding
 	if multiplayer.is_server():
@@ -504,8 +541,9 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 			total_hp += hp
 		PhysicsServer3D.body_set_shielding_hp(child_rid, total_hp)
 
-	print("[FallingCluster] Fragment split: %s → %s (%d blocks, %.1fkg)" % [
-		name, child.name, block_keys.size(), child_mass])
+	var total_us := Time.get_ticks_usec() - _t_spawn
+	print("[ClusterPerf] _spawn_child_cluster %s->%s: %d blocks, rebuild=%dus add_child=%dus total=%dus" % [
+		name, child.name, block_keys.size(), _t_rebuild_us, _t_addchild_us, total_us])
 
 
 # ======================================================================
@@ -523,19 +561,28 @@ func _on_body_entered(body: Node) -> void:
 		if get_instance_id() < body.get_instance_id():
 			return
 		_handle_cluster_vs_cluster(body)
-		GameManager.tick_add("cluster_contact", Time.get_ticks_usec() - _t_contact)
+		var us := Time.get_ticks_usec() - _t_contact
+		GameManager.tick_add("cluster_contact", us)
+		if us > 500:
+			print("[ClusterPerf] _on_body_entered cluster_vs_cluster %s->%s took %dus" % [name, body.name, us])
 		return
 
 	# --- Structure damage (momentum carving) ---
 	var target_structure := _find_structure(body)
 	if target_structure:
 		_handle_structure_hit(body, target_structure)
-		GameManager.tick_add("cluster_contact", Time.get_ticks_usec() - _t_contact)
+		var us := Time.get_ticks_usec() - _t_contact
+		GameManager.tick_add("cluster_contact", us)
+		if us > 500:
+			print("[ClusterPerf] _on_body_entered structure_hit %s->%s took %dus" % [name, target_structure.name, us])
 		return
 
 	# --- Generic damageable body (player, etc.) — momentum-based structure damage ---
 	_handle_generic_hit(body)
-	GameManager.tick_add("cluster_contact", Time.get_ticks_usec() - _t_contact)
+	var us := Time.get_ticks_usec() - _t_contact
+	GameManager.tick_add("cluster_contact", us)
+	if us > 500:
+		print("[ClusterPerf] _on_body_entered generic_hit %s->%s took %dus" % [name, body.name, us])
 
 
 func _compute_impact(body: Node, other_velocity: Vector3 = Vector3.ZERO) -> Dictionary:
@@ -593,9 +640,11 @@ func _handle_structure_hit(body: Node, target_structure: DestructibleBlockStruct
 	var contact_point: Vector3 = impact["contact_point"]
 
 	# Damage target structure at the contact point
+	var _t0 := Time.get_ticks_usec()
 	var target_result: Dictionary = target_structure.take_momentum_damage_at(
 		contact_point, base_damage, attacker_id, impact_speed
 	)
+	var _t_target_dmg := Time.get_ticks_usec() - _t0
 	var target_absorbed: float = target_result.get("absorbed", 0.0)
 
 	# Resistance force — absorbed HP slows the impactor
@@ -608,33 +657,46 @@ func _handle_structure_hit(body: Node, target_structure: DestructibleBlockStruct
 		apply_central_impulse(brake_impulse)
 
 	# Breakthrough explosion on TARGET structure — per-block momentum at remaining speed
+	var _t_target_expl := 0
 	if target_result.get("block_destroyed", false) and remaining_speed > MIN_DAMAGE_SPEED:
 		var per_block_momentum: float = _mass_per_block * remaining_speed
 		var expl_damage: float = per_block_momentum * BREAKTHROUGH_DAMAGE_SCALE * GameManager.structure_explosion_damage_scale
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = target_result.get("block_pos", contact_point)
 		if expl_damage > 0.5 and expl_radius > 0.1:
+			_t0 = Time.get_ticks_usec()
 			target_structure.take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], remaining_speed)
+			_t_target_expl = Time.get_ticks_usec() - _t0
 
 	# Mutual damage — same collision, same damage to this cluster
+	_t0 = Time.get_ticks_usec()
 	var self_result: Dictionary = take_momentum_damage_at(contact_point, base_damage, -1, impact_speed)
+	var _t_self_dmg := Time.get_ticks_usec() - _t0
 
 	# Breakthrough explosion on SELF — per-block momentum at remaining speed
+	var _t_self_expl := 0
 	if self_result.get("block_destroyed", false) and remaining_speed > MIN_DAMAGE_SPEED:
 		var per_block_momentum: float = _mass_per_block * remaining_speed
 		var expl_damage: float = per_block_momentum * BREAKTHROUGH_DAMAGE_SCALE * GameManager.structure_explosion_damage_scale
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = self_result.get("block_pos", contact_point)
 		if expl_damage > 0.5 and not _cluster_blocks.is_empty():
+			_t0 = Time.get_ticks_usec()
 			take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], remaining_speed)
+			_t_self_expl = Time.get_ticks_usec() - _t0
 
 	print("[FallingCluster] Carve into %s: dmg=%.1f absorbed=%.1f remaining_speed=%.1f" % [
 		target_structure.name, base_damage, target_absorbed, remaining_speed])
+	var total_us := _t_target_dmg + _t_target_expl + _t_self_dmg + _t_self_expl
+	if total_us > 500:
+		print("[ClusterPerf] _handle_structure_hit %s->%s: target_dmg=%dus target_expl=%dus self_dmg=%dus self_expl=%dus total=%dus" % [
+			name, target_structure.name, _t_target_dmg, _t_target_expl, _t_self_dmg, _t_self_expl, total_us])
 
 
 func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 	## Two falling clusters collide. Both take per-block momentum damage at the
 	## contact point. Only called on the cluster with the higher instance_id.
+	var _t_cvc := Time.get_ticks_usec()
 
 	# Compute relative contact velocity (both may have angular velocity)
 	var contact_offset_self: Vector3 = other.global_position - global_position
@@ -659,33 +721,47 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 	var contact_midpoint: Vector3 = (global_position + other.global_position) * 0.5
 
 	# This cluster damages the other
+	var _t0 := Time.get_ticks_usec()
 	var other_result: Dictionary = other.take_momentum_damage_at(
 		contact_midpoint, my_damage, attacker_id, impact_speed)
+	var _t_other_dmg := Time.get_ticks_usec() - _t0
 
 	# Other cluster damages this one
+	_t0 = Time.get_ticks_usec()
 	var self_result: Dictionary = take_momentum_damage_at(
 		contact_midpoint, other_damage, other.attacker_id, impact_speed)
+	var _t_self_dmg := Time.get_ticks_usec() - _t0
 
 	# Breakthrough on the other cluster (from this cluster's remaining momentum)
+	var _t_other_expl := 0
 	if other_result.get("block_destroyed", false) and impact_speed > MIN_DAMAGE_SPEED:
 		var per_block_momentum: float = _mass_per_block * impact_speed
 		var expl_damage: float = per_block_momentum * BREAKTHROUGH_DAMAGE_SCALE * GameManager.structure_explosion_damage_scale
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = other_result.get("block_pos", contact_midpoint)
 		if expl_damage > 0.5 and not other._cluster_blocks.is_empty():
+			_t0 = Time.get_ticks_usec()
 			other.take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], impact_speed)
+			_t_other_expl = Time.get_ticks_usec() - _t0
 
 	# Breakthrough on this cluster (from other cluster's remaining momentum)
+	var _t_self_expl := 0
 	if self_result.get("block_destroyed", false) and impact_speed > MIN_DAMAGE_SPEED:
 		var per_block_momentum: float = other._mass_per_block * impact_speed
 		var expl_damage: float = per_block_momentum * BREAKTHROUGH_DAMAGE_SCALE * GameManager.structure_explosion_damage_scale
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = self_result.get("block_pos", contact_midpoint)
 		if expl_damage > 0.5 and not _cluster_blocks.is_empty():
+			_t0 = Time.get_ticks_usec()
 			take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], impact_speed)
+			_t_self_expl = Time.get_ticks_usec() - _t0
 
+	var total_us := Time.get_ticks_usec() - _t_cvc
 	print("[FallingCluster] Cluster vs cluster: %s(%.1fkg) vs %s(%.1fkg) speed=%.1f" % [
 		name, cluster_mass, other.name, other.cluster_mass, impact_speed])
+	if total_us > 500:
+		print("[ClusterPerf] _handle_cluster_vs_cluster %s vs %s: other_dmg=%dus self_dmg=%dus other_expl=%dus self_expl=%dus total=%dus" % [
+			name, other.name, _t_other_dmg, _t_self_dmg, _t_other_expl, _t_self_expl, total_us])
 
 
 # ======================================================================
@@ -696,9 +772,17 @@ func _rebuild_visuals() -> void:
 	## Rebuild mesh and per-column collision shapes from current block set.
 	if _cluster_blocks.is_empty():
 		return
+	var _t0 := Time.get_ticks_usec()
 	if _mesh_instance:
 		_mesh_instance.mesh = _build_mesh()
+	var _t_mesh_us := Time.get_ticks_usec() - _t0
+	var _t1 := Time.get_ticks_usec()
 	_rebuild_collision_shapes()
+	var _t_col_us := Time.get_ticks_usec() - _t1
+	var total_us := _t_mesh_us + _t_col_us
+	if total_us > 500:
+		print("[ClusterPerf] _rebuild_visuals %s: %d blocks, mesh=%dus collision=%dus total=%dus" % [
+			name, _cluster_blocks.size(), _t_mesh_us, _t_col_us, total_us])
 
 
 func _build_mesh() -> Mesh:

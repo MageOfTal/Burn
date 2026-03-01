@@ -384,8 +384,8 @@ static func _calc_player_explosion_damage(
 				var col_layer := 0
 				if collider is CollisionObject3D:
 					col_layer = (collider as CollisionObject3D).collision_layer
-				var cname: String = collider.name if collider else "null"
-				var cclass: String = collider.get_class() if collider else "null"
+				var cname: String = str(collider.name) if collider else "null"
+				var cclass: String = str(collider.get_class()) if collider else "null"
 				var is_cluster := collider is FallingBlockCluster
 				hit_details.append(hit_pos)
 				print("[ShieldDiag] ray %d hit: %s (%s) layer=%d tag=%d hp=%.1f pos=%s cluster=%s" % [
