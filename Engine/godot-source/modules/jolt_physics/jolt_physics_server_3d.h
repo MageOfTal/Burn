@@ -238,6 +238,8 @@ public:
 	virtual void body_remove_shape(RID p_body, int p_shape_idx) override;
 	virtual void body_clear_shapes(RID p_body) override;
 
+	virtual void body_set_shapes_bulk_mode(RID p_body, bool p_enabled) override;
+
 	virtual void body_attach_object_instance_id(RID p_body, ObjectID p_id) override;
 	virtual ObjectID body_get_object_instance_id(RID p_body) const override;
 

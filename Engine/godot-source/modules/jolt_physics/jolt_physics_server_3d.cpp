@@ -642,6 +642,13 @@ void JoltPhysicsServer3D::body_clear_shapes(RID p_body) {
 	body->clear_shapes();
 }
 
+void JoltPhysicsServer3D::body_set_shapes_bulk_mode(RID p_body, bool p_enabled) {
+	JoltBody3D *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+
+	body->set_bulk_shapes_mode(p_enabled);
+}
+
 void JoltPhysicsServer3D::body_set_shape_disabled(RID p_body, int p_shape_idx, bool p_disabled) {
 	JoltBody3D *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);

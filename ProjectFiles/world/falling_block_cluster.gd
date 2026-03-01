@@ -19,6 +19,11 @@ class_name FallingBlockCluster
 # ======================================================================
 
 const BLOCK_SIZE := 0.5
+const NEIGHBOR_OFFSETS: Array[Vector3i] = [
+	Vector3i(1, 0, 0), Vector3i(-1, 0, 0),
+	Vector3i(0, 1, 0), Vector3i(0, -1, 0),
+	Vector3i(0, 0, 1), Vector3i(0, 0, -1),
+]
 const MIN_DAMAGE_SPEED := 3.0          ## Speed threshold for ANY damage (m/s)
 const MOMENTUM_DAMAGE_SCALE := 0.15    ## Base: damage = momentum * this * GameManager scale
 const MASS_PER_HP := 0.5               ## Matching DestructibleBlockStructure.MASS_PER_HP
@@ -160,14 +165,38 @@ func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
 
 func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 		_attacker_id: int, _exclude_rids: Array[RID] = [], _impact_speed: float = INF) -> void:
-	## AoE per-block damage from explosions. Same cubic falloff as structures.
-	## No shielding raycasts (clusters are small, shielding is negligible).
+	## AoE per-block damage from explosions. Cubic falloff + flat-HP shielding.
+	## Each block gets a shielding ray from the explosion origin — objects between
+	## the explosion and the block absorb damage equal to their HP (same as structures).
+	## Excludes own RID so this cluster's shapes don't self-shield.
 	if not multiplayer.is_server():
 		return
 	if _cluster_blocks.is_empty():
 		return
 
+	var space_state: PhysicsDirectSpaceState3D = null
+	var w3d := get_world_3d()
+	if w3d:
+		space_state = w3d.direct_space_state
+
+	var debug_rays := GameManager.debug_show_explosion_rays
+	var debug_ray_data: Array = []
+
+	# Build exclude list: rocket body + this cluster (prevent self-shielding).
+	var my_rid := get_rid()
+	var exclude: Array[RID] = _exclude_rids.duplicate()
+	if my_rid.is_valid():
+		exclude.append(my_rid)
+
+	# Reuse one query object across all block rays.
+	var query: PhysicsRayQueryParameters3D = null
+	if space_state:
+		query = ExplosionHelper._make_shielding_query(hit_pos, exclude)
+
 	var destroyed_keys: Array[Vector3i] = []
+	var dbg_blocks_hit := 0
+	var dbg_total_raw := 0.0
+	var dbg_total_absorbed := 0.0
 
 	for key: Vector3i in _cluster_blocks:
 		var block_world: Vector3 = _block_world_pos(key)
@@ -176,11 +205,48 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 			continue
 		var norm_dist: float = dist / blast_radius
 		var falloff: float = 1.0 / (1.0 + (norm_dist * 3.0) ** 3)
-		var dmg: float = amount * falloff
+		var raw_dmg: float = amount * falloff
 
+		# Shielding: cast ray from explosion to block, sum flat HP absorption.
+		var absorbed := 0.0
+		if query:
+			query.to = block_world
+			absorbed = space_state.calc_ray_shielding(query, RID(), raw_dmg)
+		var dmg := maxf(raw_dmg - absorbed, 0.0)
+
+		dbg_blocks_hit += 1
+		dbg_total_raw += raw_dmg
+		dbg_total_absorbed += absorbed
+
+		if debug_rays:
+			debug_ray_data.append({
+				"from": hit_pos, "to": block_world,
+				"raw_dmg": raw_dmg, "final_dmg": dmg,
+				"hits": [],
+			})
+
+		if dmg < 0.5:
+			continue
 		_cluster_blocks[key] -= dmg
 		if _cluster_blocks[key] <= 0.0:
 			destroyed_keys.append(key)
+
+	if dbg_blocks_hit > 0:
+		print("[FallingCluster] take_damage_at %s: %d blocks hit, raw=%.1f, absorbed=%.1f, applied=%.1f" % [
+			name, dbg_blocks_hit, dbg_total_raw, dbg_total_absorbed,
+			dbg_total_raw - dbg_total_absorbed])
+
+	if debug_rays and not debug_ray_data.is_empty():
+		ExplosionHelper.draw_debug_rays(debug_ray_data)
+
+	# Update cached shielding HP so other targets' rays see correct absorption.
+	# _after_blocks_destroyed also calls _update_mass, but partial damage to
+	# surviving blocks still changes total HP without destroying any block.
+	if dbg_blocks_hit > 0 and destroyed_keys.is_empty():
+		var total_hp := 0.0
+		for hp: float in _cluster_blocks.values():
+			total_hp += hp
+		PhysicsServer3D.body_set_shielding_hp(get_rid(), total_hp)
 
 	if not destroyed_keys.is_empty():
 		for key in destroyed_keys:
@@ -238,6 +304,13 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 	## Shared cleanup after blocks are destroyed. Updates mass, syncs to
 	## clients, and schedules visual rebuild.
+
+	# Wake up frozen/settled clusters so they (and any fragments) fall properly.
+	# Without this, a settled cluster that gets split stays frozen in mid-air.
+	if multiplayer.is_server() and freeze:
+		freeze = false
+		_settle_timer = 0.0
+
 	_update_mass()
 	_mesh_dirty = true
 	set_process(true)
@@ -250,11 +323,20 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 
 	if _cluster_blocks.is_empty():
 		queue_free()
+		return
+
+	# Check if remaining blocks split into disconnected groups
+	_check_cluster_integrity()
 
 
 func _update_mass() -> void:
 	cluster_mass = _cluster_blocks.size() * _mass_per_block
 	mass = maxf(cluster_mass, 0.1)
+	# Keep C++ shielding HP in sync with remaining block HP
+	var total_hp := 0.0
+	for hp: float in _cluster_blocks.values():
+		total_hp += hp
+	PhysicsServer3D.body_set_shielding_hp(get_rid(), total_hp)
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -267,6 +349,163 @@ func _sync_blocks_destroyed(keys: Array) -> void:
 	set_process(true)
 	if _cluster_blocks.is_empty():
 		queue_free()
+
+
+# ======================================================================
+#  Cluster fragmentation — split disconnected groups into child clusters
+# ======================================================================
+
+func _check_cluster_integrity() -> void:
+	## Server-only: if remaining blocks form multiple disconnected groups,
+	## split smaller groups into new child FallingBlockCluster instances.
+	if not multiplayer.is_server():
+		return
+	if _cluster_blocks.size() < 2:
+		return
+
+	# BFS to find connected components
+	var visited: Dictionary = {}
+	var components: Array = []
+
+	for start_key: Vector3i in _cluster_blocks:
+		if visited.has(start_key):
+			continue
+		var component: Array[Vector3i] = []
+		var queue: Array[Vector3i] = [start_key]
+		visited[start_key] = true
+		var head := 0
+		while head < queue.size():
+			var current: Vector3i = queue[head]
+			head += 1
+			component.append(current)
+			for offset in NEIGHBOR_OFFSETS:
+				var neighbor: Vector3i = current + offset
+				if _cluster_blocks.has(neighbor) and not visited.has(neighbor):
+					visited[neighbor] = true
+					queue.append(neighbor)
+		components.append(component)
+
+	if components.size() <= 1:
+		return
+
+	# Keep the largest component in self, split off the rest
+	var largest_idx := 0
+	for i in components.size():
+		if components[i].size() > components[largest_idx].size():
+			largest_idx = i
+
+	for i in components.size():
+		if i == largest_idx:
+			continue
+		var keys_variant: Array = []
+		for key in components[i]:
+			keys_variant.append(key)
+		_sync_fragment_split.rpc(keys_variant)
+
+
+@rpc("authority", "call_local", "reliable")
+func _sync_fragment_split(block_keys_variant: Array) -> void:
+	## All peers: split specified blocks off into a new child FallingBlockCluster.
+	## Blocks are still in _cluster_blocks so we can read their HPs.
+	var block_hp_dict: Dictionary = {}
+	for key_variant in block_keys_variant:
+		var key: Vector3i = key_variant
+		if _cluster_blocks.has(key):
+			block_hp_dict[key] = _cluster_blocks[key]
+			_cluster_blocks.erase(key)
+
+	if block_hp_dict.is_empty():
+		return
+
+	# Update self: mass, visuals, shapes
+	_update_mass()
+	_mesh_dirty = true
+	set_process(true)
+
+	if _cluster_blocks.is_empty():
+		queue_free()
+		return
+
+	# Spawn child cluster from the split-off blocks
+	_spawn_child_cluster(block_hp_dict)
+
+
+func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
+	## Create a new FallingBlockCluster from split-off blocks on all peers.
+	var scene_root := get_tree().current_scene
+	if scene_root == null:
+		return
+
+	var block_keys: Array[Vector3i] = []
+	for key: Vector3i in block_hp_dict:
+		block_keys.append(key)
+
+	var child_mass := float(block_keys.size()) * _mass_per_block
+
+	# Compute child centroid in grid space (same formula as init_cluster_blocks)
+	var child_centroid_grid := Vector3.ZERO
+	for key: Vector3i in block_keys:
+		child_centroid_grid += Vector3(
+			(key.x + 0.5 - _grid_num_x * 0.5) * BLOCK_SIZE,
+			(key.y + 0.5 - _grid_num_y * 0.5) * BLOCK_SIZE,
+			(key.z + 0.5 - _grid_num_z * 0.5) * BLOCK_SIZE
+		)
+	child_centroid_grid /= float(block_keys.size())
+
+	# World position: parent origin + basis * (child centroid offset from parent centroid)
+	var spawn_pos := global_position + global_transform.basis * (child_centroid_grid - _centroid_local)
+
+	# Build child RigidBody3D
+	var child := RigidBody3D.new()
+	child.set_script(get_script())
+	child.name = "FallingCluster_frag_%d" % (randi() % 10000)
+	child.mass = child_mass
+	child.cluster_mass = child_mass
+	child.attacker_id = attacker_id
+	child.collision_layer = collision_layer
+	child.collision_mask = collision_mask
+	child.contact_monitor = true
+	child.max_contacts_reported = 4
+	child.gravity_scale = 1.0
+	child.continuous_cd = true
+
+	# Create MeshInstance3D (filled by _rebuild_visuals below)
+	var mesh_inst := MeshInstance3D.new()
+	mesh_inst.name = "ClusterMesh"
+	if _mesh_instance and _mesh_instance.material_override:
+		mesh_inst.material_override = _mesh_instance.material_override.duplicate()
+	mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	child.add_child(mesh_inst)
+
+	# Initialize block tracking (sets _centroid_local, caches mesh ref)
+	child.init_cluster_blocks(block_hp_dict, _grid_num_x, _grid_num_y, _grid_num_z,
+		_mass_per_block)
+	# Build mesh + collision shapes before entering tree
+	child._rebuild_visuals()
+
+	# Add to scene
+	var parent_node := get_parent()
+	if parent_node:
+		parent_node.add_child(child)
+	else:
+		scene_root.add_child(child)
+	child.global_transform = Transform3D(global_transform.basis, spawn_pos)
+
+	# Server: inherit velocity and register shielding
+	if multiplayer.is_server():
+		var offset := spawn_pos - global_position
+		child.linear_velocity = linear_velocity + angular_velocity.cross(offset)
+		child.angular_velocity = angular_velocity
+
+		var child_rid := child.get_rid()
+		PhysicsServer3D.body_set_shielding_tag(child_rid, 4)
+		var total_hp := 0.0
+		for hp: float in block_hp_dict.values():
+			total_hp += hp
+		PhysicsServer3D.body_set_shielding_hp(child_rid, total_hp)
+
+	print("[FallingCluster] Fragment split: %s → %s (%d blocks, %.1fkg)" % [
+		name, child.name, block_keys.size(), child_mass])
 
 
 # ======================================================================
@@ -515,9 +754,11 @@ func _build_mesh() -> Mesh:
 func _rebuild_collision_shapes() -> void:
 	## Remove all existing collision shapes and rebuild per-column box shapes
 	## from current blocks. Same approach as structure's smooth collision.
-	# Remove old shapes
+	# Remove old shapes — disable immediately so they leave the physics world
+	# before new shapes (or child cluster shapes) are added this frame.
 	for child in get_children():
 		if child is CollisionShape3D:
+			child.disabled = true
 			child.queue_free()
 
 	if _cluster_blocks.is_empty():

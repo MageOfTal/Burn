@@ -84,6 +84,55 @@ static func do_explosion(
 	var results := space_state.intersect_shape(query, 64)
 	var t_sphere_end := Time.get_ticks_usec()
 
+	# --- DEBUG: scan for nearby FallingBlockClusters and dump their shielding state ---
+	if GameManager.debug_show_explosion_rays:
+		var tree_dbg := Engine.get_main_loop() as SceneTree
+		if tree_dbg and tree_dbg.current_scene:
+			var structures_dbg: Node = null
+			var seed_dbg := tree_dbg.current_scene.get_node_or_null("SeedWorld")
+			if seed_dbg == null:
+				seed_dbg = tree_dbg.current_scene.get_node_or_null("BlockoutMap/SeedWorld")
+			if seed_dbg:
+				structures_dbg = seed_dbg.get_node_or_null("Structures")
+			if structures_dbg:
+				for child in structures_dbg.get_children():
+					if not (child is FallingBlockCluster):
+						continue
+					var cdist := explosion_pos.distance_to(child.global_position)
+					if cdist > radius + 10.0:
+						continue
+					var crid: RID = child.get_rid()
+					var ctag := PhysicsServer3D.body_get_shielding_tag(crid)
+					var chp := PhysicsServer3D.body_get_shielding_hp(crid)
+					var clayer: int = child.collision_layer
+					var frozen: bool = child.freeze
+					print("[ClusterDiag] %s dist=%.1f layer=%d (WALL_BLOCKS=%s) tag=%d hp=%.1f frozen=%s rid=%s" % [
+						child.name, cdist, clayer,
+						str(bool(clayer & CollisionLayers.WALL_BLOCKS)),
+						ctag, chp, str(frozen), str(crid)])
+					# Test: cast a single ray from explosion through this cluster center
+					var test_q := PhysicsRayQueryParameters3D.new()
+					test_q.from = explosion_pos
+					test_q.to = child.global_position
+					test_q.collision_mask = CollisionLayers.SHIELDING
+					test_q.exclude = exclude_rids
+					var test_hits := space_state.intersect_ray_all(test_q, 32)
+					var found_self := false
+					for th in test_hits:
+						var tc: Object = th.get("collider")
+						if tc == child:
+							found_self = true
+						var trid: RID = th.get("rid", RID())
+						var ttag := PhysicsServer3D.body_get_shielding_tag(trid) if trid.is_valid() else -1
+						print("[ClusterDiag]   ray_hit: %s (%s) tag=%d rid=%s" % [
+							tc.name if tc else "null",
+							tc.get_class() if tc else "null",
+							ttag, str(trid)])
+					if not found_self:
+						print("[ClusterDiag]   >>> CLUSTER NOT HIT BY RAY! mask=%d, cluster_layer=%d, overlap=%d" % [
+							CollisionLayers.SHIELDING, clayer,
+							CollisionLayers.SHIELDING & clayer])
+
 	var t_pass1_process := Time.get_ticks_usec()
 	var pass1_players := 0
 	var pass1_structures := 0
@@ -273,11 +322,33 @@ static func _calc_player_explosion_damage(
 
 		total_damage += final_dmg
 
+		# --- DEBUG: enumerate every body the shielding ray hits ---
 		if debug_rays:
+			var all_hits := space_state.intersect_ray_all(query, MAX_RAY_ITERATIONS)
+			var hit_details: Array = []
+			for hit in all_hits:
+				var collider: Object = hit.get("collider")
+				var hit_rid: RID = hit.get("rid", RID())
+				var hit_pos: Vector3 = hit.get("position", Vector3.ZERO)
+				var tag := PhysicsServer3D.body_get_shielding_tag(hit_rid) if hit_rid.is_valid() else -1
+				var shp := PhysicsServer3D.body_get_shielding_hp(hit_rid) if hit_rid.is_valid() else 0.0
+				var col_layer := 0
+				if collider is CollisionObject3D:
+					col_layer = (collider as CollisionObject3D).collision_layer
+				var cname := collider.name if collider else "null"
+				var cclass := collider.get_class() if collider else "null"
+				var is_cluster := collider is FallingBlockCluster
+				hit_details.append(hit_pos)
+				print("[ShieldDiag] ray %d hit: %s (%s) layer=%d tag=%d hp=%.1f pos=%s cluster=%s" % [
+					i_sample, cname, cclass, col_layer, tag, shp,
+					str(hit_pos).substr(0, 30), str(is_cluster)])
+			if all_hits.is_empty():
+				print("[ShieldDiag] ray %d: NO HITS (mask=%d)" % [i_sample, query.collision_mask])
+
 			debug_ray_data.append({
 				"from": explosion_pos, "to": sample_pos,
 				"raw_dmg": raw_dmg, "final_dmg": final_dmg,
-				"hits": [],
+				"hits": hit_details,
 			})
 
 	if debug_rays and not debug_ray_data.is_empty():

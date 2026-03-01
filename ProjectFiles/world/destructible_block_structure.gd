@@ -51,8 +51,9 @@ var _mesh_dirty: bool = false
 ## Per-block bodies are on layer 11 (bit 1024) for weapon raycasts only.
 ## This eliminates seam bouncing when the player slides along the wall.
 var _collision_body: StaticBody3D = null
-## Maps Vector2i(bx, bz) → Array[CollisionShape3D] for column shape rebuild.
-var _col_shapes: Dictionary = {}
+## Column shape tracking — direct PhysicsServer3D RIDs (no CollisionShape3D nodes).
+var _col_shape_rids: Dictionary = {}    # Vector2i → Array[RID]
+var _col_shape_xforms: Dictionary = {}  # Vector2i → Array[Transform3D]
 
 ## Cached debris config from subclass (populated in _ready)
 var _debris_size: float = 0.15
@@ -392,11 +393,12 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
-		_rebuild_column(key.x, key.z)
-		_sync_block_destroyed.rpc(key, block_pos, blast_origin, debris_count, INF, ok_frac)
+		_rebuild_column_batched(key.x, key.z)
+		var spd := DebrisHelper.calc_hitscan_speed(ok_frac)
+		_sync_block_destroyed.rpc(key, block_pos, blast_origin, debris_count, spd)
 
 		# Host also spawns debris locally (RPC is call_remote, host needs it too).
-		_spawn_debris(block_pos, blast_origin, debris_count, INF, ok_frac)
+		_spawn_debris(block_pos, blast_origin, debris_count, spd)
 
 		# Check if destroying this block left floating islands
 		_check_structural_integrity()
@@ -408,7 +410,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 @rpc("authority", "call_remote", "reliable")
 func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 		blast_center: Vector3 = Vector3.ZERO, debris_count: int = 0,
-		impact_speed: float = INF, overkill_frac: float = 0.0) -> void:
+		debris_speed: float = 8.0) -> void:
 	## Client-side: remove a destroyed block, rebuild mesh, and spawn cosmetic debris.
 	if _blocks.has(key):
 		var block_data: Dictionary = _blocks[key]
@@ -419,11 +421,11 @@ func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)
-		_rebuild_column(key.x, key.z)
+		_rebuild_column_batched(key.x, key.z)
 
 	# Spawn cosmetic debris on the client.
 	if debris_count > 0:
-		_spawn_debris(block_pos, blast_center, debris_count, impact_speed, overkill_frac)
+		_spawn_debris(block_pos, blast_center, debris_count, debris_speed)
 
 
 func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attacker_id: int, exclude_rids: Array[RID] = [], impact_speed: float = INF) -> void:
@@ -442,67 +444,55 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	var space_state := get_world_3d().direct_space_state
 	var debug_rays := GameManager.debug_show_explosion_rays
 
-	var debris_spawned := 0
 	var destroyed_keys: Array[Vector3i] = []
 	var destroyed_positions: Array[Vector3] = []
 	var destroyed_overkill: Array[float] = []
 	var debug_ray_data: Array = []
 
-	# Two-pass damage: compute all damage first (read-only), then apply.
-	# This prevents block HP mutations from affecting shielding calculations
-	# for later blocks, which caused directional bias in single-pass.
-	var damage_map: Dictionary = {}  # Vector3i -> float
+	# C++ computes damage, shielding, applies HP, and returns destroyed/survived info.
+	var explosion_result: Dictionary = {}
 
-	# --- Pass 1: Compute damage for all blocks (read-only) ---
 	var t_pass1 := Time.get_ticks_usec()
+	var t_query_setup := Time.get_ticks_usec()
+	var query: PhysicsRayQueryParameters3D = null
 	if space_state:
-		# C++ production path: single call does collection + distance filter +
-		# falloff + multi-threaded shielding raycasts. Returns Dictionary[Vector3i -> float].
-		var query := ExplosionHelper._make_shielding_query(hit_pos, exclude_rids)
+		query = ExplosionHelper._make_shielding_query(hit_pos, exclude_rids)
+	var t_query_setup_end := Time.get_ticks_usec()
+	var t_calc_explosion := Time.get_ticks_usec()
+	if space_state:
 		var repeat_count := 2000 if GameManager.debug_explosion_repeat else 1
 		for _i in repeat_count:
-			damage_map = space_state.calc_structure_explosion(
-				query, _blocks, global_transform, BLOCK_SIZE,
-				_num_x, _num_y, _num_z, blast_radius, amount
+			explosion_result = space_state.calc_structure_explosion(
+				query, _blocks, _block_grid, global_transform, BLOCK_SIZE,
+				_num_x, _num_y, _num_z, blast_radius, amount, _block_hp
 			)
+	var t_calc_explosion_end := Time.get_ticks_usec()
 
-		# Draw debug rays if enabled (visualize C++ results without changing behavior).
-		if debug_rays:
-			for key: Vector3i in _blocks:
-				var block_data: Dictionary = _blocks[key]
-				var block_body: StaticBody3D = block_data["body"]
-				if not is_instance_valid(block_body):
-					continue
-				var block_world_pos: Vector3 = block_body.global_position
-				var d: float = hit_pos.distance_to(block_world_pos)
-				if d > blast_radius:
-					continue
-				var nd: float = d / blast_radius
-				var fo: float = 1.0 / (1.0 + (nd * 3.0) ** 3)
-				var dmg_raw: float = amount * fo
-				var final_dmg: float = float(damage_map.get(key, 0.0))
-				debug_ray_data.append({
-					"from": hit_pos, "to": block_world_pos,
-					"raw_dmg": dmg_raw, "final_dmg": final_dmg,
-					"hits": [],
-				})
+	# Unpack C++ results.
+	if not explosion_result.is_empty():
+		destroyed_keys.assign(explosion_result["destroyed_keys"])
+		destroyed_positions.assign(explosion_result["destroyed_positions"])
+		destroyed_overkill.assign(explosion_result["destroyed_overkill"])
+
+		# Update survived blocks — HP + shielding (tiny loop, ~42 blocks).
+		var s_keys: Array = explosion_result["survived_keys"]
+		var s_hps: PackedFloat32Array = explosion_result["survived_hps"]
+		var s_rids: Array[RID] = explosion_result["survived_rids"]
+		for i in s_keys.size():
+			_blocks[s_keys[i]]["hp"] = s_hps[i]
+			PhysicsServer3D.body_set_shielding_hp(s_rids[i], s_hps[i])
 	var t_pass1_end := Time.get_ticks_usec()
 
-	# --- Pass 2: Apply all damage simultaneously ---
-	var t_pass2 := Time.get_ticks_usec()
-	for key: Vector3i in damage_map:
-		if not _blocks.has(key):
-			continue
+	# Erase destroyed blocks.
+	var t_erase := Time.get_ticks_usec()
+	for i in destroyed_keys.size():
+		var key: Vector3i = destroyed_keys[i]
 		var block_data: Dictionary = _blocks[key]
 		var block_body: StaticBody3D = block_data["body"]
-		block_data["hp"] -= damage_map[key]
-		PhysicsServer3D.body_set_shielding_hp(block_body.get_rid(), block_data["hp"])
-		if block_data["hp"] <= 0.0:
-			destroyed_keys.append(key)
-			destroyed_positions.append(block_body.global_position)
-			destroyed_overkill.append(clampf(-block_data["hp"] / _block_hp, 0.0, 1.0))
-			block_body.queue_free()
-	var t_pass2_end := Time.get_ticks_usec()
+		block_body.queue_free()
+		_blocks.erase(key)
+		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+	var t_erase_end := Time.get_ticks_usec()
 
 	# Draw debug rays if toggled on
 	var t_debug := Time.get_ticks_usec()
@@ -510,41 +500,47 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		ExplosionHelper.draw_debug_rays(debug_ray_data)
 	var t_debug_end := Time.get_ticks_usec()
 
-	# Clean up destroyed entries and sync to clients (with debris info).
+	# Sync destroyed blocks to clients and spawn debris.
+	# Debris speed uses the same cubic falloff as damage — blocks near the blast
+	# center produce fast debris, blocks at the edge produce slow debris.
 	var t_debris := Time.get_ticks_usec()
 	var rpc_count := 0
 	var debris_spawn_count := 0
+	var t_debris_rpcs := Time.get_ticks_usec()
 	for i in destroyed_keys.size():
 		var key := destroyed_keys[i]
 		var block_pos := destroyed_positions[i]
 		var ok_frac := destroyed_overkill[i]
-		_blocks.erase(key)
-		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
-
-		# Determine debris count for this block.
-		var to_spawn := 0
-		if debris_spawned < _debris_max_total:
-			to_spawn = mini(_debris_per_block, _debris_max_total - debris_spawned)
-			debris_spawned += to_spawn
-
-		# Sync to clients (they spawn debris). Host spawns debris locally.
-		# Mirror the explosion center through the block so debris flies OUTWARD
-		# from the blast, not into it. blast_center semantics = "where debris
-		# should fly toward", so we reflect hit_pos to the far side.
+		var norm_dist := hit_pos.distance_to(block_pos) / blast_radius
+		var spd := DebrisHelper.calc_explosion_speed(norm_dist, ok_frac)
+		var to_spawn := randi_range(1, _debris_per_block)
 		var debris_origin := block_pos + (block_pos - hit_pos)
-		_sync_block_destroyed.rpc(key, block_pos, debris_origin, to_spawn, impact_speed, ok_frac)
+		_sync_block_destroyed.rpc(key, block_pos, debris_origin, to_spawn, spd)
 		rpc_count += 1
+	var t_debris_rpcs_end := Time.get_ticks_usec()
+	var t_debris_spawn := Time.get_ticks_usec()
+	for i in destroyed_keys.size():
+		var block_pos := destroyed_positions[i]
+		var ok_frac := destroyed_overkill[i]
+		var norm_dist := hit_pos.distance_to(block_pos) / blast_radius
+		var spd := DebrisHelper.calc_explosion_speed(norm_dist, ok_frac)
+		var to_spawn := randi_range(1, _debris_per_block)
+		var debris_origin := block_pos + (block_pos - hit_pos)
 		if to_spawn > 0:
-			_spawn_debris(block_pos, debris_origin, to_spawn, impact_speed, ok_frac)
+			_spawn_debris(block_pos, debris_origin, to_spawn, spd)
 			debris_spawn_count += to_spawn
+	var t_debris_spawn_end := Time.get_ticks_usec()
 	var t_debris_end := Time.get_ticks_usec()
 
 	var t_columns := Time.get_ticks_usec()
 	var num_columns_rebuilt := 0
+	var col_body_rid := RID()
+	var t_col_rebuild := Time.get_ticks_usec()
 	if destroyed_keys.size() > 0:
 		_mesh_dirty = true
 		set_process(true)
-		# Rebuild smooth collision for affected columns
+		col_body_rid = _collision_body.get_rid()
+		PhysicsServer3D.body_set_shapes_bulk_mode(col_body_rid, true)
 		var rebuilt_columns: Dictionary = {}
 		for key in destroyed_keys:
 			var col_key := Vector2i(key.x, key.z)
@@ -552,6 +548,12 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 				rebuilt_columns[col_key] = true
 				_rebuild_column(key.x, key.z)
 				num_columns_rebuilt += 1
+	var t_col_rebuild_end := Time.get_ticks_usec()
+	var t_col_commit := Time.get_ticks_usec()
+	if destroyed_keys.size() > 0:
+		_commit_all_shapes()
+		PhysicsServer3D.body_set_shapes_bulk_mode(col_body_rid, false)
+	var t_col_commit_end := Time.get_ticks_usec()
 	var t_columns_end := Time.get_ticks_usec()
 
 	# Batch structural integrity check after all blocks destroyed this frame
@@ -562,13 +564,12 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 
 	var t_total_end := Time.get_ticks_usec()
 	var _total_us := t_total_end - t_total
-	print("[TakeDamageAt] %s  blocks=%d  pass1=%dus  pass2=%dus  debug_rays=%dus  debris=%dus(rpcs=%d spawned=%d)  columns=%dus(%d)  integrity=%dus  destroyed=%d  total=%dus" % [
+	print("[TakeDamageAt] %s  blocks=%d  pass1=%dus(query=%d calc=%d)  erase=%dus  debris=%dus(rpcs=%d spawned=%d rpc_time=%d spawn_time=%d)  columns=%dus(%d rebuild=%d commit=%d)  integrity=%dus  destroyed=%d  total=%dus" % [
 		name, _blocks.size(),
-		t_pass1_end - t_pass1,
-		t_pass2_end - t_pass2,
-		t_debug_end - t_debug,
-		t_debris_end - t_debris, rpc_count, debris_spawn_count,
-		t_columns_end - t_columns, num_columns_rebuilt,
+		t_pass1_end - t_pass1, t_query_setup_end - t_query_setup, t_calc_explosion_end - t_calc_explosion,
+		t_erase_end - t_erase,
+		t_debris_end - t_debris, rpc_count, debris_spawn_count, t_debris_rpcs_end - t_debris_rpcs, t_debris_spawn_end - t_debris_spawn,
+		t_columns_end - t_columns, num_columns_rebuilt, t_col_rebuild_end - t_col_rebuild, t_col_commit_end - t_col_commit,
 		t_integrity_end - t_integrity,
 		destroyed_keys.size(),
 		_total_us,
@@ -644,12 +645,13 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	_block_grid[_grid_idx(target_key.x, target_key.y, target_key.z)] = 0
 	_mesh_dirty = true
 	set_process(true)
-	_rebuild_column(target_key.x, target_key.z)
+	_rebuild_column_batched(target_key.x, target_key.z)
 
 	# Sync destruction + debris to clients
 	var debris_count := randi_range(1, 2)
-	_sync_block_destroyed.rpc(target_key, block_pos, hit_world_pos, debris_count, impact_speed, ok_frac)
-	_spawn_debris(block_pos, hit_world_pos, debris_count, impact_speed, ok_frac)
+	var spd := DebrisHelper.calc_momentum_speed(impact_speed)
+	_sync_block_destroyed.rpc(target_key, block_pos, hit_world_pos, debris_count, spd)
+	_spawn_debris(block_pos, hit_world_pos, debris_count, spd)
 
 	# Structural integrity check (may detach more blocks)
 	if not _blocks.is_empty():
@@ -666,10 +668,10 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 # ======================================================================
 
 func _spawn_debris(block_pos: Vector3, blast_center: Vector3, count: int,
-		impact_speed: float = INF, overkill_frac: float = 0.0) -> void:
+		debris_speed: float) -> void:
 	DebrisHelper.spawn_debris(
 		get_parent(), block_pos, blast_center, count, _structure_material,
-		impact_speed, overkill_frac,
+		debris_speed,
 		{
 			"size": _debris_size,
 			"lifetime": _debris_lifetime, "mass": _debris_mass,
@@ -818,10 +820,12 @@ func _detach_cluster(block_keys: Array[Vector3i]) -> void:
 			_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 	var t_erase_end := Time.get_ticks_usec()
 
-	# Rebuild visuals and smooth collision for affected columns
+	# Rebuild visuals and smooth collision for affected columns (bulk = single compound rebuild)
 	var t_col_rebuild := Time.get_ticks_usec()
 	_mesh_dirty = true
 	set_process(true)
+	var body_rid := _collision_body.get_rid()
+	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, true)
 	var rebuilt_columns: Dictionary = {}
 	var num_col_rebuilt := 0
 	for key in valid_keys:
@@ -830,6 +834,8 @@ func _detach_cluster(block_keys: Array[Vector3i]) -> void:
 			rebuilt_columns[col_key] = true
 			_rebuild_column(key.x, key.z)
 			num_col_rebuilt += 1
+	_commit_all_shapes()
+	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, false)
 	var t_col_rebuild_end := Time.get_ticks_usec()
 
 	# Sync to all peers — pass per-block HP and grid info for cluster init
@@ -870,13 +876,18 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 
 		_mesh_dirty = true
 		set_process(true)
-		var rebuilt_columns: Dictionary = {}
-		for key_variant in block_keys:
-			var key: Vector3i = key_variant
-			var col_key := Vector2i(key.x, key.z)
-			if not rebuilt_columns.has(col_key):
-				rebuilt_columns[col_key] = true
-				_rebuild_column(key.x, key.z)
+		if _collision_body != null and is_instance_valid(_collision_body):
+			var body_rid := _collision_body.get_rid()
+			PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, true)
+			var rebuilt_columns: Dictionary = {}
+			for key_variant in block_keys:
+				var key: Vector3i = key_variant
+				var col_key := Vector2i(key.x, key.z)
+				if not rebuilt_columns.has(col_key):
+					rebuilt_columns[col_key] = true
+					_rebuild_column(key.x, key.z)
+			_commit_all_shapes()
+			PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, false)
 	var t_client_cleanup_end := Time.get_ticks_usec()
 
 	var t_type_convert := Time.get_ticks_usec()
@@ -889,8 +900,8 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 
 	var t_spawn := Time.get_ticks_usec()
 	if not GameManager.debug_disable_detached_structures:
-		# Default: spawn a new static structure from the detached blocks
-		_spawn_detached_structure(typed_keys, typed_hps)
+		_spawn_falling_cluster(typed_keys, typed_hps, spawn_pos, cluster_mass,
+			attacker_id, grid_num_x, grid_num_y, grid_num_z, mass_per_block)
 	var t_spawn_end := Time.get_ticks_usec()
 
 	var sync_total := Time.get_ticks_usec() - t_sync_total
@@ -994,7 +1005,7 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 	cluster.mass = cluster_mass
 	cluster.cluster_mass = cluster_mass
 	cluster.attacker_id = attacker_id
-	cluster.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_SMOOTH
+	cluster.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_BLOCKS | CollisionLayers.WALL_SMOOTH
 	cluster.collision_mask = CollisionLayers.DEFAULT_PHYSICS | CollisionLayers.DEBRIS
 	cluster.contact_monitor = true
 	cluster.max_contacts_reported = 4
@@ -1034,6 +1045,14 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 	else:
 		scene_root.add_child(cluster)
 	cluster.global_transform = Transform3D(global_transform.basis, spawn_pos)
+
+	# Register with C++ shielding system so explosions see this cluster
+	var cluster_rid := cluster.get_rid()
+	PhysicsServer3D.body_set_shielding_tag(cluster_rid, 4)  # damageable
+	var total_hp := 0.0
+	for hp: float in block_hp_dict.values():
+		total_hp += hp
+	PhysicsServer3D.body_set_shielding_hp(cluster_rid, total_hp)
 	var t_addchild_end := Time.get_ticks_usec()
 
 	print("[SpawnCluster] %s  blocks=%d  centroid=%dus  body=%dus  mesh=%dus  shapes=%dus  init=%dus  add_child=%dus  total=%dus" % [
@@ -1218,33 +1237,57 @@ func _build_smooth_collision() -> void:
 	_collision_body.collision_mask = 0
 	add_child(_collision_body)
 
+	var body_rid := _collision_body.get_rid()
+	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, true)
 	for bx in _num_x:
 		for bz in _num_z:
 			_build_column_shapes(bx, bz)
+	_commit_all_shapes()
+	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, false)
 
 
 func _rebuild_column(bx: int, bz: int) -> void:
-	## Remove and recreate collision shapes for one (bx, bz) column.
+	## Free old shape RIDs for this column and build new shape data.
+	## Does NOT touch the body — call _commit_all_shapes() after.
 	var col_key := Vector2i(bx, bz)
-	if _col_shapes.has(col_key):
-		for shape_node: CollisionShape3D in _col_shapes[col_key]:
-			if is_instance_valid(shape_node):
-				shape_node.queue_free()
-		_col_shapes.erase(col_key)
-
-	if _collision_body == null or not is_instance_valid(_collision_body):
-		return
-
+	if _col_shape_rids.has(col_key):
+		for rid: RID in _col_shape_rids[col_key]:
+			PhysicsServer3D.free_rid(rid)
 	_build_column_shapes(bx, bz)
 
 
+func _rebuild_column_batched(bx: int, bz: int) -> void:
+	## Rebuild a single column with bulk shape mode (single compound rebuild).
+	if _collision_body == null or not is_instance_valid(_collision_body):
+		return
+	var body_rid := _collision_body.get_rid()
+	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, true)
+	_rebuild_column(bx, bz)
+	_commit_all_shapes()
+	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, false)
+
+
+func _commit_all_shapes() -> void:
+	## Clear all shapes from body and re-add from tracked RIDs.
+	if _collision_body == null or not is_instance_valid(_collision_body):
+		return
+	var body_rid := _collision_body.get_rid()
+	PhysicsServer3D.body_clear_shapes(body_rid)
+	for col_key: Vector2i in _col_shape_rids:
+		var rids: Array = _col_shape_rids[col_key]
+		var xforms: Array = _col_shape_xforms[col_key]
+		for i in rids.size():
+			PhysicsServer3D.body_add_shape(body_rid, rids[i], xforms[i])
+
+
 func _build_column_shapes(bx: int, bz: int) -> void:
-	## Scan blocks in this column, find contiguous Y runs, create shapes.
+	## Scan blocks in this column, find contiguous Y runs, create shape RIDs.
 	if _collision_body == null or not is_instance_valid(_collision_body):
 		return
 
 	var col_key := Vector2i(bx, bz)
-	var shapes: Array = []
+	var rids: Array[RID] = []
+	var xforms: Array[Transform3D] = []
 
 	# Collect which Y indices still have blocks in this column (flat array lookup)
 	var y_present: Array[int] = []
@@ -1254,7 +1297,8 @@ func _build_column_shapes(bx: int, bz: int) -> void:
 			y_present.append(by)
 
 	if y_present.is_empty():
-		_col_shapes[col_key] = shapes
+		_col_shape_rids[col_key] = rids
+		_col_shape_xforms[col_key] = xforms
 		return
 
 	# Find contiguous runs
@@ -1265,37 +1309,34 @@ func _build_column_shapes(bx: int, bz: int) -> void:
 		if y_present[i] == run_end + 1:
 			run_end = y_present[i]
 		else:
-			# Emit shape for previous run
-			_add_column_shape(shapes, bx, bz, run_start, run_end)
+			_add_column_shape_rid(rids, xforms, bx, bz, run_start, run_end)
 			run_start = y_present[i]
 			run_end = y_present[i]
 
 	# Emit final run
-	_add_column_shape(shapes, bx, bz, run_start, run_end)
+	_add_column_shape_rid(rids, xforms, bx, bz, run_start, run_end)
 
-	_col_shapes[col_key] = shapes
+	_col_shape_rids[col_key] = rids
+	_col_shape_xforms[col_key] = xforms
 
 
-func _add_column_shape(shapes: Array,
+func _add_column_shape_rid(rids: Array[RID], xforms: Array[Transform3D],
 		bx: int, bz: int, by_start: int, by_end: int) -> void:
-	## Add a single CollisionShape3D for a contiguous vertical run.
+	## Create a box shape RID for a contiguous vertical run (no scene tree nodes).
 	var run_count: int = by_end - by_start + 1
 	var run_height: float = run_count * BLOCK_SIZE
+	var half_extents := Vector3(BLOCK_SIZE * 0.5, run_height * 0.5, BLOCK_SIZE * 0.5)
 
-	var box := BoxShape3D.new()
-	box.size = Vector3(BLOCK_SIZE, run_height, BLOCK_SIZE)
-
-	var col := CollisionShape3D.new()
-	col.shape = box
+	var shape_rid := PhysicsServer3D.box_shape_create()
+	PhysicsServer3D.shape_set_data(shape_rid, half_extents)
 
 	# Position in structure local space (same coordinate system as _spawn_block)
 	var cx: float = (bx + 0.5 - _num_x * 0.5) * BLOCK_SIZE
 	var cy: float = ((by_start + by_end) * 0.5 + 0.5 - _num_y * 0.5) * BLOCK_SIZE
 	var cz: float = (bz + 0.5 - _num_z * 0.5) * BLOCK_SIZE
-	col.position = Vector3(cx, cy, cz)
 
-	_collision_body.add_child(col)
-	shapes.append(col)
+	rids.append(shape_rid)
+	xforms.append(Transform3D(Basis.IDENTITY, Vector3(cx, cy, cz)))
 
 
 # ======================================================================

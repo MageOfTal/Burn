@@ -160,7 +160,7 @@ public:
 	virtual PackedFloat32Array calc_ray_shielding_batch(const RayParameters &p_base_params, const PackedVector3Array &p_to_points, const TypedArray<RID> &p_target_bodies, const PackedFloat32Array &p_max_absorptions) override {
 		return PackedFloat32Array();
 	}
-	virtual Dictionary calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount) override {
+	virtual Dictionary calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp) override {
 		return Dictionary();
 	}
 	virtual PackedInt32Array calc_structural_integrity(const PackedByteArray &p_block_grid, int p_num_x, int p_num_y, int p_num_z, int p_total_blocks) override {
@@ -327,6 +327,8 @@ public:
 
 	EXBIND2(body_remove_shape, RID, int)
 	EXBIND1(body_clear_shapes, RID)
+
+	EXBIND2(body_set_shapes_bulk_mode, RID, bool)
 
 	EXBIND2(body_attach_object_instance_id, RID, ObjectID)
 	EXBIND1RC(ObjectID, body_get_object_instance_id, RID)

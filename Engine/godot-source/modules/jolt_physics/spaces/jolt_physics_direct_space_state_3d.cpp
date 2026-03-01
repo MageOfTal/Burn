@@ -967,11 +967,13 @@ PackedFloat32Array JoltPhysicsDirectSpaceState3D::calc_ray_shielding_batch(
 Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 		const RayParameters &p_base_params,
 		const Dictionary &p_blocks,
+		const PackedByteArray &p_block_grid,
 		const Transform3D &p_structure_transform,
 		float p_block_size,
 		int p_num_x, int p_num_y, int p_num_z,
 		float p_blast_radius,
-		float p_damage_amount) {
+		float p_damage_amount,
+		float p_block_hp) {
 	ERR_FAIL_COND_V_MSG(space->is_stepping(), Dictionary(),
 		"calc_structure_explosion must not be called while the physics space is being stepped.");
 
@@ -983,70 +985,94 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 
 	space->flush_pending_objects();
 
-	// --- Phase 1: Iterate blocks, compute positions, filter by distance ---
-	// This replaces the 3.5ms GDScript collection loop with C++ (~0.5ms).
+	// --- Phase 1: Iterate block_grid, compute positions, filter by distance_squared ---
+	// Iterates flat byte array instead of Dictionary.keys() — avoids Variant boxing overhead.
+	// Uses distance_squared for the initial range check — avoids sqrt per block.
 	static const StringName sn_body("body");
+	static const StringName sn_hp("hp");
 
 	const float half_x = p_num_x * 0.5f;
 	const float half_y = p_num_y * 0.5f;
 	const float half_z = p_num_z * 0.5f;
 	const Vector3 hit_pos = p_base_params.from;
+	const float blast_radius_sq = p_blast_radius * p_blast_radius;
 
 	Vector<Vector3i> in_range_keys;
 	PackedVector3Array to_points;
 	Vector<RID> target_rids;
 	PackedFloat32Array raw_damages;
+	PackedFloat32Array block_hps;
 
-	Array block_keys = p_blocks.keys();
-	int total_blocks = block_keys.size();
+	const int grid_size = p_num_x * p_num_y * p_num_z;
+	ERR_FAIL_COND_V_MSG(p_block_grid.size() != grid_size, Dictionary(),
+		vformat("calc_structure_explosion: block_grid size %d != expected %d (%dx%dx%d)",
+			p_block_grid.size(), grid_size, p_num_x, p_num_y, p_num_z));
+	const uint8_t *grid_ptr = p_block_grid.ptr();
+	int total_blocks = p_blocks.size();
 
 	int skip_dist = 0;
 	int skip_body = 0;
 	int skip_cast = 0;
+	int skip_grid = 0;
 
-	for (int i = 0; i < total_blocks; i++) {
-		Vector3i key = block_keys[i];
+	// Iterate flat grid: index = bx * num_y * num_z + by * num_z + bz
+	for (int bx = 0; bx < p_num_x; bx++) {
+		const float local_x = (bx + 0.5f - half_x) * p_block_size;
+		for (int by = 0; by < p_num_y; by++) {
+			const float local_y = (by + 0.5f - half_y) * p_block_size;
+			for (int bz = 0; bz < p_num_z; bz++) {
+				int idx = bx * p_num_y * p_num_z + by * p_num_z + bz;
+				if (grid_ptr[idx] != 1) {
+					continue; // empty cell
+				}
 
-		// Compute world position from grid key (avoids global_position scene tree traversal).
-		Vector3 local_offset(
-			(key.x + 0.5f - half_x) * p_block_size,
-			(key.y + 0.5f - half_y) * p_block_size,
-			(key.z + 0.5f - half_z) * p_block_size
-		);
-		Vector3 world_pos = p_structure_transform.xform(local_offset);
+				const float local_z = (bz + 0.5f - half_z) * p_block_size;
+				Vector3 local_offset(local_x, local_y, local_z);
+				Vector3 world_pos = p_structure_transform.xform(local_offset);
 
-		float dist = hit_pos.distance_to(world_pos);
-		if (dist > p_blast_radius) {
-			skip_dist++;
-			continue;
+				float dist_sq = hit_pos.distance_squared_to(world_pos);
+				if (dist_sq > blast_radius_sq) {
+					skip_dist++;
+					continue;
+				}
+
+				// Only look up Dictionary for in-range blocks.
+				Vector3i key(bx, by, bz);
+				if (!p_blocks.has(key)) {
+					skip_grid++;
+					continue;
+				}
+
+				Dictionary block_dict = p_blocks[key];
+				Variant v_body = block_dict[sn_body];
+				Object *body_obj = v_body.get_validated_object();
+				if (!body_obj) {
+					skip_body++;
+					continue;
+				}
+
+				CollisionObject3D *col_obj = Object::cast_to<CollisionObject3D>(body_obj);
+				if (!col_obj) {
+					skip_cast++;
+					continue;
+				}
+				RID rid = col_obj->get_rid();
+				float hp = float(block_dict[sn_hp]);
+
+				// Compute actual distance for falloff (only for in-range blocks).
+				float dist = Math::sqrt(dist_sq);
+				float norm_dist = dist / p_blast_radius;
+				float nd3 = norm_dist * 3.0f;
+				float falloff = 1.0f / (1.0f + nd3 * nd3 * nd3);
+				float dmg = p_damage_amount * falloff;
+
+				in_range_keys.push_back(key);
+				to_points.push_back(world_pos);
+				target_rids.push_back(rid);
+				raw_damages.push_back(dmg);
+				block_hps.push_back(hp);
+			}
 		}
-
-		// Validate body is still alive (safe: reads ObjectID from Variant, no dangling ptr).
-		Dictionary block_dict = p_blocks[block_keys[i]];
-		Variant v_body = block_dict[sn_body];
-		Object *body_obj = v_body.get_validated_object();
-		if (!body_obj) {
-			skip_body++;
-			continue;
-		}
-
-		CollisionObject3D *col_obj = Object::cast_to<CollisionObject3D>(body_obj);
-		if (!col_obj) {
-			skip_cast++;
-			continue;
-		}
-		RID rid = col_obj->get_rid();
-
-		// Cubic falloff: 1 / (1 + (norm_dist * 3)^3)
-		float norm_dist = dist / p_blast_radius;
-		float nd3 = norm_dist * 3.0f;
-		float falloff = 1.0f / (1.0f + nd3 * nd3 * nd3);
-		float dmg = p_damage_amount * falloff;
-
-		in_range_keys.push_back(key);
-		to_points.push_back(world_pos);
-		target_rids.push_back(rid);
-		raw_damages.push_back(dmg);
 	}
 
 	int ray_count = to_points.size();
@@ -1102,26 +1128,51 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 
 	uint64_t t_rays = OS::get_singleton()->get_ticks_usec();
 
-	// --- Phase 3: Build result Dictionary[Vector3i -> float] ---
-	Dictionary result;
+	// --- Phase 3: Apply damage, collect destroyed/survived blocks ---
 	const float *abs_ptr = absorptions.ptr();
 	const float *dmg_ptr = raw_damages.ptr();
+	const float *hp_ptr = block_hps.ptr();
+
+	Array destroyed_keys;
+	PackedVector3Array destroyed_positions;
+	PackedFloat32Array destroyed_overkill;
+	Array survived_keys;
+	PackedFloat32Array survived_hps;
+	TypedArray<RID> survived_rids;
 
 	int shielded_out = 0;
 	for (int i = 0; i < ray_count; i++) {
 		float final_dmg = MAX(dmg_ptr[i] - abs_ptr[i], 0.0f);
-		if (final_dmg >= 0.5f) {
-			result[in_range_keys[i]] = final_dmg;
-		} else {
+		if (final_dmg < 0.5f) {
 			shielded_out++;
+			continue;
+		}
+		float new_hp = hp_ptr[i] - final_dmg;
+		if (new_hp <= 0.0f) {
+			destroyed_keys.push_back(in_range_keys[i]);
+			destroyed_positions.push_back(to_points[i]);
+			float overkill = CLAMP(-new_hp / p_block_hp, 0.0f, 1.0f);
+			destroyed_overkill.push_back(overkill);
+		} else {
+			survived_keys.push_back(in_range_keys[i]);
+			survived_hps.push_back(new_hp);
+			survived_rids.push_back(target_rids[i]);
 		}
 	}
 
+	Dictionary result;
+	result["destroyed_keys"] = destroyed_keys;
+	result["destroyed_positions"] = destroyed_positions;
+	result["destroyed_overkill"] = destroyed_overkill;
+	result["survived_keys"] = survived_keys;
+	result["survived_hps"] = survived_hps;
+	result["survived_rids"] = survived_rids;
+
 	uint64_t t_end = OS::get_singleton()->get_ticks_usec();
 
-	print_line(vformat("[StructureExplosion] blocks=%d  in_range=%d  damaged=%d  shielded=%d  skip(dist=%d body=%d cast=%d)  collect=%dus  raycasts=%dus  result=%dus  total=%dus",
-		total_blocks, ray_count, result.size(), shielded_out,
-		skip_dist, skip_body, skip_cast,
+	print_line(vformat("[StructureExplosion] blocks=%d  in_range=%d  destroyed=%d  survived=%d  shielded=%d  skip(dist=%d grid=%d body=%d cast=%d)  collect=%dus  raycasts=%dus  result=%dus  total=%dus",
+		total_blocks, ray_count, destroyed_keys.size(), survived_keys.size(), shielded_out,
+		skip_dist, skip_grid, skip_body, skip_cast,
 		(int)(t_collect - t_start),
 		(int)(t_rays - t_collect),
 		(int)(t_end - t_rays),
