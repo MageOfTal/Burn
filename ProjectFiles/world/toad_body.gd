@@ -218,6 +218,7 @@ func _ready() -> void:
 	mass = GameManager.debug_toad_mass
 	gravity_scale = 2.0  ## 2x gravity (matches original TOAD_GRAVITY = 19.6)
 	lock_rotation = false
+	can_sleep = false
 	continuous_cd = true  ## Prevent tunneling through ground at high speeds
 	# PhysicsMaterial (bounce=0.3, friction=0.5) is set in toad_body.tscn
 

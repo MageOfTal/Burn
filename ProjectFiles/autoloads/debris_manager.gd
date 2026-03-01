@@ -104,10 +104,8 @@ func spawn_batch(block_pos: Vector3, blast_center: Vector3, count: int,
 			randf_range(-0.2, 0.2),
 		)
 
-		# Configure while frozen (before Jolt picks up dynamic state).
+		# Configure while frozen (position/mass/visual safe to set now).
 		debris.position = spawn_pos
-		debris.linear_velocity = impulse_dir * debris_speed
-		debris.angular_velocity = Vector3(randf_range(-4, 4), randf_range(-4, 4), randf_range(-4, 4))
 		if set_mass:
 			debris.mass = mass_val
 		debris.get_child(1).material_override = material
@@ -121,9 +119,12 @@ func spawn_batch(block_pos: Vector3, blast_center: Vector3, count: int,
 		debris.dbg_contact_speed = 0.0
 		debris.dbg_frame_count = 0
 
-		# Activate.
+		# Activate — set velocity AFTER unfreeze so Jolt sees it on the
+		# dynamic body (frozen bodies are static in Jolt and discard velocity).
 		debris.visible = true
 		debris.freeze = false
+		debris.linear_velocity = impulse_dir * debris_speed
+		debris.angular_velocity = Vector3(randf_range(-4, 4), randf_range(-4, 4), randf_range(-4, 4))
 
 		_dbg_spawned += 1
 		_expire_queue.append([now_sec + lifetime + randf_range(0.0, 1.0), debris])

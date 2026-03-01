@@ -25,6 +25,10 @@ const MAX_RAY_ITERATIONS := 32
 ## Debug ray auto-delete time (seconds)
 const DEBUG_RAY_LIFETIME := 4.0
 
+## Maximum velocity change (m/s) from a single explosion impulse.
+## Prevents absurdly fast launches on very light objects (e.g. 0.1 kg bubbles).
+const MAX_IMPULSE_VELOCITY := 50.0
+
 ## Persistent sphere shape for physics queries. With threaded physics,
 ## PhysicsServer3D.shape_set_data() is deferred — a shape created + configured
 ## in the same frame reads radius=0. By reusing a persistent shape, the radius
@@ -45,12 +49,15 @@ static func do_explosion(
 	attacker_id: int,
 	exclude_body: Node = null,
 	impact_speed: float = INF,
+	impulse_strength: float = 400.0,
 ) -> void:
 	## Deal shielded explosion damage to all players and walls in radius.
 	## player_damage: base damage dealt to players (before falloff/shielding).
 	## structure_damage: base damage dealt to structures/blocks/physics objects.
 	## exclude_body: the rocket RigidBody3D or kamikaze player to skip.
 	## impact_speed: speed of the projectile at detonation (m/s). Passed to debris.
+	## impulse_strength: base impulse (N·s) applied to RigidBody3D objects (before
+	##   falloff). Heavier objects receive less velocity change. 0.0 = no impulse.
 	var t_explosion_total := Time.get_ticks_usec()
 	var space_state := world.direct_space_state
 	if space_state == null:
@@ -241,13 +248,55 @@ static func do_explosion(
 						str(_dbg_pass1_structures), str(_dbg_pass2_structures)])
 	var t_pass2_structures_end := Time.get_ticks_usec()
 
+	# ------------------------------------------------------------------
+	#  Impulse pass: push RigidBody3D objects away from the blast
+	# ------------------------------------------------------------------
+	var impulse_count := 0
+	if impulse_strength > 0.0:
+		var impulsed_rids: Dictionary = {}  # RID -> true (fast dedup)
+
+		# Bodies from the sphere query (players, items, clusters, projectiles)
+		for result in results:
+			var body: Node = result["collider"]
+			if not (body is RigidBody3D) or body == exclude_body:
+				continue
+			var rb := body as RigidBody3D
+			if rb.freeze:
+				continue
+			var rid := rb.get_rid()
+			if impulsed_rids.has(rid):
+				continue
+			_apply_explosion_impulse(rb, explosion_pos, radius, impulse_strength)
+			impulsed_rids[rid] = true
+			impulse_count += 1
+
+		# Safety net: players missed by the sphere query (mirrors pass 2)
+		if tree and tree.current_scene:
+			var impulse_players := tree.current_scene.get_node_or_null("Players")
+			if impulse_players:
+				for p in impulse_players.get_children():
+					if not (p is Player) or p == exclude_body:
+						continue
+					if not p.is_alive:
+						continue
+					var p_rid: RID = p.get_rid()
+					if impulsed_rids.has(p_rid):
+						continue
+					var dist := explosion_pos.distance_to(p.global_position)
+					if dist > radius:
+						continue
+					_apply_explosion_impulse(p, explosion_pos, radius, impulse_strength)
+					impulsed_rids[p_rid] = true
+					impulse_count += 1
+
 	var t_explosion_total_end := Time.get_ticks_usec()
 	var explosion_us := t_explosion_total_end - t_explosion_total
-	print("[DoExplosion] sphere_query=%dus(%d results)  pass1=%dus(players=%d structs=%d objs=%d)  pass2_players=%dus(%d)  pass2_structs=%dus(scanned=%d skipped=%d hit=%d)  total=%dus" % [
+	print("[DoExplosion] sphere_query=%dus(%d results)  pass1=%dus(players=%d structs=%d objs=%d)  pass2_players=%dus(%d)  pass2_structs=%dus(scanned=%d skipped=%d hit=%d)  impulse=%d  total=%dus" % [
 		t_sphere_end - t_sphere, results.size(),
 		t_pass1_process_end - t_pass1_process, pass1_players, pass1_structures, pass1_objects,
 		t_pass2_players_end - t_pass2_players, pass2_players,
 		t_pass2_structures_end - t_pass2_structures, pass2_scanned, pass2_skipped, pass2_structures,
+		impulse_count,
 		explosion_us,
 	])
 	GameManager.tick_add("do_explosion", explosion_us)
@@ -335,8 +384,8 @@ static func _calc_player_explosion_damage(
 				var col_layer := 0
 				if collider is CollisionObject3D:
 					col_layer = (collider as CollisionObject3D).collision_layer
-				var cname := collider.name if collider else "null"
-				var cclass := collider.get_class() if collider else "null"
+				var cname: String = collider.name if collider else "null"
+				var cclass: String = collider.get_class() if collider else "null"
 				var is_cluster := collider is FallingBlockCluster
 				hit_details.append(hit_pos)
 				print("[ShieldDiag] ray %d hit: %s (%s) layer=%d tag=%d hp=%.1f pos=%s cluster=%s" % [
@@ -464,6 +513,35 @@ static func _find_damageable(node: Node) -> Node:
 			first_damageable = current
 		current = current.get_parent()
 	return first_damageable
+
+
+static func _apply_explosion_impulse(
+	body: RigidBody3D,
+	explosion_pos: Vector3,
+	radius: float,
+	impulse_strength: float,
+) -> void:
+	## Push a RigidBody3D away from the explosion center. Same cubic falloff as
+	## damage, with a slight upward bias so objects arc instead of sliding.
+	## Impulse is force-based: heavier objects get less velocity change.
+	var dist := explosion_pos.distance_to(body.global_position)
+	if dist > radius:
+		return
+	var norm_dist := dist / radius
+	var falloff := 1.0 / (1.0 + (norm_dist * 3.0) ** 3)
+
+	# Direction from explosion to body, with upward bias for a satisfying arc
+	var dir := body.global_position - explosion_pos
+	if dir.length_squared() < 0.01:
+		dir = Vector3.UP
+	else:
+		dir = dir.normalized()
+		dir.y = maxf(dir.y, 0.3)
+		dir = dir.normalized()
+
+	# Cap impulse so very light objects don't reach absurd velocities
+	var impulse_mag := minf(impulse_strength * falloff, MAX_IMPULSE_VELOCITY * body.mass)
+	body.apply_central_impulse(dir * impulse_mag)
 
 
 static func _make_shielding_query(from: Vector3, exclude_rids: Array[RID]) -> PhysicsRayQueryParameters3D:
