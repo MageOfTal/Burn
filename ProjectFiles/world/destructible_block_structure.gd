@@ -1068,95 +1068,110 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 
 
 func _build_cluster_mesh(block_keys: Array[Vector3i], centroid_local: Vector3) -> Mesh:
-	## Build a greedy mesh for a set of block keys, relative to centroid_local.
+	## Build a mesh for a set of block keys, relative to centroid_local.
+	## Uses ArrayMesh with indexed geometry for fast bulk upload.
 	var key_set: Dictionary = {}
 	for key in block_keys:
 		key_set[key] = true
 
-	var st := SurfaceTool.new()
-	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var block_count := block_keys.size()
+	var max_verts := block_count * 24  # 6 faces * 4 verts
+	var max_idx := block_count * 36    # 6 faces * 6 indices
+
+	var verts := PackedVector3Array()
+	verts.resize(max_verts)
+	var norms := PackedVector3Array()
+	norms.resize(max_verts)
+	var uv_arr := PackedVector2Array()
+	uv_arr.resize(max_verts)
+	var idx := PackedInt32Array()
+	idx.resize(max_idx)
+
+	var vi := 0
+	var ii := 0
 	var bs := BLOCK_SIZE
 	var hs := bs * 0.5
+	var uv0 := Vector2(0, 0)
+	var uv1 := Vector2(1, 0)
+	var uv2 := Vector2(1, 1)
+	var uv3 := Vector2(0, 1)
 
 	for key in block_keys:
-		# Block center relative to cluster centroid
 		var cx: float = (key.x + 0.5 - _num_x * 0.5) * bs - centroid_local.x
 		var cy: float = (key.y + 0.5 - _num_y * 0.5) * bs - centroid_local.y
 		var cz: float = (key.z + 0.5 - _num_z * 0.5) * bs - centroid_local.z
 
 		# +X face
 		if not key_set.has(Vector3i(key.x + 1, key.y, key.z)):
-			var n := Vector3(1, 0, 0)
 			var x := cx + hs
-			_add_quad_simple(st, n,
-				Vector3(x, cy - hs, cz - hs), Vector3(x, cy - hs, cz + hs),
-				Vector3(x, cy + hs, cz + hs), Vector3(x, cy + hs, cz - hs))
-
+			verts[vi] = Vector3(x, cy - hs, cz - hs); verts[vi + 1] = Vector3(x, cy - hs, cz + hs)
+			verts[vi + 2] = Vector3(x, cy + hs, cz + hs); verts[vi + 3] = Vector3(x, cy + hs, cz - hs)
+			norms[vi] = Vector3.RIGHT; norms[vi + 1] = Vector3.RIGHT; norms[vi + 2] = Vector3.RIGHT; norms[vi + 3] = Vector3.RIGHT
+			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 		# -X face
 		if not key_set.has(Vector3i(key.x - 1, key.y, key.z)):
-			var n := Vector3(-1, 0, 0)
 			var x := cx - hs
-			_add_quad_simple(st, n,
-				Vector3(x, cy - hs, cz + hs), Vector3(x, cy - hs, cz - hs),
-				Vector3(x, cy + hs, cz - hs), Vector3(x, cy + hs, cz + hs))
-
+			verts[vi] = Vector3(x, cy - hs, cz + hs); verts[vi + 1] = Vector3(x, cy - hs, cz - hs)
+			verts[vi + 2] = Vector3(x, cy + hs, cz - hs); verts[vi + 3] = Vector3(x, cy + hs, cz + hs)
+			norms[vi] = Vector3.LEFT; norms[vi + 1] = Vector3.LEFT; norms[vi + 2] = Vector3.LEFT; norms[vi + 3] = Vector3.LEFT
+			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 		# +Y face (top)
 		if not key_set.has(Vector3i(key.x, key.y + 1, key.z)):
-			var n := Vector3(0, 1, 0)
 			var y := cy + hs
-			_add_quad_simple(st, n,
-				Vector3(cx - hs, y, cz - hs), Vector3(cx + hs, y, cz - hs),
-				Vector3(cx + hs, y, cz + hs), Vector3(cx - hs, y, cz + hs))
-
+			verts[vi] = Vector3(cx - hs, y, cz - hs); verts[vi + 1] = Vector3(cx + hs, y, cz - hs)
+			verts[vi + 2] = Vector3(cx + hs, y, cz + hs); verts[vi + 3] = Vector3(cx - hs, y, cz + hs)
+			norms[vi] = Vector3.UP; norms[vi + 1] = Vector3.UP; norms[vi + 2] = Vector3.UP; norms[vi + 3] = Vector3.UP
+			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 		# -Y face (bottom)
 		if not key_set.has(Vector3i(key.x, key.y - 1, key.z)):
-			var n := Vector3(0, -1, 0)
 			var y := cy - hs
-			_add_quad_simple(st, n,
-				Vector3(cx - hs, y, cz + hs), Vector3(cx + hs, y, cz + hs),
-				Vector3(cx + hs, y, cz - hs), Vector3(cx - hs, y, cz - hs))
-
+			verts[vi] = Vector3(cx - hs, y, cz + hs); verts[vi + 1] = Vector3(cx + hs, y, cz + hs)
+			verts[vi + 2] = Vector3(cx + hs, y, cz - hs); verts[vi + 3] = Vector3(cx - hs, y, cz - hs)
+			norms[vi] = Vector3.DOWN; norms[vi + 1] = Vector3.DOWN; norms[vi + 2] = Vector3.DOWN; norms[vi + 3] = Vector3.DOWN
+			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 		# +Z face
 		if not key_set.has(Vector3i(key.x, key.y, key.z + 1)):
-			var n := Vector3(0, 0, 1)
 			var z := cz + hs
-			_add_quad_simple(st, n,
-				Vector3(cx + hs, cy - hs, z), Vector3(cx - hs, cy - hs, z),
-				Vector3(cx - hs, cy + hs, z), Vector3(cx + hs, cy + hs, z))
-
+			verts[vi] = Vector3(cx + hs, cy - hs, z); verts[vi + 1] = Vector3(cx - hs, cy - hs, z)
+			verts[vi + 2] = Vector3(cx - hs, cy + hs, z); verts[vi + 3] = Vector3(cx + hs, cy + hs, z)
+			norms[vi] = Vector3.BACK; norms[vi + 1] = Vector3.BACK; norms[vi + 2] = Vector3.BACK; norms[vi + 3] = Vector3.BACK
+			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 		# -Z face
 		if not key_set.has(Vector3i(key.x, key.y, key.z - 1)):
-			var n := Vector3(0, 0, -1)
 			var z := cz - hs
-			_add_quad_simple(st, n,
-				Vector3(cx - hs, cy - hs, z), Vector3(cx + hs, cy - hs, z),
-				Vector3(cx + hs, cy + hs, z), Vector3(cx - hs, cy + hs, z))
+			verts[vi] = Vector3(cx - hs, cy - hs, z); verts[vi + 1] = Vector3(cx + hs, cy - hs, z)
+			verts[vi + 2] = Vector3(cx + hs, cy + hs, z); verts[vi + 3] = Vector3(cx - hs, cy + hs, z)
+			norms[vi] = Vector3.FORWARD; norms[vi + 1] = Vector3.FORWARD; norms[vi + 2] = Vector3.FORWARD; norms[vi + 3] = Vector3.FORWARD
+			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 
-	return st.commit()
-
-
-func _add_quad_simple(st: SurfaceTool, normal: Vector3,
-		p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3) -> void:
-	## Emit a quad as 2 triangles with simple UVs. Used for cluster meshes.
-	st.set_normal(normal)
-	st.set_uv(Vector2(0, 0))
-	st.add_vertex(p0)
-	st.set_normal(normal)
-	st.set_uv(Vector2(1, 0))
-	st.add_vertex(p1)
-	st.set_normal(normal)
-	st.set_uv(Vector2(1, 1))
-	st.add_vertex(p2)
-
-	st.set_normal(normal)
-	st.set_uv(Vector2(0, 0))
-	st.add_vertex(p0)
-	st.set_normal(normal)
-	st.set_uv(Vector2(1, 1))
-	st.add_vertex(p2)
-	st.set_normal(normal)
-	st.set_uv(Vector2(0, 1))
-	st.add_vertex(p3)
+	verts.resize(vi); norms.resize(vi); uv_arr.resize(vi); idx.resize(ii)
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_NORMAL] = norms
+	arrays[Mesh.ARRAY_TEX_UV] = uv_arr
+	arrays[Mesh.ARRAY_INDEX] = idx
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return mesh
 
 
 func _build_cluster_column_shapes(cluster: RigidBody3D,
@@ -1356,108 +1371,139 @@ func _rebuild_greedy_mesh() -> void:
 		_mesh_instance.mesh = null
 		return
 
-	var st := SurfaceTool.new()
-	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var block_count := _blocks.size()
+	var max_verts := block_count * 24  # 6 faces * 4 verts
+	var max_idx := block_count * 36    # 6 faces * 6 indices
 
+	var verts := PackedVector3Array()
+	verts.resize(max_verts)
+	var norms := PackedVector3Array()
+	norms.resize(max_verts)
+	var uv_arr := PackedVector2Array()
+	uv_arr.resize(max_verts)
+	var idx := PackedInt32Array()
+	idx.resize(max_idx)
+
+	var vi := 0
+	var ii := 0
 	var half_x := _num_x * BLOCK_SIZE * 0.5
 	var half_y := _num_y * BLOCK_SIZE * 0.5
 	var half_z := _num_z * BLOCK_SIZE * 0.5
 	var bs := BLOCK_SIZE
+	var hs := bs * 0.5
 
 	for key: Vector3i in _blocks:
 		var bx: int = key.x
 		var by: int = key.y
 		var bz: int = key.z
 
-		# Block center in local space (relative to structure origin)
 		var cx: float = (bx + 0.5) * bs - half_x
 		var cy: float = (by + 0.5) * bs - half_y
 		var cz: float = (bz + 0.5) * bs - half_z
-		var hs := bs * 0.5  # half-size
 
 		# +X face
 		if not _blocks.has(Vector3i(bx + 1, by, bz)):
-			var n := Vector3(1, 0, 0)
+			var n := Vector3.RIGHT
 			var x := cx + hs
-			_add_quad(st, n,
-				Vector3(x, cy - hs, cz - hs),
-				Vector3(x, cy - hs, cz + hs),
-				Vector3(x, cy + hs, cz + hs),
-				Vector3(x, cy + hs, cz - hs))
+			var p0 := Vector3(x, cy - hs, cz - hs)
+			var p1 := Vector3(x, cy - hs, cz + hs)
+			var p2 := Vector3(x, cy + hs, cz + hs)
+			var p3 := Vector3(x, cy + hs, cz - hs)
+			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
+			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
+			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
+			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 
 		# -X face
 		if not _blocks.has(Vector3i(bx - 1, by, bz)):
-			var n := Vector3(-1, 0, 0)
+			var n := Vector3.LEFT
 			var x := cx - hs
-			_add_quad(st, n,
-				Vector3(x, cy - hs, cz + hs),
-				Vector3(x, cy - hs, cz - hs),
-				Vector3(x, cy + hs, cz - hs),
-				Vector3(x, cy + hs, cz + hs))
+			var p0 := Vector3(x, cy - hs, cz + hs)
+			var p1 := Vector3(x, cy - hs, cz - hs)
+			var p2 := Vector3(x, cy + hs, cz - hs)
+			var p3 := Vector3(x, cy + hs, cz + hs)
+			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
+			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
+			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
+			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 
 		# +Y face (top)
 		if not _blocks.has(Vector3i(bx, by + 1, bz)):
-			var n := Vector3(0, 1, 0)
+			var n := Vector3.UP
 			var y := cy + hs
-			_add_quad(st, n,
-				Vector3(cx - hs, y, cz - hs),
-				Vector3(cx + hs, y, cz - hs),
-				Vector3(cx + hs, y, cz + hs),
-				Vector3(cx - hs, y, cz + hs))
+			var p0 := Vector3(cx - hs, y, cz - hs)
+			var p1 := Vector3(cx + hs, y, cz - hs)
+			var p2 := Vector3(cx + hs, y, cz + hs)
+			var p3 := Vector3(cx - hs, y, cz + hs)
+			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
+			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
+			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
+			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 
 		# -Y face (bottom)
 		if not _blocks.has(Vector3i(bx, by - 1, bz)):
-			var n := Vector3(0, -1, 0)
+			var n := Vector3.DOWN
 			var y := cy - hs
-			_add_quad(st, n,
-				Vector3(cx - hs, y, cz + hs),
-				Vector3(cx + hs, y, cz + hs),
-				Vector3(cx + hs, y, cz - hs),
-				Vector3(cx - hs, y, cz - hs))
+			var p0 := Vector3(cx - hs, y, cz + hs)
+			var p1 := Vector3(cx + hs, y, cz + hs)
+			var p2 := Vector3(cx + hs, y, cz - hs)
+			var p3 := Vector3(cx - hs, y, cz - hs)
+			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
+			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
+			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
+			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 
 		# +Z face
 		if not _blocks.has(Vector3i(bx, by, bz + 1)):
-			var n := Vector3(0, 0, 1)
+			var n := Vector3.BACK
 			var z := cz + hs
-			_add_quad(st, n,
-				Vector3(cx + hs, cy - hs, z),
-				Vector3(cx - hs, cy - hs, z),
-				Vector3(cx - hs, cy + hs, z),
-				Vector3(cx + hs, cy + hs, z))
+			var p0 := Vector3(cx + hs, cy - hs, z)
+			var p1 := Vector3(cx - hs, cy - hs, z)
+			var p2 := Vector3(cx - hs, cy + hs, z)
+			var p3 := Vector3(cx + hs, cy + hs, z)
+			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
+			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
+			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
+			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 
 		# -Z face
 		if not _blocks.has(Vector3i(bx, by, bz - 1)):
-			var n := Vector3(0, 0, -1)
+			var n := Vector3.FORWARD
 			var z := cz - hs
-			_add_quad(st, n,
-				Vector3(cx - hs, cy - hs, z),
-				Vector3(cx + hs, cy - hs, z),
-				Vector3(cx + hs, cy + hs, z),
-				Vector3(cx - hs, cy + hs, z))
+			var p0 := Vector3(cx - hs, cy - hs, z)
+			var p1 := Vector3(cx + hs, cy - hs, z)
+			var p2 := Vector3(cx + hs, cy + hs, z)
+			var p3 := Vector3(cx - hs, cy + hs, z)
+			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
+			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
+			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
+			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
+			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
+			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
+			vi += 4; ii += 6
 
-	_mesh_instance.mesh = st.commit()
-
-
-func _add_quad(st: SurfaceTool, normal: Vector3,
-		p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3) -> void:
-	## Emit a quad as 2 triangles. Winding is CCW: p0->p1->p2, p0->p2->p3.
-	var uvs := _compute_quad_uvs(normal, p0, p1, p2, p3)
-	st.set_normal(normal)
-	st.set_uv(uvs[0])
-	st.add_vertex(p0)
-	st.set_normal(normal)
-	st.set_uv(uvs[1])
-	st.add_vertex(p1)
-	st.set_normal(normal)
-	st.set_uv(uvs[2])
-	st.add_vertex(p2)
-
-	st.set_normal(normal)
-	st.set_uv(uvs[0])
-	st.add_vertex(p0)
-	st.set_normal(normal)
-	st.set_uv(uvs[2])
-	st.add_vertex(p2)
-	st.set_normal(normal)
-	st.set_uv(uvs[3])
-	st.add_vertex(p3)
+	verts.resize(vi); norms.resize(vi); uv_arr.resize(vi); idx.resize(ii)
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_NORMAL] = norms
+	arrays[Mesh.ARRAY_TEX_UV] = uv_arr
+	arrays[Mesh.ARRAY_INDEX] = idx
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	_mesh_instance.mesh = mesh
