@@ -373,7 +373,7 @@ func try_fire() -> void:
 	# When grounded, position control zeroes velocity and stores real movement
 	# in _ground_velocity. Restore it so existing momentum carries into the swing.
 	if player.is_on_floor():
-		player.velocity = player._ground_velocity
+		player.velocity = player.movement._ground_velocity
 
 	_rope_length = player.global_position.distance_to(anchor_point)
 	_anchor_collider_rid = result.get("rid", RID())
@@ -1347,8 +1347,8 @@ func _do_release(with_boost: bool) -> void:
 	# When boosted on the ground, force airborne so the upward velocity
 	# component actually launches the player instead of being pinned to the floor.
 	if boosted and player.is_on_floor():
-		player._is_grounded = false
-		player._ground_velocity = player.velocity
+		player.movement._is_grounded = false
+		player.movement._ground_velocity = player.velocity
 
 	_show_grapple_release.rpc(release_pos)
 	if boosted:
