@@ -114,7 +114,8 @@ func _rebuild_ui() -> void:
 
 	start_y += 35.0
 
-	# Draw weapon slots
+	# Draw weapon slots (sequential positioning — skip gaps from empty/non-weapon slots)
+	var weapon_count := 0
 	for i in _inventory.items.size():
 		if _inventory.items[i] == null:
 			continue
@@ -122,8 +123,9 @@ func _rebuild_ui() -> void:
 		if not stack.item_data is WeaponData:
 			continue
 
-		var slot_y: float = start_y + i * 110.0
+		var slot_y: float = start_y + weapon_count * 110.0
 		_draw_weapon_slot(i, stack, center_x - 400, slot_y)
+		weapon_count += 1
 
 	# --- Ammo items (right side) ---
 	# Shows WeaponData items with can_slot_as_ammo
@@ -147,6 +149,7 @@ func _rebuild_ui() -> void:
 		no_ammo.add_theme_color_override("font_color", Color(0.5, 0.5, 0.5))
 		no_ammo.position = Vector2(center_x + 100, ammo_y)
 		add_child(no_ammo)
+		ammo_y += 40.0  # Advance past the two-line label
 
 	# --- Trinket section (below ammo, right side) ---
 	ammo_y += 20.0

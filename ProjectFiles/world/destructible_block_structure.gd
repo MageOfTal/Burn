@@ -1005,7 +1005,7 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 	cluster.mass = cluster_mass
 	cluster.cluster_mass = cluster_mass
 	cluster.attacker_id = attacker_id
-	cluster.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_BLOCKS | CollisionLayers.WALL_SMOOTH
+	cluster.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_SMOOTH
 	cluster.collision_mask = CollisionLayers.DEFAULT_PHYSICS | CollisionLayers.DEBRIS
 	cluster.contact_monitor = true
 	cluster.max_contacts_reported = 4
@@ -1034,6 +1034,8 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 	var t_init := Time.get_ticks_usec()
 	cluster.init_cluster_blocks(block_hp_dict, grid_num_x, grid_num_y, grid_num_z,
 		mass_per_block)
+	cluster.set_debris_config(_debris_size, _debris_lifetime, _debris_mass,
+		_debris_name, _block_hp)
 	var t_init_end := Time.get_ticks_usec()
 
 	# Add under Structures node (same parent as this structure) so the

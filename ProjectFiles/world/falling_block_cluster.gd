@@ -2,12 +2,15 @@ extends PhysicsBodyBase
 class_name FallingBlockCluster
 
 ## Falling cluster of blocks detached from a DestructibleBlockStructure when
-## structural integrity fails. Tracks individual block HP — virtually identical
-## to a normal structure, but as a RigidBody3D with physics simulation.
+## structural integrity fails.  Uses BlockGridManager for block data, mesh
+## building, and collision shape computation — the same shared logic that
+## structures use.
+##
+## Per-block StaticBody3D hit bodies (layer 11 / WALL_BLOCKS) let hitscans
+## target individual blocks via wall_block.gd, identical to static structures.
 ##
 ## Explosions deal per-block AoE damage via take_damage_at().
 ## Momentum impacts carve through blocks via take_momentum_damage_at().
-## Blocks are destroyed individually with mesh/shape updates.
 ##
 ## Server-authoritative: only the server runs damage logic.
 ## Clients freeze the body as kinematic.
@@ -18,12 +21,6 @@ class_name FallingBlockCluster
 #  Constants
 # ======================================================================
 
-const BLOCK_SIZE := 0.5
-const NEIGHBOR_OFFSETS: Array[Vector3i] = [
-	Vector3i(1, 0, 0), Vector3i(-1, 0, 0),
-	Vector3i(0, 1, 0), Vector3i(0, -1, 0),
-	Vector3i(0, 0, 1), Vector3i(0, 0, -1),
-]
 const MIN_DAMAGE_SPEED := 3.0          ## Speed threshold for ANY damage (m/s)
 const MOMENTUM_DAMAGE_SCALE := 0.15    ## Base: damage = momentum * this * GameManager scale
 const MASS_PER_HP := 0.5               ## Matching DestructibleBlockStructure.MASS_PER_HP
@@ -43,18 +40,22 @@ var cluster_mass: float = 25.0         ## Total mass in kg
 var attacker_id: int = -1              ## Player who caused the structural failure
 
 # ======================================================================
-#  Per-block tracking — mirrors DestructibleBlockStructure._blocks but
-#  without StaticBody3D refs. Key = grid Vector3i, value = float HP.
+#  Block grid — shared data manager (position math, mesh, shapes, BFS)
 # ======================================================================
 
-var _cluster_blocks: Dictionary = {}
+var grid: BlockGridManager = null
 
-## Grid info for block position computation (set during init, never changes)
-var _centroid_local: Vector3 = Vector3.ZERO
-var _grid_num_x: int = 1
-var _grid_num_y: int = 1
-var _grid_num_z: int = 1
+## Mass per block in kg (set during init, used for momentum calculations)
 var _mass_per_block: float = 5.0
+
+# ======================================================================
+#  Per-block hit detection — StaticBody3D children on layer 11 (WALL_BLOCKS)
+#  Hitscans target individual blocks via wall_block.gd → _damage_block()
+# ======================================================================
+
+var _hit_bodies: Dictionary = {}       ## Vector3i → StaticBody3D
+var _shared_block_shape: BoxShape3D = null
+var _block_script: GDScript = preload("res://world/wall_block.gd")
 
 # ======================================================================
 #  Internal state
@@ -65,6 +66,16 @@ var _mesh_dirty: bool = false
 ## Cached child node ref for mesh rebuild (set in init_cluster_blocks)
 var _mesh_instance: MeshInstance3D = null
 
+# ======================================================================
+#  Debris config — set by structure before add_child via set_debris_config()
+# ======================================================================
+
+var _debris_size: float = 0.15
+var _debris_lifetime: float = 5.0
+var _debris_mass: float = 0.5
+var _debris_name: String = "Debris"
+var _block_hp_max: float = 35.0  ## Original full HP per block, for overkill fraction
+
 
 # ======================================================================
 #  Initialization
@@ -73,26 +84,47 @@ var _mesh_instance: MeshInstance3D = null
 func init_cluster_blocks(block_hp_dict: Dictionary, num_x: int, num_y: int,
 		num_z: int, mass_per_blk: float) -> void:
 	## Called by _spawn_falling_cluster BEFORE adding to the scene tree.
-	## Initializes per-block HP tracking and caches child refs.
-	_cluster_blocks = block_hp_dict
-	_grid_num_x = num_x
-	_grid_num_y = num_y
-	_grid_num_z = num_z
+	## Initializes the BlockGridManager, creates mesh instance, and builds
+	## mesh, collision shapes, and per-block hit bodies.
 	_mass_per_block = mass_per_blk
 
-	# Compute centroid from initial block positions (must match structure's formula)
-	_centroid_local = Vector3.ZERO
-	for key: Vector3i in _cluster_blocks:
-		_centroid_local += Vector3(
-			(key.x + 0.5 - _grid_num_x * 0.5) * BLOCK_SIZE,
-			(key.y + 0.5 - _grid_num_y * 0.5) * BLOCK_SIZE,
-			(key.z + 0.5 - _grid_num_z * 0.5) * BLOCK_SIZE
-		)
-	if _cluster_blocks.size() > 0:
-		_centroid_local /= float(_cluster_blocks.size())
+	# Create and populate the shared grid manager
+	grid = BlockGridManager.new()
+	grid.init_grid(num_x, num_y, num_z)
+	for key: Vector3i in block_hp_dict:
+		grid.set_block(key, block_hp_dict[key])
+	grid.compute_centroid()
 
-	# Cache mesh node reference for rebuilds
+	# Create shared block shape for hit bodies
+	_shared_block_shape = BoxShape3D.new()
+	_shared_block_shape.size = Vector3.ONE * BlockGridManager.BLOCK_SIZE
+
+	# Use existing mesh instance if already added by the spawner, otherwise create one
 	_mesh_instance = get_node_or_null("ClusterMesh")
+	if _mesh_instance == null:
+		_mesh_instance = MeshInstance3D.new()
+		_mesh_instance.name = "ClusterMesh"
+		_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		add_child(_mesh_instance)
+
+	# Build mesh, collision shapes, and per-block hit bodies
+	_rebuild_visuals()
+
+
+func set_material(mat: StandardMaterial3D) -> void:
+	## Set the material for the cluster mesh.
+	if _mesh_instance:
+		_mesh_instance.material_override = mat
+
+
+func set_debris_config(size: float, lifetime: float, dmass: float,
+		dname: String, block_hp_max: float) -> void:
+	## Set debris parameters (called by structure before add_child).
+	_debris_size = size
+	_debris_lifetime = lifetime
+	_debris_mass = dmass
+	_debris_name = dname
+	_block_hp_max = block_hp_max
 
 
 func _ready() -> void:
@@ -141,25 +173,48 @@ func _physics_process(delta: float) -> void:
 #  Damage — per-block, just like a normal structure
 # ======================================================================
 
+func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
+	## Called by wall_block.gd when a hitscan bullet hits a specific block.
+	## Targets one block with full damage — no falloff, no shielding.
+	if not multiplayer.is_server():
+		return
+	if not grid.has_block(key):
+		return
+
+	grid.block_hp[key] -= amount
+
+	# Update shielding HP on the per-block hit body
+	if _hit_bodies.has(key):
+		var body: StaticBody3D = _hit_bodies[key]
+		if is_instance_valid(body):
+			PhysicsServer3D.body_set_shielding_hp(body.get_rid(), maxf(grid.block_hp[key], 0.0))
+
+	if grid.block_hp[key] <= 0.0:
+		grid.erase_block(key)
+		_free_hit_body(key)
+		_after_blocks_destroyed([key])
+
+
 func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
 	## Distribute damage evenly across all remaining blocks.
 	## Fallback for non-positional damage sources.
 	if not multiplayer.is_server():
 		return
-	if _cluster_blocks.is_empty():
+	if grid == null or grid.is_empty():
 		return
 
-	var per_block: float = amount / float(_cluster_blocks.size())
+	var per_block: float = amount / float(grid.block_count())
 	var destroyed_keys: Array[Vector3i] = []
 
-	for key: Vector3i in _cluster_blocks:
-		_cluster_blocks[key] -= per_block
-		if _cluster_blocks[key] <= 0.0:
+	for key: Vector3i in grid.block_hp:
+		grid.block_hp[key] -= per_block
+		if grid.block_hp[key] <= 0.0:
 			destroyed_keys.append(key)
 
 	if not destroyed_keys.is_empty():
 		for key in destroyed_keys:
-			_cluster_blocks.erase(key)
+			grid.erase_block(key)
+			_free_hit_body(key)
 		_after_blocks_destroyed(destroyed_keys)
 
 
@@ -171,7 +226,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 	## Excludes own RID so this cluster's shapes don't self-shield.
 	if not multiplayer.is_server():
 		return
-	if _cluster_blocks.is_empty():
+	if grid == null or grid.is_empty():
 		return
 
 	var _t_take_damage_at := Time.get_ticks_usec()
@@ -201,8 +256,8 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 	var dbg_total_absorbed := 0.0
 	var _t_raycast_total := 0
 
-	for key: Vector3i in _cluster_blocks:
-		var block_world: Vector3 = _block_world_pos(key)
+	for key: Vector3i in grid.block_hp:
+		var block_world: Vector3 = global_transform * grid.block_local_pos(key)
 		var dist: float = hit_pos.distance_to(block_world)
 		if dist > blast_radius:
 			continue
@@ -232,8 +287,15 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 
 		if dmg < 0.5:
 			continue
-		_cluster_blocks[key] -= dmg
-		if _cluster_blocks[key] <= 0.0:
+		grid.block_hp[key] -= dmg
+
+		# Keep per-block hit body shielding HP in sync
+		if _hit_bodies.has(key):
+			var body: StaticBody3D = _hit_bodies[key]
+			if is_instance_valid(body):
+				PhysicsServer3D.body_set_shielding_hp(body.get_rid(), maxf(grid.block_hp[key], 0.0))
+
+		if grid.block_hp[key] <= 0.0:
 			destroyed_keys.append(key)
 
 	if dbg_blocks_hit > 0:
@@ -248,14 +310,12 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 	# _after_blocks_destroyed also calls _update_mass, but partial damage to
 	# surviving blocks still changes total HP without destroying any block.
 	if dbg_blocks_hit > 0 and destroyed_keys.is_empty():
-		var total_hp := 0.0
-		for hp: float in _cluster_blocks.values():
-			total_hp += hp
-		PhysicsServer3D.body_set_shielding_hp(get_rid(), total_hp)
+		PhysicsServer3D.body_set_shielding_hp(get_rid(), grid.get_total_hp())
 
 	if not destroyed_keys.is_empty():
 		for key in destroyed_keys:
-			_cluster_blocks.erase(key)
+			grid.erase_block(key)
+			_free_hit_body(key)
 		var _t_abd := Time.get_ticks_usec()
 		_after_blocks_destroyed(destroyed_keys)
 		var _t_abd_us := Time.get_ticks_usec() - _t_abd
@@ -280,14 +340,15 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 		"block_key": Vector3i.ZERO, "block_pos": Vector3.ZERO }
 	if not multiplayer.is_server():
 		return empty_result
-	if _cluster_blocks.is_empty():
+	if grid == null or grid.is_empty():
 		return empty_result
 
 	# Find nearest block to hit position
 	var best_key := Vector3i(-1, -1, -1)
 	var best_dist_sq := 999999.0
-	for key: Vector3i in _cluster_blocks:
-		var d := hit_world_pos.distance_squared_to(_block_world_pos(key))
+	for key: Vector3i in grid.block_hp:
+		var block_world := global_transform * grid.block_local_pos(key)
+		var d := hit_world_pos.distance_squared_to(block_world)
 		if d < best_dist_sq:
 			best_dist_sq = d
 			best_key = key
@@ -295,17 +356,23 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	if best_dist_sq > 999998.0:
 		return empty_result
 
-	var block_world := _block_world_pos(best_key)
-	var hp_before: float = _cluster_blocks[best_key]
+	var block_world := global_transform * grid.block_local_pos(best_key)
+	var hp_before: float = grid.block_hp[best_key]
 	var absorbed: float = minf(damage, hp_before)
 
-	_cluster_blocks[best_key] -= damage
-	if _cluster_blocks[best_key] > 0.0:
+	grid.block_hp[best_key] -= damage
+	if grid.block_hp[best_key] > 0.0:
+		# Update per-block hit body shielding HP
+		if _hit_bodies.has(best_key):
+			var body: StaticBody3D = _hit_bodies[best_key]
+			if is_instance_valid(body):
+				PhysicsServer3D.body_set_shielding_hp(body.get_rid(), grid.block_hp[best_key])
 		return { "absorbed": absorbed, "block_destroyed": false,
 			"block_key": best_key, "block_pos": block_world }
 
 	# Block destroyed
-	_cluster_blocks.erase(best_key)
+	grid.erase_block(best_key)
+	_free_hit_body(best_key)
 	_after_blocks_destroyed([best_key])
 
 	return { "absorbed": absorbed, "block_destroyed": true,
@@ -318,7 +385,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 
 func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 	## Shared cleanup after blocks are destroyed. Updates mass, syncs to
-	## clients, and schedules visual rebuild.
+	## clients, spawns debris, and schedules visual rebuild.
 	var _t_abd_start := Time.get_ticks_usec()
 
 	# Wake up frozen/settled clusters so they (and any fragments) fall properly.
@@ -331,13 +398,30 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 	_mesh_dirty = true
 	set_process(true)
 
+	# Compute world positions for debris spawning before syncing
+	var block_positions: Array[Vector3] = []
+	var debris_speeds: Array[float] = []
+	for key in destroyed_keys:
+		var local_pos := grid.block_local_pos(key)
+		var world_pos := global_transform * local_pos
+		block_positions.append(world_pos)
+		# Hitscan-style speed (no blast radius context on clusters)
+		debris_speeds.append(DebrisHelper.calc_hitscan_speed(0.0))
+
 	# Sync to clients (call_remote — server rebuilds via _process)
 	var keys_variant: Array = []
-	for key in destroyed_keys:
-		keys_variant.append(key)
-	_sync_blocks_destroyed.rpc(keys_variant)
+	var positions_variant: Array = []
+	var speeds_variant: Array = []
+	for i in destroyed_keys.size():
+		keys_variant.append(destroyed_keys[i])
+		positions_variant.append(block_positions[i])
+		speeds_variant.append(debris_speeds[i])
+	_sync_blocks_destroyed.rpc(keys_variant, positions_variant, speeds_variant)
 
-	if _cluster_blocks.is_empty():
+	# Host also spawns debris locally (RPC is call_remote)
+	_spawn_debris_for_blocks(block_positions, debris_speeds)
+
+	if grid.is_empty():
 		queue_free()
 		return
 
@@ -348,29 +432,57 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 	var total_us := Time.get_ticks_usec() - _t_abd_start
 	if total_us > 500:
 		print("[ClusterPerf] _after_blocks_destroyed %s: %d keys destroyed, %d remaining, integrity=%dus total=%dus" % [
-			name, destroyed_keys.size(), _cluster_blocks.size(), _t_integrity_us, total_us])
+			name, destroyed_keys.size(), grid.block_count(), _t_integrity_us, total_us])
 
 
 func _update_mass() -> void:
-	cluster_mass = _cluster_blocks.size() * _mass_per_block
+	cluster_mass = grid.block_count() * _mass_per_block
 	mass = maxf(cluster_mass, 0.1)
 	# Keep C++ shielding HP in sync with remaining block HP
-	var total_hp := 0.0
-	for hp: float in _cluster_blocks.values():
-		total_hp += hp
-	PhysicsServer3D.body_set_shielding_hp(get_rid(), total_hp)
+	PhysicsServer3D.body_set_shielding_hp(get_rid(), grid.get_total_hp())
 
 
 @rpc("authority", "call_remote", "reliable")
-func _sync_blocks_destroyed(keys: Array) -> void:
-	## Client-side: remove destroyed blocks and schedule visual rebuild.
+func _sync_blocks_destroyed(keys: Array, positions: Array = [],
+		speeds: Array = []) -> void:
+	## Client-side: remove destroyed blocks, spawn debris, and schedule visual rebuild.
 	for key_variant in keys:
 		var key: Vector3i = key_variant
-		_cluster_blocks.erase(key)
+		grid.erase_block(key)
+		_free_hit_body(key)
 	_mesh_dirty = true
 	set_process(true)
-	if _cluster_blocks.is_empty():
+
+	# Spawn cosmetic debris on the client
+	if not positions.is_empty():
+		var typed_positions: Array[Vector3] = []
+		var typed_speeds: Array[float] = []
+		for i in positions.size():
+			typed_positions.append(positions[i] as Vector3)
+			typed_speeds.append(float(speeds[i]) if i < speeds.size() else 8.0)
+		_spawn_debris_for_blocks(typed_positions, typed_speeds)
+
+	if grid.is_empty():
 		queue_free()
+
+
+func _spawn_debris_for_blocks(block_positions: Array[Vector3],
+		debris_speeds: Array[float]) -> void:
+	## Spawn cosmetic debris for destroyed blocks (both server host and clients).
+	var mat: StandardMaterial3D = null
+	if _mesh_instance and _mesh_instance.material_override:
+		mat = _mesh_instance.material_override
+	if mat == null:
+		return
+	var config := { "size": _debris_size, "lifetime": _debris_lifetime,
+		"mass": _debris_mass, "name": _debris_name }
+	for i in block_positions.size():
+		var pos: Vector3 = block_positions[i]
+		var spd: float = debris_speeds[i] if i < debris_speeds.size() else 8.0
+		var count := randi_range(1, 2)
+		# Use a random nearby point as blast origin for scattered debris direction
+		var blast_origin := pos + Vector3(randf_range(-1, 1), 0, randf_range(-1, 1)).normalized() * 0.5
+		DebrisHelper.spawn_debris(get_parent(), pos, blast_origin, count, mat, spd, config)
 
 
 # ======================================================================
@@ -382,32 +494,11 @@ func _check_cluster_integrity() -> void:
 	## split smaller groups into new child FallingBlockCluster instances.
 	if not multiplayer.is_server():
 		return
-	if _cluster_blocks.size() < 2:
+	if grid.block_count() < 2:
 		return
 
 	var _t_integrity_start := Time.get_ticks_usec()
-
-	# BFS to find connected components
-	var visited: Dictionary = {}
-	var components: Array = []
-
-	for start_key: Vector3i in _cluster_blocks:
-		if visited.has(start_key):
-			continue
-		var component: Array[Vector3i] = []
-		var queue: Array[Vector3i] = [start_key]
-		visited[start_key] = true
-		var head := 0
-		while head < queue.size():
-			var current: Vector3i = queue[head]
-			head += 1
-			component.append(current)
-			for offset in NEIGHBOR_OFFSETS:
-				var neighbor: Vector3i = current + offset
-				if _cluster_blocks.has(neighbor) and not visited.has(neighbor):
-					visited[neighbor] = true
-					queue.append(neighbor)
-		components.append(component)
+	var components := grid.find_all_components()
 
 	var _t_bfs_us := Time.get_ticks_usec() - _t_integrity_start
 
@@ -432,19 +523,20 @@ func _check_cluster_integrity() -> void:
 		split_count += 1
 	var _t_splits_us := Time.get_ticks_usec() - _t_splits
 	print("[ClusterPerf] _check_cluster_integrity %s: %d blocks, %d components, %d splits, bfs=%dus splits=%dus" % [
-		name, _cluster_blocks.size(), components.size(), split_count, _t_bfs_us, _t_splits_us])
+		name, grid.block_count(), components.size(), split_count, _t_bfs_us, _t_splits_us])
 
 
 @rpc("authority", "call_local", "reliable")
 func _sync_fragment_split(block_keys_variant: Array) -> void:
 	## All peers: split specified blocks off into a new child FallingBlockCluster.
-	## Blocks are still in _cluster_blocks so we can read their HPs.
+	## Blocks are still in grid so we can read their HPs.
 	var block_hp_dict: Dictionary = {}
 	for key_variant in block_keys_variant:
 		var key: Vector3i = key_variant
-		if _cluster_blocks.has(key):
-			block_hp_dict[key] = _cluster_blocks[key]
-			_cluster_blocks.erase(key)
+		if grid.has_block(key):
+			block_hp_dict[key] = grid.block_hp[key]
+			grid.erase_block(key)
+			_free_hit_body(key)
 
 	if block_hp_dict.is_empty():
 		return
@@ -454,7 +546,7 @@ func _sync_fragment_split(block_keys_variant: Array) -> void:
 	_mesh_dirty = true
 	set_process(true)
 
-	if _cluster_blocks.is_empty():
+	if grid.is_empty():
 		queue_free()
 		return
 
@@ -475,18 +567,14 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 
 	var child_mass := float(block_keys.size()) * _mass_per_block
 
-	# Compute child centroid in grid space (same formula as init_cluster_blocks)
+	# Compute child centroid in grid space
 	var child_centroid_grid := Vector3.ZERO
 	for key: Vector3i in block_keys:
-		child_centroid_grid += Vector3(
-			(key.x + 0.5 - _grid_num_x * 0.5) * BLOCK_SIZE,
-			(key.y + 0.5 - _grid_num_y * 0.5) * BLOCK_SIZE,
-			(key.z + 0.5 - _grid_num_z * 0.5) * BLOCK_SIZE
-		)
+		child_centroid_grid += grid.block_local_pos_raw(key)
 	child_centroid_grid /= float(block_keys.size())
 
 	# World position: parent origin + basis * (child centroid offset from parent centroid)
-	var spawn_pos := global_position + global_transform.basis * (child_centroid_grid - _centroid_local)
+	var spawn_pos := global_position + global_transform.basis * (child_centroid_grid - grid.centroid)
 
 	# Build child RigidBody3D
 	var child := RigidBody3D.new()
@@ -502,21 +590,13 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 	child.gravity_scale = 1.0
 	child.continuous_cd = true
 
-	# Create MeshInstance3D (filled by _rebuild_visuals below)
-	var mesh_inst := MeshInstance3D.new()
-	mesh_inst.name = "ClusterMesh"
-	if _mesh_instance and _mesh_instance.material_override:
-		mesh_inst.material_override = _mesh_instance.material_override.duplicate()
-	mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
-	child.add_child(mesh_inst)
-
-	# Initialize block tracking (sets _centroid_local, caches mesh ref)
-	child.init_cluster_blocks(block_hp_dict, _grid_num_x, _grid_num_y, _grid_num_z,
+	# Initialize block tracking (creates mesh, collision shapes, hit bodies)
+	child.init_cluster_blocks(block_hp_dict, grid.num_x, grid.num_y, grid.num_z,
 		_mass_per_block)
-	# Build mesh + collision shapes before entering tree
-	var _t_rebuild := Time.get_ticks_usec()
-	child._rebuild_visuals()
-	var _t_rebuild_us := Time.get_ticks_usec() - _t_rebuild
+	if _mesh_instance and _mesh_instance.material_override:
+		child.set_material(_mesh_instance.material_override.duplicate())
+	child.set_debris_config(_debris_size, _debris_lifetime, _debris_mass,
+		_debris_name, _block_hp_max)
 
 	# Add to scene
 	var _t_addchild := Time.get_ticks_usec()
@@ -536,14 +616,11 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 
 		var child_rid := child.get_rid()
 		PhysicsServer3D.body_set_shielding_tag(child_rid, 4)
-		var total_hp := 0.0
-		for hp: float in block_hp_dict.values():
-			total_hp += hp
-		PhysicsServer3D.body_set_shielding_hp(child_rid, total_hp)
+		PhysicsServer3D.body_set_shielding_hp(child_rid, child.grid.get_total_hp())
 
 	var total_us := Time.get_ticks_usec() - _t_spawn
-	print("[ClusterPerf] _spawn_child_cluster %s->%s: %d blocks, rebuild=%dus add_child=%dus total=%dus" % [
-		name, child.name, block_keys.size(), _t_rebuild_us, _t_addchild_us, total_us])
+	print("[ClusterPerf] _spawn_child_cluster %s->%s: %d blocks, add_child=%dus total=%dus" % [
+		name, child.name, block_keys.size(), _t_addchild_us, total_us])
 
 
 # ======================================================================
@@ -680,7 +757,7 @@ func _handle_structure_hit(body: Node, target_structure: DestructibleBlockStruct
 		var expl_damage: float = per_block_momentum * BREAKTHROUGH_DAMAGE_SCALE * GameManager.structure_explosion_damage_scale
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = self_result.get("block_pos", contact_point)
-		if expl_damage > 0.5 and not _cluster_blocks.is_empty():
+		if expl_damage > 0.5 and not grid.is_empty():
 			_t0 = Time.get_ticks_usec()
 			take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], remaining_speed)
 			_t_self_expl = Time.get_ticks_usec() - _t0
@@ -739,7 +816,7 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 		var expl_damage: float = per_block_momentum * BREAKTHROUGH_DAMAGE_SCALE * GameManager.structure_explosion_damage_scale
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = other_result.get("block_pos", contact_midpoint)
-		if expl_damage > 0.5 and not other._cluster_blocks.is_empty():
+		if expl_damage > 0.5 and not other.grid.is_empty():
 			_t0 = Time.get_ticks_usec()
 			other.take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], impact_speed)
 			_t_other_expl = Time.get_ticks_usec() - _t0
@@ -751,7 +828,7 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 		var expl_damage: float = per_block_momentum * BREAKTHROUGH_DAMAGE_SCALE * GameManager.structure_explosion_damage_scale
 		var expl_radius: float = BREAKTHROUGH_BASE_RADIUS + per_block_momentum * BREAKTHROUGH_RADIUS_SCALE * GameManager.structure_explosion_radius_scale
 		var block_pos: Vector3 = self_result.get("block_pos", contact_midpoint)
-		if expl_damage > 0.5 and not _cluster_blocks.is_empty():
+		if expl_damage > 0.5 and not grid.is_empty():
 			_t0 = Time.get_ticks_usec()
 			take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], impact_speed)
 			_t_self_expl = Time.get_ticks_usec() - _t0
@@ -765,210 +842,108 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 
 
 # ======================================================================
-#  Visual and collision rebuild
+#  Visual, collision, and hit body rebuild
 # ======================================================================
 
 func _rebuild_visuals() -> void:
-	## Rebuild mesh and per-column collision shapes from current block set.
-	if _cluster_blocks.is_empty():
+	## Rebuild mesh, per-column collision shapes, and per-block hit bodies
+	## from the current block grid.
+	if grid == null or grid.is_empty():
 		return
 	var _t0 := Time.get_ticks_usec()
+	# Rebuild mesh
 	if _mesh_instance:
-		_mesh_instance.mesh = _build_mesh()
+		_mesh_instance.mesh = grid.build_mesh()
 	var _t_mesh_us := Time.get_ticks_usec() - _t0
 	var _t1 := Time.get_ticks_usec()
+	# Rebuild collision shapes (remove old, create new)
 	_rebuild_collision_shapes()
 	var _t_col_us := Time.get_ticks_usec() - _t1
 	var total_us := _t_mesh_us + _t_col_us
 	if total_us > 500:
 		print("[ClusterPerf] _rebuild_visuals %s: %d blocks, mesh=%dus collision=%dus total=%dus" % [
-			name, _cluster_blocks.size(), _t_mesh_us, _t_col_us, total_us])
+			name, grid.block_count(), _t_mesh_us, _t_col_us, total_us])
 
-
-func _build_mesh() -> Mesh:
-	## Build a mesh from current blocks, relative to the original centroid.
-	## Uses ArrayMesh with indexed geometry for fast bulk upload.
-	var key_set: Dictionary = {}
-	for key: Vector3i in _cluster_blocks:
-		key_set[key] = true
-
-	var block_count := _cluster_blocks.size()
-	var max_verts := block_count * 24  # 6 faces * 4 verts
-	var max_idx := block_count * 36    # 6 faces * 6 indices
-
-	var verts := PackedVector3Array()
-	verts.resize(max_verts)
-	var norms := PackedVector3Array()
-	norms.resize(max_verts)
-	var uv_arr := PackedVector2Array()
-	uv_arr.resize(max_verts)
-	var idx := PackedInt32Array()
-	idx.resize(max_idx)
-
-	var vi := 0
-	var ii := 0
-	var bs := BLOCK_SIZE
-	var hs := bs * 0.5
-	var uv0 := Vector2(0, 0)
-	var uv1 := Vector2(1, 0)
-	var uv2 := Vector2(1, 1)
-	var uv3 := Vector2(0, 1)
-
-	for key: Vector3i in _cluster_blocks:
-		var cx: float = (key.x + 0.5 - _grid_num_x * 0.5) * bs - _centroid_local.x
-		var cy: float = (key.y + 0.5 - _grid_num_y * 0.5) * bs - _centroid_local.y
-		var cz: float = (key.z + 0.5 - _grid_num_z * 0.5) * bs - _centroid_local.z
-
-		# +X face
-		if not key_set.has(Vector3i(key.x + 1, key.y, key.z)):
-			var x := cx + hs
-			verts[vi] = Vector3(x, cy - hs, cz - hs); verts[vi + 1] = Vector3(x, cy - hs, cz + hs)
-			verts[vi + 2] = Vector3(x, cy + hs, cz + hs); verts[vi + 3] = Vector3(x, cy + hs, cz - hs)
-			norms[vi] = Vector3.RIGHT; norms[vi + 1] = Vector3.RIGHT; norms[vi + 2] = Vector3.RIGHT; norms[vi + 3] = Vector3.RIGHT
-			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-		# -X face
-		if not key_set.has(Vector3i(key.x - 1, key.y, key.z)):
-			var x := cx - hs
-			verts[vi] = Vector3(x, cy - hs, cz + hs); verts[vi + 1] = Vector3(x, cy - hs, cz - hs)
-			verts[vi + 2] = Vector3(x, cy + hs, cz - hs); verts[vi + 3] = Vector3(x, cy + hs, cz + hs)
-			norms[vi] = Vector3.LEFT; norms[vi + 1] = Vector3.LEFT; norms[vi + 2] = Vector3.LEFT; norms[vi + 3] = Vector3.LEFT
-			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-		# +Y face
-		if not key_set.has(Vector3i(key.x, key.y + 1, key.z)):
-			var y := cy + hs
-			verts[vi] = Vector3(cx - hs, y, cz - hs); verts[vi + 1] = Vector3(cx + hs, y, cz - hs)
-			verts[vi + 2] = Vector3(cx + hs, y, cz + hs); verts[vi + 3] = Vector3(cx - hs, y, cz + hs)
-			norms[vi] = Vector3.UP; norms[vi + 1] = Vector3.UP; norms[vi + 2] = Vector3.UP; norms[vi + 3] = Vector3.UP
-			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-		# -Y face
-		if not key_set.has(Vector3i(key.x, key.y - 1, key.z)):
-			var y := cy - hs
-			verts[vi] = Vector3(cx - hs, y, cz + hs); verts[vi + 1] = Vector3(cx + hs, y, cz + hs)
-			verts[vi + 2] = Vector3(cx + hs, y, cz - hs); verts[vi + 3] = Vector3(cx - hs, y, cz - hs)
-			norms[vi] = Vector3.DOWN; norms[vi + 1] = Vector3.DOWN; norms[vi + 2] = Vector3.DOWN; norms[vi + 3] = Vector3.DOWN
-			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-		# +Z face
-		if not key_set.has(Vector3i(key.x, key.y, key.z + 1)):
-			var z := cz + hs
-			verts[vi] = Vector3(cx + hs, cy - hs, z); verts[vi + 1] = Vector3(cx - hs, cy - hs, z)
-			verts[vi + 2] = Vector3(cx - hs, cy + hs, z); verts[vi + 3] = Vector3(cx + hs, cy + hs, z)
-			norms[vi] = Vector3.BACK; norms[vi + 1] = Vector3.BACK; norms[vi + 2] = Vector3.BACK; norms[vi + 3] = Vector3.BACK
-			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-		# -Z face
-		if not key_set.has(Vector3i(key.x, key.y, key.z - 1)):
-			var z := cz - hs
-			verts[vi] = Vector3(cx - hs, cy - hs, z); verts[vi + 1] = Vector3(cx + hs, cy - hs, z)
-			verts[vi + 2] = Vector3(cx + hs, cy + hs, z); verts[vi + 3] = Vector3(cx - hs, cy + hs, z)
-			norms[vi] = Vector3.FORWARD; norms[vi + 1] = Vector3.FORWARD; norms[vi + 2] = Vector3.FORWARD; norms[vi + 3] = Vector3.FORWARD
-			uv_arr[vi] = uv0; uv_arr[vi + 1] = uv1; uv_arr[vi + 2] = uv2; uv_arr[vi + 3] = uv3
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-
-	verts.resize(vi); norms.resize(vi); uv_arr.resize(vi); idx.resize(ii)
-	var arrays := []
-	arrays.resize(Mesh.ARRAY_MAX)
-	arrays[Mesh.ARRAY_VERTEX] = verts
-	arrays[Mesh.ARRAY_NORMAL] = norms
-	arrays[Mesh.ARRAY_TEX_UV] = uv_arr
-	arrays[Mesh.ARRAY_INDEX] = idx
-	var mesh := ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-	return mesh
+	# Rebuild per-block hit bodies (remove stale, add missing)
+	_rebuild_hit_bodies()
 
 
 func _rebuild_collision_shapes() -> void:
-	## Remove all existing collision shapes and rebuild per-column box shapes
-	## from current blocks. Same approach as structure's smooth collision.
-	# Remove old shapes — disable immediately so they leave the physics world
-	# before new shapes (or child cluster shapes) are added this frame.
+	## Remove all existing collision shapes and rebuild from grid.
 	for child in get_children():
 		if child is CollisionShape3D:
 			child.disabled = true
 			child.queue_free()
 
-	if _cluster_blocks.is_empty():
+	if grid.is_empty():
 		return
 
-	var bs := BLOCK_SIZE
-
-	# Group blocks by (x, z) column
-	var columns: Dictionary = {}
-	for key: Vector3i in _cluster_blocks:
-		var col_key := Vector2i(key.x, key.z)
-		if not columns.has(col_key):
-			columns[col_key] = []
-		columns[col_key].append(key.y)
-
-	for col_key: Vector2i in columns:
-		var y_list: Array = columns[col_key]
-		y_list.sort()
-
-		# Find contiguous Y runs
-		var run_start: int = y_list[0]
-		var run_end: int = y_list[0]
-
-		for i in range(1, y_list.size()):
-			if y_list[i] == run_end + 1:
-				run_end = y_list[i]
-			else:
-				_add_column_shape(col_key.x, col_key.y, run_start, run_end)
-				run_start = y_list[i]
-				run_end = y_list[i]
-
-		_add_column_shape(col_key.x, col_key.y, run_start, run_end)
+	var shapes := grid.compute_column_shapes()
+	for shape_data: Dictionary in shapes:
+		var box := BoxShape3D.new()
+		box.size = shape_data["size"]
+		var col := CollisionShape3D.new()
+		col.shape = box
+		col.position = shape_data["position"]
+		add_child(col)
 
 
-func _add_column_shape(bx: int, bz: int, by_start: int, by_end: int) -> void:
-	## Add a BoxShape3D for one contiguous vertical run.
-	var bs := BLOCK_SIZE
-	var run_count: int = by_end - by_start + 1
+# ======================================================================
+#  Per-block hit detection bodies
+# ======================================================================
 
-	var box := BoxShape3D.new()
-	box.size = Vector3(bs, run_count * bs, bs)
+func _rebuild_hit_bodies() -> void:
+	## Sync per-block StaticBody3D hit bodies with the grid.
+	## Removes stale bodies and creates missing ones.
+	# Remove stale
+	var stale_keys: Array[Vector3i] = []
+	for key: Vector3i in _hit_bodies:
+		if not grid.has_block(key):
+			stale_keys.append(key)
+	for key in stale_keys:
+		_free_hit_body(key)
+
+	# Add missing
+	for key: Vector3i in grid.block_hp:
+		if not _hit_bodies.has(key):
+			_spawn_hit_body(key)
+
+
+func _spawn_hit_body(key: Vector3i) -> void:
+	## Create a lightweight StaticBody3D for hitscan hit detection on one block.
+	## Layer 11 (WALL_BLOCKS) only, mask 0 — for weapon raycasts, not physics push.
+	var body := StaticBody3D.new()
+	body.set_script(_block_script)
+	body.grid_key = key
+	body.parent_wall = self
+	body.collision_layer = CollisionLayers.WALL_BLOCKS
+	body.collision_mask = 0
+	body.position = grid.block_local_pos(key)
 
 	var col := CollisionShape3D.new()
-	col.shape = box
-	col.position = Vector3(
-		(bx + 0.5 - _grid_num_x * 0.5) * bs - _centroid_local.x,
-		((by_start + by_end) * 0.5 + 0.5 - _grid_num_y * 0.5) * bs - _centroid_local.y,
-		(bz + 0.5 - _grid_num_z * 0.5) * bs - _centroid_local.z
-	)
-	add_child(col)
+	col.shape = _shared_block_shape.duplicate()
+	body.add_child(col)
+
+	add_child(body)
+
+	# Tag for C++ shielding classification (same as structure's per-block bodies)
+	PhysicsServer3D.body_set_shielding_tag(body.get_rid(), 1)  # WALL_BLOCK
+	PhysicsServer3D.body_set_shielding_hp(body.get_rid(), grid.block_hp.get(key, 0.0))
+
+	_hit_bodies[key] = body
+
+
+func _free_hit_body(key: Vector3i) -> void:
+	if _hit_bodies.has(key):
+		var body: StaticBody3D = _hit_bodies[key]
+		if is_instance_valid(body):
+			body.queue_free()
+		_hit_bodies.erase(key)
 
 
 # ======================================================================
 #  Utility
 # ======================================================================
-
-func _block_local_pos(key: Vector3i) -> Vector3:
-	## Block position in cluster-local space (relative to centroid).
-	return Vector3(
-		(key.x + 0.5 - _grid_num_x * 0.5) * BLOCK_SIZE - _centroid_local.x,
-		(key.y + 0.5 - _grid_num_y * 0.5) * BLOCK_SIZE - _centroid_local.y,
-		(key.z + 0.5 - _grid_num_z * 0.5) * BLOCK_SIZE - _centroid_local.z
-	)
-
-
-func _block_world_pos(key: Vector3i) -> Vector3:
-	## Block position in world space (cluster transform applied).
-	return global_transform * _block_local_pos(key)
-
 
 func _find_structure(node: Node) -> DestructibleBlockStructure:
 	## Walk up the tree to find a DestructibleBlockStructure ancestor.
