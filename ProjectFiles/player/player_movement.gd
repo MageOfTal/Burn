@@ -70,7 +70,7 @@ func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	_on_dynamic_body = false
 	_dynamic_body_ref = null
 
-	var wall_angle_threshold := FLOOR_MAX_ANGLE if _is_grounded else deg_to_rad(30.0)
+	var wall_angle_threshold := FLOOR_MAX_ANGLE if (_is_grounded or _post_jump_rising) else deg_to_rad(30.0)
 
 	var normals: Array[Vector2] = []
 	for i in state.get_contact_count():
