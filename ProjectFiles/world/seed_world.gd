@@ -522,7 +522,7 @@ func _spawn_obj_structures_batched(rng: RandomNumberGenerator, parent: Node3D) -
 	for i in num_obj_structures:
 		var data: ObjStructureData = obj_defs[rng.randi() % obj_defs.size()]
 
-		var y_offset := data.grid_dimensions.y * DestructibleBlockStructure.BLOCK_SIZE * 0.5
+		var y_offset := data.grid_dimensions.y * BlockGridManager.BLOCK_SIZE * 0.5
 		var pos := _get_random_ground_pos(rng, y_offset, 25.0)
 		if pos == Vector3.INF:
 			continue
