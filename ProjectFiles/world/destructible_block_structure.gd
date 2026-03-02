@@ -299,7 +299,17 @@ func _physics_process(delta: float) -> void:
 		global_position.y -= move_dist
 		# Kill if fallen out of the world
 		if global_position.y < -200:
+			_clear_physics_before_free()
 			queue_free()
+
+
+func _clear_physics_before_free() -> void:
+	## Zero collision layers on the smooth collision body so Jolt drops it from
+	## the broadphase immediately. Prevents phantom collisions (e.g. rockets
+	## hitting a stale body) during the queue_free() deferral window.
+	if _collision_body and is_instance_valid(_collision_body):
+		_collision_body.collision_layer = 0
+		_collision_body.collision_mask = 0
 
 
 # ======================================================================
@@ -404,6 +414,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		_check_structural_integrity()
 
 		if _blocks.is_empty():
+			_clear_physics_before_free()
 			queue_free()
 
 
@@ -578,6 +589,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 
 	# If all blocks gone, remove the structure node entirely
 	if _blocks.is_empty():
+		_clear_physics_before_free()
 		queue_free()
 
 
@@ -657,6 +669,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	if not _blocks.is_empty():
 		_check_structural_integrity()
 	if _blocks.is_empty():
+		_clear_physics_before_free()
 		queue_free()
 
 	return { "absorbed": absorbed, "block_destroyed": true,

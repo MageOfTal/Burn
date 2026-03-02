@@ -422,6 +422,7 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 	_spawn_debris_for_blocks(block_positions, debris_speeds)
 
 	if grid.is_empty():
+		_clear_physics_before_free()
 		queue_free()
 		return
 
@@ -463,6 +464,7 @@ func _sync_blocks_destroyed(keys: Array, positions: Array = [],
 		_spawn_debris_for_blocks(typed_positions, typed_speeds)
 
 	if grid.is_empty():
+		_clear_physics_before_free()
 		queue_free()
 
 
@@ -547,6 +549,7 @@ func _sync_fragment_split(block_keys_variant: Array) -> void:
 	set_process(true)
 
 	if grid.is_empty():
+		_clear_physics_before_free()
 		queue_free()
 		return
 
@@ -944,6 +947,20 @@ func _free_hit_body(key: Vector3i) -> void:
 # ======================================================================
 #  Utility
 # ======================================================================
+
+func _clear_physics_before_free() -> void:
+	## Zero collision layers so Jolt drops this body from broadphase immediately.
+	## Prevents phantom collisions during the queue_free() deferral window.
+	collision_layer = 0
+	collision_mask = 0
+	for key: Vector3i in _hit_bodies:
+		var body: StaticBody3D = _hit_bodies[key]
+		if is_instance_valid(body):
+			body.collision_layer = 0
+	for child in get_children():
+		if child is CollisionShape3D:
+			child.disabled = true
+
 
 func _find_structure(node: Node) -> DestructibleBlockStructure:
 	## Walk up the tree to find a DestructibleBlockStructure ancestor.
