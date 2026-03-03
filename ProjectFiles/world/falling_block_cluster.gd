@@ -6,8 +6,8 @@ class_name FallingBlockCluster
 ## building, and collision shape computation — the same shared logic that
 ## structures use.
 ##
-## Per-block StaticBody3D hit bodies (layer 11 / WALL_BLOCKS) let hitscans
-## target individual blocks via wall_block.gd, identical to static structures.
+## A compound StaticBody3D (one body, N shapes) on layer 11 (WALL_BLOCKS)
+## provides per-block hitscan targeting via shape_index → grid_key mapping.
 ##
 ## Explosions deal per-block AoE damage via take_damage_at().
 ## Momentum impacts carve through blocks via take_momentum_damage_at().
@@ -49,13 +49,25 @@ var grid: BlockGridManager = null
 var _mass_per_block: float = 5.0
 
 # ======================================================================
-#  Per-block hit detection — StaticBody3D children on layer 11 (WALL_BLOCKS)
-#  Hitscans target individual blocks via wall_block.gd → _damage_block()
+#  Compound hit body — one StaticBody3D with N shapes on layer 11 (WALL_BLOCKS)
+#  Each shape corresponds to one block; shape_index → grid_key mapping
+#  for hitscan targeting via compound_hit_body.gd → _damage_block()
 # ======================================================================
 
-var _hit_bodies: Dictionary = {}       ## Vector3i → StaticBody3D
-var _shared_block_shape: BoxShape3D = null
-var _block_script: GDScript = preload("res://world/wall_block.gd")
+var _compound_hit_body: StaticBody3D = null  ## Single body with N shapes
+var _shape_to_key: Array[Vector3i] = []      ## shape_index → grid_key
+var _key_to_shape: Dictionary = {}            ## Vector3i → shape_index
+var _shared_hit_shape: BoxShape3D = null      ## Shared shape RID for all blocks
+var _compound_body_script: GDScript = preload("res://world/compound_hit_body.gd")
+
+# ======================================================================
+#  Direct collision shapes — added via PhysicsServer3D.body_add_shape()
+#  on this RigidBody3D's own RID (layer 12, smooth wall collision).
+#  No CollisionShape3D nodes — eliminates add_child overhead.
+# ======================================================================
+
+var _col_shapes: Array = []            ## BoxShape3D refs (prevent GC, keep RIDs alive)
+var _col_shape_count: int = 0          ## Number of shapes added to this body
 
 # ======================================================================
 #  Internal state
@@ -65,6 +77,8 @@ var _settle_timer: float = 0.0
 var _mesh_dirty: bool = false
 ## Cached child node ref for mesh rebuild (set in init_cluster_blocks)
 var _mesh_instance: MeshInstance3D = null
+## Per-tick contact counter — tracks how many body_entered signals fire per physics frame
+var _contacts_this_tick: int = 0
 
 # ======================================================================
 #  Debris config — set by structure before add_child via set_debris_config()
@@ -85,21 +99,18 @@ func init_cluster_blocks(block_hp_dict: Dictionary, num_x: int, num_y: int,
 		num_z: int, mass_per_blk: float) -> void:
 	## Called by _spawn_falling_cluster BEFORE adding to the scene tree.
 	## Initializes the BlockGridManager, creates mesh instance, and builds
-	## mesh, collision shapes, and per-block hit bodies.
+	## mesh, collision shapes, and compound hit body — all via a single C++ call.
+	var _t_init_total := Time.get_ticks_usec()
 	_mass_per_block = mass_per_blk
 
-	# Create and populate the shared grid manager
+	# Create grid manager and set dimensions (needed for ongoing damage tracking)
 	grid = BlockGridManager.new()
-	grid.init_grid(num_x, num_y, num_z)
-	for key: Vector3i in block_hp_dict:
-		grid.set_block(key, block_hp_dict[key])
-	grid.compute_centroid()
+	grid.num_x = num_x
+	grid.num_y = num_y
+	grid.num_z = num_z
+	grid.block_hp = block_hp_dict
 
-	# Create shared block shape for hit bodies
-	_shared_block_shape = BoxShape3D.new()
-	_shared_block_shape.size = Vector3.ONE * BlockGridManager.BLOCK_SIZE
-
-	# Use existing mesh instance if already added by the spawner, otherwise create one
+	# Create mesh instance
 	_mesh_instance = get_node_or_null("ClusterMesh")
 	if _mesh_instance == null:
 		_mesh_instance = MeshInstance3D.new()
@@ -107,8 +118,56 @@ func init_cluster_blocks(block_hp_dict: Dictionary, num_x: int, num_y: int,
 		_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 		add_child(_mesh_instance)
 
-	# Build mesh, collision shapes, and per-block hit bodies
-	_rebuild_visuals()
+	# Create shared hit shape and compound hit body (need RIDs for build_cluster)
+	if _shared_hit_shape == null:
+		_shared_hit_shape = BoxShape3D.new()
+		_shared_hit_shape.size = Vector3.ONE * BlockGridManager.BLOCK_SIZE
+
+	_clear_compound_hit_body()
+	_compound_hit_body = StaticBody3D.new()
+	_compound_hit_body.set_script(_compound_body_script)
+	_compound_hit_body.parent_wall = self
+	_compound_hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
+	_compound_hit_body.collision_mask = 0
+	_compound_hit_body.name = "CompoundHitBody"
+
+	# All-in-one C++ call: grid + mesh + collision shapes + hit body shapes
+	var result: Dictionary = BlockMeshBuilder.build_cluster(
+		block_hp_dict, num_x, num_y, num_z, BlockGridManager.BLOCK_SIZE,
+		get_rid(), _compound_hit_body.get_rid(), _shared_hit_shape.get_rid())
+
+	# Unpack grid data
+	grid.block_grid = result["block_grid"]
+	grid.centroid = result["centroid"]
+
+	# Set mesh
+	if _mesh_instance:
+		_mesh_instance.mesh = result["mesh"]
+
+	# Store collision shape refs (prevent GC, keep RIDs alive)
+	_col_shapes = result["col_shapes"]
+	_col_shape_count = result["col_count"]
+
+	# Unpack hit body shape→key mappings
+	var shape_keys: Array = result["shape_to_key"]
+	_shape_to_key.clear()
+	_key_to_shape.clear()
+	for i in shape_keys.size():
+		var key: Vector3i = shape_keys[i]
+		_shape_to_key.append(key)
+		_key_to_shape[key] = i
+	_compound_hit_body._shape_to_key = _shape_to_key
+
+	# Add compound hit body to scene tree
+	add_child(_compound_hit_body)
+
+	# Set shielding on compound hit body
+	PhysicsServer3D.body_set_shielding_tag(_compound_hit_body.get_rid(), 1)
+	_update_compound_shielding_hp()
+
+	var _t_init_us := Time.get_ticks_usec() - _t_init_total
+	print("[ClusterPerf] init_cluster_blocks %s: %d blocks, total=%dus (single C++ call)" % [
+		name, block_hp_dict.size(), _t_init_us])
 
 
 func set_material(mat: StandardMaterial3D) -> void:
@@ -136,6 +195,12 @@ func _ready() -> void:
 	set_process(false)
 
 
+func _exit_tree() -> void:
+	# Clear shape references so BoxShape3D resources are freed.
+	_col_shapes.clear()
+	_col_shape_count = 0
+
+
 # ======================================================================
 #  Frame processing
 # ======================================================================
@@ -158,6 +223,12 @@ func _physics_process(delta: float) -> void:
 		GameManager.tick_add("cluster_tick", Time.get_ticks_usec() - _t0)
 		return
 
+	# Log per-tick contact count (reset after logging)
+	if _contacts_this_tick > 0:
+		print("[ClusterPerf] %s: %d body_entered contacts this tick, vel=%.1f angvel=%.1f" % [
+			name, _contacts_this_tick, linear_velocity.length(), angular_velocity.length()])
+		_contacts_this_tick = 0
+
 	# Freeze on settle: if moving slowly for long enough, stop simulating
 	if linear_velocity.length() < SETTLE_SPEED:
 		_settle_timer += delta
@@ -174,7 +245,7 @@ func _physics_process(delta: float) -> void:
 # ======================================================================
 
 func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
-	## Called by wall_block.gd when a hitscan bullet hits a specific block.
+	## Called by compound_hit_body.gd when a hitscan bullet hits a specific block.
 	## Targets one block with full damage — no falloff, no shielding.
 	if not multiplayer.is_server():
 		return
@@ -182,16 +253,11 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		return
 
 	grid.block_hp[key] -= amount
-
-	# Update shielding HP on the per-block hit body
-	if _hit_bodies.has(key):
-		var body: StaticBody3D = _hit_bodies[key]
-		if is_instance_valid(body):
-			PhysicsServer3D.body_set_shielding_hp(body.get_rid(), maxf(grid.block_hp[key], 0.0))
+	_update_compound_shielding_hp()
 
 	if grid.block_hp[key] <= 0.0:
 		grid.erase_block(key)
-		_free_hit_body(key)
+		_disable_hit_shape(key)
 		_after_blocks_destroyed([key])
 
 
@@ -212,9 +278,14 @@ func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
 			destroyed_keys.append(key)
 
 	if not destroyed_keys.is_empty():
+		# Bulk mode: disable all shapes in one commit instead of N rebuilds.
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
 		for key in destroyed_keys:
 			grid.erase_block(key)
-			_free_hit_body(key)
+			_disable_hit_shape(key)
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 		_after_blocks_destroyed(destroyed_keys)
 
 
@@ -289,12 +360,6 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 			continue
 		grid.block_hp[key] -= dmg
 
-		# Keep per-block hit body shielding HP in sync
-		if _hit_bodies.has(key):
-			var body: StaticBody3D = _hit_bodies[key]
-			if is_instance_valid(body):
-				PhysicsServer3D.body_set_shielding_hp(body.get_rid(), maxf(grid.block_hp[key], 0.0))
-
 		if grid.block_hp[key] <= 0.0:
 			destroyed_keys.append(key)
 
@@ -311,11 +376,17 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 	# surviving blocks still changes total HP without destroying any block.
 	if dbg_blocks_hit > 0 and destroyed_keys.is_empty():
 		PhysicsServer3D.body_set_shielding_hp(get_rid(), grid.get_total_hp())
+		_update_compound_shielding_hp()
 
 	if not destroyed_keys.is_empty():
+		# Bulk mode: disable all shapes in one commit instead of N rebuilds.
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
 		for key in destroyed_keys:
 			grid.erase_block(key)
-			_free_hit_body(key)
+			_disable_hit_shape(key)
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 		var _t_abd := Time.get_ticks_usec()
 		_after_blocks_destroyed(destroyed_keys)
 		var _t_abd_us := Time.get_ticks_usec() - _t_abd
@@ -362,17 +433,13 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 
 	grid.block_hp[best_key] -= damage
 	if grid.block_hp[best_key] > 0.0:
-		# Update per-block hit body shielding HP
-		if _hit_bodies.has(best_key):
-			var body: StaticBody3D = _hit_bodies[best_key]
-			if is_instance_valid(body):
-				PhysicsServer3D.body_set_shielding_hp(body.get_rid(), grid.block_hp[best_key])
+		_update_compound_shielding_hp()
 		return { "absorbed": absorbed, "block_destroyed": false,
 			"block_key": best_key, "block_pos": block_world }
 
 	# Block destroyed
 	grid.erase_block(best_key)
-	_free_hit_body(best_key)
+	_disable_hit_shape(best_key)
 	_after_blocks_destroyed([best_key])
 
 	return { "absorbed": absorbed, "block_destroyed": true,
@@ -431,7 +498,7 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 	_check_cluster_integrity()
 	var _t_integrity_us := Time.get_ticks_usec() - _t_integrity
 	var total_us := Time.get_ticks_usec() - _t_abd_start
-	if total_us > 500:
+	if total_us > 100:
 		print("[ClusterPerf] _after_blocks_destroyed %s: %d keys destroyed, %d remaining, integrity=%dus total=%dus" % [
 			name, destroyed_keys.size(), grid.block_count(), _t_integrity_us, total_us])
 
@@ -447,10 +514,14 @@ func _update_mass() -> void:
 func _sync_blocks_destroyed(keys: Array, positions: Array = [],
 		speeds: Array = []) -> void:
 	## Client-side: remove destroyed blocks, spawn debris, and schedule visual rebuild.
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
 	for key_variant in keys:
 		var key: Vector3i = key_variant
 		grid.erase_block(key)
-		_free_hit_body(key)
+		_disable_hit_shape(key)
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 	_mesh_dirty = true
 	set_process(true)
 
@@ -494,6 +565,7 @@ func _spawn_debris_for_blocks(block_positions: Array[Vector3],
 func _check_cluster_integrity() -> void:
 	## Server-only: if remaining blocks form multiple disconnected groups,
 	## split smaller groups into new child FallingBlockCluster instances.
+	## Uses a single batched RPC so all fragments are built in one C++ call.
 	if not multiplayer.is_server():
 		return
 	if grid.block_count() < 2:
@@ -513,34 +585,51 @@ func _check_cluster_integrity() -> void:
 		if components[i].size() > components[largest_idx].size():
 			largest_idx = i
 
+	# Collect all fragment key lists into one batched RPC
 	var _t_splits := Time.get_ticks_usec()
-	var split_count := 0
+	var all_fragment_keys: Array = []
 	for i in components.size():
 		if i == largest_idx:
 			continue
 		var keys_variant: Array = []
 		for key in components[i]:
 			keys_variant.append(key)
-		_sync_fragment_split.rpc(keys_variant)
-		split_count += 1
+		all_fragment_keys.append(keys_variant)
+
+	if not all_fragment_keys.is_empty():
+		_sync_fragment_split_batch.rpc(all_fragment_keys)
 	var _t_splits_us := Time.get_ticks_usec() - _t_splits
 	print("[ClusterPerf] _check_cluster_integrity %s: %d blocks, %d components, %d splits, bfs=%dus splits=%dus" % [
-		name, grid.block_count(), components.size(), split_count, _t_bfs_us, _t_splits_us])
+		name, grid.block_count(), components.size(), all_fragment_keys.size(), _t_bfs_us, _t_splits_us])
 
 
 @rpc("authority", "call_local", "reliable")
-func _sync_fragment_split(block_keys_variant: Array) -> void:
-	## All peers: split specified blocks off into a new child FallingBlockCluster.
-	## Blocks are still in grid so we can read their HPs.
-	var block_hp_dict: Dictionary = {}
-	for key_variant in block_keys_variant:
-		var key: Vector3i = key_variant
-		if grid.has_block(key):
-			block_hp_dict[key] = grid.block_hp[key]
-			grid.erase_block(key)
-			_free_hit_body(key)
+func _sync_fragment_split_batch(all_fragment_keys: Array) -> void:
+	## All peers: split ALL specified fragment groups off into child clusters
+	## in one batched C++ call. Bulk mode wraps ALL bodies at once.
+	var _t_total := Time.get_ticks_usec()
 
-	if block_hp_dict.is_empty():
+	# Phase 1: Extract block HPs and erase from grid for all fragments.
+	var _t_extract := Time.get_ticks_usec()
+	var fragment_dicts: Array = []
+	# Bulk mode: disable all fragment shapes in one commit instead of N rebuilds.
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
+	for keys_variant: Array in all_fragment_keys:
+		var block_hp_dict: Dictionary = {}
+		for key_variant in keys_variant:
+			var key: Vector3i = key_variant
+			if grid.has_block(key):
+				block_hp_dict[key] = grid.block_hp[key]
+				_disable_hit_shape(key)
+				grid.erase_block(key)
+		if not block_hp_dict.is_empty():
+			fragment_dicts.append(block_hp_dict)
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
+	var _t_extract_us := Time.get_ticks_usec() - _t_extract
+
+	if fragment_dicts.is_empty():
 		return
 
 	# Update self: mass, visuals, shapes
@@ -553,8 +642,148 @@ func _sync_fragment_split(block_keys_variant: Array) -> void:
 		queue_free()
 		return
 
-	# Spawn child cluster from the split-off blocks
-	_spawn_child_cluster(block_hp_dict)
+	# Phase 2: Create all child bodies and hit bodies (need RIDs for batch call).
+	var _t_create := Time.get_ticks_usec()
+	var scene_root := get_tree().current_scene
+	if scene_root == null:
+		return
+
+	var children: Array = []
+	var spawn_positions: Array = []
+	var cluster_body_rids: Array = []
+	var hit_body_rids: Array = []
+
+	# Shared hit shape for all children
+	if _shared_hit_shape == null:
+		_shared_hit_shape = BoxShape3D.new()
+		_shared_hit_shape.size = Vector3.ONE * BlockGridManager.BLOCK_SIZE
+
+	for block_hp_dict: Dictionary in fragment_dicts:
+		var block_keys: Array[Vector3i] = []
+		for key: Vector3i in block_hp_dict:
+			block_keys.append(key)
+
+		var child_mass := float(block_keys.size()) * _mass_per_block
+
+		# Compute child centroid in grid space for spawn position
+		var child_centroid_grid := Vector3.ZERO
+		for key: Vector3i in block_keys:
+			child_centroid_grid += grid.block_local_pos_raw(key)
+		child_centroid_grid /= float(block_keys.size())
+		var spawn_pos := global_position + global_transform.basis * (child_centroid_grid - grid.centroid)
+
+		# Build child RigidBody3D
+		var child := RigidBody3D.new()
+		child.set_script(get_script())
+		child.name = "FallingCluster_frag_%d" % (randi() % 10000)
+		child.mass = child_mass
+		child.cluster_mass = child_mass
+		child.attacker_id = attacker_id
+		child.collision_layer = collision_layer
+		child.collision_mask = collision_mask
+		child.contact_monitor = true
+		child.max_contacts_reported = 4
+		child.gravity_scale = 1.0
+		child.continuous_cd = true
+
+		# Create grid manager (needed for ongoing damage tracking)
+		child.grid = BlockGridManager.new()
+		child.grid.num_x = grid.num_x
+		child.grid.num_y = grid.num_y
+		child.grid.num_z = grid.num_z
+		child.grid.block_hp = block_hp_dict
+
+		# Create mesh instance
+		var mesh_inst := MeshInstance3D.new()
+		mesh_inst.name = "ClusterMesh"
+		mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		child.add_child(mesh_inst)
+		child._mesh_instance = mesh_inst
+
+		# Create compound hit body (need RID for batch call)
+		child._shared_hit_shape = _shared_hit_shape
+		var hit_body := StaticBody3D.new()
+		hit_body.set_script(_compound_body_script)
+		hit_body.parent_wall = child
+		hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
+		hit_body.collision_mask = 0
+		hit_body.name = "CompoundHitBody"
+		child._compound_hit_body = hit_body
+
+		children.append(child)
+		spawn_positions.append(spawn_pos)
+		cluster_body_rids.append(child.get_rid())
+		hit_body_rids.append(hit_body.get_rid())
+	var _t_create_us := Time.get_ticks_usec() - _t_create
+
+	# Phase 3: One batched C++ call — all grids, meshes, and shapes at once.
+	var _t_build := Time.get_ticks_usec()
+	var results: Array = BlockMeshBuilder.build_clusters_batch(
+		fragment_dicts, grid.num_x, grid.num_y, grid.num_z,
+		BlockGridManager.BLOCK_SIZE, cluster_body_rids, hit_body_rids,
+		_shared_hit_shape.get_rid())
+	var _t_build_us := Time.get_ticks_usec() - _t_build
+
+	# Phase 4: Unpack results and add children to scene tree.
+	var _t_finish := Time.get_ticks_usec()
+	var parent_node := get_parent()
+	for i in children.size():
+		var child: FallingBlockCluster = children[i]
+		var result: Dictionary = results[i]
+
+		# Unpack grid data
+		child.grid.block_grid = result["block_grid"]
+		child.grid.centroid = result["centroid"]
+
+		# Set mesh
+		child._mesh_instance.mesh = result["mesh"]
+
+		# Store collision shape refs
+		child._col_shapes = result["col_shapes"]
+		child._col_shape_count = result["col_count"]
+
+		# Unpack hit body shape→key mappings
+		var shape_keys: Array = result["shape_to_key"]
+		child._shape_to_key.clear()
+		child._key_to_shape.clear()
+		for si in shape_keys.size():
+			var key: Vector3i = shape_keys[si]
+			child._shape_to_key.append(key)
+			child._key_to_shape[key] = si
+		child._compound_hit_body._shape_to_key = child._shape_to_key
+
+		# Add compound hit body to child
+		child.add_child(child._compound_hit_body)
+		PhysicsServer3D.body_set_shielding_tag(child._compound_hit_body.get_rid(), 1)
+		child._update_compound_shielding_hp()
+
+		# Material and debris config
+		if _mesh_instance and _mesh_instance.material_override:
+			child.set_material(_mesh_instance.material_override.duplicate())
+		child.set_debris_config(_debris_size, _debris_lifetime, _debris_mass,
+			_debris_name, _block_hp_max)
+
+		# Add to scene tree
+		if parent_node:
+			parent_node.add_child(child)
+		else:
+			scene_root.add_child(child)
+		child.global_transform = Transform3D(global_transform.basis, spawn_positions[i])
+
+		# Server: inherit velocity and register shielding
+		if multiplayer.is_server():
+			var offset: Vector3 = spawn_positions[i] - global_position
+			child.linear_velocity = linear_velocity + angular_velocity.cross(offset)
+			child.angular_velocity = angular_velocity
+
+			var child_rid := child.get_rid()
+			PhysicsServer3D.body_set_shielding_tag(child_rid, 4)
+			PhysicsServer3D.body_set_shielding_hp(child_rid, child.grid.get_total_hp())
+	var _t_finish_us := Time.get_ticks_usec() - _t_finish
+
+	var total_us := Time.get_ticks_usec() - _t_total
+	print("[ClusterPerf] _sync_fragment_split_batch %s: %d fragments, extract=%dus create=%dus build=%dus finish=%dus total=%dus" % [
+		name, fragment_dicts.size(), _t_extract_us, _t_create_us, _t_build_us, _t_finish_us, total_us])
 
 
 func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
@@ -593,15 +822,17 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 	child.gravity_scale = 1.0
 	child.continuous_cd = true
 
-	# Initialize block tracking (creates mesh, collision shapes, hit bodies)
+	# Initialize block tracking — builds compound hit body
+	var _t_init := Time.get_ticks_usec()
 	child.init_cluster_blocks(block_hp_dict, grid.num_x, grid.num_y, grid.num_z,
 		_mass_per_block)
 	if _mesh_instance and _mesh_instance.material_override:
 		child.set_material(_mesh_instance.material_override.duplicate())
 	child.set_debris_config(_debris_size, _debris_lifetime, _debris_mass,
 		_debris_name, _block_hp_max)
+	var _t_init_us := Time.get_ticks_usec() - _t_init
 
-	# Add to scene
+	# Add to scene (triggers _ready, Jolt body registration, all child shapes added to physics)
 	var _t_addchild := Time.get_ticks_usec()
 	var parent_node := get_parent()
 	if parent_node:
@@ -622,8 +853,8 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 		PhysicsServer3D.body_set_shielding_hp(child_rid, child.grid.get_total_hp())
 
 	var total_us := Time.get_ticks_usec() - _t_spawn
-	print("[ClusterPerf] _spawn_child_cluster %s->%s: %d blocks, add_child=%dus total=%dus" % [
-		name, child.name, block_keys.size(), _t_addchild_us, total_us])
+	print("[ClusterPerf] _spawn_child_cluster %s->%s: %d blocks, children=%d, init=%dus add_child=%dus total=%dus" % [
+		name, child.name, block_keys.size(), child.get_child_count(), _t_init_us, _t_addchild_us, total_us])
 
 
 # ======================================================================
@@ -634,6 +865,7 @@ func _on_body_entered(body: Node) -> void:
 	if not multiplayer.is_server():
 		return
 
+	_contacts_this_tick += 1
 	var _t_contact := Time.get_ticks_usec()
 
 	# --- Cluster-vs-cluster: only higher instance_id processes to avoid double ---
@@ -643,7 +875,7 @@ func _on_body_entered(body: Node) -> void:
 		_handle_cluster_vs_cluster(body)
 		var us := Time.get_ticks_usec() - _t_contact
 		GameManager.tick_add("cluster_contact", us)
-		if us > 500:
+		if us > 100:
 			print("[ClusterPerf] _on_body_entered cluster_vs_cluster %s->%s took %dus" % [name, body.name, us])
 		return
 
@@ -653,7 +885,7 @@ func _on_body_entered(body: Node) -> void:
 		_handle_structure_hit(body, target_structure)
 		var us := Time.get_ticks_usec() - _t_contact
 		GameManager.tick_add("cluster_contact", us)
-		if us > 500:
+		if us > 100:
 			print("[ClusterPerf] _on_body_entered structure_hit %s->%s took %dus" % [name, target_structure.name, us])
 		return
 
@@ -661,7 +893,7 @@ func _on_body_entered(body: Node) -> void:
 	_handle_generic_hit(body)
 	var us := Time.get_ticks_usec() - _t_contact
 	GameManager.tick_add("cluster_contact", us)
-	if us > 500:
+	if us > 100:
 		print("[ClusterPerf] _on_body_entered generic_hit %s->%s took %dus" % [name, body.name, us])
 
 
@@ -768,7 +1000,7 @@ func _handle_structure_hit(body: Node, target_structure: DestructibleBlockStruct
 	print("[FallingCluster] Carve into %s: dmg=%.1f absorbed=%.1f remaining_speed=%.1f" % [
 		target_structure.name, base_damage, target_absorbed, remaining_speed])
 	var total_us := _t_target_dmg + _t_target_expl + _t_self_dmg + _t_self_expl
-	if total_us > 500:
+	if total_us > 100:
 		print("[ClusterPerf] _handle_structure_hit %s->%s: target_dmg=%dus target_expl=%dus self_dmg=%dus self_expl=%dus total=%dus" % [
 			name, target_structure.name, _t_target_dmg, _t_target_expl, _t_self_dmg, _t_self_expl, total_us])
 
@@ -839,7 +1071,7 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 	var total_us := Time.get_ticks_usec() - _t_cvc
 	print("[FallingCluster] Cluster vs cluster: %s(%.1fkg) vs %s(%.1fkg) speed=%.1f" % [
 		name, cluster_mass, other.name, other.cluster_mass, impact_speed])
-	if total_us > 500:
+	if total_us > 100:
 		print("[ClusterPerf] _handle_cluster_vs_cluster %s vs %s: other_dmg=%dus self_dmg=%dus other_expl=%dus self_expl=%dus total=%dus" % [
 			name, other.name, _t_other_dmg, _t_self_dmg, _t_other_expl, _t_self_expl, total_us])
 
@@ -849,8 +1081,8 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 # ======================================================================
 
 func _rebuild_visuals() -> void:
-	## Rebuild mesh, per-column collision shapes, and per-block hit bodies
-	## from the current block grid.
+	## Rebuild mesh and per-column collision shapes from the current block grid.
+	## Compound hit body shapes are disabled individually — no rebuild needed.
 	if grid == null or grid.is_empty():
 		return
 	var _t0 := Time.get_ticks_usec()
@@ -858,90 +1090,142 @@ func _rebuild_visuals() -> void:
 	if _mesh_instance:
 		_mesh_instance.mesh = grid.build_mesh()
 	var _t_mesh_us := Time.get_ticks_usec() - _t0
-	var _t1 := Time.get_ticks_usec()
+
 	# Rebuild collision shapes (remove old, create new)
+	var _t1 := Time.get_ticks_usec()
 	_rebuild_collision_shapes()
 	var _t_col_us := Time.get_ticks_usec() - _t1
-	var total_us := _t_mesh_us + _t_col_us
-	if total_us > 500:
-		print("[ClusterPerf] _rebuild_visuals %s: %d blocks, mesh=%dus collision=%dus total=%dus" % [
-			name, grid.block_count(), _t_mesh_us, _t_col_us, total_us])
 
-	# Rebuild per-block hit bodies (remove stale, add missing)
-	_rebuild_hit_bodies()
+	# Update compound body shielding HP (shapes already disabled individually)
+	_update_compound_shielding_hp()
+
+	var total_us := _t_mesh_us + _t_col_us
+	print("[ClusterPerf] _rebuild_visuals %s: %d blocks, mesh=%dus collision=%dus total=%dus" % [
+		name, grid.block_count(), _t_mesh_us, _t_col_us, total_us])
 
 
 func _rebuild_collision_shapes() -> void:
-	## Remove all existing collision shapes and rebuild from grid.
-	for child in get_children():
-		if child is CollisionShape3D:
-			child.disabled = true
-			child.queue_free()
+	## Remove old shapes and rebuild from grid using direct PhysicsServer3D calls.
+	## No CollisionShape3D nodes — shapes are added to this body's RID directly.
+	var body_rid := get_rid()
+
+	var _t_free := Time.get_ticks_usec()
+	# Remove old shapes from body (remove from end to avoid index shifting)
+	while _col_shape_count > 0:
+		_col_shape_count -= 1
+		PhysicsServer3D.body_remove_shape(body_rid, _col_shape_count)
+	_col_shapes.clear()
+	var _t_free_us := Time.get_ticks_usec() - _t_free
 
 	if grid.is_empty():
 		return
 
+	var _t_create := Time.get_ticks_usec()
 	var shapes := grid.compute_column_shapes()
-	for shape_data: Dictionary in shapes:
-		var box := BoxShape3D.new()
-		box.size = shape_data["size"]
-		var col := CollisionShape3D.new()
-		col.shape = box
-		col.position = shape_data["position"]
-		add_child(col)
+	var _t_compute_us := Time.get_ticks_usec() - _t_create
+
+	var _t_add := Time.get_ticks_usec()
+	# Build flat position/size arrays for bulk C++ call
+	var positions := PackedVector3Array()
+	var sizes := PackedVector3Array()
+	positions.resize(shapes.size())
+	sizes.resize(shapes.size())
+	for i in shapes.size():
+		positions[i] = shapes[i]["position"]
+		sizes[i] = shapes[i]["size"]
+	_col_shapes = BlockMeshBuilder.bulk_add_box_shapes(body_rid, positions, sizes)
+	_col_shape_count = shapes.size()
+	var _t_add_us := Time.get_ticks_usec() - _t_add
+
+	var total_us := _t_free_us + _t_compute_us + _t_add_us
+	if total_us > 200:
+		print("[ClusterPerf] _rebuild_collision_shapes %s: compute=%dus add=%d(%dus) total=%dus" % [
+			name, _t_compute_us, shapes.size(), _t_add_us, total_us])
 
 
 # ======================================================================
-#  Per-block hit detection bodies
+#  Compound hit body — one StaticBody3D with N shapes
 # ======================================================================
 
-func _rebuild_hit_bodies() -> void:
-	## Sync per-block StaticBody3D hit bodies with the grid.
-	## Removes stale bodies and creates missing ones.
-	# Remove stale
-	var stale_keys: Array[Vector3i] = []
-	for key: Vector3i in _hit_bodies:
-		if not grid.has_block(key):
-			stale_keys.append(key)
-	for key in stale_keys:
-		_free_hit_body(key)
+func _build_compound_hit_body() -> void:
+	## Build a single compound StaticBody3D with one BoxShape3D per block.
+	## All shapes share the same RID, positioned via local transforms.
+	## Shapes are added before the body enters the physics space (before
+	## add_child on the cluster), so all N shapes register in one broadphase
+	## insert — much faster than N individual StaticBody3D nodes.
+	_clear_compound_hit_body()
 
-	# Add missing
+	if grid == null or grid.is_empty():
+		return
+
+	# Shared box shape (kept alive as member)
+	if _shared_hit_shape == null:
+		_shared_hit_shape = BoxShape3D.new()
+		_shared_hit_shape.size = Vector3.ONE * BlockGridManager.BLOCK_SIZE
+	var shape_rid := _shared_hit_shape.get_rid()
+
+	# Create the compound body node
+	_compound_hit_body = StaticBody3D.new()
+	_compound_hit_body.set_script(_compound_body_script)
+	_compound_hit_body.parent_wall = self
+	_compound_hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
+	_compound_hit_body.collision_mask = 0
+	_compound_hit_body.name = "CompoundHitBody"
+
+	# Build position array and key mappings
+	var body_rid := _compound_hit_body.get_rid()
+	_shape_to_key.clear()
+	_key_to_shape.clear()
+
+	var positions := PackedVector3Array()
+	positions.resize(grid.block_hp.size())
+	var shape_idx := 0
 	for key: Vector3i in grid.block_hp:
-		if not _hit_bodies.has(key):
-			_spawn_hit_body(key)
+		positions[shape_idx] = grid.block_local_pos(key)
+		_shape_to_key.append(key)
+		_key_to_shape[key] = shape_idx
+		shape_idx += 1
+
+	# Bulk add all shapes in one C++ call
+	BlockMeshBuilder.bulk_add_shapes(body_rid, shape_rid, positions)
+
+	# Push mapping to the compound body script
+	_compound_hit_body._shape_to_key = _shape_to_key
+
+	# Add to scene tree
+	add_child(_compound_hit_body)
+
+	# Shielding: tag as wall_block with average HP
+	PhysicsServer3D.body_set_shielding_tag(body_rid, 1)
+	_update_compound_shielding_hp()
 
 
-func _spawn_hit_body(key: Vector3i) -> void:
-	## Create a lightweight StaticBody3D for hitscan hit detection on one block.
-	## Layer 11 (WALL_BLOCKS) only, mask 0 — for weapon raycasts, not physics push.
-	var body := StaticBody3D.new()
-	body.set_script(_block_script)
-	body.grid_key = key
-	body.parent_wall = self
-	body.collision_layer = CollisionLayers.WALL_BLOCKS
-	body.collision_mask = 0
-	body.position = grid.block_local_pos(key)
-
-	var col := CollisionShape3D.new()
-	col.shape = _shared_block_shape.duplicate()
-	body.add_child(col)
-
-	add_child(body)
-
-	# Tag for C++ shielding classification (same as structure's per-block bodies)
-	PhysicsServer3D.body_set_shielding_tag(body.get_rid(), 1)  # WALL_BLOCK
-	PhysicsServer3D.body_set_shielding_hp(body.get_rid(), grid.block_hp.get(key, 0.0))
-
-	_hit_bodies[key] = body
+func _clear_compound_hit_body() -> void:
+	## Remove the compound hit body and clear mappings.
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		_compound_hit_body.collision_layer = 0
+		_compound_hit_body.queue_free()
+		_compound_hit_body = null
+	_shape_to_key.clear()
+	_key_to_shape.clear()
 
 
-func _free_hit_body(key: Vector3i) -> void:
-	if _hit_bodies.has(key):
-		var body: StaticBody3D = _hit_bodies[key]
-		if is_instance_valid(body):
-			body.queue_free()
-		_hit_bodies.erase(key)
+func _disable_hit_shape(key: Vector3i) -> void:
+	## Disable the compound body shape for a destroyed/removed block.
+	if not _key_to_shape.has(key):
+		return
+	var shape_idx: int = _key_to_shape[key]
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		PhysicsServer3D.body_set_shape_disabled(_compound_hit_body.get_rid(), shape_idx, true)
+	_key_to_shape.erase(key)
+
+
+func _update_compound_shielding_hp() -> void:
+	## Update compound body shielding HP to average block HP.
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		var count := grid.block_count()
+		var avg_hp := grid.get_total_hp() / maxf(float(count), 1.0) if count > 0 else 0.0
+		PhysicsServer3D.body_set_shielding_hp(_compound_hit_body.get_rid(), avg_hp)
 
 
 # ======================================================================
@@ -953,13 +1237,8 @@ func _clear_physics_before_free() -> void:
 	## Prevents phantom collisions during the queue_free() deferral window.
 	collision_layer = 0
 	collision_mask = 0
-	for key: Vector3i in _hit_bodies:
-		var body: StaticBody3D = _hit_bodies[key]
-		if is_instance_valid(body):
-			body.collision_layer = 0
-	for child in get_children():
-		if child is CollisionShape3D:
-			child.disabled = true
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		_compound_hit_body.collision_layer = 0
 
 
 func _find_structure(node: Node) -> DestructibleBlockStructure:

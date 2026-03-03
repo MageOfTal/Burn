@@ -215,6 +215,8 @@ func _spawn_heavy_structures() -> void:
 		await get_tree().process_frame  # Yield once so signal timing stays consistent
 	_spawn_dummies(rng)
 
+	_spawn_test_platforms()
+
 	structures_complete = true
 	world_generation_complete.emit()
 	print("[SeedWorld] World generation complete — all structures placed")
@@ -657,6 +659,82 @@ func _spawn_tower(_rng: RandomNumberGenerator, parent: Node3D) -> void:
 		await tower.generation_complete
 
 	print("[SeedWorld] Spiral tower spawned at %s" % str(_tower_position))
+
+
+func _spawn_test_platforms() -> void:
+	## DEBUG: Upright wall + 40° upward ramp side by side for contact normal testing.
+	## Wall 1 (white) stands upright. Wall 2 (red) is a ramp angled 40° upward,
+	## hinged from the top-right edge of Wall 1. Walk along Z on the seam
+	## so the capsule contacts both surfaces simultaneously.
+	var pos_x := 15.0
+	var pos_z := 0.0
+	var ground_y := get_height_from_noise(pos_x, pos_z)
+	var wall_height := 3.0
+	var wall_depth := 1.0   # Top surface width the player walks on
+	var wall_length := 12.0
+	var ramp_width := 5.0
+	var ramp_thickness := 0.3
+
+	var container := Node3D.new()
+	container.name = "TestPlatforms"
+	add_child(container)
+
+	# --- Wall 1: Upright (white) ---
+	var w1 := StaticBody3D.new()
+	w1.name = "TestUpright"
+	w1.collision_layer = CollisionLayers.WORLD
+	w1.collision_mask = 0
+	w1.position = Vector3(pos_x - wall_depth * 0.5, ground_y + wall_height * 0.5, pos_z)
+
+	var shape1 := BoxShape3D.new()
+	shape1.size = Vector3(wall_depth, wall_height, wall_length)
+	var col1 := CollisionShape3D.new()
+	col1.shape = shape1
+	w1.add_child(col1)
+
+	var mesh1 := MeshInstance3D.new()
+	var box1 := BoxMesh.new()
+	box1.size = shape1.size
+	mesh1.mesh = box1
+	w1.add_child(mesh1)
+	container.add_child(w1)
+
+	# --- Wall 2: Ramp tilted 40° upward (red) ---
+	# Pivot at the seam — top-right edge of Wall 1.
+	# The ramp hinges from this edge and slopes upward to the right.
+	var seam := Vector3(pos_x, ground_y, pos_z)
+
+	var pivot := Node3D.new()
+	pivot.name = "TestTiltPivot"
+	pivot.position = seam
+	pivot.rotation.z = deg_to_rad(40)
+	container.add_child(pivot)
+
+	var w2 := StaticBody3D.new()
+	w2.name = "TestTilted"
+	w2.collision_layer = CollisionLayers.WORLD
+	w2.collision_mask = 0
+	w2.position = Vector3(ramp_width * 0.5, -ramp_thickness * 0.5, 0.0)
+
+	var shape2 := BoxShape3D.new()
+	shape2.size = Vector3(ramp_width, ramp_thickness, wall_length)
+	var col2 := CollisionShape3D.new()
+	col2.shape = shape2
+	w2.add_child(col2)
+
+	var mesh2 := MeshInstance3D.new()
+	var box2 := BoxMesh.new()
+	box2.size = shape2.size
+	mesh2.mesh = box2
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.8, 0.2, 0.2)
+	mesh2.material_override = mat
+	w2.add_child(mesh2)
+	pivot.add_child(w2)
+
+	var top_y := ground_y + wall_height
+	print("[TestPlatforms] Upright wall + 40° ramp at x=%.0f z=%.0f — top at y=%.1f" % [
+		pos_x, pos_z, top_y])
 
 
 func _create_cloud_sky_shader() -> Shader:

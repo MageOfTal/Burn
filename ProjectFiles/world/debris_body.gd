@@ -51,9 +51,14 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	if best <= 0.0:
 		return
 
+	var decel := best * FRICTION_DECEL * state.step
+
 	var vel := state.linear_velocity
 	var speed := vel.length()
-	if speed < 0.01:
-		return
-	var decel := best * FRICTION_DECEL * state.step
-	state.linear_velocity = vel * maxf((speed - decel) / speed, 0.0)
+	if speed > 0.01:
+		state.linear_velocity = vel * maxf((speed - decel) / speed, 0.0)
+
+	var ang := state.angular_velocity
+	var ang_speed := ang.length()
+	if ang_speed > 0.01:
+		state.angular_velocity = ang * maxf((ang_speed - decel) / ang_speed, 0.0)

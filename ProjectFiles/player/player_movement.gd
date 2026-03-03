@@ -27,6 +27,7 @@ const SLOPE_SLIDE_MAX_SPEED: float = 20.0  ## Terminal velocity for slope gravit
 const FLOOR_SNAP_MARGIN: float = 0.3
 const CAPSULE_RADIUS: float = 0.4
 const FLOOR_CONTACT_TOLERANCE: float = 0.1
+const LAUNCH_DOT_THRESHOLD: float = 2.0  ## Quake-style: dot(velocity, normal) above this = launch
 
 # ======================================================================
 #  State
@@ -327,6 +328,18 @@ func _update_ground_state() -> void:
 		_floor_y = -INF
 		_slope_traction = 0.0
 		return
+
+	# Quake-style launch: if grounded velocity is diverging from the surface,
+	# go airborne. On steady slopes dot ≈ 0 (tangent). At convex transitions
+	# (crests) the surface flattens but velocity still points uphill → dot > 0.
+	if _was_grounded and _ground_velocity.y > 0.5:
+		var launch_dot := _ground_velocity.dot(normal)
+		if launch_dot > LAUNCH_DOT_THRESHOLD:
+			_is_grounded = false
+			_floor_normal = Vector3.UP
+			_floor_y = -INF
+			_slope_traction = 0.0
+			return
 
 	_slope_traction = normal.y  # cos(angle) — traction degrades with steepness
 	_floor_normal = normal

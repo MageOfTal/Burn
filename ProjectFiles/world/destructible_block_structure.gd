@@ -51,6 +51,9 @@ var _mesh_dirty: bool = false
 ## Per-block bodies are on layer 11 (bit 1024) for weapon raycasts only.
 ## This eliminates seam bouncing when the player slides along the wall.
 var _collision_body: StaticBody3D = null
+
+## Temporary storage for hit bodies being reparented to a falling cluster.
+## Populated by _detach_cluster(), consumed by _sync_cluster_detach() (call_local).
 ## Column shape tracking — direct PhysicsServer3D RIDs (no CollisionShape3D nodes).
 var _col_shape_rids: Dictionary = {}    # Vector2i → Array[RID]
 var _col_shape_xforms: Dictionary = {}  # Vector2i → Array[Transform3D]
@@ -828,6 +831,7 @@ func _detach_cluster(block_keys: Array[Vector3i]) -> void:
 			var block_data: Dictionary = _blocks[key]
 			var block_body: StaticBody3D = block_data["body"]
 			if is_instance_valid(block_body):
+				block_body.collision_layer = 0
 				block_body.queue_free()
 			_blocks.erase(key)
 			_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
@@ -874,15 +878,18 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 	## All peers: remove detached blocks (clients only) and create the falling cluster.
 	var t_sync_total := Time.get_ticks_usec()
 
-	# Clients: remove blocks from local _blocks + rebuild mesh/collision
+	# Server: blocks already cleaned up in _detach_cluster(). Client: erase now.
 	var t_client_cleanup := Time.get_ticks_usec()
-	if not multiplayer.is_server():
+	if multiplayer.is_server():
+		pass  # Blocks already erased and queue_freed in _detach_cluster()
+	else:
 		for key_variant in block_keys:
 			var key: Vector3i = key_variant
 			if _blocks.has(key):
 				var block_data: Dictionary = _blocks[key]
 				var block_body: StaticBody3D = block_data["body"]
 				if is_instance_valid(block_body):
+					block_body.collision_layer = 0
 					block_body.queue_free()
 				_blocks.erase(key)
 				_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
@@ -918,14 +925,13 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 	var t_spawn_end := Time.get_ticks_usec()
 
 	var sync_total := Time.get_ticks_usec() - t_sync_total
-	if sync_total > 5000:
-		print("[SyncClusterDetach] %s  keys=%d  client_cleanup=%dus  type_convert=%dus  spawn_structure=%dus  total=%dus" % [
-			name, block_keys.size(),
-			t_client_cleanup_end - t_client_cleanup,
-			t_type_convert_end - t_type_convert,
-			t_spawn_end - t_spawn,
-			sync_total,
-		])
+	print("[SyncClusterDetach] %s  keys=%d  client_cleanup=%dus  type_convert=%dus  spawn_structure=%dus  total=%dus" % [
+		name, block_keys.size(),
+		t_client_cleanup_end - t_client_cleanup,
+		t_type_convert_end - t_type_convert,
+		t_spawn_end - t_spawn,
+		sync_total,
+	])
 
 
 func _spawn_detached_structure(block_keys: Array[Vector3i],
@@ -993,22 +999,12 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 	if scene_root == null:
 		return
 
-	# Compute centroid in grid-local coordinates for mesh/shape building
-	var t_centroid := Time.get_ticks_usec()
-	var centroid_local := Vector3.ZERO
-	for key in block_keys:
-		centroid_local += Vector3(
-			(key.x + 0.5 - grid_num_x * 0.5) * BLOCK_SIZE,
-			(key.y + 0.5 - grid_num_y * 0.5) * BLOCK_SIZE,
-			(key.z + 0.5 - grid_num_z * 0.5) * BLOCK_SIZE
-		)
-	centroid_local /= float(block_keys.size())
-
 	# Build per-block HP dictionary
+	var t_prep := Time.get_ticks_usec()
 	var block_hp_dict: Dictionary = {}
 	for i in block_keys.size():
 		block_hp_dict[block_keys[i]] = block_hps[i]
-	var t_centroid_end := Time.get_ticks_usec()
+	var t_prep_end := Time.get_ticks_usec()
 
 	# Build the RigidBody3D
 	var t_body := Time.get_ticks_usec()
@@ -1026,27 +1022,12 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 	cluster.continuous_cd = true
 	var t_body_end := Time.get_ticks_usec()
 
-	# Build greedy mesh for the cluster
-	var t_mesh := Time.get_ticks_usec()
-	var mesh_inst := MeshInstance3D.new()
-	mesh_inst.name = "ClusterMesh"
-	mesh_inst.mesh = _build_cluster_mesh(block_keys, centroid_local)
-	if _structure_material:
-		mesh_inst.material_override = _structure_material.duplicate()
-	mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
-	cluster.add_child(mesh_inst)
-	var t_mesh_end := Time.get_ticks_usec()
-
-	# Build per-column box collision shapes (matches structure's smooth collision)
-	var t_shapes := Time.get_ticks_usec()
-	_build_cluster_column_shapes(cluster, block_keys, centroid_local,
-		grid_num_x, grid_num_y, grid_num_z)
-	var t_shapes_end := Time.get_ticks_usec()
-
-	# Initialize per-block tracking BEFORE adding to scene
+	# init_cluster_blocks handles mesh, collision shapes, AND compound hit body.
 	var t_init := Time.get_ticks_usec()
 	cluster.init_cluster_blocks(block_hp_dict, grid_num_x, grid_num_y, grid_num_z,
 		mass_per_block)
+	if _structure_material:
+		cluster.set_material(_structure_material.duplicate())
 	cluster.set_debris_config(_debris_size, _debris_lifetime, _debris_mass,
 		_debris_name, _block_hp)
 	var t_init_end := Time.get_ticks_usec()
@@ -1070,12 +1051,10 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 	PhysicsServer3D.body_set_shielding_hp(cluster_rid, total_hp)
 	var t_addchild_end := Time.get_ticks_usec()
 
-	print("[SpawnCluster] %s  blocks=%d  centroid=%dus  body=%dus  mesh=%dus  shapes=%dus  init=%dus  add_child=%dus  total=%dus" % [
+	print("[SpawnCluster] %s  blocks=%d  prep=%dus  body=%dus  init=%dus  add_child=%dus  total=%dus" % [
 		name, block_keys.size(),
-		t_centroid_end - t_centroid,
+		t_prep_end - t_prep,
 		t_body_end - t_body,
-		t_mesh_end - t_mesh,
-		t_shapes_end - t_shapes,
 		t_init_end - t_init,
 		t_addchild_end - t_addchild,
 		Time.get_ticks_usec() - t_spawn_total,

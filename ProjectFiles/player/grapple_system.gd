@@ -370,10 +370,8 @@ func try_fire() -> void:
 
 	anchor_point = result.position
 
-	# When grounded, position control zeroes velocity and stores real movement
-	# in _ground_velocity. Restore it so existing momentum carries into the swing.
-	if player.is_on_floor():
-		player.velocity = player.movement._ground_velocity
+	# Velocity is already correct — Jolt handles position integration, so
+	# player.velocity reflects actual movement speed at all times.
 
 	_rope_length = player.global_position.distance_to(anchor_point)
 	_anchor_collider_rid = result.get("rid", RID())
@@ -771,7 +769,7 @@ func _is_rope_obstructed() -> bool:
 			tri_normal /= tri_n_len
 		else:
 			tri_normal = Vector3.UP
-		var offset: Vector3 = tri_normal * 0.005
+		var offset: Vector3 = tri_normal * 0.055
 		_center_sweep_shape.points = PackedVector3Array([
 			prev_chest + offset, player_chest + offset, anchor_point + offset,
 			prev_chest - offset, player_chest - offset, anchor_point - offset])
@@ -1348,7 +1346,6 @@ func _do_release(with_boost: bool) -> void:
 	# component actually launches the player instead of being pinned to the floor.
 	if boosted and player.is_on_floor():
 		player.movement._is_grounded = false
-		player.movement._ground_velocity = player.velocity
 
 	_show_grapple_release.rpc(release_pos)
 	if boosted:

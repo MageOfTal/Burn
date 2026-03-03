@@ -55,6 +55,7 @@ func _create_node() -> RigidBody3D:
 	d.contact_monitor = true
 	d.max_contacts_reported = 3
 	d.can_sleep = false
+	d.continuous_cd = true
 	d.physics_material_override = _shared_phys_mat
 	d.collision_layer = CollisionLayers.DEBRIS
 	d.collision_mask = CollisionLayers.SURFACE

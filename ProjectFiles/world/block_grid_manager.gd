@@ -62,6 +62,18 @@ func init_grid(p_num_x: int, p_num_y: int, p_num_z: int) -> void:
 	block_grid.fill(0)
 
 
+func init_from_dict(block_hp_dict: Dictionary, p_num_x: int, p_num_y: int, p_num_z: int) -> void:
+	## Fast C++ path: build flat grid + centroid from block_hp dict in one native call.
+	## Also sets block_hp to the input dict (shared reference).
+	num_x = p_num_x
+	num_y = p_num_y
+	num_z = p_num_z
+	block_hp = block_hp_dict
+	var result: Dictionary = BlockMeshBuilder.init_block_grid(block_hp_dict, num_x, num_y, num_z, BLOCK_SIZE)
+	block_grid = result["block_grid"]
+	centroid = result["centroid"]
+
+
 func set_block(key: Vector3i, hp: float) -> void:
 	block_hp[key] = hp
 	var ix := key.x
@@ -150,15 +162,19 @@ func get_total_hp() -> float:
 # ======================================================================
 
 func build_mesh(uv_callback: Callable = Callable()) -> ArrayMesh:
-	## Build a greedy-style mesh from current blocks.
+	## Build a face-culled block mesh from current blocks.
 	## Vertex positions are relative to `centroid`.
 	## If uv_callback is valid it is called per face as:
 	##   uv_callback(normal: Vector3, p0, p1, p2, p3: Vector3) -> Array[Vector2]
-	## Otherwise default 0-1 UVs are used.
+	## Otherwise default 0-1 UVs are used (via C++ fast path).
 	if block_hp.is_empty():
 		return null
 
+	# Fast C++ path when no UV callback is needed.
 	var use_callback := uv_callback.is_valid()
+	if not use_callback:
+		return BlockMeshBuilder.build_block_mesh(
+			block_grid, num_x, num_y, num_z, BLOCK_SIZE, centroid, true)
 
 	var bc := block_hp.size()
 	var max_verts := bc * 24  # 6 faces * 4 verts
@@ -318,25 +334,10 @@ func compute_column_shapes() -> Array[Dictionary]:
 	## Compute all per-column contiguous-Y-run box shapes.
 	## Returns Array of { "position": Vector3, "size": Vector3 }.
 	## Positions are relative to centroid.
-	## Caller uses these to create CollisionShape3D nodes or PhysicsServer3D RIDs.
-	var result: Array[Dictionary] = []
+	## Uses C++ fast path via BlockMeshBuilder.
 	if block_hp.is_empty():
-		return result
-
-	# Group blocks by (x, z) column
-	var columns: Dictionary = {}
-	for key: Vector3i in block_hp:
-		var col_key := Vector2i(key.x, key.z)
-		if not columns.has(col_key):
-			columns[col_key] = []
-		columns[col_key].append(key.y)
-
-	for col_key: Vector2i in columns:
-		var y_list: Array = columns[col_key]
-		y_list.sort()
-		_emit_column_runs(result, col_key.x, col_key.y, y_list)
-
-	return result
+		return []
+	return BlockMeshBuilder.compute_column_shapes(block_grid, num_x, num_y, num_z, BLOCK_SIZE, centroid)
 
 
 func compute_column_shapes_for(bx: int, bz: int) -> Array[Dictionary]:

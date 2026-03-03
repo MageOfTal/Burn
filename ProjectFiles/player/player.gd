@@ -9,19 +9,12 @@ class_name Player
 ## Jolt's rigid body solver directly. Physics objects (toads, boulders, etc.)
 ## collide with the player natively via layer 10 (physics push layer).
 ##
-## GROUNDED movement bypasses Jolt's velocity integration for POSITION, but
-## leaves velocity non-zero so Jolt's solver sees real movement speed for
-## collision impulses (pushing toads, physics objects). Position is applied
-## directly from _ground_velocity each frame. Jolt also integrates position
-## from that velocity (unwanted), so the integration is undone at the start
-## of the next _physics_process — before ground detection or movement run.
-## This gives correct collision impulses AND correct position control.
-##
-## AIRBORNE movement uses Jolt's integration normally: linear_velocity contains
-## Jolt's solver output, movement modifies it, and Jolt integrates position.
-## When touching walls, movement is decomposed into wall-parallel and
-## wall-perpendicular axes so that move_toward() only steers the parallel
-## component — preserving Jolt's depenetration pushes.
+## Jolt handles ALL position integration and collision response (bumps, walls,
+## depenetration). Movement sets velocity each frame; Jolt integrates it next
+## frame. A downward-only Y-snap in post_physics_step keeps the player glued
+## to the floor surface without fighting Jolt's upward depenetration for bumps.
+## Wall-slide decomposes movement into wall-parallel and wall-perpendicular
+## axes so that move_toward() only steers the parallel component.
 ##
 ## Subsystems (child nodes):
 ##   SlideCrouchSystem — slide/crouch physics
@@ -85,6 +78,9 @@ var _frame_jump := false
 var _debug_wall := false
 var _jump_debug_frames: int = 0
 var _debug_wall_key_held := false
+## DEBUG: floor/edge diagnostics (toggle with F10)
+var _debug_floor := false
+var _debug_floor_key_held := false
 
 ## Forfeit (hold P to self-kill)
 var _forfeit_hold_time := 0.0
@@ -315,6 +311,13 @@ func _physics_process(delta: float) -> void:
 		print("[WALL_DEBUG] === %s ===" % ("ENABLED" if _debug_wall else "DISABLED"))
 	if not Input.is_key_pressed(KEY_F9):
 		_debug_wall_key_held = false
+	# DEBUG: F10 toggles floor/edge diagnostics for the local player
+	if peer_id == multiplayer.get_unique_id() and Input.is_key_pressed(KEY_F10) and not _debug_floor_key_held:
+		_debug_floor = not _debug_floor
+		_debug_floor_key_held = true
+		print("[FLOOR_DEBUG] === %s ===" % ("ENABLED" if _debug_floor else "DISABLED"))
+	if not Input.is_key_pressed(KEY_F10):
+		_debug_floor_key_held = false
 
 	# Debug freecam: freeze player physics but keep rendering visuals
 	var freecam_frozen: bool = GameManager.debug_freecam_active and peer_id == multiplayer.get_unique_id()
@@ -330,8 +333,14 @@ func _physics_process(delta: float) -> void:
 				30 - _jump_debug_frames, global_position.y, velocity.y, str(movement._is_grounded), movement._floor_y, linear_velocity.y])
 			_jump_debug_frames -= 1
 
-		# Undo Jolt integration and update floor detection
+		# Undo Jolt integration + update floor detection
 		movement.pre_physics_step(delta)
+
+		var _dbg_vel_y_after_detect := velocity.y
+		var _dbg_grounded_after_detect := movement._is_grounded
+		var _dbg_floor_normal := movement._floor_normal
+		var _dbg_floor_y := movement._floor_y
+		var _dbg_ground_vel_y := movement._ground_velocity.y
 
 		# Tick Second Wind timer
 		if _second_wind_timer > 0.0:
@@ -340,8 +349,24 @@ func _physics_process(delta: float) -> void:
 		# Server game logic (input, movement, combat, subsystems)
 		_server_process(delta)
 
-		# Grounded position control + pre-solver velocity save
+		var _dbg_vel_y_after_move := velocity.y
+		var _dbg_pos_y_before_snap := global_position.y
+
+		# Downward Y-snap to floor surface
 		movement.post_physics_step(delta, grapple_system.is_active())
+
+		if _debug_floor and peer_id == 1:
+			var snapped := global_position.y != _dbg_pos_y_before_snap
+			var transition := _dbg_grounded_after_detect != movement._is_grounded
+			# Print every frame where: grounded state changed, Y-snap fired, or velocity.y is notable
+			if transition or snapped or (movement._is_grounded and absf(_dbg_vel_y_after_move) > 0.5) or not movement._is_grounded:
+				print("[FLOOR] gnd=%s→%s normal=(%.2f,%.2f,%.2f) angle=%.1f° | vel_y: detect=%.2f move=%.2f final=%.2f gnd_vel_y=%.2f | pos_y=%.3f snap=%s floor_y=%.3f" % [
+					str(_dbg_grounded_after_detect), str(movement._is_grounded),
+					_dbg_floor_normal.x, _dbg_floor_normal.y, _dbg_floor_normal.z,
+					rad_to_deg(_dbg_floor_normal.angle_to(Vector3.UP)),
+					_dbg_vel_y_after_detect, _dbg_vel_y_after_move, velocity.y, _dbg_ground_vel_y,
+					global_position.y, str(snapped), _dbg_floor_y,
+				])
 
 		# Update sync vars AFTER all server movement
 		sync_position = global_position

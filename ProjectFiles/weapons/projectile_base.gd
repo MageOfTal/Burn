@@ -129,6 +129,12 @@ func _server_process(_delta: float) -> void:
 func _on_body_entered(body: Node) -> void:
 	if not multiplayer.is_server() or _is_terminated:
 		return
+	# Jolt fires body_entered when EITHER side's mask matches the other's layer.
+	# Debris masks layer 1 (world) so it generates contacts with any projectile
+	# on layer 1, even though the projectile doesn't mask debris. Filter here:
+	# only process bodies whose layer overlaps our collision_mask.
+	if body is CollisionObject3D and (collision_mask & body.collision_layer) == 0:
+		return
 	# Shooter immunity: skip the shooter for a brief window after launch.
 	# Subclasses can override get_shooter_immunity_time() to customize.
 	if _is_shooter_immune(body):

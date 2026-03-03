@@ -143,7 +143,10 @@ func _process_pellet_hits(hit_info: Dictionary, current_weapon: WeaponBase, muzz
 		var final_damage: float = base_pellet_dmg * player.heat_system.get_damage_multiplier()
 		if 11 in player.active_bonuses:  # Juggernaut: +10% damage
 			final_damage *= 1.10
-		if not is_player_hit and collider.has_method("take_damage_at"):
+		if not is_player_hit and collider.has_method("take_damage_at_shape"):
+			var shape_idx: int = pellet.get("hit_shape", -1)
+			collider.take_damage_at_shape(final_damage, player.peer_id, shape_idx)
+		elif not is_player_hit and collider.has_method("take_damage_at"):
 			var hit_pos: Vector3 = pellet.get("hit_position", collider.global_position)
 			collider.take_damage_at(hit_pos, final_damage, 0.5, player.peer_id)
 		elif collider.has_method("take_damage"):
@@ -175,7 +178,10 @@ func _process_single_hit(hit_info: Dictionary, current_weapon: WeaponBase, muzzl
 		var final_damage: float = base_dmg * player.heat_system.get_damage_multiplier()
 		if 11 in player.active_bonuses:  # Juggernaut: +10% damage
 			final_damage *= 1.10
-		if not is_player_hit and collider.has_method("take_damage_at"):
+		if not is_player_hit and collider.has_method("take_damage_at_shape"):
+			var shape_idx: int = hit_info.get("hit_shape", -1)
+			collider.take_damage_at_shape(final_damage, player.peer_id, shape_idx)
+		elif not is_player_hit and collider.has_method("take_damage_at"):
 			var hit_pos: Vector3 = hit_info.get("hit_position", collider.global_position)
 			collider.take_damage_at(hit_pos, final_damage, 0.5, player.peer_id)
 		elif collider.has_method("take_damage"):

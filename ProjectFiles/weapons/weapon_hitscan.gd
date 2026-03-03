@@ -35,6 +35,7 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 				"hit_position": result.position,
 				"hit_normal": result.normal,
 				"hit_collider": result.collider,
+				"hit_shape": result.shape,
 				"shot_end": result.position,
 			})
 
