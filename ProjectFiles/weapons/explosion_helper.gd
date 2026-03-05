@@ -81,6 +81,8 @@ static func do_explosion(
 	# explosion call the shape uses its default radius (0.5m). Pass 2's
 	# scene scan catches anything missed. All subsequent calls use the
 	# correct radius from the previous frame's flush.
+	if _query_sphere == null:
+		_query_sphere = SphereShape3D.new()
 	_query_sphere.radius = radius
 	query.shape = _query_sphere
 	query.transform = Transform3D(Basis(), explosion_pos)

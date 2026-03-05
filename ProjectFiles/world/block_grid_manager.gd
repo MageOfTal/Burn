@@ -422,8 +422,5 @@ func find_connected_components(keys: Array[Vector3i]) -> Array:
 
 
 func find_all_components() -> Array:
-	## BFS on ALL current blocks.  Used by cluster fragmentation.
-	var all_keys: Array[Vector3i] = []
-	for key: Vector3i in block_hp:
-		all_keys.append(key)
-	return find_connected_components(all_keys)
+	## BFS on ALL current blocks via C++ fast path.  Used by cluster fragmentation.
+	return BlockMeshBuilder.find_connected_components(block_grid, num_x, num_y, num_z)

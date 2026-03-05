@@ -2,18 +2,21 @@ extends Node3D
 class_name DestructibleBlockStructure
 
 ## Base class for destructible block-grid structures (walls, ramps, etc.).
-## Manages a grid of StaticBody3D blocks with greedy meshing for visuals,
-## AoE/hitscan damage with flat HP shielding, debris spawning, and RPC sync.
+## Manages a grid of blocks with compound hit body for weapon targeting,
+## greedy meshing for visuals, AoE/hitscan damage with flat HP shielding,
+## debris spawning, and RPC sync.
 ##
 ## Subclasses override _get_tier_info() and _get_debris_config() to provide
 ## their specific tier data and debris parameters.
 ##
 ## Server-authoritative: only the server tracks block health and spawns debris.
 ##
-## GREEDY MESHING: blocks keep individual StaticBody3D for collision/damage,
-## but the visual mesh is a single greedy-meshed surface. When blocks are
-## destroyed the mesh rebuilds. This reduces draw calls from N_blocks to 1
-## per structure.
+## GREEDY MESHING: one MeshInstance3D for the entire structure. When blocks are
+## destroyed the mesh rebuilds. This reduces draw calls from N_blocks to 1.
+##
+## COMPOUND HIT BODY: one StaticBody3D (layer 11) with N shapes via
+## PhysicsServer3D. Weapon raycasts hit individual shapes, routed to blocks
+## via shape_index → grid_key mapping (compound_hit_body.gd script).
 
 const BLOCK_SIZE := 0.5
 const NEIGHBOR_OFFSETS: Array[Vector3i] = [
@@ -27,33 +30,40 @@ const FallingBlockClusterScript: GDScript = preload("res://world/falling_block_c
 ## compatibility alias (wall_size / ramp_size) that delegates here.
 var structure_size: Vector3 = Vector3(10, 4, 1)
 
-## Block grid: Dictionary[Vector3i -> { "body": StaticBody3D, "hp": float }]
-var _blocks: Dictionary = {}
+## Block HP: Dictionary[Vector3i → float]
+var _block_hp_dict: Dictionary = {}
 var _num_x: int = 0
 var _num_y: int = 0
 var _num_z: int = 0
 
 ## Flat occupancy grid: 1 = block exists, 0 = empty. Indexed via _grid_idx().
-## Avoids Dictionary hashing in BFS inner loops (~20x faster than _blocks.has()).
+## Avoids Dictionary hashing in BFS inner loops (~20x faster than Dictionary.has()).
 var _block_grid: PackedByteArray = PackedByteArray()
 var _block_hp: float = 35.0
 var _structure_material: StandardMaterial3D = null
 
 ## Shared resources (created once, reused by all blocks)
 var _block_shape: BoxShape3D = null
-var _block_script: GDScript = preload("res://world/wall_block.gd")
+
+## Compound hit body — one StaticBody3D with N shapes (layer 11 WALL_BLOCKS).
+## Weapon raycasts hit individual shapes; shape_index → grid_key mapping
+## routes damage to the correct block via compound_hit_body.gd script.
+var _compound_hit_body: StaticBody3D = null
+var _shape_to_key: Array[Vector3i] = []   ## shape_index → grid_key
+var _key_to_shape: Dictionary = {}        ## Vector3i → shape_index
+var _compound_body_script: GDScript = preload("res://world/compound_hit_body.gd")
 
 ## Greedy mesh — single MeshInstance3D for the entire structure
 var _mesh_instance: MeshInstance3D = null
 var _mesh_dirty: bool = false
 
 ## Smooth collision — single StaticBody3D for player physics (layer 12, bit 2048).
-## Per-block bodies are on layer 11 (bit 1024) for weapon raycasts only.
+## Compound hit body handles weapon raycasts on layer 11 (bit 1024).
 ## This eliminates seam bouncing when the player slides along the wall.
 var _collision_body: StaticBody3D = null
 
 ## Temporary storage for hit bodies being reparented to a falling cluster.
-## Populated by _detach_cluster(), consumed by _sync_cluster_detach() (call_local).
+## Populated by _detach_clusters(), consumed by _sync_cluster_detach() (call_local).
 ## Column shape tracking — direct PhysicsServer3D RIDs (no CollisionShape3D nodes).
 var _col_shape_rids: Dictionary = {}    # Vector2i → Array[RID]
 var _col_shape_xforms: Dictionary = {}  # Vector2i → Array[Transform3D]
@@ -187,26 +197,53 @@ func _ready() -> void:
 	_block_grid.resize(_num_x * _num_y * _num_z)
 	_block_grid.fill(0)
 
-	# Build block grid (collision only — no per-block meshes)
+	# Build block HP dict and flat occupancy grid
 	var t_blocks := Time.get_ticks_usec()
 	if is_detach:
-		# Detached structure: spawn only the provided blocks with their HPs
+		# Detached structure: populate only the provided blocks with their HPs
 		var detach_keys: Array = _init_from_detach["block_keys"]
 		var detach_hps: Dictionary = _init_from_detach["block_hps"]
 		for key: Vector3i in detach_keys:
-			_spawn_block(key.x, key.y, key.z)
-			if _blocks.has(key):
-				var hp: float = detach_hps.get(key, _block_hp)
-				_blocks[key]["hp"] = hp
-				PhysicsServer3D.body_set_shielding_hp(
-					_blocks[key]["body"].get_rid(), hp)
+			var hp: float = detach_hps.get(key, _block_hp)
+			_block_hp_dict[key] = hp
+			_block_grid[_grid_idx(key.x, key.y, key.z)] = 1
 		_init_from_detach = {}  # Clear to free references
 	else:
 		for bx in _num_x:
 			for by in _num_y:
 				for bz in _num_z:
 					if _should_spawn_block(bx, by, bz):
-						_spawn_block(bx, by, bz)
+						_block_hp_dict[Vector3i(bx, by, bz)] = _block_hp
+						_block_grid[_grid_idx(bx, by, bz)] = 1
+
+	# Build compound hit body (one StaticBody3D with N shapes, layer 11).
+	_compound_hit_body = StaticBody3D.new()
+	_compound_hit_body.set_script(_compound_body_script)
+	_compound_hit_body.name = "CompoundHitBody"
+	_compound_hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
+	_compound_hit_body.collision_mask = 0
+	_compound_hit_body.parent_wall = self
+
+	# Add all block shapes in one C++ call (bulk_add_shapes).
+	var positions := PackedVector3Array()
+	_shape_to_key.clear()
+	positions.resize(_block_hp_dict.size())
+	_shape_to_key.resize(_block_hp_dict.size())
+	var idx := 0
+	for key: Vector3i in _block_hp_dict:
+		positions[idx] = _block_local_pos(key)
+		_shape_to_key[idx] = key
+		_key_to_shape[key] = idx
+		idx += 1
+	BlockMeshBuilder.bulk_add_shapes(
+		_compound_hit_body.get_rid(), _block_shape.get_rid(), positions)
+	_compound_hit_body._shape_to_key = _shape_to_key
+	add_child(_compound_hit_body)
+
+	# Tag for C++ shielding classification (tag 1 = WALL_BLOCK, average HP).
+	PhysicsServer3D.body_set_shielding_tag(_compound_hit_body.get_rid(), 1)
+	_update_compound_shielding_hp()
+
 	var t_blocks_end := Time.get_ticks_usec()
 
 	# Build single greedy-meshed visual
@@ -226,7 +263,7 @@ func _ready() -> void:
 	var ready_total := Time.get_ticks_usec() - t_blocks
 	if ready_total > 5000:
 		print("[StructureReady] %s  blocks=%d  spawn_blocks=%dus  greedy_mesh=%dus  smooth_col=%dus  total=%dus%s" % [
-			name, _blocks.size(),
+			name, _block_hp_dict.size(),
 			t_blocks_end - t_blocks,
 			t_mesh_end - t_mesh,
 			t_smooth_end - t_smooth,
@@ -235,20 +272,19 @@ func _ready() -> void:
 		])
 
 	# Detached structures: compute bottom-center for ground raycast and start falling
-	if is_detach and not _blocks.is_empty():
+	if is_detach and not _block_hp_dict.is_empty():
 		_is_falling = true
 		var sum_x := 0.0
 		var sum_z := 0.0
 		var min_y := INF
-		for key: Vector3i in _blocks:
-			var body: StaticBody3D = _blocks[key]["body"]
-			if is_instance_valid(body):
-				sum_x += body.position.x
-				sum_z += body.position.z
-				var bottom_y := body.position.y - BLOCK_SIZE * 0.5
-				if bottom_y < min_y:
-					min_y = bottom_y
-		var count := float(_blocks.size())
+		for key: Vector3i in _block_hp_dict:
+			var pos := _block_local_pos(key)
+			sum_x += pos.x
+			sum_z += pos.z
+			var bottom_y := pos.y - BLOCK_SIZE * 0.5
+			if bottom_y < min_y:
+				min_y = bottom_y
+		var count := float(_block_hp_dict.size())
 		_fall_ray_local = Vector3(sum_x / count, min_y, sum_z / count)
 
 	set_physics_process(_is_falling)
@@ -265,7 +301,7 @@ func _process(_delta: float) -> void:
 		_rebuild_greedy_mesh()
 		var t_mesh_end := Time.get_ticks_usec()
 		var _mesh_us := t_mesh_end - t_mesh
-		print("[GreedyMesh] %s  blocks=%d  time=%dus" % [name, _blocks.size(), _mesh_us])
+		print("[GreedyMesh] %s  blocks=%d  time=%dus" % [name, _block_hp_dict.size(), _mesh_us])
 		GameManager.frame_add("greedy_mesh", _mesh_us)
 		set_process(false)
 
@@ -307,55 +343,50 @@ func _physics_process(delta: float) -> void:
 
 
 func _clear_physics_before_free() -> void:
-	## Zero collision layers on the smooth collision body so Jolt drops it from
+	## Zero collision layers on both collision bodies so Jolt drops them from
 	## the broadphase immediately. Prevents phantom collisions (e.g. rockets
 	## hitting a stale body) during the queue_free() deferral window.
 	if _collision_body and is_instance_valid(_collision_body):
 		_collision_body.collision_layer = 0
 		_collision_body.collision_mask = 0
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		_compound_hit_body.collision_layer = 0
 
 
 # ======================================================================
-#  Block management
+#  Block management — helpers
 # ======================================================================
 
-func _spawn_block(bx: int, by: int, bz: int) -> void:
-	## Create a single block at grid position (bx, by, bz).
-	## Block has collision only — no individual mesh (greedy mesh handles visuals).
-	## Layer 11 (1024): weapon raycast detection only, NOT player physics.
-	var block_body := StaticBody3D.new()
-	block_body.set_script(_block_script)
-	block_body.name = "Block_%d_%d_%d" % [bx, by, bz]
-	block_body.grid_key = Vector3i(bx, by, bz)
-	block_body.parent_wall = self
-	block_body.collision_layer = CollisionLayers.WALL_BLOCKS
-	block_body.collision_mask = 0
-
-	# Position relative to structure center (local space)
-	var local_offset := Vector3(
-		(bx + 0.5 - _num_x * 0.5) * BLOCK_SIZE,
-		(by + 0.5 - _num_y * 0.5) * BLOCK_SIZE,
-		(bz + 0.5 - _num_z * 0.5) * BLOCK_SIZE
+func _block_local_pos(key: Vector3i) -> Vector3:
+	## Compute block position in structure-local space from grid coordinates.
+	return Vector3(
+		(key.x + 0.5 - _num_x * 0.5) * BLOCK_SIZE,
+		(key.y + 0.5 - _num_y * 0.5) * BLOCK_SIZE,
+		(key.z + 0.5 - _num_z * 0.5) * BLOCK_SIZE
 	)
-	block_body.position = local_offset
 
-	var col := CollisionShape3D.new()
-	col.shape = _block_shape.duplicate()
-	block_body.add_child(col)
 
-	# No MeshInstance3D — greedy mesh handles all rendering
-	add_child(block_body)
+func _disable_hit_shape(key: Vector3i) -> void:
+	## Disable the compound body shape for a destroyed/removed block.
+	if not _key_to_shape.has(key):
+		return
+	var shape_idx: int = _key_to_shape[key]
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		PhysicsServer3D.body_set_shape_disabled(
+			_compound_hit_body.get_rid(), shape_idx, true)
+	_key_to_shape.erase(key)
 
-	# Tag for fast C++ shielding classification (skips Object::get() probes).
-	# Tag 1 = WALL_BLOCK. HP cached on the physics body for zero-overhead reads.
-	PhysicsServer3D.body_set_shielding_tag(block_body.get_rid(), 1)
-	PhysicsServer3D.body_set_shielding_hp(block_body.get_rid(), _block_hp)
 
-	_blocks[Vector3i(bx, by, bz)] = {
-		"body": block_body,
-		"hp": _block_hp,
-	}
-	_block_grid[_grid_idx(bx, by, bz)] = 1
+func _update_compound_shielding_hp() -> void:
+	## Update the compound body's cached shielding HP (average of all blocks).
+	if not (_compound_hit_body and is_instance_valid(_compound_hit_body)):
+		return
+	var count := _block_hp_dict.size()
+	var total := 0.0
+	for hp: float in _block_hp_dict.values():
+		total += hp
+	var avg := total / maxf(float(count), 1.0) if count > 0 else 0.0
+	PhysicsServer3D.body_set_shielding_hp(_compound_hit_body.get_rid(), avg)
 
 
 # ======================================================================
@@ -370,26 +401,19 @@ func take_damage(_amount: float, _attacker_id: int) -> void:
 
 
 func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
-	## Called by wall_block.gd when a bullet hits a specific block.
+	## Called by compound_hit_body.gd when a bullet hits a specific block shape.
 	if not multiplayer.is_server():
 		return
-	if not _blocks.has(key):
-		return
-
-	var block_data: Dictionary = _blocks[key]
-	var block_body: StaticBody3D = block_data["body"]
-	if not is_instance_valid(block_body):
-		_blocks.erase(key)
-		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+	if not _block_hp_dict.has(key):
 		return
 
 	_last_attacker_id = _attacker_id
-	block_data["hp"] -= amount
-	PhysicsServer3D.body_set_shielding_hp(block_body.get_rid(), block_data["hp"])
-	if block_data["hp"] <= 0.0:
-		var block_pos: Vector3 = block_body.global_position
+	_block_hp_dict[key] -= amount
+	_update_compound_shielding_hp()
+	if _block_hp_dict[key] <= 0.0:
+		var block_pos: Vector3 = global_transform * _block_local_pos(key)
 		var debris_count := randi_range(1, 2)
-		var ok_frac := clampf(-block_data["hp"] / _block_hp, 0.0, 1.0)
+		var ok_frac := clampf(-_block_hp_dict[key] / _block_hp, 0.0, 1.0)
 
 		# Use the attacker's position as the blast origin so debris flies away
 		# from the shooter. Falls back to a random offset if attacker not found.
@@ -401,8 +425,8 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 				blast_origin = attacker.global_position
 
 		# Server: destroy block, sync to clients. Debris spawns on all peers via RPC.
-		block_body.queue_free()
-		_blocks.erase(key)
+		_disable_hit_shape(key)
+		_block_hp_dict.erase(key)
 		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
@@ -416,7 +440,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		# Check if destroying this block left floating islands
 		_check_structural_integrity()
 
-		if _blocks.is_empty():
+		if _block_hp_dict.is_empty():
 			_clear_physics_before_free()
 			queue_free()
 
@@ -426,12 +450,9 @@ func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 		blast_center: Vector3 = Vector3.ZERO, debris_count: int = 0,
 		debris_speed: float = 8.0) -> void:
 	## Client-side: remove a destroyed block, rebuild mesh, and spawn cosmetic debris.
-	if _blocks.has(key):
-		var block_data: Dictionary = _blocks[key]
-		var block_body: StaticBody3D = block_data["body"]
-		if is_instance_valid(block_body):
-			block_body.queue_free()
-		_blocks.erase(key)
+	if _block_hp_dict.has(key):
+		_disable_hit_shape(key)
+		_block_hp_dict.erase(key)
 		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)
@@ -448,7 +469,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	## explosion and a target block absorbs damage equal to its current HP.
 	## exclude_rids: physics bodies to ignore in shielding raycasts (e.g. the rocket).
 	print("[TakeDamageAt-ENTRY] %s  blocks=%d  is_server=%s  hit_pos=%s  global_pos=%s" % [
-		name, _blocks.size(), str(multiplayer.is_server()), str(hit_pos), str(global_position)])
+		name, _block_hp_dict.size(), str(multiplayer.is_server()), str(hit_pos), str(global_position)])
 	if not multiplayer.is_server():
 		return
 
@@ -474,11 +495,13 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	var t_query_setup_end := Time.get_ticks_usec()
 	var t_calc_explosion := Time.get_ticks_usec()
 	if space_state:
+		var compound_rid := _compound_hit_body.get_rid() if (_compound_hit_body and is_instance_valid(_compound_hit_body)) else RID()
 		var repeat_count := 2000 if GameManager.debug_explosion_repeat else 1
 		for _i in repeat_count:
 			explosion_result = space_state.calc_structure_explosion(
-				query, _blocks, _block_grid, global_transform, BLOCK_SIZE,
-				_num_x, _num_y, _num_z, blast_radius, amount, _block_hp
+				query, _block_hp_dict, _block_grid, global_transform, BLOCK_SIZE,
+				_num_x, _num_y, _num_z, blast_radius, amount, _block_hp,
+				compound_rid
 			)
 	var t_calc_explosion_end := Time.get_ticks_usec()
 
@@ -488,24 +511,25 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		destroyed_positions.assign(explosion_result["destroyed_positions"])
 		destroyed_overkill.assign(explosion_result["destroyed_overkill"])
 
-		# Update survived blocks — HP + shielding (tiny loop, ~42 blocks).
+		# Update survived blocks — HP only (compound body shielding HP updated once below).
 		var s_keys: Array = explosion_result["survived_keys"]
 		var s_hps: PackedFloat32Array = explosion_result["survived_hps"]
-		var s_rids: Array[RID] = explosion_result["survived_rids"]
 		for i in s_keys.size():
-			_blocks[s_keys[i]]["hp"] = s_hps[i]
-			PhysicsServer3D.body_set_shielding_hp(s_rids[i], s_hps[i])
+			_block_hp_dict[s_keys[i]] = s_hps[i]
+		_update_compound_shielding_hp()
 	var t_pass1_end := Time.get_ticks_usec()
 
-	# Erase destroyed blocks.
+	# Erase destroyed blocks — disable compound body shapes (instant vs queue_free).
 	var t_erase := Time.get_ticks_usec()
+	if destroyed_keys.size() > 0 and _compound_hit_body and is_instance_valid(_compound_hit_body):
+		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
 	for i in destroyed_keys.size():
 		var key: Vector3i = destroyed_keys[i]
-		var block_data: Dictionary = _blocks[key]
-		var block_body: StaticBody3D = block_data["body"]
-		block_body.queue_free()
-		_blocks.erase(key)
+		_disable_hit_shape(key)
+		_block_hp_dict.erase(key)
 		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+	if destroyed_keys.size() > 0 and _compound_hit_body and is_instance_valid(_compound_hit_body):
+		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 	var t_erase_end := Time.get_ticks_usec()
 
 	# Draw debug rays if toggled on
@@ -533,16 +557,30 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		rpc_count += 1
 	var t_debris_rpcs_end := Time.get_ticks_usec()
 	var t_debris_spawn := Time.get_ticks_usec()
-	for i in destroyed_keys.size():
-		var block_pos := destroyed_positions[i]
-		var ok_frac := destroyed_overkill[i]
-		var norm_dist := hit_pos.distance_to(block_pos) / blast_radius
-		var spd := DebrisHelper.calc_explosion_speed(norm_dist, ok_frac)
-		var to_spawn := randi_range(1, _debris_per_block)
-		var debris_origin := block_pos + (block_pos - hit_pos)
-		if to_spawn > 0:
-			_spawn_debris(block_pos, debris_origin, to_spawn, spd)
-			debris_spawn_count += to_spawn
+	# Batch debris spawn — build arrays and do one C++ call instead of per-block loop.
+	var n_destroyed := destroyed_keys.size()
+	if n_destroyed > 0:
+		var batch_positions := PackedVector3Array()
+		var batch_centers := PackedVector3Array()
+		var batch_counts := PackedInt32Array()
+		var batch_speeds := PackedFloat32Array()
+		batch_positions.resize(n_destroyed)
+		batch_centers.resize(n_destroyed)
+		batch_counts.resize(n_destroyed)
+		batch_speeds.resize(n_destroyed)
+		for i in n_destroyed:
+			var block_pos := destroyed_positions[i]
+			var ok_frac := destroyed_overkill[i]
+			var norm_dist := hit_pos.distance_to(block_pos) / blast_radius
+			batch_positions[i] = block_pos
+			batch_centers[i] = block_pos + (block_pos - hit_pos)
+			batch_counts[i] = randi_range(1, _debris_per_block)
+			batch_speeds[i] = DebrisHelper.calc_explosion_speed(norm_dist, ok_frac)
+			debris_spawn_count += batch_counts[i]
+		DebrisHelper.spawn_debris_batch(
+			batch_positions, batch_centers, batch_counts, batch_speeds,
+			_structure_material,
+			{"lifetime": _debris_lifetime, "mass": _debris_mass})
 	var t_debris_spawn_end := Time.get_ticks_usec()
 	var t_debris_end := Time.get_ticks_usec()
 
@@ -579,7 +617,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	var t_total_end := Time.get_ticks_usec()
 	var _total_us := t_total_end - t_total
 	print("[TakeDamageAt] %s  blocks=%d  pass1=%dus(query=%d calc=%d)  erase=%dus  debris=%dus(rpcs=%d spawned=%d rpc_time=%d spawn_time=%d)  columns=%dus(%d rebuild=%d commit=%d)  integrity=%dus  destroyed=%d  total=%dus" % [
-		name, _blocks.size(),
+		name, _block_hp_dict.size(),
 		t_pass1_end - t_pass1, t_query_setup_end - t_query_setup, t_calc_explosion_end - t_calc_explosion,
 		t_erase_end - t_erase,
 		t_debris_end - t_debris, rpc_count, debris_spawn_count, t_debris_rpcs_end - t_debris_rpcs, t_debris_spawn_end - t_debris_spawn,
@@ -591,7 +629,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	GameManager.tick_add("take_damage_at", _total_us)
 
 	# If all blocks gone, remove the structure node entirely
-	if _blocks.is_empty():
+	if _block_hp_dict.is_empty():
 		_clear_physics_before_free()
 		queue_free()
 
@@ -611,7 +649,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 		"block_key": Vector3i.ZERO, "block_pos": Vector3.ZERO }
 	if not multiplayer.is_server():
 		return empty_result
-	if _blocks.is_empty():
+	if _block_hp_dict.is_empty():
 		return empty_result
 
 	_last_attacker_id = p_attacker_id
@@ -624,14 +662,14 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	var target_key := Vector3i(gx, gy, gz)
 
 	# If exact key doesn't exist, find the nearest block within 2 cells
-	if not _blocks.has(target_key):
+	if not _block_hp_dict.has(target_key):
 		var best_key := Vector3i(-1, -1, -1)
 		var best_dist_sq := 999.0
 		for dx in range(-2, 3):
 			for dy in range(-2, 3):
 				for dz in range(-2, 3):
 					var candidate := Vector3i(gx + dx, gy + dy, gz + dz)
-					if _blocks.has(candidate):
+					if _block_hp_dict.has(candidate):
 						var d := Vector3(dx, dy, dz).length_squared()
 						if d < best_dist_sq:
 							best_dist_sq = d
@@ -640,27 +678,27 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 			return empty_result
 		target_key = best_key
 
-	var block_data: Dictionary = _blocks[target_key]
-	var block_body: StaticBody3D = block_data["body"]
-	var hp_before: float = block_data["hp"]
+	var hp_before: float = _block_hp_dict[target_key]
 	var absorbed: float = minf(damage, hp_before)
 
 	# Apply damage
-	block_data["hp"] -= damage
-	if block_data["hp"] > 0.0:
-		PhysicsServer3D.body_set_shielding_hp(block_body.get_rid(), block_data["hp"])
+	_block_hp_dict[target_key] -= damage
+	if _block_hp_dict[target_key] > 0.0:
+		_update_compound_shielding_hp()
+		var block_pos_local := _block_local_pos(target_key)
 		return { "absorbed": absorbed, "block_destroyed": false,
-			"block_key": target_key, "block_pos": block_body.global_position }
+			"block_key": target_key, "block_pos": global_transform * block_pos_local }
 
 	# Block destroyed
-	var block_pos: Vector3 = block_body.global_position
-	var ok_frac := clampf(-block_data["hp"] / _block_hp, 0.0, 1.0)
-	block_body.queue_free()
-	_blocks.erase(target_key)
+	var block_pos: Vector3 = global_transform * _block_local_pos(target_key)
+	var ok_frac := clampf(-_block_hp_dict[target_key] / _block_hp, 0.0, 1.0)
+	_disable_hit_shape(target_key)
+	_block_hp_dict.erase(target_key)
 	_block_grid[_grid_idx(target_key.x, target_key.y, target_key.z)] = 0
 	_mesh_dirty = true
 	set_process(true)
 	_rebuild_column_batched(target_key.x, target_key.z)
+	_update_compound_shielding_hp()
 
 	# Sync destruction + debris to clients
 	var debris_count := randi_range(1, 2)
@@ -669,9 +707,9 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	_spawn_debris(block_pos, hit_world_pos, debris_count, spd)
 
 	# Structural integrity check (may detach more blocks)
-	if not _blocks.is_empty():
+	if not _block_hp_dict.is_empty():
 		_check_structural_integrity()
-	if _blocks.is_empty():
+	if _block_hp_dict.is_empty():
 		_clear_physics_before_free()
 		queue_free()
 
@@ -706,146 +744,106 @@ func _spawn_debris(block_pos: Vector3, blast_center: Vector3, count: int,
 
 func _check_structural_integrity() -> void:
 	## Server-only: find blocks not connected to ground and detach them.
+	## Single C++ call does ground-BFS + component finding (replaces old
+	## calc_structural_integrity + GDScript _find_connected_components).
 	if not multiplayer.is_server():
 		return
-	if _blocks.is_empty():
+	if _block_hp_dict.is_empty():
 		return
-	# Detached structures have no y=0 ground blocks by definition.  Skip the
-	# integrity cascade — otherwise every single block destruction would
-	# re-detach ALL remaining blocks into yet another new structure, creating
-	# an infinite chain of ephemeral objects.
 	if _is_detached_structure:
 		return
 
 	var t_si_total := Time.get_ticks_usec()
 
-	# C++ BFS: returns PackedInt32Array of (bx,by,bz) triplets for unsupported blocks.
-	# Handles ground seed collection, BFS expansion, early exit, and result gathering
-	# entirely in native code with raw pointer access (~20-40x faster than GDScript).
-	var space_state := get_world_3d().direct_space_state
-	var result := space_state.calc_structural_integrity(
-		_block_grid, _num_x, _num_y, _num_z, _blocks.size())
+	# C++ ground-BFS + component finding in one native call.
+	# Returns Array of TypedArray[Vector3i] — one per disconnected component.
+	var components: Array = BlockMeshBuilder.calc_integrity_components(
+		_block_grid, _num_x, _num_y, _num_z, _block_hp_dict.size())
 
-	# Early exit: no unsupported blocks (C++ already logged BFS timing)
-	if result.is_empty():
+	if components.is_empty():
 		GameManager.tick_add("structural_integrity", Time.get_ticks_usec() - t_si_total)
 		return
 
-	# Parse triplets into Vector3i array
-	var unsupported: Array[Vector3i] = []
-	var count := result.size() / 3
-	unsupported.resize(count)
-	for i in count:
-		var base := i * 3
-		unsupported[i] = Vector3i(result[base], result[base + 1], result[base + 2])
-
-	# Group unsupported blocks into connected components, each becomes a cluster
-	var t_comp := Time.get_ticks_usec()
-	var components := _find_connected_components(unsupported)
-	var t_comp_end := Time.get_ticks_usec()
-
 	var t_detach := Time.get_ticks_usec()
-	for component in components:
-		_detach_cluster(component)
+	_detach_clusters(components)
 	var t_detach_end := Time.get_ticks_usec()
 
 	var si_us := Time.get_ticks_usec() - t_si_total
-	print("[StructuralIntegrity] %s  blocks=%d  unsupported=%d  components=%dus(%d)  detach=%dus  total=%dus" % [
-		name, _blocks.size(), unsupported.size(),
-		t_comp_end - t_comp, components.size(),
-		t_detach_end - t_detach,
-		si_us,
+	print("[StructuralIntegrity] %s  blocks=%d  components=%d  detach=%dus  total=%dus" % [
+		name, _block_hp_dict.size(), components.size(),
+		t_detach_end - t_detach, si_us,
 	])
 	GameManager.tick_add("structural_integrity", si_us)
 
 
-func _find_connected_components(keys: Array[Vector3i]) -> Array:
-	## Given a list of block keys, group into connected components via BFS.
-	## Returns Array of Array[Vector3i], each sub-array is one component.
-	var key_set: Dictionary = {}
-	for key in keys:
-		key_set[key] = true
+func _detach_clusters(components: Array) -> void:
+	## Batch-detach all unsupported components in a single bulk-mode session.
+	## Enters bulk mode ONCE for compound hit body and smooth collision body,
+	## deduplicates column rebuilds across all components, single shielding update.
+	var t_total := Time.get_ticks_usec()
 
-	var visited: Dictionary = {}
-	var components: Array = []
-
-	for start_key in keys:
-		if visited.has(start_key):
-			continue
-		var component: Array[Vector3i] = []
-		var queue: Array[Vector3i] = [start_key]
-		visited[start_key] = true
-		var head := 0
-		while head < queue.size():
-			var current: Vector3i = queue[head]
-			head += 1
-			component.append(current)
-			for offset in NEIGHBOR_OFFSETS:
-				var neighbor: Vector3i = current + offset
-				if key_set.has(neighbor) and not visited.has(neighbor):
-					visited[neighbor] = true
-					queue.append(neighbor)
-		components.append(component)
-
-	return components
-
-
-func _detach_cluster(block_keys: Array[Vector3i]) -> void:
-	## Remove unsupported blocks from the structure and spawn a FallingBlockCluster.
-	## Server-authoritative: server computes, then RPCs to all peers.
-	if block_keys.is_empty():
-		return
-
-	var t_detach_total := Time.get_ticks_usec()
-
-	# Compute centroid and collect per-block HP before erasing
+	# ── Collect per-component data (centroids, valid keys, HPs) ──
 	var t_collect := Time.get_ticks_usec()
-	var centroid_local := Vector3.ZERO
-	var valid_count := 0
-	var valid_keys: Array[Vector3i] = []
-	var block_hps: Array[float] = []
+	var cluster_data: Array = []  # Array of {keys, hps, centroid_world, mass}
+	var all_valid_keys: Array[Vector3i] = []
 
-	for key in block_keys:
-		if not _blocks.has(key):
-			continue
-		var block_data: Dictionary = _blocks[key]
-		var block_body: StaticBody3D = block_data["body"]
-		if is_instance_valid(block_body):
-			centroid_local += block_body.position
+	for component in components:
+		var centroid_local := Vector3.ZERO
+		var valid_count := 0
+		var valid_keys: Array[Vector3i] = []
+		var block_hps: Array[float] = []
+
+		for key in component:
+			if not _block_hp_dict.has(key):
+				continue
+			centroid_local += _block_local_pos(key)
 			valid_count += 1
 			valid_keys.append(key)
-			block_hps.append(block_data["hp"])
+			block_hps.append(_block_hp_dict[key])
 
-	if valid_count == 0:
-		return
+		if valid_count == 0:
+			continue
 
-	centroid_local /= float(valid_count)
-	var centroid_world: Vector3 = global_transform * centroid_local
-	var cluster_mass: float = valid_count * _get_block_mass()
+		centroid_local /= float(valid_count)
+		var centroid_world: Vector3 = global_transform * centroid_local
+		var cluster_mass: float = valid_count * _get_block_mass()
+
+		cluster_data.append({
+			"keys": valid_keys,
+			"hps": block_hps,
+			"centroid": centroid_world,
+			"mass": cluster_mass,
+		})
+		all_valid_keys.append_array(valid_keys)
 	var t_collect_end := Time.get_ticks_usec()
 
-	# Remove blocks from the structure (server side)
+	if cluster_data.is_empty():
+		return
+
+	# ── Erase blocks: single bulk-mode session for compound hit body ──
 	var t_erase := Time.get_ticks_usec()
-	for key in valid_keys:
-		if _blocks.has(key):
-			var block_data: Dictionary = _blocks[key]
-			var block_body: StaticBody3D = block_data["body"]
-			if is_instance_valid(block_body):
-				block_body.collision_layer = 0
-				block_body.queue_free()
-			_blocks.erase(key)
+	var has_compound := _compound_hit_body and is_instance_valid(_compound_hit_body)
+	if has_compound:
+		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
+	for key in all_valid_keys:
+		if _block_hp_dict.has(key):
+			_disable_hit_shape(key)
+			_block_hp_dict.erase(key)
 			_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+	if has_compound:
+		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
+	_update_compound_shielding_hp()
 	var t_erase_end := Time.get_ticks_usec()
 
-	# Rebuild visuals and smooth collision for affected columns (bulk = single compound rebuild)
-	var t_col_rebuild := Time.get_ticks_usec()
+	# ── Rebuild columns: single bulk-mode session, deduplicated ──
+	var t_col := Time.get_ticks_usec()
 	_mesh_dirty = true
 	set_process(true)
 	var body_rid := _collision_body.get_rid()
 	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, true)
 	var rebuilt_columns: Dictionary = {}
 	var num_col_rebuilt := 0
-	for key in valid_keys:
+	for key in all_valid_keys:
 		var col_key := Vector2i(key.x, key.z)
 		if not rebuilt_columns.has(col_key):
 			rebuilt_columns[col_key] = true
@@ -853,21 +851,22 @@ func _detach_cluster(block_keys: Array[Vector3i]) -> void:
 			num_col_rebuilt += 1
 	_commit_all_shapes()
 	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, false)
-	var t_col_rebuild_end := Time.get_ticks_usec()
+	var t_col_end := Time.get_ticks_usec()
 
-	# Sync to all peers — pass per-block HP and grid info for cluster init
+	# ── RPC each cluster to all peers ──
 	var t_rpc := Time.get_ticks_usec()
-	_sync_cluster_detach.rpc(valid_keys, block_hps, centroid_world, cluster_mass,
-		_last_attacker_id, _num_x, _num_y, _num_z, _get_block_mass())
+	for data in cluster_data:
+		_sync_cluster_detach.rpc(data["keys"], data["hps"], data["centroid"], data["mass"],
+			_last_attacker_id, _num_x, _num_y, _num_z, _get_block_mass())
 	var t_rpc_end := Time.get_ticks_usec()
 
-	print("[DetachCluster] %s  blocks=%d  collect=%dus  erase=%dus  columns=%dus(%d)  rpc+spawn=%dus  total=%dus" % [
-		name, valid_count,
+	print("[DetachClusters] %s  components=%d  blocks=%d  collect=%dus  erase=%dus  columns=%dus(%d)  rpc=%dus  total=%dus" % [
+		name, cluster_data.size(), all_valid_keys.size(),
 		t_collect_end - t_collect,
 		t_erase_end - t_erase,
-		t_col_rebuild_end - t_col_rebuild, num_col_rebuilt,
+		t_col_end - t_col, num_col_rebuilt,
 		t_rpc_end - t_rpc,
-		Time.get_ticks_usec() - t_detach_total,
+		Time.get_ticks_usec() - t_total,
 	])
 
 
@@ -878,21 +877,21 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 	## All peers: remove detached blocks (clients only) and create the falling cluster.
 	var t_sync_total := Time.get_ticks_usec()
 
-	# Server: blocks already cleaned up in _detach_cluster(). Client: erase now.
+	# Server: blocks already cleaned up in _detach_clusters(). Client: erase now.
 	var t_client_cleanup := Time.get_ticks_usec()
 	if multiplayer.is_server():
-		pass  # Blocks already erased and queue_freed in _detach_cluster()
+		pass  # Blocks already erased and shapes disabled in _detach_clusters()
 	else:
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
 		for key_variant in block_keys:
 			var key: Vector3i = key_variant
-			if _blocks.has(key):
-				var block_data: Dictionary = _blocks[key]
-				var block_body: StaticBody3D = block_data["body"]
-				if is_instance_valid(block_body):
-					block_body.collision_layer = 0
-					block_body.queue_free()
-				_blocks.erase(key)
+			if _block_hp_dict.has(key):
+				_disable_hit_shape(key)
+				_block_hp_dict.erase(key)
 				_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 
 		_mesh_dirty = true
 		set_process(true)
@@ -977,13 +976,11 @@ func _spawn_detached_structure(block_keys: Array[Vector3i],
 
 	# Diagnostic: print creation details + first block's global position
 	var sample_block_pos := "N/A"
-	if not new_structure._blocks.is_empty():
-		var first_key: Vector3i = new_structure._blocks.keys()[0]
-		var first_body: StaticBody3D = new_structure._blocks[first_key]["body"]
-		if is_instance_valid(first_body):
-			sample_block_pos = str(first_body.global_position)
+	if not new_structure._block_hp_dict.is_empty():
+		var first_key: Vector3i = new_structure._block_hp_dict.keys()[0]
+		sample_block_pos = str(new_structure.global_transform * new_structure._block_local_pos(first_key))
 	print("[SpawnDetachedStructure] name=%s  blocks=%d  parent=%s  struct_pos=%s  sample_block_pos=%s  script=%s" % [
-		new_structure.name, new_structure._blocks.size(),
+		new_structure.name, new_structure._block_hp_dict.size(),
 		new_structure.get_parent().name if new_structure.get_parent() else "null",
 		str(new_structure.global_position), sample_block_pos,
 		str(new_structure.get_script().resource_path)])
@@ -1361,11 +1358,11 @@ func _rebuild_greedy_mesh() -> void:
 	if _mesh_instance == null:
 		return
 
-	if _blocks.is_empty():
+	if _block_hp_dict.is_empty():
 		_mesh_instance.mesh = null
 		return
 
-	var block_count := _blocks.size()
+	var block_count := _block_hp_dict.size()
 	var max_verts := block_count * 24  # 6 faces * 4 verts
 	var max_idx := block_count * 36    # 6 faces * 6 indices
 
@@ -1386,7 +1383,7 @@ func _rebuild_greedy_mesh() -> void:
 	var bs := BLOCK_SIZE
 	var hs := bs * 0.5
 
-	for key: Vector3i in _blocks:
+	for key: Vector3i in _block_hp_dict:
 		var bx: int = key.x
 		var by: int = key.y
 		var bz: int = key.z
@@ -1396,7 +1393,7 @@ func _rebuild_greedy_mesh() -> void:
 		var cz: float = (bz + 0.5) * bs - half_z
 
 		# +X face
-		if not _blocks.has(Vector3i(bx + 1, by, bz)):
+		if not _block_hp_dict.has(Vector3i(bx + 1, by, bz)):
 			var n := Vector3.RIGHT
 			var x := cx + hs
 			var p0 := Vector3(x, cy - hs, cz - hs)
@@ -1412,7 +1409,7 @@ func _rebuild_greedy_mesh() -> void:
 			vi += 4; ii += 6
 
 		# -X face
-		if not _blocks.has(Vector3i(bx - 1, by, bz)):
+		if not _block_hp_dict.has(Vector3i(bx - 1, by, bz)):
 			var n := Vector3.LEFT
 			var x := cx - hs
 			var p0 := Vector3(x, cy - hs, cz + hs)
@@ -1428,7 +1425,7 @@ func _rebuild_greedy_mesh() -> void:
 			vi += 4; ii += 6
 
 		# +Y face (top)
-		if not _blocks.has(Vector3i(bx, by + 1, bz)):
+		if not _block_hp_dict.has(Vector3i(bx, by + 1, bz)):
 			var n := Vector3.UP
 			var y := cy + hs
 			var p0 := Vector3(cx - hs, y, cz - hs)
@@ -1444,7 +1441,7 @@ func _rebuild_greedy_mesh() -> void:
 			vi += 4; ii += 6
 
 		# -Y face (bottom)
-		if not _blocks.has(Vector3i(bx, by - 1, bz)):
+		if not _block_hp_dict.has(Vector3i(bx, by - 1, bz)):
 			var n := Vector3.DOWN
 			var y := cy - hs
 			var p0 := Vector3(cx - hs, y, cz + hs)
@@ -1460,7 +1457,7 @@ func _rebuild_greedy_mesh() -> void:
 			vi += 4; ii += 6
 
 		# +Z face
-		if not _blocks.has(Vector3i(bx, by, bz + 1)):
+		if not _block_hp_dict.has(Vector3i(bx, by, bz + 1)):
 			var n := Vector3.BACK
 			var z := cz + hs
 			var p0 := Vector3(cx + hs, cy - hs, z)
@@ -1476,7 +1473,7 @@ func _rebuild_greedy_mesh() -> void:
 			vi += 4; ii += 6
 
 		# -Z face
-		if not _blocks.has(Vector3i(bx, by, bz - 1)):
+		if not _block_hp_dict.has(Vector3i(bx, by, bz - 1)):
 			var n := Vector3.FORWARD
 			var z := cz - hs
 			var p0 := Vector3(cx - hs, cy - hs, z)

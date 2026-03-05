@@ -256,9 +256,18 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 	_update_compound_shielding_hp()
 
 	if grid.block_hp[key] <= 0.0:
+		var ok_frac := clampf(-grid.block_hp[key] / _block_hp_max, 0.0, 1.0)
+		var spd := DebrisHelper.calc_hitscan_speed(ok_frac)
+		# Use attacker position as blast origin so debris flies away from shooter
+		var blast_pos := Vector3.INF
+		var players_node := get_tree().current_scene.get_node_or_null("Players")
+		if players_node and _attacker_id >= 0:
+			var attacker := players_node.get_node_or_null(str(_attacker_id))
+			if attacker and is_instance_valid(attacker):
+				blast_pos = attacker.global_position
 		grid.erase_block(key)
 		_disable_hit_shape(key)
-		_after_blocks_destroyed([key])
+		_after_blocks_destroyed([key], blast_pos, [spd])
 
 
 func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
@@ -379,6 +388,14 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 		_update_compound_shielding_hp()
 
 	if not destroyed_keys.is_empty():
+		# Compute per-block debris speeds BEFORE erasing (need block_hp for overkill).
+		var per_block_speeds: Array[float] = []
+		for key in destroyed_keys:
+			var block_world: Vector3 = global_transform * grid.block_local_pos(key)
+			var norm_d: float = hit_pos.distance_to(block_world) / blast_radius
+			var ok_frac: float = clampf(-grid.block_hp[key] / _block_hp_max, 0.0, 1.0)
+			per_block_speeds.append(DebrisHelper.calc_explosion_speed(norm_d, ok_frac))
+
 		# Bulk mode: disable all shapes in one commit instead of N rebuilds.
 		if _compound_hit_body and is_instance_valid(_compound_hit_body):
 			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
@@ -388,7 +405,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 		if _compound_hit_body and is_instance_valid(_compound_hit_body):
 			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 		var _t_abd := Time.get_ticks_usec()
-		_after_blocks_destroyed(destroyed_keys)
+		_after_blocks_destroyed(destroyed_keys, hit_pos, per_block_speeds, true)
 		var _t_abd_us := Time.get_ticks_usec() - _t_abd
 		var total_us := Time.get_ticks_usec() - _t_take_damage_at
 		print("[ClusterPerf] take_damage_at %s: %d blocks hit, %d destroyed, raycasts=%dus after_destroyed=%dus total=%dus" % [
@@ -437,10 +454,11 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 		return { "absorbed": absorbed, "block_destroyed": false,
 			"block_key": best_key, "block_pos": block_world }
 
-	# Block destroyed
+	# Block destroyed — compute momentum speed before erasing
+	var momentum_spd := DebrisHelper.calc_momentum_speed(_impact_speed)
 	grid.erase_block(best_key)
 	_disable_hit_shape(best_key)
-	_after_blocks_destroyed([best_key])
+	_after_blocks_destroyed([best_key], hit_world_pos, [momentum_spd])
 
 	return { "absorbed": absorbed, "block_destroyed": true,
 		"block_key": best_key, "block_pos": block_world }
@@ -450,9 +468,15 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 #  Post-destruction cleanup
 # ======================================================================
 
-func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
+func _after_blocks_destroyed(destroyed_keys: Array[Vector3i],
+		blast_origin: Vector3 = Vector3.INF,
+		precomputed_speeds: Array[float] = [],
+		is_explosion: bool = false) -> void:
 	## Shared cleanup after blocks are destroyed. Updates mass, syncs to
 	## clients, spawns debris, and schedules visual rebuild.
+	## blast_origin: explosion/attacker/impact position for debris direction (INF = random).
+	## precomputed_speeds: per-block speeds from caller (empty = fallback to hitscan).
+	## is_explosion: true = mirror debris away from blast; false = direct toward origin.
 	var _t_abd_start := Time.get_ticks_usec()
 
 	# Wake up frozen/settled clusters so they (and any fragments) fall properly.
@@ -465,15 +489,18 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 	_mesh_dirty = true
 	set_process(true)
 
-	# Compute world positions for debris spawning before syncing
+	# Compute world positions and use precomputed speeds (or fallback)
 	var block_positions: Array[Vector3] = []
 	var debris_speeds: Array[float] = []
-	for key in destroyed_keys:
-		var local_pos := grid.block_local_pos(key)
+	var has_speeds := precomputed_speeds.size() == destroyed_keys.size()
+	for i in destroyed_keys.size():
+		var local_pos := grid.block_local_pos(destroyed_keys[i])
 		var world_pos := global_transform * local_pos
 		block_positions.append(world_pos)
-		# Hitscan-style speed (no blast radius context on clusters)
-		debris_speeds.append(DebrisHelper.calc_hitscan_speed(0.0))
+		if has_speeds:
+			debris_speeds.append(precomputed_speeds[i])
+		else:
+			debris_speeds.append(DebrisHelper.calc_hitscan_speed(0.0))
 
 	# Sync to clients (call_remote — server rebuilds via _process)
 	var keys_variant: Array = []
@@ -483,10 +510,11 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i]) -> void:
 		keys_variant.append(destroyed_keys[i])
 		positions_variant.append(block_positions[i])
 		speeds_variant.append(debris_speeds[i])
-	_sync_blocks_destroyed.rpc(keys_variant, positions_variant, speeds_variant)
+	_sync_blocks_destroyed.rpc(keys_variant, positions_variant, speeds_variant,
+		blast_origin, is_explosion)
 
 	# Host also spawns debris locally (RPC is call_remote)
-	_spawn_debris_for_blocks(block_positions, debris_speeds)
+	_spawn_debris_for_blocks(block_positions, debris_speeds, blast_origin, is_explosion)
 
 	if grid.is_empty():
 		_clear_physics_before_free()
@@ -512,7 +540,8 @@ func _update_mass() -> void:
 
 @rpc("authority", "call_remote", "reliable")
 func _sync_blocks_destroyed(keys: Array, positions: Array = [],
-		speeds: Array = []) -> void:
+		speeds: Array = [], p_blast_origin: Vector3 = Vector3.INF,
+		p_is_explosion: bool = false) -> void:
 	## Client-side: remove destroyed blocks, spawn debris, and schedule visual rebuild.
 	if _compound_hit_body and is_instance_valid(_compound_hit_body):
 		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
@@ -532,7 +561,7 @@ func _sync_blocks_destroyed(keys: Array, positions: Array = [],
 		for i in positions.size():
 			typed_positions.append(positions[i] as Vector3)
 			typed_speeds.append(float(speeds[i]) if i < speeds.size() else 8.0)
-		_spawn_debris_for_blocks(typed_positions, typed_speeds)
+		_spawn_debris_for_blocks(typed_positions, typed_speeds, p_blast_origin, p_is_explosion)
 
 	if grid.is_empty():
 		_clear_physics_before_free()
@@ -540,22 +569,42 @@ func _sync_blocks_destroyed(keys: Array, positions: Array = [],
 
 
 func _spawn_debris_for_blocks(block_positions: Array[Vector3],
-		debris_speeds: Array[float]) -> void:
+		debris_speeds: Array[float], blast_origin: Vector3 = Vector3.INF,
+		is_explosion: bool = false) -> void:
 	## Spawn cosmetic debris for destroyed blocks (both server host and clients).
+	## blast_origin: hit/attacker position (INF = random scatter).
+	## is_explosion: if true, mirrors per-block away from blast (like structures).
+	##   If false, passes blast_origin directly as blast_center (hitscan/momentum).
 	var mat: StandardMaterial3D = null
 	if _mesh_instance and _mesh_instance.material_override:
 		mat = _mesh_instance.material_override
 	if mat == null:
 		return
-	var config := { "size": _debris_size, "lifetime": _debris_lifetime,
-		"mass": _debris_mass, "name": _debris_name }
-	for i in block_positions.size():
+	var has_blast := blast_origin != Vector3.INF
+	var n_blocks := block_positions.size()
+	var batch_positions := PackedVector3Array()
+	var batch_centers := PackedVector3Array()
+	var batch_counts := PackedInt32Array()
+	var batch_speeds := PackedFloat32Array()
+	batch_positions.resize(n_blocks)
+	batch_centers.resize(n_blocks)
+	batch_counts.resize(n_blocks)
+	batch_speeds.resize(n_blocks)
+	for i in n_blocks:
 		var pos: Vector3 = block_positions[i]
-		var spd: float = debris_speeds[i] if i < debris_speeds.size() else 8.0
-		var count := randi_range(1, 2)
-		# Use a random nearby point as blast origin for scattered debris direction
-		var blast_origin := pos + Vector3(randf_range(-1, 1), 0, randf_range(-1, 1)).normalized() * 0.5
-		DebrisHelper.spawn_debris(get_parent(), pos, blast_origin, count, mat, spd, config)
+		batch_positions[i] = pos
+		batch_speeds[i] = debris_speeds[i] if i < debris_speeds.size() else 8.0
+		batch_counts[i] = randi_range(1, 2)
+		if has_blast:
+			if is_explosion:
+				batch_centers[i] = pos + (pos - blast_origin)
+			else:
+				batch_centers[i] = blast_origin
+		else:
+			batch_centers[i] = pos + Vector3(randf_range(-1, 1), 0, randf_range(-1, 1)).normalized() * 0.5
+	DebrisHelper.spawn_debris_batch(
+		batch_positions, batch_centers, batch_counts, batch_speeds,
+		mat, {"lifetime": _debris_lifetime, "mass": _debris_mass})
 
 
 # ======================================================================

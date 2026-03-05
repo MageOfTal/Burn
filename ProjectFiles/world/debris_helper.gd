@@ -52,6 +52,30 @@ static func calc_momentum_speed(impact_speed: float) -> float:
 ##     "mass"     (float)  — RigidBody3D mass
 ##     "name"     (String) — unused with pooling
 
+## Batch-spawn debris for multiple blocks in one C++ call.
+## block_positions, blast_centers, counts, speeds: parallel arrays (one per block).
+## Speeds are clamped to MIN_SPEED.
+static func spawn_debris_batch(
+	block_positions: PackedVector3Array,
+	blast_centers: PackedVector3Array,
+	counts: PackedInt32Array,
+	speeds: PackedFloat32Array,
+	material: Material,
+	config: Dictionary,
+) -> void:
+	if GameManager.disable_debris:
+		return
+	var lifetime: float = config.get("lifetime", 5.0)
+	var mass_val: float = config.get("mass", 0.5)
+	# Clamp speeds to minimum.
+	for i in speeds.size():
+		if speeds[i] < MIN_SPEED:
+			speeds[i] = MIN_SPEED
+	DebrisManager.spawn_multi_batch(
+		block_positions, blast_centers, counts, speeds,
+		material, mass_val, lifetime)
+
+
 static func spawn_debris(
 	parent_node: Node,
 	block_pos: Vector3,
