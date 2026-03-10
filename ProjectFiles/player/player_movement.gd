@@ -14,7 +14,7 @@ class_name PlayerMovement
 #  Constants
 # ======================================================================
 
-const SPEED := 50.0
+const SPEED := 9.1
 const JUMP_VELOCITY := 10.5
 const WALK_ACCEL: float = 30.33  ## Ground acceleration (m/s²) — 0.3s to top speed
 const ACCELERATION := 45.0
@@ -25,7 +25,7 @@ const AIR_DECELERATION := 0.0
 const FLOOR_MAX_ANGLE: float = 0.8727  ## 50 degrees — walkable threshold
 const SLOPE_MAX_GROUND_ANGLE: float = 1.4835  ## 85 degrees — grounding ceiling
 const SLOPE_SLIDE_MAX_SPEED: float = 20.0  ## Terminal velocity for slope gravity
-const CONTROL_SPEED_THRESHOLD: float = 50.0  ## Below this: instant stop, full control. Above: uncontrolled skid.
+const CONTROL_SPEED_THRESHOLD: float = 13.0  ## Below this: instant stop, full control. Above: uncontrolled skid.
 const INSTANT_STOP_THRESHOLD: float = 13.0  ## Above this: friction decel on release instead of instant stop
 const SKID_FRICTION: float = 20.0  ## Deceleration (m/s²) in uncontrolled regime
 const SKID_STEER_STRENGTH: float = 3.0  ## How fast skid direction rotates toward input (lerp rate/sec)
@@ -52,6 +52,10 @@ var _best_contact_normal: Vector3 = Vector3.ZERO  ## Most upward-facing contact 
 ## Press undo: tracks the press velocity applied last frame so we can undo it
 ## if the capsule launched (solver didn't absorb it because there's no contact).
 var _last_press_vel: Vector3 = Vector3.ZERO
+
+## Landing correction: position/velocity we sent Jolt last frame, used to undo
+## slope deflection on landing (solver converts vertical impact into horizontal).
+var _last_sent_pos: Vector3 = Vector3.ZERO
 
 
 ## Non-floor obstacle normals (>FLOOR_MAX_ANGLE) for wall-slide projection
@@ -161,6 +165,18 @@ func pre_physics_step(delta: float) -> void:
 	if _momentum_launch_flash > 0.0:
 		_momentum_launch_flash = maxf(_momentum_launch_flash - delta, 0.0)
 	_update_ground_state()
+
+	# Landing correction: Jolt's solver deflects vertical impacts along slopes,
+	# creating unwanted horizontal displacement. On landing, if we weren't moving
+	# at skid speeds, snap XZ back to pre-impact position and restore horizontal
+	# velocity. Y stays as Jolt resolved it (correctly on the surface).
+	if not _was_grounded and _is_grounded and _last_sent_pos != Vector3.ZERO:
+		var sent_h_speed := Vector2(_dbg_set_vel.x, _dbg_set_vel.z).length()
+		if sent_h_speed < CONTROL_SPEED_THRESHOLD:
+			player.global_position.x = _last_sent_pos.x
+			player.global_position.z = _last_sent_pos.z
+			player.velocity.x = _dbg_set_vel.x
+			player.velocity.z = _dbg_set_vel.z
 
 	# Proportional press undo: measure how much the solver absorbed the press
 	# by projecting the solver's velocity correction onto the press direction.
@@ -309,8 +325,9 @@ func post_physics_step(_delta: float, _grapple_active: bool) -> void:
 
 	_prev_frame_trace = _frame_trace
 
-	# Record what we're giving Jolt (for solver delta next frame)
+	# Record what we're giving Jolt (for solver delta and landing correction next frame)
 	_dbg_set_vel = player.velocity
+	_last_sent_pos = player.global_position
 	_dbg_set_pos_y = player.global_position.y
 
 
@@ -658,3 +675,4 @@ func reset_movement() -> void:
 	_floor_y = -INF
 	_slope_traction = 1.0
 	_last_press_vel = Vector3.ZERO
+	_last_sent_pos = Vector3.ZERO
