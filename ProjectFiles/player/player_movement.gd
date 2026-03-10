@@ -1,8 +1,8 @@
 extends PlayerSubsystem
 class_name PlayerMovement
 
-## Player movement subsystem — owns floor detection, grounded position control,
-## wall-slide, acceleration, and the Jolt integration undo pipeline.
+## Player movement subsystem — owns floor detection, slope-projected velocity,
+## wall-slide, and acceleration. Jolt handles position integration and collision.
 ##
 ## Delegated from player.gd: player retains _integrate_forces() and
 ## _physics_process() callbacks but calls into movement at specific points.
@@ -14,8 +14,9 @@ class_name PlayerMovement
 #  Constants
 # ======================================================================
 
-const SPEED := 9.1
+const SPEED := 50.0
 const JUMP_VELOCITY := 10.5
+const WALK_ACCEL: float = 30.33  ## Ground acceleration (m/s²) — 0.3s to top speed
 const ACCELERATION := 45.0
 const DECELERATION := 30.0
 const AIR_ACCELERATION := 15.0
@@ -24,16 +25,17 @@ const AIR_DECELERATION := 0.0
 const FLOOR_MAX_ANGLE: float = 0.8727  ## 50 degrees — walkable threshold
 const SLOPE_MAX_GROUND_ANGLE: float = 1.4835  ## 85 degrees — grounding ceiling
 const SLOPE_SLIDE_MAX_SPEED: float = 20.0  ## Terminal velocity for slope gravity
-const FLOOR_SNAP_MARGIN: float = 0.3
-const CAPSULE_RADIUS: float = 0.4
-const FLOOR_CONTACT_TOLERANCE: float = 0.1
-const LAUNCH_DOT_THRESHOLD: float = 2.0  ## Quake-style: dot(velocity, normal) above this = launch
+const CONTROL_SPEED_THRESHOLD: float = 50.0  ## Below this: instant stop, full control. Above: uncontrolled skid.
+const INSTANT_STOP_THRESHOLD: float = 13.0  ## Above this: friction decel on release instead of instant stop
+const SKID_FRICTION: float = 20.0  ## Deceleration (m/s²) in uncontrolled regime
+const SKID_STEER_STRENGTH: float = 3.0  ## How fast skid direction rotates toward input (lerp rate/sec)
+const SURFACE_PRESS_DEPTH: float = 0.06  ## Target penetration depth (m) per frame for contact maintenance
 
 # ======================================================================
 #  State
 # ======================================================================
 
-## Floor detection (raycast-based)
+## Floor detection (contact-based — Jolt contacts from _integrate_forces)
 var _is_grounded: bool = false
 var _floor_normal: Vector3 = Vector3.UP
 var _floor_y: float = -INF
@@ -42,22 +44,47 @@ var _slope_traction: float = 1.0  ## cos(slope_angle): 1.0 = flat, 0.0 = vertica
 
 ## Grounded velocity tracking
 var _ground_velocity: Vector3 = Vector3.ZERO
-var _pre_solver_velocity: Vector3 = Vector3.ZERO
-var _undo_jolt_integration: bool = false
 
-## Dynamic body contact tracking (set in on_integrate_forces each tick)
-var _touching_dynamic_body: bool = false
-var _on_dynamic_body: bool = false
-var _dynamic_body_ref: RigidBody3D = null
+## Contact tracking (set in on_integrate_forces each tick)
+var _has_floor_contact: bool = false  ## Any walkable contact exists
+var _best_contact_normal: Vector3 = Vector3.ZERO  ## Most upward-facing contact normal (any body type)
 
-## Wall-slide normals (individual 2D normals from Jolt contacts)
-var _wall_normals: Array[Vector2] = []
+## Press undo: tracks the press velocity applied last frame so we can undo it
+## if the capsule launched (solver didn't absorb it because there's no contact).
+var _last_press_vel: Vector3 = Vector3.ZERO
+
+
+## Non-floor obstacle normals (>FLOOR_MAX_ANGLE) for wall-slide projection
+var _obstacle_normals: Array[Vector2] = []
 
 ## Air-jump tracking
 var _air_jumps_used: int = 0
 
 ## Post-jump rising suppression (prevents re-grounding on uphill slopes)
 var _post_jump_rising: bool = false
+var _left_ground_since_jump: bool = false
+
+## Debug: momentum-based ungrounding flash timer (seconds remaining)
+var _momentum_launch_flash: float = 0.0
+## Debug: reason string for last momentum ungrounding
+var _momentum_launch_reason: String = ""
+
+## Pipeline trace — captures velocity/state at every stage each frame.
+## On ground→air transitions, dumps the last grounded + first airborne frame.
+var _dbg_set_vel: Vector3 = Vector3.ZERO  ## Velocity we gave Jolt last frame
+var _dbg_set_pos_y: float = 0.0  ## Position when we gave Jolt last frame
+var _frame_trace: String = ""  ## Current frame's accumulated trace
+var _prev_frame_trace: String = ""  ## Previous frame's trace (for transition dump)
+var _trace_air_frames: int = 0  ## Consecutive airborne frames
+var _trace_normal_ran: bool = false  ## Whether process_normal_movement ran this frame
+
+## Wall-force budget tracking (populated during pipeline, printed in post_physics_step)
+var _dbg_h_sent: Vector2 = Vector2.ZERO       ## Horizontal we sent to Jolt last frame
+var _dbg_h_jolt: Vector2 = Vector2.ZERO       ## Horizontal Jolt returned
+var _dbg_h_after_undo: Vector2 = Vector2.ZERO ## After press undo
+var _dbg_h_after_pull: Vector2 = Vector2.ZERO ## After slope pull
+var _dbg_h_after_move: Vector2 = Vector2.ZERO ## After move_toward
+var _dbg_h_final: Vector2 = Vector2.ZERO      ## Final (after press)
 
 
 # ======================================================================
@@ -65,106 +92,251 @@ var _post_jump_rising: bool = false
 # ======================================================================
 
 func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
-	## Sample contact normals for wall-slide and dynamic body tracking.
+	## Sample contact normals for wall-slide and best floor contact.
 	## Called from player._integrate_forces() each physics tick.
-	_touching_dynamic_body = false
-	_on_dynamic_body = false
-	_dynamic_body_ref = null
 
-	var wall_angle_threshold := FLOOR_MAX_ANGLE if (_is_grounded or _post_jump_rising) else deg_to_rad(30.0)
+	# --- Start frame trace ---
+	_dbg_h_sent = Vector2(_dbg_set_vel.x, _dbg_set_vel.z)
+	_dbg_h_jolt = Vector2(player.velocity.x, player.velocity.z)
+	_frame_trace = "  Jolt->us: vel=(%.3f, %.3f, %.3f) pos_y=%.4f" % [
+		player.velocity.x, player.velocity.y, player.velocity.z, player.global_position.y]
+	if _dbg_set_vel != Vector3.ZERO:
+		var dv_y := player.velocity.y - _dbg_set_vel.y
+		var push_y := (player.global_position.y - _dbg_set_pos_y) - _dbg_set_vel.y * state.step
+		_frame_trace += "\n  Solver delta: we_set_y=%.4f jolt_returned_y=%.4f dv_y=%+.4f pos_push=%+.5fm" % [
+			_dbg_set_vel.y, player.velocity.y, dv_y, push_y]
+	_trace_normal_ran = false
 
-	var normals: Array[Vector2] = []
+	_has_floor_contact = false
+	_best_contact_normal = Vector3.ZERO
+
+	var best_y := -1.0
+	var static_count := 0
+	var rigid_count := 0
+
+	var obstacles: Array[Vector2] = []
+	var contact_str := ""
+	var _capture := player.capture_movement
 	for i in state.get_contact_count():
 		var normal: Vector3 = state.get_contact_local_normal(i)
 		var collider := state.get_contact_collider_object(i)
-		if collider is RigidBody3D:
-			_touching_dynamic_body = true
-			_dynamic_body_ref = collider
-			if normal.y > 0.7:
-				_on_dynamic_body = true
-		if normal.angle_to(Vector3.UP) > wall_angle_threshold:
-			if collider is RigidBody3D:
-				continue
-			if _is_grounded and normal.dot(_floor_normal) > 0.9:
-				continue
+		var is_rigid := collider is RigidBody3D
+		# Track walkable floor contacts (any body type)
+		if normal.angle_to(Vector3.UP) <= FLOOR_MAX_ANGLE:
+			_has_floor_contact = true
+		if is_rigid:
+			rigid_count += 1
+		else:
+			static_count += 1
+		# Track the most upward-facing contact regardless of body type
+		if normal.y > best_y:
+			best_y = normal.y
+			_best_contact_normal = normal
+		var contact_angle := normal.angle_to(Vector3.UP)
+		contact_str += " [%s %.1f°]" % ["R" if is_rigid else "S",
+			rad_to_deg(contact_angle)]
+		if _capture and contact_angle > FLOOR_MAX_ANGLE:
+			var cpos: Vector3 = state.get_contact_local_position(i)
+			var cname: String = collider.name if collider else "?"
+			contact_str += "{n=(%.3f,%.3f,%.3f) p=(%.2f,%.2f,%.2f) %s}" % [
+				normal.x, normal.y, normal.z, cpos.x, cpos.y, cpos.z, cname]
+		# Obstacle normals: all non-floor static contacts for wall-slide
+		if not is_rigid and contact_angle > FLOOR_MAX_ANGLE:
 			var n2 := Vector2(normal.x, normal.z).normalized()
 			var is_dup := false
-			for existing in normals:
+			for existing in obstacles:
 				if n2.dot(existing) > 0.966:
 					is_dup = true
 					break
 			if not is_dup:
-				normals.append(n2)
-	_wall_normals = normals
+				obstacles.append(n2)
+	_obstacle_normals = obstacles
+	_frame_trace += "\n  Contacts: %d (S:%d R:%d)%s best_y=%.3f" % [
+		state.get_contact_count(), static_count, rigid_count, contact_str, best_y]
 
 
 func pre_physics_step(delta: float) -> void:
-	## Undo Jolt position integration and update floor detection.
+	## Update floor detection before movement runs.
 	## Called at the start of the server block in player._physics_process().
-	_was_grounded = _is_grounded
-
-	if _undo_jolt_integration:
-		player.global_position -= _pre_solver_velocity * delta
-		_undo_jolt_integration = false
-
+	if _momentum_launch_flash > 0.0:
+		_momentum_launch_flash = maxf(_momentum_launch_flash - delta, 0.0)
 	_update_ground_state()
 
+	# Proportional press undo: measure how much the solver absorbed the press
+	# by projecting the solver's velocity correction onto the press direction.
+	# Undo only the unabsorbed remainder — prevents false launches on ramp lips
+	# (where wall contacts absorb the press) while still giving clean launches
+	# (where zero contacts means zero absorption).
+	if _last_press_vel != Vector3.ZERO and _dbg_set_vel != Vector3.ZERO:
+		var solver_correction: Vector3 = player.velocity - _dbg_set_vel
+		var press_dir: Vector3 = _last_press_vel.normalized()
+		var press_mag: float = _last_press_vel.length()
+		var absorbed: float = solver_correction.dot(press_dir)
+		var unabsorbed: float = maxf(press_mag - absorbed, 0.0)
+		var _capture := player.capture_movement
+		if _capture and _obstacle_normals.size() > 0:
+			_frame_trace += "\n  [PRESS UNDO DEBUG]"
+			_frame_trace += "\n    vel_before_undo=(%.4f, %.4f, %.4f)" % [
+				player.velocity.x, player.velocity.y, player.velocity.z]
+			_frame_trace += "\n    we_set=(%.4f, %.4f, %.4f)" % [
+				_dbg_set_vel.x, _dbg_set_vel.y, _dbg_set_vel.z]
+			_frame_trace += "\n    solver_correction=(%.4f, %.4f, %.4f) mag=%.4f" % [
+				solver_correction.x, solver_correction.y, solver_correction.z,
+				solver_correction.length()]
+			_frame_trace += "\n    press_vel=(%.4f, %.4f, %.4f) press_dir=(%.4f, %.4f, %.4f) press_mag=%.4f" % [
+				_last_press_vel.x, _last_press_vel.y, _last_press_vel.z,
+				press_dir.x, press_dir.y, press_dir.z, press_mag]
+			_frame_trace += "\n    absorbed=%.4f unabsorbed=%.4f" % [absorbed, unabsorbed]
+			# Per-wall breakdown: how much each wall contributes to solver_correction along press_dir
+			for wi in _obstacle_normals.size():
+				var wn2: Vector2 = _obstacle_normals[wi]
+				var wn3 := Vector3(wn2.x, 0.0, wn2.y)
+				var wall_response := solver_correction.dot(wn3)
+				var wall_press_contam := wn3.dot(press_dir) * wall_response
+				_frame_trace += "\n    wall[%d] n2=(%.3f,%.3f) solver_dot_wall=%+.4f wall_contam_on_press=%+.4f" % [
+					wi, wn2.x, wn2.y, wall_response, wall_press_contam]
+		if unabsorbed > 0.01:
+			player.velocity += press_dir * unabsorbed
+			_frame_trace += "\n  Press undo: %.3f/%.3f (absorbed=%.3f)" % [
+				unabsorbed, press_mag, absorbed]
+			if _capture and _obstacle_normals.size() > 0:
+				_frame_trace += "\n    vel_after_undo=(%.4f, %.4f, %.4f)" % [
+					player.velocity.x, player.velocity.y, player.velocity.z]
+		_last_press_vel = Vector3.ZERO
 
-func post_physics_step(delta: float, grapple_active: bool) -> void:
-	## Grounded position control and pre-solver velocity save.
+	_dbg_h_after_undo = Vector2(player.velocity.x, player.velocity.z)
+
+	_frame_trace += "\n  Ground: grounded=%s (was=%s) normal=(%.3f,%.3f,%.3f) angle=%.1f° walkable=%s" % [
+		_is_grounded, _was_grounded,
+		_floor_normal.x, _floor_normal.y, _floor_normal.z,
+		rad_to_deg(_floor_normal.angle_to(Vector3.UP)), is_on_walkable_floor()]
+
+
+func post_physics_step(_delta: float, _grapple_active: bool) -> void:
+	## Save grounded velocity for launch detection.
 	## Called after _server_process() in player._physics_process().
-	var on_top_of_lightweight := _on_dynamic_body and _dynamic_body_ref != null \
-			and is_instance_valid(_dynamic_body_ref) and _dynamic_body_ref.mass < 20.0
-	if is_on_walkable_floor() and _was_grounded and not on_top_of_lightweight \
-			and not grapple_active:
-		var dx := player.velocity.x * delta
-		var dz := player.velocity.z * delta
-		player.global_position.x += dx
-		player.global_position.z += dz
-		if _floor_y > -INF and _floor_normal.y > 0.001:
-			var hemi_offset := CAPSULE_RADIUS * (1.0 - _floor_normal.y) / _floor_normal.y
-			var estimated_floor_y := _floor_y - (_floor_normal.x * dx + _floor_normal.z * dz) / _floor_normal.y
-			player.global_position.y = estimated_floor_y + hemi_offset
-		_ground_velocity = player.velocity
-		_undo_jolt_integration = true
-	elif on_top_of_lightweight and is_on_floor():
-		_ground_velocity = player.velocity
-	elif is_on_floor() and _was_grounded:
+	if is_on_floor():
 		_ground_velocity = player.velocity
 
-	_pre_solver_velocity = player.velocity
+	# --- Complete frame trace ---
+	if not _trace_normal_ran:
+		_frame_trace += "\n  Move: [slide/crouch/grapple — not normal movement]"
+	_frame_trace += "\n  Final->Jolt: vel=(%.3f, %.3f, %.3f) pos_y=%.4f h_speed=%.2f" % [
+		player.velocity.x, player.velocity.y, player.velocity.z,
+		player.global_position.y,
+		Vector2(player.velocity.x, player.velocity.z).length()]
+
+	# --- Wall debug: dump full pipeline trace every frame when touching walls ---
+	var _capture: bool = player.capture_movement
+	if _capture and _obstacle_normals.size() > 0:
+		print("[WALL TRACE] obs=%d" % _obstacle_normals.size())
+		print(_frame_trace)
+
+		# Wall-force budget: decompose each step's horizontal delta into
+		# wall-perpendicular (w⊥, positive=away) and wall-parallel (w∥).
+		var wn: Vector2 = _obstacle_normals[0]
+		var wp: Vector2 = Vector2(-wn.y, wn.x)  # wall-parallel unit vector
+		var d_solver := _dbg_h_jolt - _dbg_h_sent
+		var d_undo := _dbg_h_after_undo - _dbg_h_jolt
+		var d_pull := _dbg_h_after_pull - _dbg_h_after_undo
+		var d_move := _dbg_h_after_move - _dbg_h_after_pull
+		var d_press := _dbg_h_final - _dbg_h_after_move
+		print("  [WALL BUDGET] wn=(%.3f,%.3f) wp=(%.3f,%.3f)" % [wn.x, wn.y, wp.x, wp.y])
+		print("    %-12s w⊥=%+7.3f  w∥=%+7.3f  (h: %.3f -> %.3f)" % [
+			"jolt_solver:", d_solver.dot(wn), d_solver.dot(wp),
+			_dbg_h_sent.length(), _dbg_h_jolt.length()])
+		print("    %-12s w⊥=%+7.3f  w∥=%+7.3f" % [
+			"press_undo:", d_undo.dot(wn), d_undo.dot(wp)])
+		print("    %-12s w⊥=%+7.3f  w∥=%+7.3f" % [
+			"slope_pull:", d_pull.dot(wn), d_pull.dot(wp)])
+		print("    %-12s w⊥=%+7.3f  w∥=%+7.3f" % [
+			"move_toward:", d_move.dot(wn), d_move.dot(wp)])
+		print("    %-12s w⊥=%+7.3f  w∥=%+7.3f" % [
+			"press:", d_press.dot(wn), d_press.dot(wp)])
+		var total_perp := _dbg_h_final.dot(wn)
+		var total_para := _dbg_h_final.dot(wp)
+		print("    %-12s w⊥=%+7.3f  w∥=%+7.3f  |h|=%.3f" % [
+			"TOTAL:", total_perp, total_para, _dbg_h_final.length()])
+		print("")
+
+	# --- Transition detection ---
+	if _was_grounded and not _is_grounded:
+		# Ground→Air: dump last grounded frame + this first airborne frame
+		_trace_air_frames = 1
+		if _capture:
+			print("")
+			print("=== GROUND -> AIR ===")
+			if _prev_frame_trace != "":
+				print("--- LAST GROUNDED FRAME ---")
+				print(_prev_frame_trace)
+			print("--- FIRST AIRBORNE FRAME ---")
+			print(_frame_trace)
+			# Raycast to measure separation
+			var space := player.get_world_3d().direct_space_state
+			var from := player.global_position + Vector3(0, 0.5, 0)
+			var to := player.global_position - Vector3(0, 2.0, 0)
+			var query := PhysicsRayQueryParameters3D.create(from, to, CollisionLayers.WORLD)
+			query.exclude = [player.get_rid()]
+			var result := space.intersect_ray(query)
+			if result:
+				var sep: float = player.global_position.y - result.position.y
+				print("  Raycast: separation=%.4fm floor_angle=%.1f°" % [
+					sep, rad_to_deg(result.normal.angle_to(Vector3.UP))])
+			else:
+				print("  Raycast: MISS (no terrain within 2.5m)")
+			print("=====================")
+			print("")
+	elif not _was_grounded and _is_grounded:
+		# Air→Ground
+		if _capture:
+			print("")
+			print("=== AIR -> GROUND (after %d airborne frames) ===" % _trace_air_frames)
+			if _prev_frame_trace != "":
+				print("--- LAST AIRBORNE FRAME ---")
+				print(_prev_frame_trace)
+			print("--- FIRST GROUNDED FRAME ---")
+			print(_frame_trace)
+			print("=====================")
+			print("")
+		_trace_air_frames = 0
+	elif not _is_grounded:
+		_trace_air_frames += 1
+		# Print continued airborne frames (up to 5)
+		if _capture and _trace_air_frames <= 5:
+			print("  AIRBORNE f=%d: vel=(%.3f,%.3f,%.3f) pos_y=%.4f" % [
+				_trace_air_frames, player.velocity.x, player.velocity.y,
+				player.velocity.z, player.global_position.y])
+
+	_prev_frame_trace = _frame_trace
+
+	# Record what we're giving Jolt (for solver delta next frame)
+	_dbg_set_vel = player.velocity
+	_dbg_set_pos_y = player.global_position.y
 
 
 func begin_movement(_delta: float) -> void:
-	## Grounded velocity management — restore tracked velocity on floor,
-	## hand off to Jolt on air transition. Called at the start of movement
-	## in player._server_process().
-	# Reset air-jump counter on landing
+	## Pre-movement setup. Called at the start of movement in
+	## player._server_process().
 	if is_on_floor():
 		_air_jumps_used = 0
 
-	var _on_dynamic_lightweight := _on_dynamic_body and _dynamic_body_ref != null \
-			and is_instance_valid(_dynamic_body_ref) and _dynamic_body_ref.mass < 20.0
-	if is_on_walkable_floor() and not _on_dynamic_lightweight:
-		if not _was_grounded:
-			_ground_velocity = Vector3(_pre_solver_velocity.x, 0.0, _pre_solver_velocity.z)
-		player.velocity = _ground_velocity
-	elif is_on_floor() and _on_dynamic_lightweight:
-		if player.velocity.y < 0.0:
-			player.velocity.y = 0.0
-	elif _was_grounded:
-		player.velocity = _ground_velocity
-		_ground_velocity = Vector3.ZERO
-
 
 func apply_gravity(delta: float) -> void:
-	## Apply manual gravity (skip when grounded or sliding).
-	if not is_on_floor() and not player.slide_crouch.is_sliding:
-		player.velocity.y -= player.gravity * delta
+	## Apply gravity every frame. Jolt's contact solver balances this at
+	## the surface, preventing penetration while maintaining contacts.
+	var pre_y := player.velocity.y
+	player.velocity.y -= player.gravity * delta
+	_frame_trace += "\n  Gravity: vel_y %.4f -> %.4f (%+.4f)" % [
+		pre_y, player.velocity.y, -player.gravity * delta]
 
 
 func process_normal_movement(delta: float) -> void:
-	## Acceleration-based horizontal movement with wall-slide projection.
+	## Two-regime horizontal movement:
+	##   Controlled  (≤ CONTROL_SPEED_THRESHOLD on walkable ground):
+	##       Full steering, instant stop when input is released.
+	##   Uncontrolled (> threshold on walkable ground):
+	##       No steering — friction decelerates until control speed is reached.
+	##   Air / non-walkable slopes use the original accel/decel model.
 	var shoe_bonus: float = player.inventory.get_shoe_speed_bonus() if player.inventory else 0.0
 	var bonus_speed: float = 0.0
 	if 5 in player.active_bonuses:
@@ -177,91 +349,188 @@ func process_normal_movement(delta: float) -> void:
 
 	var horizontal := Vector2(player.velocity.x, player.velocity.z)
 	var on_floor := is_on_floor()
+	var walkable := is_on_walkable_floor()
 	var traction := _slope_traction if on_floor else 1.0
+	var h_speed := horizontal.length()
+	_trace_normal_ran = true
+	_frame_trace += "\n  Move start: vel=(%.3f, %.3f, %.3f) h_speed=%.2f on_floor=%s walkable=%s" % [
+		player.velocity.x, player.velocity.y, player.velocity.z, h_speed, on_floor, walkable]
+
+	var _wall_dbg := player.capture_movement and _obstacle_normals.size() > 0
 
 	# --- Slope gravity (downhill pull along surface) ---
-	# floor_normal XZ = downhill direction with magnitude sin(angle).
-	# Diminish contribution at high speed to create natural terminal velocity.
+	# Applies in uncontrolled skid and controlled-with-input regimes.
+	# Skipped for controlled stop (instant zero discards it anyway).
 	if on_floor and _floor_normal.y < 0.999:
 		var slope_pull := Vector2(_floor_normal.x, _floor_normal.z) * player.gravity
 		var gravity_scale := clampf(1.0 - horizontal.length() / SLOPE_SLIDE_MAX_SPEED, 0.0, 1.0)
+		var h_before_pull := horizontal
 		horizontal += slope_pull * gravity_scale * delta
+		if _wall_dbg:
+			_frame_trace += "\n  [SLOPE PULL] pull=(%.4f,%.4f) grav_scale=%.3f h_delta=(%.4f,%.4f)" % [
+				slope_pull.x, slope_pull.y, gravity_scale,
+				horizontal.x - h_before_pull.x, horizontal.y - h_before_pull.y]
 
-	# --- Wall-slide projection ---
-	if direction:
+	_dbg_h_after_pull = horizontal
+	var h_after_slope := horizontal
+	var _regime := ""
+
+	# --- Movement regime ---
+	if walkable and h_speed > CONTROL_SPEED_THRESHOLD:
+		_regime = "UNCONTROLLED"
+		# UNCONTROLLED — above threshold on walkable ground.
+		# Player can steer (rotate velocity direction) but not accelerate.
+		if direction and horizontal.length() > 1.0:
+			var input2 := Vector2(direction.x, direction.z).normalized()
+			var skid_dir := horizontal.normalized()
+			var turn_rate := SKID_STEER_STRENGTH * delta
+			horizontal = horizontal.length() * skid_dir.lerp(input2, turn_rate).normalized()
+		# Friction decelerates toward zero.
+		horizontal = horizontal.move_toward(Vector2.ZERO, SKID_FRICTION * delta)
+	elif direction:
+		# CONTROLLED WITH INPUT — accelerate toward target velocity.
+		# Jolt's contact solver handles wall interactions: we just push toward
+		# the desired velocity and the solver's contact response naturally
+		# produces wall-sliding without any manual projection.
 		var target := Vector2(direction.x, direction.z) * current_speed
 
-		var best_normal := Vector2.ZERO
-		var best_dot := 0.0
-		for wn in _wall_normals:
-			var d := target.dot(wn)
-			if d < best_dot:
-				best_dot = d
-				best_normal = wn
-
-		if best_normal != Vector2.ZERO:
-			target -= best_normal * target.dot(best_normal)
-
-			var wall_tang := Vector2(-best_normal.y, best_normal.x)
-			var perp_speed := horizontal.dot(best_normal)
-			var para_speed := horizontal.dot(wall_tang)
-			var target_para := target.dot(wall_tang)
-
-			var accel := (ACCELERATION if on_floor else AIR_ACCELERATION) * traction
-			para_speed = move_toward(para_speed, target_para, accel * delta)
-
-			var perp_out := maxf(perp_speed, 0.0)
-
-			horizontal = wall_tang * para_speed + best_normal * perp_out
-
-			for wn in _wall_normals:
-				var d := horizontal.dot(wn)
-				if d < 0.0:
-					horizontal -= wn * d
+		if walkable:
+			_regime = "WALK"
+			horizontal = horizontal.move_toward(target, WALK_ACCEL * delta)
+			if _wall_dbg:
+				_frame_trace += "\n  [MOVE] regime=WALK target=(%.3f,%.3f) mag=%.2f accel=%.2f*%.4f=%.4f" % [
+					target.x, target.y, target.length(), WALK_ACCEL, delta, WALK_ACCEL * delta]
+				_frame_trace += "\n    input_dir=(%.3f,%.3f) direction=(%.3f,%.3f,%.3f)" % [
+					input_dir.x, input_dir.y, direction.x, direction.y, direction.z]
+				_frame_trace += "\n    h_before=(%.4f,%.4f) h_after=(%.4f,%.4f) h_delta=(%.4f,%.4f)" % [
+					h_after_slope.x, h_after_slope.y, horizontal.x, horizontal.y,
+					horizontal.x - h_after_slope.x, horizontal.y - h_after_slope.y]
+		elif on_floor:
+			_regime = "FLOOR_ACCEL"
+			horizontal = horizontal.move_toward(target, ACCELERATION * traction * delta)
 		else:
-			if on_floor:
-				horizontal = horizontal.move_toward(target, ACCELERATION * traction * delta)
-			else:
-				var current_mag := horizontal.length()
-				var input_dot := horizontal.normalized().dot(target.normalized()) if current_mag > 0.1 else 1.0
-				horizontal = horizontal.move_toward(target, AIR_ACCELERATION * delta)
-				if horizontal.length() < current_mag and input_dot > 0.0:
-					horizontal = horizontal.normalized() * current_mag
+			_regime = "AIR_ACCEL"
+			var current_mag := horizontal.length()
+			var input_dot := horizontal.normalized().dot(target.normalized()) if current_mag > 0.1 else 1.0
+			horizontal = horizontal.move_toward(target, AIR_ACCELERATION * delta)
+			if horizontal.length() < current_mag and input_dot > 0.0:
+				horizontal = horizontal.normalized() * current_mag
+	elif walkable:
+		_regime = "WALK_STOP"
+		# CONTROLLED WITHOUT INPUT — instant stop below threshold, friction above.
+		if h_speed > INSTANT_STOP_THRESHOLD:
+			horizontal = horizontal.move_toward(Vector2.ZERO, SKID_FRICTION * delta)
+		else:
+			horizontal = Vector2.ZERO
 	else:
+		_regime = "AIR_DECEL"
+		# AIR / NON-WALKABLE — original deceleration model.
 		var decel := (DECELERATION if on_floor else AIR_DECELERATION) * traction
 		horizontal = horizontal.move_toward(Vector2.ZERO, decel * delta)
 
+	if _wall_dbg and _regime != "WALK":
+		_frame_trace += "\n  [MOVE] regime=%s h_before=(%.4f,%.4f) h_after=(%.4f,%.4f)" % [
+			_regime, h_after_slope.x, h_after_slope.y, horizontal.x, horizontal.y]
+
+	_dbg_h_after_move = horizontal
 	player.velocity.x = horizontal.x
 	player.velocity.z = horizontal.y
 
-	# Velocity dead zone — only on gentle slopes where friction can hold
-	if on_floor and not direction and horizontal.length_squared() < 0.01 and _floor_normal.y > 0.85:
-		player.velocity.x = 0.0
-		player.velocity.z = 0.0
-		player.velocity.y = 0.0
+	# Velocity dead zone — stopped on walkable ground with no input.
+	# Zero everything and skip slope projection. The press's horizontal
+	# component along the tilted floor normal causes slow drift on slopes;
+	# zeroing vel entirely keeps the capsule at rest (gravity + solver
+	# maintain contact from the previous frame's overlap).
+	if walkable and not direction and horizontal.length_squared() < 0.01:
+		player.velocity = Vector3.ZERO
+		_last_press_vel = Vector3.ZERO
+		_dbg_h_final = Vector2.ZERO
+		_frame_trace += "\n  Move end: vel=(%.3f, %.3f, %.3f) [dead zone]" % [
+			player.velocity.x, player.velocity.y, player.velocity.z]
 		return
 
-	# Slope alignment — project velocity onto slope surface
-	var on_slope := _floor_normal.dot(Vector3.UP) <= 0.999
-	if on_floor and on_slope and not player._frame_jump:
-		if _floor_normal.y > 0.3:
-			# Walkable slopes: algebraic Y projection
-			player.velocity.y = -(_floor_normal.x * player.velocity.x + _floor_normal.z * player.velocity.z) / _floor_normal.y
+	# Slope alignment
+	apply_slope_projection(delta)
+	_frame_trace += "\n  Move end: vel=(%.3f, %.3f, %.3f)" % [
+		player.velocity.x, player.velocity.y, player.velocity.z]
+
+
+func apply_slope_projection(delta: float, force_tangent: bool = false) -> void:
+	## Keep the capsule in actual contact with the surface by:
+	## 1. Setting vel.y to the surface tangent (prevents solver bounce AND
+	##    prevents gravity accumulation that causes hill sliding).
+	## 2. Pushing a fixed depth into the surface each frame so Jolt's solver
+	##    always has penetration to resolve (creating real contacts).
+	## The press is tracked so it can be undone if the capsule launches
+	## (see pre_physics_step) — launch velocity stays clean.
+	## force_tangent: always use the tangent + press path (used by slides to
+	## ride steep surfaces smoothly instead of fighting the solver).
+	var _wall_dbg2 := player.capture_movement and _obstacle_normals.size() > 0
+	if not is_on_floor() or player._frame_jump:
+		_last_press_vel = Vector3.ZERO
+		_dbg_h_final = Vector2(player.velocity.x, player.velocity.z)
+		if _wall_dbg2:
+			_frame_trace += "\n  [SLOPE PROJ] skipped (on_floor=%s frame_jump=%s)" % [
+				is_on_floor(), player._frame_jump]
+		return
+	var n := _floor_normal
+	if is_on_walkable_floor() or force_tangent:
+		var vel_before_proj := player.velocity
+		# Tangent y-velocity: prevents gravity accumulation (sliding).
+		# When downhill (slope_y < 0), always follow the surface.
+		# When uphill (slope_y >= 0), only snap upward — preserve excess
+		# upward momentum so ramp-to-flat transitions feel natural.
+		var slope_y := -(n.x * player.velocity.x + n.z * player.velocity.z) / n.y
+		var old_vel_y := player.velocity.y
+		var did_snap := slope_y < 0.0 or player.velocity.y <= slope_y
+		if did_snap:
+			player.velocity.y = slope_y
+		# Fixed-depth press into surface along -normal. This guarantees the
+		# capsule penetrates by SURFACE_PRESS_DEPTH each frame, so the solver
+		# always creates real contacts (not speculative).
+		# When touching a wall, skip the press: Jolt already maintains floor
+		# contact via the wall+floor constraint network. Pressing into the
+		# surface with wall contacts overconstains the solver, causing it to
+		# bleed corrections into the wall-parallel axis (the bobbing bug).
+		if _obstacle_normals.size() == 0:
+			var press_speed := SURFACE_PRESS_DEPTH / delta
+			_last_press_vel = press_speed * n
+			player.velocity -= _last_press_vel
 		else:
-			# Steep slopes: vector projection (numerically stable)
-			var into_surface := player.velocity.dot(_floor_normal)
-			if into_surface < 0.0:
-				player.velocity -= _floor_normal * into_surface
+			_last_press_vel = Vector3.ZERO
+		_dbg_h_final = Vector2(player.velocity.x, player.velocity.z)
+		if _wall_dbg2:
+			_frame_trace += "\n  [SLOPE PROJ] walkable n=(%.4f,%.4f,%.4f) angle=%.1f°" % [
+				n.x, n.y, n.z, rad_to_deg(n.angle_to(Vector3.UP))]
+			_frame_trace += "\n    slope_y=%.4f old_vel_y=%.4f snapped=%s" % [
+				slope_y, old_vel_y, did_snap]
+			_frame_trace += "\n    vel_after_tangent=(%.4f, %.4f, %.4f)" % [
+				vel_before_proj.x, player.velocity.y + _last_press_vel.y, vel_before_proj.z]
+			_frame_trace += "\n    press_vel=(%.4f, %.4f, %.4f) walls=%d" % [
+				_last_press_vel.x, _last_press_vel.y, _last_press_vel.z,
+				_obstacle_normals.size()]
+			_frame_trace += "\n    vel_final=(%.4f, %.4f, %.4f)" % [
+				player.velocity.x, player.velocity.y, player.velocity.z]
+			_frame_trace += "\n    vel_change=(%.4f, %.4f, %.4f)" % [
+				player.velocity.x - vel_before_proj.x,
+				player.velocity.y - vel_before_proj.y,
+				player.velocity.z - vel_before_proj.z]
+	else:
+		# Steep slope: only strip velocity going INTO the surface.
+		# Preserve the away-from-surface component so the player can
+		# crest ramp lips without being pulled back.
+		var perp := player.velocity.dot(n)
+		if perp < 0.0:
+			player.velocity -= n * perp
+		_last_press_vel = Vector3.ZERO
+		_dbg_h_final = Vector2(player.velocity.x, player.velocity.z)
+		if _wall_dbg2:
+			_frame_trace += "\n  [SLOPE PROJ] steep n=(%.4f,%.4f,%.4f) perp=%.4f" % [
+				n.x, n.y, n.z, perp]
 
 
 func slope_compensated_jump_y() -> float:
-	## Returns JUMP_VELOCITY compensated for slope rise at the current horizontal
-	## speed, ensuring consistent jump height relative to the ground surface.
-	## On flat ground this equals JUMP_VELOCITY. On a slope it adds the slope's
-	## Y-rate so the player clears the same height above the surface.
-	if _floor_normal.y > 0.3 and _floor_normal.dot(Vector3.UP) < 0.999:
-		var slope_y := maxf(-(_floor_normal.x * player.velocity.x + _floor_normal.z * player.velocity.z) / _floor_normal.y, 0.0)
-		return slope_y + JUMP_VELOCITY
+	## Returns a fixed JUMP_VELOCITY regardless of slope.
 	return JUMP_VELOCITY
 
 
@@ -301,88 +570,91 @@ func is_on_walkable_floor() -> bool:
 
 
 func _update_ground_state() -> void:
-	## Downward raycast for floor detection. Must run in _physics_process().
-	var space := player.get_world_3d().direct_space_state
-	if space == null:
-		_is_grounded = false
-		_floor_y = -INF
-		return
+	## Contact-based floor detection. Grounded when Jolt contacts include a
+	## surface within SLOPE_MAX_GROUND_ANGLE. Zero contacts → airborne.
+	## Gravity keeps the capsule pressed to surfaces every frame, so contacts
+	## are maintained naturally by the solver.
+	_was_grounded = _is_grounded
 
-	var origin := player.global_position + Vector3(0, 0.9, 0)
-	var end := origin + Vector3(0, -(0.9 + FLOOR_SNAP_MARGIN), 0)
-	var query := PhysicsRayQueryParameters3D.create(origin, end)
-	query.collision_mask = CollisionLayers.WORLD | CollisionLayers.ITEMS | CollisionLayers.TOAD_WALLS | CollisionLayers.TOAD_RAIN | CollisionLayers.WALL_SMOOTH
-	query.exclude = [player.get_rid()]
+	# Post-jump rising: once the player is falling, the flag has served its
+	# purpose (preventing re-ground on the launch surface while still rising).
+	# Clear it so contacts can ground the player normally.  Without this, a
+	# player who jumps into a ramp edge and never loses contacts gets stuck
+	# airborne forever (_left_ground_since_jump is never set).
+	if _post_jump_rising and player.velocity.y <= 0.0:
+		_post_jump_rising = false
+		_left_ground_since_jump = false
 
-	var result := space.intersect_ray(query)
-	if result.is_empty():
-		_is_grounded = false
-		_floor_normal = Vector3.UP
-		_floor_y = -INF
-		return
+	var has_floor_contact := _best_contact_normal != Vector3.ZERO \
+			and _best_contact_normal.angle_to(Vector3.UP) <= SLOPE_MAX_GROUND_ANGLE
 
-	var normal: Vector3 = result["normal"]
-	if normal.angle_to(Vector3.UP) > SLOPE_MAX_GROUND_ANGLE:
-		_is_grounded = false
-		_floor_normal = Vector3.UP
-		_floor_y = -INF
-		_slope_traction = 0.0
-		return
-
-	# Quake-style launch: if grounded velocity is diverging from the surface,
-	# go airborne. On steady slopes dot ≈ 0 (tangent). At convex transitions
-	# (crests) the surface flattens but velocity still points uphill → dot > 0.
-	if _was_grounded and _ground_velocity.y > 0.5:
-		var launch_dot := _ground_velocity.dot(normal)
-		if launch_dot > LAUNCH_DOT_THRESHOLD:
+	# --- Launch detection (only when we have a new floor contact to compare) ---
+	if has_floor_contact and _was_grounded:
+		# Edge detection: momentum diverging from current surface → lift off
+		var edge_momentum := _ground_velocity.dot(_best_contact_normal)
+		if edge_momentum > 0.0:
+			_momentum_launch_flash = 0.3
+			_momentum_launch_reason = "EDGE LAUNCH: prev=%.1f° new=%.1f° mom=%.3f" % [
+				rad_to_deg(_floor_normal.angle_to(Vector3.UP)),
+				rad_to_deg(_best_contact_normal.angle_to(Vector3.UP)),
+				edge_momentum]
+			if player.capture_movement:
+				print(_momentum_launch_reason)
 			_is_grounded = false
 			_floor_normal = Vector3.UP
 			_floor_y = -INF
 			_slope_traction = 0.0
 			return
 
-	_slope_traction = normal.y  # cos(angle) — traction degrades with steepness
-	_floor_normal = normal
-	_floor_y = result["position"].y
-
-	# Clamp hemi_offset — the hemisphere formula breaks down on steep slopes
-	# where the capsule cylinder contacts the surface, not the bottom hemisphere.
-	var hemi_offset := minf(CAPSULE_RADIUS * (1.0 - normal.y) / maxf(normal.y, 0.01),
-			CAPSULE_RADIUS * 2.0)
-	var feet_gap := player.global_position.y - (_floor_y + hemi_offset)
-	if _is_grounded:
-		_is_grounded = feet_gap <= FLOOR_SNAP_MARGIN
-	else:
-		_is_grounded = feet_gap <= FLOOR_CONTACT_TOLERANCE
-
-	# Post-jump rising suppression
-	if _post_jump_rising:
-		if player.velocity.y > 0.0:
-			_is_grounded = false
-		else:
-			_post_jump_rising = false
-
-	# On-top-of-dynamic-body override
-	if _on_dynamic_body and _dynamic_body_ref != null \
-			and is_instance_valid(_dynamic_body_ref) \
-			and _dynamic_body_ref.mass < 20.0 \
-			and player.velocity.y <= 0.0:
+	# --- Grounded: update floor normal from contacts ---
+	if has_floor_contact:
+		_floor_normal = _best_contact_normal
+		_slope_traction = _best_contact_normal.y
+		_floor_y = player.global_position.y
 		_is_grounded = true
+
+		# Post-jump rising suppression
+		if _post_jump_rising:
+			if _left_ground_since_jump:
+				_post_jump_rising = false
+				_left_ground_since_jump = false
+			else:
+				_is_grounded = false
+		return
+
+	# --- No floor contacts → airborne ---
+	if _post_jump_rising:
+		_left_ground_since_jump = true
+	_is_grounded = false
+	_floor_normal = Vector3.UP
+	_floor_y = -INF
+	_slope_traction = 0.0
+
+
+# ======================================================================
+#  Force airborne
+# ======================================================================
+
+func force_airborne() -> void:
+	## Force player to airborne state (used by slide-jump, grapple release, etc.)
+	_is_grounded = false
+	_post_jump_rising = true
 
 
 # ======================================================================
 #  Reset
 # ======================================================================
 
+
 func reset_movement() -> void:
 	## Reset movement state on respawn.
 	_air_jumps_used = 0
-	_wall_normals = []
+	_obstacle_normals = []
 	_ground_velocity = Vector3.ZERO
-	_pre_solver_velocity = Vector3.ZERO
-	_undo_jolt_integration = false
 	_post_jump_rising = false
+	_left_ground_since_jump = false
 	_is_grounded = false
 	_floor_normal = Vector3.UP
 	_floor_y = -INF
 	_slope_traction = 1.0
+	_last_press_vel = Vector3.ZERO
