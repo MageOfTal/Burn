@@ -377,19 +377,28 @@ func process_normal_movement(delta: float) -> void:
 	var walkable := is_on_walkable_floor()
 	var traction := _slope_traction if on_floor else 1.0
 
-	# On landing, the solver deflects vertical impact into horizontal velocity
-	# along the slope. Restore pre-solver horizontal velocity and undo the
-	# solver's horizontal position push (only when no walls nearby).
+	# Solver horizontal correction: when the solver resolves floor contacts,
+	# it absorbs the into-surface velocity component, which has horizontal
+	# elements on sloped surfaces. This causes speed loss at landing and at
+	# surface transitions (flat → ramp). Restore pre-solver horizontal;
+	# the tangent snap handles vel_y for the current surface.
+	# Skip when touching walls — the solver's wall response is legitimate.
 	if not _was_grounded and on_floor:
+		# Landing: restore velocity + undo solver's horizontal position push.
 		var pre_solver_h := Vector2(_dbg_set_vel.x, _dbg_set_vel.z)
 		if pre_solver_h.length() <= CONTROL_SPEED_THRESHOLD:
 			horizontal = pre_solver_h
 			if _last_sent_pos != Vector3.ZERO and _obstacle_normals.is_empty():
-				# Where we should be: old position + velocity * delta
 				var expected_x := _last_sent_pos.x + _dbg_set_vel.x * delta
 				var expected_z := _last_sent_pos.z + _dbg_set_vel.z * delta
 				player.global_position.x = expected_x
 				player.global_position.z = expected_z
+	elif _was_grounded and on_floor and _obstacle_normals.is_empty():
+		# Grounded-to-grounded: restore velocity only (no position snap).
+		# Prevents solver drag on ramps from gravity-bias depenetration.
+		var pre_solver_h := Vector2(_dbg_set_vel.x, _dbg_set_vel.z)
+		if pre_solver_h.length() <= CONTROL_SPEED_THRESHOLD:
+			horizontal = pre_solver_h
 
 	var h_speed := horizontal.length()
 	_trace_normal_ran = true
