@@ -77,6 +77,8 @@ var _momentum_launch_reason: String = ""
 ## On ground→air transitions, dumps the last grounded + first airborne frame.
 var _dbg_set_vel: Vector3 = Vector3.ZERO  ## Velocity we gave Jolt last frame
 var _dbg_set_pos_y: float = 0.0  ## Position when we gave Jolt last frame
+var _prev_solver_push: float = 0.0  ## Previous frame's solver position push (for raycast tolerance)
+var _curr_solver_push: float = 0.0  ## Current frame's solver push (becomes prev next frame)
 var _frame_trace: String = ""  ## Current frame's accumulated trace
 var _prev_frame_trace: String = ""  ## Previous frame's trace (for transition dump)
 var _trace_air_frames: int = 0  ## Consecutive airborne frames
@@ -107,6 +109,8 @@ func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	if _dbg_set_vel != Vector3.ZERO:
 		var dv_y := player.velocity.y - _dbg_set_vel.y
 		var push_y := (player.global_position.y - _dbg_set_pos_y) - _dbg_set_vel.y * state.step
+		_prev_solver_push = _curr_solver_push
+		_curr_solver_push = absf(push_y)
 		_frame_trace += "\n  Solver delta: we_set_y=%.4f jolt_returned_y=%.4f dv_y=%+.4f pos_push=%+.5fm" % [
 			_dbg_set_vel.y, player.velocity.y, dv_y, push_y]
 	_trace_normal_ran = false
@@ -371,6 +375,21 @@ func process_normal_movement(delta: float) -> void:
 	var on_floor := is_on_floor()
 	var walkable := is_on_walkable_floor()
 	var traction := _slope_traction if on_floor else 1.0
+
+	# On landing, the solver deflects vertical impact into horizontal velocity
+	# along the slope. Restore pre-solver horizontal velocity and undo the
+	# solver's horizontal position push (only when no walls nearby).
+	if not _was_grounded and on_floor:
+		var pre_solver_h := Vector2(_dbg_set_vel.x, _dbg_set_vel.z)
+		if pre_solver_h.length() <= CONTROL_SPEED_THRESHOLD:
+			horizontal = pre_solver_h
+			if _last_sent_pos != Vector3.ZERO and _obstacle_normals.is_empty():
+				# Where we should be: old position + velocity * delta
+				var expected_x := _last_sent_pos.x + _dbg_set_vel.x * delta
+				var expected_z := _last_sent_pos.z + _dbg_set_vel.z * delta
+				player.global_position.x = expected_x
+				player.global_position.z = expected_z
+
 	var h_speed := horizontal.length()
 	_trace_normal_ran = true
 	_frame_trace += "\n  Move start: vel=(%.3f, %.3f, %.3f) h_speed=%.2f on_floor=%s walkable=%s" % [
@@ -654,35 +673,36 @@ func _update_ground_state(delta: float) -> void:
 	# the capsule can't move farther than velocity * delta in one frame.
 	# This maintains grounded state (enabling tangent snap) without touching
 	# velocity — zero horizontal contamination.
-	#if _was_grounded and not _post_jump_rising:
-		## Separation check: if velocity is going AWAY from the surface we were
-		## on, the player is launching off a convex slope — don't persist.
-		#var departing := player.velocity.dot(_floor_normal) > 0.0
-		#if not departing:
-			## Cap search distance to capsule radius — at high speeds
-			## velocity * delta can far exceed the capsule's physical reach.
-			#var max_sep := minf(player.velocity.length() * delta, 0.4)
-			#var space := player.get_world_3d().direct_space_state
-			#var from := player.global_position + Vector3(0, 0.5, 0)
-			#var to := from + Vector3(0, -(0.5 + max_sep), 0)
-			#var query := PhysicsRayQueryParameters3D.create(from, to, CollisionLayers.WORLD)
-			#query.exclude = [player.get_rid()]
-			#var result := space.intersect_ray(query)
-			#if result and result.normal.angle_to(Vector3.UP) <= SLOPE_MAX_GROUND_ANGLE:
-				#var departing_new := player.velocity.dot(result.normal) > 0.0
-				#if departing_new:
-					#pass
-				#else:
-					#var sep: float = player.global_position.y - result.position.y
-					#if sep <= max_sep:
-						#_floor_normal = result.normal
-						#_slope_traction = result.normal.y
-						#_floor_y = result.position.y
-						#_is_grounded = true
-						#if player.capture_movement:
-							#_frame_trace += "\n  [RAY PERSIST] sep=%.4f max=%.4f n=(%.3f,%.3f,%.3f)" % [
-								#sep, max_sep, result.normal.x, result.normal.y, result.normal.z]
-						#return
+	if _was_grounded and not _post_jump_rising:
+		var departing := player.velocity.dot(_floor_normal) > 0.0
+		if not departing:
+			var max_sep := player.velocity.length() * delta
+			var space := player.get_world_3d().direct_space_state
+			var from := player.global_position + Vector3(0, 0.5, 0)
+			var to := from + Vector3(0, -(0.5 + max_sep), 0)
+			var query := PhysicsRayQueryParameters3D.create(from, to, CollisionLayers.WORLD)
+			query.exclude = [player.get_rid()]
+			var result := space.intersect_ray(query)
+			if result and result.normal.angle_to(Vector3.UP) <= SLOPE_MAX_GROUND_ANGLE:
+				var sep: float = player.global_position.y - result.position.y
+				if sep <= max_sep:
+					_floor_normal = result.normal
+					_slope_traction = result.normal.y
+					_floor_y = result.position.y
+					_is_grounded = true
+					_frame_trace += "\n  [RAY PERSIST] sep=%.4f max=%.4f n=(%.3f,%.3f,%.3f)" % [
+						sep, max_sep, result.normal.x, result.normal.y, result.normal.z]
+					return
+				else:
+					_frame_trace += "\n  [RAY REJECT sep] sep=%.4f > max=%.4f" % [sep, max_sep]
+			elif result:
+				_frame_trace += "\n  [RAY REJECT angle] ang=%.1f° n=(%.3f,%.3f,%.3f)" % [
+					rad_to_deg(result.normal.angle_to(Vector3.UP)), result.normal.x, result.normal.y, result.normal.z]
+			else:
+				_frame_trace += "\n  [RAY MISS] from_y=%.4f to_y=%.4f max_sep=%.4f" % [from.y, to.y, max_sep]
+		else:
+			_frame_trace += "\n  [RAY SKIP departing] dot=%.4f floor_n=(%.3f,%.3f,%.3f)" % [
+				player.velocity.dot(_floor_normal), _floor_normal.x, _floor_normal.y, _floor_normal.z]
 
 	# --- Airborne ---
 	if _post_jump_rising:
