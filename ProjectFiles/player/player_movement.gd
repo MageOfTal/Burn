@@ -25,7 +25,7 @@ const AIR_DECELERATION := 0.0
 const FLOOR_MAX_ANGLE: float = 0.8727  ## 50 degrees — walkable threshold
 const SLOPE_MAX_GROUND_ANGLE: float = 1.4835  ## 85 degrees — grounding ceiling
 const SLOPE_SLIDE_MAX_SPEED: float = 20.0  ## Terminal velocity for slope gravity
-const CONTROL_SPEED_THRESHOLD: float = 13.0  ## Below this: instant stop, full control. Above: uncontrolled skid.
+const CONTROL_SPEED_THRESHOLD: float = 50.0  ## Below this: instant stop, full control. Above: uncontrolled skid.
 const INSTANT_STOP_THRESHOLD: float = 13.0  ## Above this: friction decel on release instead of instant stop
 const SKID_FRICTION: float = 20.0  ## Deceleration (m/s²) in uncontrolled regime
 const SKID_STEER_STRENGTH: float = 3.0  ## How fast skid direction rotates toward input (lerp rate/sec)
@@ -269,7 +269,6 @@ func post_physics_step(_delta: float, _grapple_active: bool) -> void:
 	if _was_grounded and not _is_grounded:
 		# Ground→Air
 		_trace_air_frames = 1
-		# Always-on flicker diagnostic: raycast + shape cast to measure terrain distance
 		var space := player.get_world_3d().direct_space_state
 		var from := player.global_position + Vector3(0, 0.5, 0)
 		var to := player.global_position - Vector3(0, 2.0, 0)
@@ -289,20 +288,18 @@ func post_physics_step(_delta: float, _grapple_active: bool) -> void:
 			_best_contact_normal.x, _best_contact_normal.y, _best_contact_normal.z,
 			rad_to_deg(_best_contact_normal.angle_to(Vector3.UP)) if _best_contact_normal != Vector3.ZERO else -1.0,
 			_floor_normal.x, _floor_normal.y, _floor_normal.z])
-		if _capture:
-			print("")
-			print("=== GROUND -> AIR ===")
-			if _prev_frame_trace != "":
-				print("--- LAST GROUNDED FRAME ---")
-				print(_prev_frame_trace)
-			print("--- FIRST AIRBORNE FRAME ---")
-			print(_frame_trace)
-			if ray_result:
-				print("  Raycast: separation=%.4fm floor_angle=%.1f°" % [ray_sep, ray_angle])
-			else:
-				print("  Raycast: MISS (no terrain within 2.5m)")
-			print("=====================")
-			print("")
+		# Always dump full pipeline trace on G->A for flicker diagnosis
+		print("=== GROUND -> AIR ===")
+		if _prev_frame_trace != "":
+			print("--- LAST GROUNDED FRAME ---")
+			print(_prev_frame_trace)
+		print("--- FIRST AIRBORNE FRAME ---")
+		print(_frame_trace)
+		if ray_result:
+			print("  Raycast: separation=%.4fm floor_angle=%.1f°" % [ray_sep, ray_angle])
+		else:
+			print("  Raycast: MISS (no terrain within 2.5m)")
+		print("=====================")
 	elif not _was_grounded and _is_grounded:
 		# Air→Ground
 		var h_speed := Vector2(player.velocity.x, player.velocity.z).length()
@@ -311,16 +308,14 @@ func post_physics_step(_delta: float, _grapple_active: bool) -> void:
 			player.global_position.y, _trace_air_frames,
 			_best_contact_normal.x, _best_contact_normal.y, _best_contact_normal.z,
 			rad_to_deg(_best_contact_normal.angle_to(Vector3.UP))])
-		if _capture:
-			print("")
-			print("=== AIR -> GROUND (after %d airborne frames) ===" % _trace_air_frames)
-			if _prev_frame_trace != "":
-				print("--- LAST AIRBORNE FRAME ---")
-				print(_prev_frame_trace)
-			print("--- FIRST GROUNDED FRAME ---")
-			print(_frame_trace)
-			print("=====================")
-			print("")
+		# Always dump full pipeline trace on A->G for flicker diagnosis
+		print("=== AIR -> GROUND (after %d airborne frames) ===" % _trace_air_frames)
+		if _prev_frame_trace != "":
+			print("--- LAST AIRBORNE FRAME ---")
+			print(_prev_frame_trace)
+		print("--- FIRST GROUNDED FRAME ---")
+		print(_frame_trace)
+		print("=====================")
 		_trace_air_frames = 0
 	elif not _is_grounded:
 		_trace_air_frames += 1
@@ -492,9 +487,7 @@ func process_normal_movement(delta: float) -> void:
 			var slope_y := -(n.x * player.velocity.x + n.z * player.velocity.z) / n.y
 			var gravity_normal := player.gravity * delta * n.y
 			var target_y := slope_y - gravity_normal
-			# Preserve excess upward momentum for natural ramp-to-flat launches.
-			if slope_y < 0.0 or player.velocity.y <= target_y:
-				player.velocity.y = target_y
+			player.velocity.y = target_y
 		else:
 			# Steep slope: strip velocity going INTO the surface.
 			var perp := player.velocity.dot(n)
@@ -661,25 +654,35 @@ func _update_ground_state(delta: float) -> void:
 	# the capsule can't move farther than velocity * delta in one frame.
 	# This maintains grounded state (enabling tangent snap) without touching
 	# velocity — zero horizontal contamination.
-	if _was_grounded and not _post_jump_rising:
-		var max_sep := player.velocity.length() * delta
-		var space := player.get_world_3d().direct_space_state
-		var from := player.global_position + Vector3(0, 0.5, 0)
-		var to := from + Vector3(0, -(0.5 + max_sep), 0)
-		var query := PhysicsRayQueryParameters3D.create(from, to, CollisionLayers.WORLD)
-		query.exclude = [player.get_rid()]
-		var result := space.intersect_ray(query)
-		if result and result.normal.angle_to(Vector3.UP) <= SLOPE_MAX_GROUND_ANGLE:
-			var sep: float = player.global_position.y - result.position.y
-			if sep <= max_sep:
-				_floor_normal = result.normal
-				_slope_traction = result.normal.y
-				_floor_y = result.position.y
-				_is_grounded = true
-				if player.capture_movement:
-					_frame_trace += "\n  [RAY PERSIST] sep=%.4f max=%.4f n=(%.3f,%.3f,%.3f)" % [
-						sep, max_sep, result.normal.x, result.normal.y, result.normal.z]
-				return
+	#if _was_grounded and not _post_jump_rising:
+		## Separation check: if velocity is going AWAY from the surface we were
+		## on, the player is launching off a convex slope — don't persist.
+		#var departing := player.velocity.dot(_floor_normal) > 0.0
+		#if not departing:
+			## Cap search distance to capsule radius — at high speeds
+			## velocity * delta can far exceed the capsule's physical reach.
+			#var max_sep := minf(player.velocity.length() * delta, 0.4)
+			#var space := player.get_world_3d().direct_space_state
+			#var from := player.global_position + Vector3(0, 0.5, 0)
+			#var to := from + Vector3(0, -(0.5 + max_sep), 0)
+			#var query := PhysicsRayQueryParameters3D.create(from, to, CollisionLayers.WORLD)
+			#query.exclude = [player.get_rid()]
+			#var result := space.intersect_ray(query)
+			#if result and result.normal.angle_to(Vector3.UP) <= SLOPE_MAX_GROUND_ANGLE:
+				#var departing_new := player.velocity.dot(result.normal) > 0.0
+				#if departing_new:
+					#pass
+				#else:
+					#var sep: float = player.global_position.y - result.position.y
+					#if sep <= max_sep:
+						#_floor_normal = result.normal
+						#_slope_traction = result.normal.y
+						#_floor_y = result.position.y
+						#_is_grounded = true
+						#if player.capture_movement:
+							#_frame_trace += "\n  [RAY PERSIST] sep=%.4f max=%.4f n=(%.3f,%.3f,%.3f)" % [
+								#sep, max_sep, result.normal.x, result.normal.y, result.normal.z]
+						#return
 
 	# --- Airborne ---
 	if _post_jump_rising:
