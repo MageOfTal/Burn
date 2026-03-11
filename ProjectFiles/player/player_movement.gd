@@ -682,7 +682,7 @@ func _update_ground_state(delta: float) -> void:
 			var query := PhysicsRayQueryParameters3D.create(from, to, CollisionLayers.WORLD)
 			query.exclude = [player.get_rid()]
 			var result := space.intersect_ray(query)
-			if result and result.normal.angle_to(Vector3.UP) <= FLOOR_MAX_ANGLE:
+			if result and result.normal.angle_to(Vector3.UP) <= SLOPE_MAX_GROUND_ANGLE:
 				var sep: float = player.global_position.y - result.position.y
 				if sep <= max_sep:
 					_floor_normal = result.normal
