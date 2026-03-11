@@ -14,7 +14,7 @@ class_name PlayerMovement
 #  Constants
 # ======================================================================
 
-const SPEED := 9.0
+const SPEED := 50.0
 const JUMP_VELOCITY := 10.5
 const WALK_ACCEL: float = 30.33  ## Ground acceleration (m/s²) — 0.3s to top speed
 const ACCELERATION := 45.0
@@ -285,9 +285,10 @@ func post_physics_step(_delta: float, _grapple_active: bool) -> void:
 			ray_sep = player.global_position.y - ray_result.position.y
 			ray_angle = rad_to_deg(ray_result.normal.angle_to(Vector3.UP))
 		var h_speed := Vector2(player.velocity.x, player.velocity.z).length()
-		print("[G->A] vel=(%.2f,%.2f,%.2f) h=%.2f pos_y=%.4f ray_sep=%.4f ray_ang=%.1f° contacts=%d best_n=(%.3f,%.3f,%.3f) best_ang=%.1f° last_floor_n=(%.3f,%.3f,%.3f)" % [
+		var diag_max_sep := _prev_solver_push + 0.01
+		print("[G->A] vel=(%.2f,%.2f,%.2f) h=%.2f pos_y=%.4f ray_sep=%.4f ray_ang=%.1f° max_sep=%.4f contacts=%d best_n=(%.3f,%.3f,%.3f) best_ang=%.1f° last_floor_n=(%.3f,%.3f,%.3f)" % [
 			player.velocity.x, player.velocity.y, player.velocity.z, h_speed,
-			player.global_position.y, ray_sep, ray_angle,
+			player.global_position.y, ray_sep, ray_angle, diag_max_sep,
 			_dbg_last_contact_count,
 			_best_contact_normal.x, _best_contact_normal.y, _best_contact_normal.z,
 			rad_to_deg(_best_contact_normal.angle_to(Vector3.UP)) if _best_contact_normal != Vector3.ZERO else -1.0,
@@ -668,22 +669,20 @@ func _update_ground_state(delta: float) -> void:
 		return
 
 	# --- No contacts: raycast persistence ---
-	# If we were grounded and contacts dropped (block edge), check if the
-	# surface is still within one frame's travel. Distance is physics-derived:
-	# the capsule can't move farther than velocity * delta in one frame.
-	# This maintains grounded state (enabling tangent snap) without touching
-	# velocity — zero horizontal contamination.
+	# Bridges single-frame contact gaps from solver depenetration overshoot.
+	# max_sep = previous frame's solver push (the physical cause of the gap)
+	# plus a small float-precision margin.
 	if _was_grounded and not _post_jump_rising:
 		var departing := player.velocity.dot(_floor_normal) > 0.0
 		if not departing:
-			var max_sep := player.velocity.length() * delta
+			var max_sep := _prev_solver_push + 0.01
 			var space := player.get_world_3d().direct_space_state
 			var from := player.global_position + Vector3(0, 0.5, 0)
 			var to := from + Vector3(0, -(0.5 + max_sep), 0)
 			var query := PhysicsRayQueryParameters3D.create(from, to, CollisionLayers.WORLD)
 			query.exclude = [player.get_rid()]
 			var result := space.intersect_ray(query)
-			if result and result.normal.angle_to(Vector3.UP) <= SLOPE_MAX_GROUND_ANGLE:
+			if result and result.normal.angle_to(Vector3.UP) <= FLOOR_MAX_ANGLE:
 				var sep: float = player.global_position.y - result.position.y
 				if sep <= max_sep:
 					_floor_normal = result.normal
