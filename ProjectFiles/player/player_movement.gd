@@ -377,28 +377,19 @@ func process_normal_movement(delta: float) -> void:
 	var walkable := is_on_walkable_floor()
 	var traction := _slope_traction if on_floor else 1.0
 
-	# Solver horizontal correction: when the solver resolves floor contacts,
-	# it absorbs the into-surface velocity component, which has horizontal
-	# elements on sloped surfaces. This causes speed loss at landing and at
-	# surface transitions (flat → ramp). Restore pre-solver horizontal;
-	# the tangent snap handles vel_y for the current surface.
-	# Skip when touching walls — the solver's wall response is legitimate.
+	# On landing, the solver deflects vertical impact into horizontal velocity
+	# along the slope. Restore pre-solver horizontal velocity and undo the
+	# solver's horizontal position push (only when no walls nearby).
 	if not _was_grounded and on_floor:
-		# Landing: restore velocity + undo solver's horizontal position push.
 		var pre_solver_h := Vector2(_dbg_set_vel.x, _dbg_set_vel.z)
 		if pre_solver_h.length() <= CONTROL_SPEED_THRESHOLD:
 			horizontal = pre_solver_h
 			if _last_sent_pos != Vector3.ZERO and _obstacle_normals.is_empty():
+				# Where we should be: old position + velocity * delta
 				var expected_x := _last_sent_pos.x + _dbg_set_vel.x * delta
 				var expected_z := _last_sent_pos.z + _dbg_set_vel.z * delta
 				player.global_position.x = expected_x
 				player.global_position.z = expected_z
-	elif _was_grounded and on_floor and _obstacle_normals.is_empty():
-		# Grounded-to-grounded: restore velocity only (no position snap).
-		# Prevents solver drag on ramps from gravity-bias depenetration.
-		var pre_solver_h := Vector2(_dbg_set_vel.x, _dbg_set_vel.z)
-		if pre_solver_h.length() <= CONTROL_SPEED_THRESHOLD:
-			horizontal = pre_solver_h
 
 	var h_speed := horizontal.length()
 	_trace_normal_ran = true
@@ -508,6 +499,30 @@ func process_normal_movement(delta: float) -> void:
 	if is_on_floor() and not player._frame_jump:
 		var n := _floor_normal
 		if is_on_walkable_floor():
+			# Forward surface prediction: cast a ray one frame ahead in the
+			# travel direction to detect upcoming slope changes. When the
+			# ahead surface is steeper (flat → ramp), use its normal for
+			# tangent snap so vel_y aligns with the ramp BEFORE contact.
+			# This prevents the solver from absorbing the into-surface
+			# velocity component at the transition (which costs horizontal
+			# speed on sloped surfaces).
+			var h_vel := Vector3(player.velocity.x, 0, player.velocity.z)
+			var h_spd_sq := h_vel.length_squared()
+			if h_spd_sq > 100.0:
+				var h_spd := sqrt(h_spd_sq)
+				var h_dir := h_vel / h_spd
+				var look_dist := h_spd * delta
+				var space := player.get_world_3d().direct_space_state
+				var ray_from := player.global_position + h_dir * look_dist + Vector3(0, 1.5, 0)
+				var ray_to := ray_from - Vector3(0, 2.5, 0)
+				var query := PhysicsRayQueryParameters3D.create(ray_from, ray_to, CollisionLayers.WORLD)
+				query.exclude = [player.get_rid()]
+				var result := space.intersect_ray(query)
+				if result and result.normal.angle_to(Vector3.UP) <= FLOOR_MAX_ANGLE:
+					if result.normal.y < n.y:
+						_frame_trace += "\n  [AHEAD SNAP] cur_n=(%.3f,%.3f,%.3f) ahead_n=(%.3f,%.3f,%.3f)" % [
+							n.x, n.y, n.z, result.normal.x, result.normal.y, result.normal.z]
+						n = result.normal
 			# Tangent snap with gravity-normal contact bias.
 			# slope_y = exact surface tangent (vel · n = 0).
 			# Subtracting gravity's normal component leaves a small into-surface
