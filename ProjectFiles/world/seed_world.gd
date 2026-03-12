@@ -1,16 +1,15 @@
 extends Node3D
 
-## Procedural terrain using Zylann's Voxel Tools GDExtension.
-## Uses VoxelTerrain + VoxelMesherTransvoxel + VoxelGeneratorNoise2D
-## for a smooth, destructible terrain with hills and bumps.
+## Procedural terrain using custom volumetric chunk system.
+## SDF data is stored per-chunk and meshed with VoxelMesherTransvoxel.
+## Collision meshes include a 1-voxel skirt overlap at chunk boundaries
+## to eliminate Jolt Physics boundary-edge impulse artifacts.
 ##
-## The terrain is SDF-based (Signed Distance Field) which means digging
-## creates smooth holes — not blocky Minecraft-style cuts.
-##
-## Key APIs preserved from old system:
-##   - create_crater(pos, radius, depth)  — deforms terrain via VoxelTool
+## Key APIs:
+##   - create_crater(pos, radius, depth)  — deforms terrain SDF
 ##   - get_height_at(x, z)                — raycast-based surface query
 ##   - get_normal_at(x, z)                — central-difference from height samples
+##   - get_height_from_noise(x, z)        — instant noise lookup (no physics)
 ##
 ## Structures (walls, ramps) are spawned on top of the terrain surface.
 
@@ -19,7 +18,7 @@ extends Node3D
 @export var map_size: float = 400.0         ## Circular map diameter (world units)
 @export var height_scale: float = 16.0      ## Max height variation (meters)
 @export var noise_period: float = 128.0     ## Noise repeat period (larger = broader hills)
-@export var height_range: float = 32.0      ## VoxelGeneratorNoise2D height range
+@export var height_range: float = 32.0      ## Vertical span of noise terrain (meters)
 
 ## Structure generation
 @export_group("Structures")
@@ -35,8 +34,7 @@ extends Node3D
 signal world_generation_complete
 
 ## Internal refs
-var _voxel_terrain: VoxelTerrain = null
-var _voxel_tool: VoxelTool = null
+var _terrain_system: TerrainSystem = null
 var _noise: FastNoiseLite = null
 var _terrain_ready := false
 var structures_complete := false  ## True after all walls/ramps have been spawned
@@ -49,16 +47,7 @@ const TOWER_EXCLUSION_RADIUS := 15.0        ## No walls/ramps within this of tow
 
 
 func _ready() -> void:
-	# --- Create VoxelTerrain node ---
-	_voxel_terrain = VoxelTerrain.new()
-	_voxel_terrain.name = "VoxelTerrainNode"
-
-	# --- Mesher: Transvoxel for smooth terrain ---
-	var mesher := VoxelMesherTransvoxel.new()
-	_voxel_terrain.mesher = mesher
-
-	# --- Generator: Noise2D for hilly terrain ---
-	var generator := VoxelGeneratorNoise2D.new()
+	# --- Noise setup (same as old VoxelGeneratorNoise2D) ---
 	var noise := FastNoiseLite.new()
 	noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	noise.frequency = 1.0 / noise_period
@@ -66,70 +55,17 @@ func _ready() -> void:
 	noise.fractal_lacunarity = 2.0
 	noise.fractal_gain = 0.45
 	noise.seed = 10293847
-	_noise = noise  # Store for direct height queries
-	generator.noise = noise
-	# height_start: Y position of the lowest terrain surface.
-	# height_range: vertical span the noise covers above height_start.
-	# So terrain surface lives between Y=0 and Y=height_range.
-	generator.height_start = 0.0
-	generator.height_range = height_range
-	# Channel must be SDF for smooth Transvoxel meshing (should be default, but be explicit)
-	generator.channel = VoxelBuffer.CHANNEL_SDF
-	_voxel_terrain.generator = generator
-
-	# --- Stream: keep SDF edits (craters, tower carving) in memory ---
-	# Without a stream, chunks unloaded by the viewer (e.g. toad dimension
-	# teleport to Y=-500) lose all edits and regenerate from the noise generator.
-	# VoxelStreamMemory stores only modified blocks in RAM — unedited chunks
-	# are still generated on the fly from the noise, so memory cost is minimal.
-	var stream := VoxelStreamMemory.new()
-	_voxel_terrain.stream = stream
-
-	# --- Terrain settings ---
-	_voxel_terrain.mesh_block_size = 16
-	_voxel_terrain.max_view_distance = 256
-	_voxel_terrain.generate_collisions = true
-	_voxel_terrain.collision_layer = CollisionLayers.WORLD
-	_voxel_terrain.collision_mask = 0
-
-	# Constrain terrain to our map area (prevent infinite generation).
-	# Bounds AABB is in data-block coordinates (each block = mesh_block_size voxels).
-	# With mesh_block_size=16, one block covers 16 voxels = 16 world units.
-	var half_extent := map_size * 0.5
-	_voxel_terrain.bounds = AABB(
-		Vector3(-half_extent, -64.0, -half_extent),
-		Vector3(map_size, 128.0, map_size)
-	)
+	_noise = noise
 
 	# --- Terrain material ---
-	# Use a simple green material. For triplanar mapping in the future,
-	# this can be replaced with a ShaderMaterial.
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = Color(0.25, 0.65, 0.35)
-	_voxel_terrain.material_override = mat
 
-	add_child(_voxel_terrain)
-
-	# --- Server-side VoxelViewer: load ALL terrain chunks permanently ---
-	# Without this, chunks only load around player VoxelViewers, which means
-	# terrain may not have collision meshes when a player spawns (causing them
-	# to fall through the ground). A single viewer at map center with a view
-	# distance covering the full map ensures all chunks are always loaded.
-	if multiplayer.is_server() and ClassDB.class_exists(&"VoxelViewer"):
-		var server_viewer: Node3D = ClassDB.instantiate(&"VoxelViewer")
-		server_viewer.name = "ServerVoxelViewer"
-		server_viewer.position = Vector3(0.0, 0.0, 0.0)
-		if server_viewer.has_method("set_view_distance"):
-			server_viewer.set_view_distance(512)
-		elif "view_distance" in server_viewer:
-			server_viewer.view_distance = 512
-		# Require collisions so physics meshes are generated for all chunks
-		if "requires_collisions" in server_viewer:
-			server_viewer.requires_collisions = true
-		_voxel_terrain.add_child(server_viewer)
-
-	# Get the VoxelTool for editing (digging, craters)
-	_voxel_tool = _voxel_terrain.get_voxel_tool()
+	# --- Custom terrain system (replaces VoxelTerrain) ---
+	_terrain_system = TerrainSystem.new()
+	_terrain_system.name = "TerrainSystem"
+	add_child(_terrain_system)
+	_terrain_system.setup(noise, height_range, mat)
 
 	# --- Directional light ---
 	if not get_parent().has_node("Sun"):
@@ -201,6 +137,9 @@ func _spawn_heavy_structures() -> void:
 	structures_node.name = "Structures"
 	add_child(structures_node)
 
+	# Build terrain chunks before spawning structures (need collision for raycasts)
+	await _terrain_system.build_initial()
+
 	# Pre-compute tower position so walls/ramps can respect the exclusion zone.
 	# The tower itself is spawned last (it awaits voxel generation).
 	_precompute_tower_position(rng)
@@ -208,6 +147,7 @@ func _spawn_heavy_structures() -> void:
 	if not GameManager.debug_skip_structures:
 		await _spawn_walls_batched(rng, structures_node)
 		await _spawn_ramps_batched(rng, structures_node)
+		await _spawn_smooth_ramps_batched(rng, structures_node)
 		await _spawn_obj_structures_batched(rng, structures_node)
 		await _spawn_tower(rng, structures_node)
 	else:
@@ -216,6 +156,7 @@ func _spawn_heavy_structures() -> void:
 	_spawn_dummies(rng)
 
 	_spawn_test_platforms()
+	_spawn_sine_ramps()
 
 	structures_complete = true
 	world_generation_complete.emit()
@@ -228,16 +169,10 @@ func reset_world() -> void:
 	## After calling this, call _spawn_heavy_structures() to rebuild.
 	print("[SeedWorld] ======== RESETTING WORLD ========")
 
-	# --- 1. Clear terrain deformations by replacing VoxelStreamMemory ---
-	# VoxelStreamMemory stores all SDF edits (craters) in RAM. Replacing it
-	# with a fresh instance discards every edit, so the generator's pristine
-	# noise surface is used again when chunks reload.
-	if _voxel_terrain:
-		var fresh_stream := VoxelStreamMemory.new()
-		_voxel_terrain.stream = fresh_stream
-		# Re-acquire the VoxelTool — old one may reference stale data
-		_voxel_tool = _voxel_terrain.get_voxel_tool()
-		print("[SeedWorld] Terrain stream reset (craters cleared)")
+	# --- 1. Reset terrain system (clears SDF edits and destroys chunks) ---
+	if _terrain_system:
+		_terrain_system.reset()
+		print("[SeedWorld] Terrain system reset (craters cleared)")
 
 	# --- 2. Destroy all structures (walls, ramps, tower) ---
 	var structures := get_node_or_null("Structures")
@@ -308,12 +243,13 @@ func get_normal_at(world_x: float, world_z: float) -> Vector3:
 
 func get_height_from_noise(world_x: float, world_z: float) -> float:
 	## Returns the exact terrain height at (x, z) by computing the same noise
-	## that VoxelGeneratorNoise2D uses. No raycasts, no physics, instant.
+	## used by the terrain system. No raycasts, no physics, instant.
 	## NOTE: Does NOT account for craters (use get_height_at() for that).
+	if _terrain_system:
+		return _terrain_system.get_height_from_noise(world_x, world_z)
 	if _noise == null:
 		return 0.0
-	var n: float = _noise.get_noise_2d(world_x, world_z)
-	return (n + 1.0) * 0.5 * height_range
+	return (_noise.get_noise_2d(world_x, world_z) + 1.0) * 0.5 * height_range
 
 
 func _get_slope_from_noise(world_x: float, world_z: float) -> float:
@@ -346,16 +282,16 @@ func _get_random_ground_pos(rng: RandomNumberGenerator, y_offset: float = 0.0,
 
 
 # ======================================================================
-#  Terrain deformation (craters) via VoxelTool
+#  Terrain deformation (craters) via TerrainSystem
 # ======================================================================
 
 func create_crater(world_pos: Vector3, radius: float, _crater_depth: float,
 		attacker_id: int = -1) -> void:
 	## Deform the terrain to create a crater at the given world position.
-	## Uses VoxelTool.do_sphere() with MODE_REMOVE for smooth SDF subtraction.
+	## Stamps the SDF grid and queues affected chunks for re-meshing.
 	## Also carves the spiral tower if one exists.
 	## Server calls this, then syncs to clients.
-	if _voxel_tool == null:
+	if _terrain_system == null:
 		return
 
 	_apply_crater(world_pos, radius)
@@ -382,10 +318,11 @@ func _sync_crater(world_pos: Vector3, radius: float) -> void:
 
 func _apply_crater(world_pos: Vector3, radius: float) -> void:
 	## Internal: remove a sphere of terrain at the given position.
-	if _voxel_tool == null:
+	if _terrain_system == null:
 		return
-	_voxel_tool.mode = VoxelTool.MODE_REMOVE
-	_voxel_tool.do_sphere(world_pos, radius)
+	_terrain_system.deform(world_pos, radius)
+
+
 
 
 # ======================================================================
@@ -497,6 +434,48 @@ func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 			await get_tree().process_frame
 
 	print("[SeedWorld] Spawned %d destructible ramps" % spawned)
+
+
+func _spawn_smooth_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
+	## Spawn non-destructible smooth ramps (single mesh, no block grid).
+	## Longer than block ramps, pink for visibility.
+	var smooth_scene := preload("res://world/smooth_ramp.tscn")
+	var ramp_sizes := [
+		Vector3(5, 0.5, 14),
+		Vector3(4, 0.5, 12),
+		Vector3(6, 0.5, 16),
+	]
+	var angles_deg := [15.0, 20.0, 25.0, 30.0]
+	var num_smooth := num_ramps / 4  # ~50 smooth ramps
+	var spawned := 0
+
+	for i in num_smooth:
+		var ramp_size: Vector3 = ramp_sizes[rng.randi() % ramp_sizes.size()]
+		var ramp_angle: float = angles_deg[rng.randi() % angles_deg.size()]
+		var y_rot := rng.randf_range(0, TAU)
+
+		var pos := _get_random_ground_pos(rng, 0.3, 25.0)
+		if pos == Vector3.INF:
+			continue
+
+		if _tower_position != Vector3.INF:
+			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
+			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
+				continue
+
+		var ramp: StaticBody3D = smooth_scene.instantiate()
+		ramp.name = "SmoothRamp_%d" % spawned
+		ramp.ramp_size = ramp_size
+		ramp.position = pos
+		ramp.rotation.y = y_rot
+		ramp.rotation.x = deg_to_rad(ramp_angle)
+		parent.add_child(ramp)
+		spawned += 1
+
+		if spawned % 10 == 0:
+			await get_tree().process_frame
+
+	print("[SeedWorld] Spawned %d smooth ramps" % spawned)
 
 
 func _spawn_obj_structures_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
@@ -673,7 +652,7 @@ func _spawn_test_platforms() -> void:
 	var wall_depth := 1.0   # Top surface width the player walks on
 	var wall_length := 12.0
 	var ramp_width := 5.0
-	var ramp_thickness := 0.3
+	var ramp_thickness := 0.6  # Must exceed capsule radius 0.4 to prevent phase-through
 
 	var container := Node3D.new()
 	container.name = "TestPlatforms"
@@ -735,6 +714,141 @@ func _spawn_test_platforms() -> void:
 	var top_y := ground_y + wall_height
 	print("[TestPlatforms] Upright wall + 40° ramp at x=%.0f z=%.0f — top at y=%.1f" % [
 		pos_x, pos_z, top_y])
+
+
+func _spawn_sine_ramps() -> void:
+	## DEBUG: Sinusoidal ramps with varying max inclines for movement testing.
+	## Each ramp is a smooth wave surface. The steepest point of the wave
+	## matches the labelled max angle. Ramps are placed side by side near origin.
+	var angles := [30.0, 50.0, 60.0, 70.0, 80.0]
+	var colors := [
+		Color(0.3, 0.7, 0.3),  # green  — 30°
+		Color(0.7, 0.7, 0.2),  # yellow — 50°
+		Color(0.8, 0.4, 0.1),  # orange — 60°
+		Color(0.8, 0.2, 0.2),  # red    — 70°
+		Color(0.6, 0.1, 0.6),  # purple — 80°
+	]
+	var wavelength := 20.0
+	var ramp_width := 12.0
+	var ramp_length := 60.0  # 3 complete wavelengths
+	var spacing := 4.0
+	var base_x := 40.0
+	var base_z := 0.0
+	var ground_y := get_height_from_noise(base_x, base_z) + 5.0  # elevated above terrain
+
+	var container := Node3D.new()
+	container.name = "SineTestRamps"
+	add_child(container)
+
+	for i in angles.size():
+		var max_angle: float = angles[i]
+		var amplitude := tan(deg_to_rad(max_angle)) * wavelength / (TAU)
+		var ramp := _create_sine_ramp(ramp_width, ramp_length, wavelength, amplitude, colors[i])
+		ramp.name = "SineRamp_%d" % int(max_angle)
+		ramp.position = Vector3(base_x, ground_y, base_z + i * (ramp_width + spacing))
+		container.add_child(ramp)
+
+	# Flat approach platform so the player can walk onto the ramps
+	var platform := StaticBody3D.new()
+	platform.name = "SineRampPlatform"
+	platform.collision_layer = CollisionLayers.WORLD
+	platform.collision_mask = 0
+	var total_z := angles.size() * (ramp_width + spacing) - spacing
+	var plat_size := Vector3(6.0, 0.5, total_z + 4.0)
+	var plat_shape := BoxShape3D.new()
+	plat_shape.size = plat_size
+	var plat_col := CollisionShape3D.new()
+	plat_col.shape = plat_shape
+	platform.add_child(plat_col)
+	var plat_mesh := MeshInstance3D.new()
+	var plat_box := BoxMesh.new()
+	plat_box.size = plat_size
+	plat_mesh.mesh = plat_box
+	var plat_mat := StandardMaterial3D.new()
+	plat_mat.albedo_color = Color(0.5, 0.5, 0.5)
+	plat_mesh.material_override = plat_mat
+	platform.add_child(plat_mesh)
+	platform.position = Vector3(base_x - 3.0 - plat_size.x * 0.5, ground_y - 0.25, base_z + total_z * 0.5 - 2.0)
+	container.add_child(platform)
+
+	print("[SineRamps] %d ramps at x=%.0f z=%.0f, ground_y=%.1f" % [
+		angles.size(), base_x, base_z, ground_y])
+
+
+func _create_sine_ramp(width: float, length: float, wavelength: float,
+		amplitude: float, color: Color) -> StaticBody3D:
+	## Build a sinusoidal surface as ArrayMesh + ConcavePolygonShape3D.
+	var body := StaticBody3D.new()
+	body.collision_layer = CollisionLayers.WORLD
+	body.collision_mask = 0
+
+	var step := 0.5  # vertex spacing in meters
+	var nx := int(length / step)
+	var nz := int(width / step)
+
+	var verts := PackedVector3Array()
+	var norms := PackedVector3Array()
+	var indices := PackedInt32Array()
+
+	# --- Vertices ---
+	for iz in range(nz + 1):
+		for ix in range(nx + 1):
+			var x := float(ix) * step
+			var z := float(iz) * step
+			var y := amplitude * sin(TAU * x / wavelength)
+			verts.append(Vector3(x, y, z))
+
+			# Analytical normal: dy/dx = amplitude * TAU/wavelength * cos(...)
+			var dydx := amplitude * TAU / wavelength * cos(TAU * x / wavelength)
+			norms.append(Vector3(-dydx, 1.0, 0.0).normalized())
+
+	# --- Triangles ---
+	var row := nx + 1
+	for iz in range(nz):
+		for ix in range(nx):
+			var i00 := iz * row + ix
+			var i10 := i00 + 1
+			var i01 := i00 + row
+			var i11 := i01 + 1
+			# Two triangles per quad
+			indices.append(i00); indices.append(i01); indices.append(i10)
+			indices.append(i10); indices.append(i01); indices.append(i11)
+
+	# --- Visual mesh ---
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_NORMAL] = norms
+	arrays[Mesh.ARRAY_INDEX] = indices
+
+	var arr_mesh := ArrayMesh.new()
+	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = color
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	arr_mesh.surface_set_material(0, mat)
+
+	var mesh_inst := MeshInstance3D.new()
+	mesh_inst.mesh = arr_mesh
+	body.add_child(mesh_inst)
+
+	# --- Collision (trimesh from triangle faces) ---
+	var faces := PackedVector3Array()
+	faces.resize(indices.size())
+	for t in range(indices.size()):
+		faces[t] = verts[indices[t]]
+
+	var col_shape := ConcavePolygonShape3D.new()
+	col_shape.backface_collision = true
+	col_shape.set_faces(faces)
+
+	var col_node := CollisionShape3D.new()
+	col_node.shape = col_shape
+	body.add_child(col_node)
+
+	return body
+
 
 
 func _create_cloud_sky_shader() -> Shader:
