@@ -53,6 +53,29 @@ var debug_toad_no_shadows: bool = false   # Disable shadow casting on toad rain 
 var debug_toad_show_hitboxes: bool = false  # Show collision shape wireframe on toad bodies
 var debug_toad_contacts: bool = false      # Log toad-side contact details (F10 toggles player-side, F11 toggles toad-side)
 var debug_toad_mass: float = 4.0           # Runtime-adjustable toad mass (kg), default matches TOAD_MASS
+var debug_disable_surface_press: bool = false  # Disable floor surface press in player movement
+var debug_speed_50: bool = false               # Override player speed to 50
+var debug_no_gravity_sweep: bool = false       # Use normal gravity instead of shape sweep
+var debug_sweep_1m: bool = false               # Extend sweep distance to 1 meter
+var debug_no_slope_projection: bool = false    # Disable slope projection entirely
+var debug_sweep_sets_grounded: bool = false    # Sweep result overrides _is_grounded
+var debug_no_landing_restore: bool = false     # Disable airborne hvel restore on landing
+var debug_sweep_before_move: bool = false      # Run gravity sweep before air/ground decision
+var debug_always_ground_move: bool = false     # Force ground movement even when airborne
+var debug_sweep_in_prephys: bool = false       # Run sweep in pre_physics_step right after contact check
+var debug_show_collision: bool = false         # Show terrain collision meshes as transparent red
+var debug_no_contact_unground: bool = false    # Don't unground when Jolt contacts are lost
+var debug_no_jump_unground: bool = false       # Don't unground on jump
+var debug_no_force_airborne: bool = false      # Don't force airborne
+
+# ── Grounding flicker diagnostics ──────────────────────────────────────
+var debug_grounding_surface_press: bool = false     # Add small downward vel.y after slope projection to maintain contact
+var debug_grounding_press_strength: float = 1.0     # Surface press strength (m/s downward)
+var debug_grounding_no_snap_ground: bool = false     # Disable snap-to-ground setting _is_grounded
+var debug_grounding_no_perp_strip: bool = false      # Disable perpendicular velocity stripping
+var debug_grounding_extend_snap: bool = false        # Extend snap range to 0.5m (vs normal vel-based)
+var debug_grounding_no_pos_correction: bool = false  # Disable landing position correction
+var debug_grounding_log: bool = false                # Print grounding state transitions every frame
 
 # Structure collision tuning (set from pause menu, all default to 1.0 base ratio)
 var structure_momentum_damage_scale: float = 1.0    # Multiplier on momentum → structure damage

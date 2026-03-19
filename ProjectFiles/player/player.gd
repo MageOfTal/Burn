@@ -393,6 +393,18 @@ func _process(delta: float) -> void:
 	# tick rate while the player body is interpolated between ticks.
 	if has_node("/root/NetworkManager") and get_node("/root/NetworkManager")._loading_screen != null:
 		return
+	# Visual interpolation debug: compare interpolated position with physics position
+	if capture_movement and peer_id == multiplayer.get_unique_id():
+		var interp_xform := get_global_transform_interpolated()
+		var vis_pos: Vector3 = interp_xform.origin
+		var phys_pos: Vector3 = global_position
+		var diff := vis_pos - phys_pos
+		var diff_h := Vector2(diff.x, diff.z).length()
+		if diff_h > 0.0005:  # > 0.5mm horizontal
+			print("  [INTERP] vis=(%.4f,%.4f,%.4f) phys=(%.4f,%.4f,%.4f) diff_h=%.3fmm" % [
+				vis_pos.x, vis_pos.y, vis_pos.z,
+				phys_pos.x, phys_pos.y, phys_pos.z,
+				diff_h * 1000.0])
 	_client_process(delta)
 
 
@@ -477,9 +489,8 @@ func _server_process(delta: float) -> void:
 	# Slide cooldown
 	slide_crouch.tick_cooldown(delta)
 
-	# Grounded velocity management + gravity (delegated to PlayerMovement)
+	# Grounded velocity management (gravity is applied at the end of movement)
 	movement.begin_movement(delta)
-	movement.apply_gravity(delta)
 
 	# Rotation from look input
 	rotation.y = player_input.look_yaw
@@ -515,6 +526,9 @@ func _server_process(delta: float) -> void:
 				slide_crouch.process_crouch(delta)
 			else:
 				movement.process_normal_movement(delta)
+
+	# Snap + gravity: runs after all movement branches so it's never skipped
+	movement.apply_snap_and_gravity(delta)
 
 	# Track pre-land velocity for slide-on-land momentum transfer
 	slide_crouch.track_pre_land_velocity()

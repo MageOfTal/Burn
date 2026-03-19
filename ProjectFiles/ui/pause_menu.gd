@@ -37,6 +37,8 @@ var _momentum_damage_input: LineEdit = null
 var _explosion_radius_input: LineEdit = null
 var _explosion_damage_input: LineEdit = null
 var _resistance_scale_input: LineEdit = null
+var _surface_press_button: CheckButton = null
+var _speed_50_button: CheckButton = null
 
 # ── Video Settings panel UI refs ─────────────────────────────────────────
 var _video_panel: PanelContainer = null
@@ -66,6 +68,23 @@ var _glow_label: Label = null
 var _gi_option: OptionButton = null
 var _fog_button: CheckButton = null
 var _volumetric_fog_button: CheckButton = null
+var _roughness_limiter_button: CheckButton = null
+var _tonemap_option: OptionButton = null
+var _adjustment_button: CheckButton = null
+var _contrast_slider: HSlider = null
+var _contrast_label: Label = null
+var _saturation_slider: HSlider = null
+var _saturation_label: Label = null
+var _dof_button: CheckButton = null
+var _dof_distance_slider: HSlider = null
+var _dof_distance_label: Label = null
+var _dof_blur_slider: HSlider = null
+var _dof_blur_label: Label = null
+var _auto_exposure_button: CheckButton = null
+var _debanding_button: CheckButton = null
+var _scaling_mode_option: OptionButton = null
+var _sharpening_slider: HSlider = null
+var _sharpening_label: Label = null
 var _fps_hud_button: CheckButton = null
 var _debris_button: CheckButton = null
 var _detached_structures_button: CheckButton = null
@@ -362,6 +381,78 @@ func _build_main_panel() -> void:
 	# Separator
 	vbox.add_child(HSeparator.new())
 
+	# ── Player Physics ─────────────────────────────────────────────────
+	_add_section_header("Player Physics", vbox)
+
+	_surface_press_button = _add_check("Disable Surface Press", GameManager.debug_disable_surface_press, vbox)
+	_surface_press_button.toggled.connect(_on_surface_press_toggled)
+
+	_speed_50_button = _add_check("Speed 50", GameManager.debug_speed_50, vbox)
+	_speed_50_button.toggled.connect(_on_speed_50_toggled)
+
+	var _no_gravity_sweep_button = _add_check("No Gravity Sweep", GameManager.debug_no_gravity_sweep, vbox)
+	_no_gravity_sweep_button.toggled.connect(func(p): GameManager.debug_no_gravity_sweep = p)
+
+	var _sweep_1m_button = _add_check("Sweep 1m", GameManager.debug_sweep_1m, vbox)
+	_sweep_1m_button.toggled.connect(func(p): GameManager.debug_sweep_1m = p)
+
+	var _no_slope_proj_button = _add_check("No Slope Projection", GameManager.debug_no_slope_projection, vbox)
+	_no_slope_proj_button.toggled.connect(func(p): GameManager.debug_no_slope_projection = p)
+
+	var _sweep_grounds_button = _add_check("Sweep Sets Grounded", GameManager.debug_sweep_sets_grounded, vbox)
+	_sweep_grounds_button.toggled.connect(func(p): GameManager.debug_sweep_sets_grounded = p)
+
+	var _no_landing_button = _add_check("No Landing Restore", GameManager.debug_no_landing_restore, vbox)
+	_no_landing_button.toggled.connect(func(p): GameManager.debug_no_landing_restore = p)
+
+	var _sweep_before_button = _add_check("Sweep Before Move", GameManager.debug_sweep_before_move, vbox)
+	_sweep_before_button.toggled.connect(func(p): GameManager.debug_sweep_before_move = p)
+
+	var _always_ground_button = _add_check("Always Ground Move", GameManager.debug_always_ground_move, vbox)
+	_always_ground_button.toggled.connect(func(p): GameManager.debug_always_ground_move = p)
+
+	var _sweep_prephys_button = _add_check("Sweep In PrePhys", GameManager.debug_sweep_in_prephys, vbox)
+	_sweep_prephys_button.toggled.connect(func(p): GameManager.debug_sweep_in_prephys = p)
+
+	var _show_col_button = _add_check("Show Terrain Collision", GameManager.debug_show_collision, vbox)
+	_show_col_button.toggled.connect(func(p): GameManager.debug_show_collision = p)
+
+	var _no_contact_unground_button = _add_check("No Contact Unground", GameManager.debug_no_contact_unground, vbox)
+	_no_contact_unground_button.toggled.connect(func(p): GameManager.debug_no_contact_unground = p)
+
+	var _no_jump_unground_button = _add_check("No Jump Unground", GameManager.debug_no_jump_unground, vbox)
+	_no_jump_unground_button.toggled.connect(func(p): GameManager.debug_no_jump_unground = p)
+
+	var _no_force_airborne_button = _add_check("No Force Airborne", GameManager.debug_no_force_airborne, vbox)
+	_no_force_airborne_button.toggled.connect(func(p): GameManager.debug_no_force_airborne = p)
+
+	# ── Grounding Flicker Diagnostics ──────────────────────────────────
+	vbox.add_child(HSeparator.new())
+	_add_section_header("Grounding Flicker Diag", vbox)
+
+	var _gf_press_button = _add_check("Surface Press (vel.y bias)", GameManager.debug_grounding_surface_press, vbox)
+	_gf_press_button.toggled.connect(func(p): GameManager.debug_grounding_surface_press = p)
+
+	var _gf_press_strength = _add_labeled_input("Press Strength (m/s)", str(GameManager.debug_grounding_press_strength), vbox)
+	_gf_press_strength.text_submitted.connect(func(t): GameManager.debug_grounding_press_strength = clampf(float(t), 0.1, 20.0))
+
+	var _gf_no_snap_ground = _add_check("No Snap→Grounded", GameManager.debug_grounding_no_snap_ground, vbox)
+	_gf_no_snap_ground.toggled.connect(func(p): GameManager.debug_grounding_no_snap_ground = p)
+
+	var _gf_no_perp_strip = _add_check("No Perpendicular Strip", GameManager.debug_grounding_no_perp_strip, vbox)
+	_gf_no_perp_strip.toggled.connect(func(p): GameManager.debug_grounding_no_perp_strip = p)
+
+	var _gf_extend_snap = _add_check("Extend Snap Range (0.5m)", GameManager.debug_grounding_extend_snap, vbox)
+	_gf_extend_snap.toggled.connect(func(p): GameManager.debug_grounding_extend_snap = p)
+
+	var _gf_no_pos_corr = _add_check("No Landing Pos Correction", GameManager.debug_grounding_no_pos_correction, vbox)
+	_gf_no_pos_corr.toggled.connect(func(p): GameManager.debug_grounding_no_pos_correction = p)
+
+	var _gf_log = _add_check("Log Grounding Transitions", GameManager.debug_grounding_log, vbox)
+	_gf_log.toggled.connect(func(p): GameManager.debug_grounding_log = p)
+
+	vbox.add_child(HSeparator.new())
+
 	# --- Buttons ---
 	var btn_row := HBoxContainer.new()
 	btn_row.alignment = BoxContainer.ALIGNMENT_CENTER
@@ -545,6 +636,82 @@ func _build_video_panel() -> void:
 
 	vbox.add_child(HSeparator.new())
 
+	# ── Reflections & Specular ──────────────────────────────────────────
+	_add_section_header("Reflections & Specular", vbox)
+
+	_roughness_limiter_button = _add_check("Roughness Limiter", VideoSettings.settings["roughness_limiter"], vbox)
+	_roughness_limiter_button.toggled.connect(_on_roughness_limiter_toggled)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Tonemap ────────────────────────────────────────────────────────
+	_add_section_header("Tonemap", vbox)
+
+	_tonemap_option = _add_option_row("Tonemap Mode", ["Linear", "Reinhardt", "Filmic", "ACES"], VideoSettings.settings["tonemap_mode"], vbox)
+	_tonemap_option.item_selected.connect(_on_tonemap_changed)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Color Adjustments ──────────────────────────────────────────────
+	_add_section_header("Color Adjustments", vbox)
+
+	_adjustment_button = _add_check("Enable Adjustments", VideoSettings.settings["adjustment_enabled"], vbox)
+	_adjustment_button.toggled.connect(_on_adjustment_toggled)
+
+	var contrast_row := _add_slider_row("Contrast", 0.5, 2.0, VideoSettings.settings["adjustment_contrast"], 0.05, vbox)
+	_contrast_slider = contrast_row[0]
+	_contrast_label = contrast_row[1]
+	_contrast_label.text = "%.2f" % VideoSettings.settings["adjustment_contrast"]
+	_contrast_slider.value_changed.connect(_on_contrast_changed)
+
+	var saturation_row := _add_slider_row("Saturation", 0.0, 2.0, VideoSettings.settings["adjustment_saturation"], 0.05, vbox)
+	_saturation_slider = saturation_row[0]
+	_saturation_label = saturation_row[1]
+	_saturation_label.text = "%.2f" % VideoSettings.settings["adjustment_saturation"]
+	_saturation_slider.value_changed.connect(_on_saturation_changed)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Camera Effects ─────────────────────────────────────────────────
+	_add_section_header("Camera Effects", vbox)
+
+	_dof_button = _add_check("Depth of Field", VideoSettings.settings["dof_enabled"], vbox)
+	_dof_button.toggled.connect(_on_dof_toggled)
+
+	var dof_dist_row := _add_slider_row("DOF Distance", 1.0, 200.0, VideoSettings.settings["dof_focus_distance"], 1.0, vbox)
+	_dof_distance_slider = dof_dist_row[0]
+	_dof_distance_label = dof_dist_row[1]
+	_dof_distance_label.text = "%.0f" % VideoSettings.settings["dof_focus_distance"]
+	_dof_distance_slider.value_changed.connect(_on_dof_distance_changed)
+
+	var dof_blur_row := _add_slider_row("DOF Blur", 0.01, 0.2, VideoSettings.settings["dof_blur_amount"], 0.01, vbox)
+	_dof_blur_slider = dof_blur_row[0]
+	_dof_blur_label = dof_blur_row[1]
+	_dof_blur_label.text = "%.2f" % VideoSettings.settings["dof_blur_amount"]
+	_dof_blur_slider.value_changed.connect(_on_dof_blur_changed)
+
+	_auto_exposure_button = _add_check("Auto Exposure", VideoSettings.settings["auto_exposure"], vbox)
+	_auto_exposure_button.toggled.connect(_on_auto_exposure_toggled)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Rendering Quality ──────────────────────────────────────────────
+	_add_section_header("Rendering Quality", vbox)
+
+	_debanding_button = _add_check("Debanding", VideoSettings.settings["debanding"], vbox)
+	_debanding_button.toggled.connect(_on_debanding_toggled)
+
+	_scaling_mode_option = _add_option_row("3D Scaling", ["Bilinear", "FSR 1.0", "FSR 2.2"], VideoSettings.settings["scaling_3d_mode"], vbox)
+	_scaling_mode_option.item_selected.connect(_on_scaling_mode_changed)
+
+	var sharp_row := _add_slider_row("Sharpening", 0.0, 2.0, VideoSettings.settings["sharpening"], 0.1, vbox)
+	_sharpening_slider = sharp_row[0]
+	_sharpening_label = sharp_row[1]
+	_sharpening_label.text = "%.1f" % VideoSettings.settings["sharpening"]
+	_sharpening_slider.value_changed.connect(_on_sharpening_changed)
+
+	vbox.add_child(HSeparator.new())
+
 	# ── Performance ──────────────────────────────────────────────────────
 	_add_section_header("Performance", vbox)
 
@@ -583,6 +750,21 @@ func _add_section_header(text: String, parent: Node) -> void:
 	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	label.add_theme_color_override("font_color", Color(0.6, 0.75, 1.0))
 	parent.add_child(label)
+
+
+func _add_labeled_input(label_text: String, default_text: String, parent: Node) -> LineEdit:
+	var hbox := HBoxContainer.new()
+	var label := Label.new()
+	label.text = label_text
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hbox.add_child(label)
+	var input := LineEdit.new()
+	input.text = default_text
+	input.custom_minimum_size = Vector2(80, 0)
+	input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hbox.add_child(input)
+	parent.add_child(hbox)
+	return input
 
 
 func _add_check(label_text: String, default: bool, parent: Node) -> CheckButton:
@@ -781,6 +963,81 @@ func _on_volumetric_fog_toggled(pressed: bool) -> void:
 	VideoSettings.apply_fog()
 
 
+# ── Reflections & Specular ──────────────────────────────────────────────
+
+func _on_roughness_limiter_toggled(pressed: bool) -> void:
+	VideoSettings.settings["roughness_limiter"] = pressed
+	VideoSettings.apply_reflections()
+
+
+# ── Tonemap ─────────────────────────────────────────────────────────────
+
+func _on_tonemap_changed(index: int) -> void:
+	VideoSettings.settings["tonemap_mode"] = index
+	VideoSettings.apply_tonemap()
+
+
+# ── Color Adjustments ──────────────────────────────────────────────────
+
+func _on_adjustment_toggled(pressed: bool) -> void:
+	VideoSettings.settings["adjustment_enabled"] = pressed
+	VideoSettings.apply_adjustments()
+
+
+func _on_contrast_changed(value: float) -> void:
+	_contrast_label.text = "%.2f" % value
+	VideoSettings.settings["adjustment_contrast"] = value
+	VideoSettings.apply_adjustments()
+
+
+func _on_saturation_changed(value: float) -> void:
+	_saturation_label.text = "%.2f" % value
+	VideoSettings.settings["adjustment_saturation"] = value
+	VideoSettings.apply_adjustments()
+
+
+# ── Camera Effects ─────────────────────────────────────────────────────
+
+func _on_dof_toggled(pressed: bool) -> void:
+	VideoSettings.settings["dof_enabled"] = pressed
+	VideoSettings.apply_camera_effects()
+
+
+func _on_dof_distance_changed(value: float) -> void:
+	_dof_distance_label.text = "%.0f" % value
+	VideoSettings.settings["dof_focus_distance"] = value
+	VideoSettings.apply_camera_effects()
+
+
+func _on_dof_blur_changed(value: float) -> void:
+	_dof_blur_label.text = "%.2f" % value
+	VideoSettings.settings["dof_blur_amount"] = value
+	VideoSettings.apply_camera_effects()
+
+
+func _on_auto_exposure_toggled(pressed: bool) -> void:
+	VideoSettings.settings["auto_exposure"] = pressed
+	VideoSettings.apply_camera_effects()
+
+
+# ── Rendering Quality ──────────────────────────────────────────────────
+
+func _on_debanding_toggled(pressed: bool) -> void:
+	VideoSettings.settings["debanding"] = pressed
+	VideoSettings.apply_rendering_quality()
+
+
+func _on_scaling_mode_changed(index: int) -> void:
+	VideoSettings.settings["scaling_3d_mode"] = index
+	VideoSettings.apply_rendering_quality()
+
+
+func _on_sharpening_changed(value: float) -> void:
+	_sharpening_label.text = "%.1f" % value
+	VideoSettings.settings["sharpening"] = value
+	VideoSettings.apply_rendering_quality()
+
+
 # ── Performance ──────────────────────────────────────────────────────────
 
 func _on_fps_hud_toggled(pressed: bool) -> void:
@@ -794,6 +1051,18 @@ func _on_debris_toggled(pressed: bool) -> void:
 func _on_detached_structures_toggled(pressed: bool) -> void:
 	GameManager.debug_disable_detached_structures = pressed
 	print("[PauseMenu] Detached structures: %s" % ("DISABLED" if pressed else "ENABLED"))
+
+
+# ── Player Physics ──────────────────────────────────────────────────────
+
+func _on_surface_press_toggled(pressed: bool) -> void:
+	GameManager.debug_disable_surface_press = pressed
+	print("[PauseMenu] Surface press: %s" % ("DISABLED" if pressed else "ENABLED"))
+
+
+func _on_speed_50_toggled(pressed: bool) -> void:
+	GameManager.debug_speed_50 = pressed
+	print("[PauseMenu] Speed 50: %s" % ("ON" if pressed else "OFF"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -834,6 +1103,24 @@ func _refresh_all_video_controls() -> void:
 
 	_set_check_silent(_fog_button, s["fog_enabled"])
 	_set_check_silent(_volumetric_fog_button, s["volumetric_fog"])
+
+	_set_check_silent(_roughness_limiter_button, s["roughness_limiter"])
+	_set_option_silent(_tonemap_option, s["tonemap_mode"])
+	_set_check_silent(_adjustment_button, s["adjustment_enabled"])
+	_set_slider_silent(_contrast_slider, s["adjustment_contrast"])
+	_contrast_label.text = "%.2f" % s["adjustment_contrast"]
+	_set_slider_silent(_saturation_slider, s["adjustment_saturation"])
+	_saturation_label.text = "%.2f" % s["adjustment_saturation"]
+	_set_check_silent(_dof_button, s["dof_enabled"])
+	_set_slider_silent(_dof_distance_slider, s["dof_focus_distance"])
+	_dof_distance_label.text = "%.0f" % s["dof_focus_distance"]
+	_set_slider_silent(_dof_blur_slider, s["dof_blur_amount"])
+	_dof_blur_label.text = "%.2f" % s["dof_blur_amount"]
+	_set_check_silent(_auto_exposure_button, s["auto_exposure"])
+	_set_check_silent(_debanding_button, s["debanding"])
+	_set_option_silent(_scaling_mode_option, s["scaling_3d_mode"])
+	_set_slider_silent(_sharpening_slider, s["sharpening"])
+	_sharpening_label.text = "%.1f" % s["sharpening"]
 
 
 func _set_check_silent(btn: CheckButton, value: bool) -> void:

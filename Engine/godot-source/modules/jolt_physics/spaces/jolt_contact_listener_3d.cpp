@@ -61,7 +61,39 @@ void JoltContactListener3D::reset_mass_scale_diag() {
 	MassScaleDiag::angled_scale.store(0, std::memory_order_relaxed);
 }
 
+void JoltContactListener3D::_try_ground_custom_integrator(const JPH::Body &p_body1, const JPH::Body &p_body2, const JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings) {
+	constexpr float WALKABLE_COS = 0.6428f; // cos(50 degrees)
+	constexpr float JUMPABLE_COS = 0.0872f; // cos(85 degrees)
+
+	auto try_ground = [&](const JPH::Body &p_dynamic, float p_normal_y) {
+		if (p_normal_y < JUMPABLE_COS) {
+			return; // Too steep — wall, not ground
+		}
+		JoltBody3D *body = reinterpret_cast<JoltBody3D *>(p_dynamic.GetUserData());
+		if (!body->has_custom_integrator()) {
+			return;
+		}
+		// Jumpable or walkable — set grounded
+		body->grounded_by_contact = true;
+		if (p_normal_y >= WALKABLE_COS) {
+			// Record pre-solver vel.y for GDScript's snap calculation.
+			float vel_y = p_dynamic.GetLinearVelocity().GetY();
+			if (vel_y < body->zeroed_vel_y) {
+				body->zeroed_vel_y = vel_y;
+			}
+		}
+	};
+
+	const float dot_up = p_manifold.mWorldSpaceNormal.GetY();
+	if (p_body1.IsDynamic() && !p_body2.IsDynamic()) {
+		try_ground(p_body1, -dot_up);
+	} else if (p_body2.IsDynamic() && !p_body1.IsDynamic()) {
+		try_ground(p_body2, dot_up);
+	}
+}
+
 void JoltContactListener3D::OnContactAdded(const JPH::Body &p_body1, const JPH::Body &p_body2, JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings) {
+	_try_ground_custom_integrator(p_body1, p_body2, p_manifold);
 	_try_override_collision_response(p_body1, p_body2, p_settings);
 	_apply_contact_mass_scale(p_body1, p_body2, p_manifold, p_settings);
 	_try_apply_surface_velocities(p_body1, p_body2, p_settings);
@@ -74,6 +106,7 @@ void JoltContactListener3D::OnContactAdded(const JPH::Body &p_body1, const JPH::
 }
 
 void JoltContactListener3D::OnContactPersisted(const JPH::Body &p_body1, const JPH::Body &p_body2, JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings) {
+	_try_ground_custom_integrator(p_body1, p_body2, p_manifold);
 	_try_override_collision_response(p_body1, p_body2, p_settings);
 	_apply_contact_mass_scale(p_body1, p_body2, p_manifold, p_settings);
 	_try_apply_surface_velocities(p_body1, p_body2, p_settings);

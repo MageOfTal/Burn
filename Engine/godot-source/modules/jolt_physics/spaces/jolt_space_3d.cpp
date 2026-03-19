@@ -89,6 +89,25 @@ void JoltSpace3D::_pre_step(float p_step) {
 void JoltSpace3D::_post_step(float p_step) {
 	contact_listener->post_step();
 
+	// Save grounding state for custom integrator bodies.
+	// Velocity is managed entirely by GDScript (slope projection, gravity,
+	// snap) — no engine-level vel.y zeroing.
+	{
+		const JPH::BodyLockInterface &lock_iface = get_lock_iface();
+		const JPH::BodyID *active_bodies = physics_system->GetActiveBodiesUnsafe(JPH::EBodyType::RigidBody);
+		const JPH::uint32 active_count = physics_system->GetNumActiveBodies(JPH::EBodyType::RigidBody);
+
+		for (JPH::uint32 i = 0; i < active_count; i++) {
+			JPH::Body *jolt_body = lock_iface.TryGetBody(active_bodies[i]);
+			if (!jolt_body || !jolt_body->IsDynamic()) continue;
+
+			JoltBody3D *body = reinterpret_cast<JoltBody3D *>(jolt_body->GetUserData());
+			if (!body->has_custom_integrator()) continue;
+
+			body->was_grounded_last_step = body->grounded_by_contact;
+		}
+	}
+
 	while (shapes_changed_list.first()) {
 		JoltShapedObject3D *object = shapes_changed_list.first()->self();
 		shapes_changed_list.remove(shapes_changed_list.first());

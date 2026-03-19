@@ -179,6 +179,23 @@ public:
 	bool has_custom_integrator() const { return custom_integrator; }
 	void set_custom_integrator(bool p_enabled);
 
+	// Set by the contact listener when a custom_integrator body lands on
+	// walkable static ground. Read and cleared by GDScript each frame.
+	bool grounded_by_contact = false;
+	bool is_grounded_by_contact() const { return grounded_by_contact; }
+	void clear_grounded_by_contact() { grounded_by_contact = false; }
+
+	// True if grounded_by_contact was set during the previous physics step.
+	// Used by _pre_step to inject snap velocity before the solver runs.
+	bool was_grounded_last_step = false;
+
+	// The pre-impulse vel.y recorded by the contact listener when the body
+	// hits walkable ground. Represents the velocity that would have penetrated
+	// past the surface. Read by GDScript for snap distance calculation.
+	float zeroed_vel_y = 0.0f;
+	float get_zeroed_vel_y() const { return zeroed_vel_y; }
+	void clear_zeroed_vel_y() { zeroed_vel_y = 0.0f; }
+
 	bool is_sleeping() const;
 	void set_is_sleeping(bool p_enabled);
 
