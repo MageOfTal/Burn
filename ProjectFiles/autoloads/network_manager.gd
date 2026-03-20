@@ -189,10 +189,12 @@ func host_game(port: int = NetConstants.DEFAULT_PORT) -> Error:
 
 
 func _start_host() -> void:
+	var t_host := Time.get_ticks_msec()
 	print("[Server] _start_host() — beginning host setup...")
 	_show_loading_screen("Loading game map...")
-	print("[Server] Step 1/2: Loading game map...")
+	var t := Time.get_ticks_msec()
 	await _load_game_map()
+	print("[STARTUP] Load map: %dms" % (Time.get_ticks_msec() - t))
 	print("[Server] Step 2/2: Building structures...")
 	var seed_world := get_tree().current_scene.get_node_or_null("SeedWorld")
 	if seed_world:

@@ -29,6 +29,7 @@ ToadDimension="*res://world/toad_dimension.gd"
 ZoneManager="*res://autoloads/zone_manager.gd"
 DebugFreecam="*res://autoloads/debug_freecam.gd"
 DebrisManager="*res://autoloads/debris_manager.gd"
+Profiler="*res://autoloads/profiler.gd"
 
 [display]
 

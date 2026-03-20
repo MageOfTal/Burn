@@ -317,6 +317,7 @@ func _physics_process(delta: float) -> void:
 	var freecam_frozen: bool = GameManager.debug_freecam_active and peer_id == multiplayer.get_unique_id()
 
 	if multiplayer.is_server() and not freecam_frozen:
+		Profiler.begin("player_physics")
 		var _t_tick_player := Time.get_ticks_usec()
 
 		# --- JUMP DEBUG: track position for 30 frames after a jump ---
@@ -370,6 +371,7 @@ func _physics_process(delta: float) -> void:
 		sync_rotation_y = rotation.y
 
 		GameManager.tick_add("player", Time.get_ticks_usec() - _t_tick_player)
+		Profiler.end("player_physics")
 
 	# --- Client-side interpolation (all players on non-server peers) ---
 	# Server runs physics directly via _server_process(); clients apply the
@@ -387,11 +389,13 @@ func _physics_process(delta: float) -> void:
 
 
 func _process(delta: float) -> void:
+	Profiler.begin("player_render")
 	# All client visuals run in _process() so they update every render frame and
 	# sample the engine's physics-interpolated positions. This prevents visual
 	# artifacts (e.g. grapple rope splitting) caused by drawing at the physics
 	# tick rate while the player body is interpolated between ticks.
 	if has_node("/root/NetworkManager") and get_node("/root/NetworkManager")._loading_screen != null:
+		Profiler.end("player_render")
 		return
 	# Visual interpolation debug: compare interpolated position with physics position
 	if capture_movement and peer_id == multiplayer.get_unique_id():
@@ -406,6 +410,7 @@ func _process(delta: float) -> void:
 				phys_pos.x, phys_pos.y, phys_pos.z,
 				diff_h * 1000.0])
 	_client_process(delta)
+	Profiler.end("player_render")
 
 
 ## ======================================================================

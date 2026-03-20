@@ -13,7 +13,7 @@ extends Node3D
 const CHUNK_SIZE := 16
 const VIEW_DISTANCE := 256.0
 const LOAD_BUDGET_INIT := 50   # chunks per yield during initial build
-const LOAD_BUDGET_PLAY := 8    # chunks per frame during gameplay
+const LOAD_BUDGET_PLAY := 2    # chunks to submit per frame
 const REBUILD_BUDGET := 4      # dirty chunk rebuilds per frame
 
 var sdf_grid: TerrainSDFGrid
@@ -22,20 +22,28 @@ var _streaming: TerrainStreaming
 var _deformer: TerrainDeformer
 
 var _chunks: Dictionary = {}          # Vector3i -> TerrainChunk
+var _pending: Dictionary = {}         # Vector3i -> true (submitted to thread pool)
 var _dirty_queue: Array[Vector3i] = []
 var _initial_load_done := false
-var _players_node: Node = null        # cached reference to Players node
+var _players_node: Node = null
 var _stream_frame: int = 0
-const STREAM_INTERVAL := 10           # run streaming logic every N frames
+const STREAM_INTERVAL := 10
+var _stream_to_load: Array[Vector3i] = []
+var _stream_to_unload: Array[Vector3i] = []
 
-## Single collision body shared by every chunk.  One body = one manifold
-## per contacting object, so Jolt's solver handles boundary normals
-## smoothly instead of producing conflicting impulses.
 var _terrain_body: StaticBody3D
+var _debug_collision_shown := false
 
-# Noise + params (kept for height queries and reset)
+# Noise + params
 var _noise: FastNoiseLite
 var _height_range: float
+
+# Threading: pool of meshers (one per worker) + results queue
+var _mesher_pool: Array[TerrainMesher] = []
+var _mesher_mutex := Mutex.new()
+var _results_mutex := Mutex.new()
+var _results: Array[Dictionary] = []  # { block_pos, mesh, faces }
+const MESHER_POOL_SIZE := 8
 
 
 func setup(noise: FastNoiseLite, height_range: float, material: Material) -> void:
@@ -54,33 +62,44 @@ func setup(noise: FastNoiseLite, height_range: float, material: Material) -> voi
 	_terrain_body.collision_mask = 0
 	add_child(_terrain_body)
 
+	# Create a pool of meshers for background threads (one per worker)
+	for i in MESHER_POOL_SIZE:
+		_mesher_pool.append(TerrainMesher.new(material))
+
 
 # ------------------------------------------------------------------
 #  Initial world build (called from seed_world during loading)
 # ------------------------------------------------------------------
 
 func build_initial() -> void:
-	## Generate and mesh all chunks in view.  Yields periodically.
-	## Call this during the loading phase before players spawn.
+	## Generate and mesh all chunks in view. Submits work to thread pool
+	## and yields while waiting for results.
 	var positions: Array[Vector3] = [Vector3.ZERO]
 	var info: Dictionary = _streaming.update(positions, {})
 	var to_load: Array[Vector3i] = info["to_load"]
 
 	print("[TerrainSystem] Initial build: %d chunks to generate" % to_load.size())
-	var built := 0
+
+	# Pre-generate all SDF data on main thread (cheap, ~0.5ms each).
+	# Workers need read access to neighbor chunks for buffer fill.
 	for bp: Vector3i in to_load:
-		_generate_and_mesh(bp)
-		built += 1
-		if built % LOAD_BUDGET_INIT == 0:
-			await get_tree().process_frame
+		_ensure_sdf_with_neighbors(bp)
+
+	# Submit all chunks to thread pool
+	for bp: Vector3i in to_load:
+		_submit_chunk(bp)
+
+	# Harvest results until all done
+	while _pending.size() > 0:
+		_harvest_results()
+		await get_tree().process_frame
 
 	_initial_load_done = true
 	print("[TerrainSystem] Initial build complete: %d chunks (%d with geometry)" % [
 		_chunks.size(),
 		_count_visible_chunks()])
 
-	# Debug: check mesh continuity at chunk boundaries near origin
-	debug_check_boundary_continuity(Vector3.ZERO, 64.0)
+	call_deferred("debug_raycast_boundary_gaps", Vector3.ZERO, 64.0)
 
 
 # ------------------------------------------------------------------
@@ -91,36 +110,53 @@ func _process(_delta: float) -> void:
 	if not _initial_load_done:
 		return
 
-	# Rebuild dirty chunks every frame (craters need fast feedback)
+	# Detect debug collision toggle
+	if GameManager.debug_show_collision != _debug_collision_shown:
+		_debug_collision_shown = GameManager.debug_show_collision
+		rebuild_all_debug_collision()
+
+	# Harvest completed background chunk results every frame
+	Profiler.begin("terrain_harvest")
+	_harvest_results()
+	Profiler.end("terrain_harvest")
+
+	# Rebuild dirty chunks synchronously (craters need fast feedback)
+	Profiler.begin("terrain_rebuild")
 	var rebuilt := 0
 	while not _dirty_queue.is_empty() and rebuilt < REBUILD_BUDGET:
 		var bp: Vector3i = _dirty_queue.pop_front()
 		if _chunks.has(bp):
 			_chunks[bp].rebuild(sdf_grid, _mesher)
 			rebuilt += 1
+	Profiler.end("terrain_rebuild")
 
-	# Streaming check is expensive — run every STREAM_INTERVAL frames
+	# Streaming update: refresh the needed/to_load/to_unload lists periodically
 	_stream_frame += 1
-	if _stream_frame < STREAM_INTERVAL:
-		return
-	_stream_frame = 0
+	if _stream_frame >= STREAM_INTERVAL:
+		_stream_frame = 0
+		Profiler.begin("terrain_stream_update")
+		var positions := _get_player_positions()
+		var info: Dictionary = _streaming.update(positions, _chunks)
+		_stream_to_unload = info["to_unload"]
+		_stream_to_load = info["to_load"]
+		# Unload immediately (cheap)
+		for bp: Vector3i in _stream_to_unload:
+			if not _pending.has(bp):
+				_unload_chunk(bp)
+		Profiler.end("terrain_stream_update")
 
-	var positions := _get_player_positions()
-	var info: Dictionary = _streaming.update(positions, _chunks)
-
-	# Unload out-of-range chunks
-	var to_unload: Array[Vector3i] = info["to_unload"]
-	for bp: Vector3i in to_unload:
-		_unload_chunk(bp)
-
-	# Load new chunks (budgeted)
-	var to_load: Array[Vector3i] = info["to_load"]
-	var loaded := 0
-	for bp: Vector3i in to_load:
-		if loaded >= LOAD_BUDGET_PLAY:
-			break
-		_generate_and_mesh(bp)
-		loaded += 1
+	# Submit a few chunks every frame (spread the buffer fill cost)
+	if not _stream_to_load.is_empty():
+		Profiler.begin("terrain_submit")
+		var submitted := 0
+		while submitted < LOAD_BUDGET_PLAY and not _stream_to_load.is_empty():
+			var bp: Vector3i = _stream_to_load.pop_front()
+			if _chunks.has(bp) or _pending.has(bp):
+				continue
+			_ensure_sdf_with_neighbors(bp)
+			_submit_chunk(bp)
+			submitted += 1
+		Profiler.end("terrain_submit")
 
 
 # ------------------------------------------------------------------
@@ -150,9 +186,13 @@ func get_height_from_noise(world_x: float, world_z: float) -> float:
 func reset() -> void:
 	## Destroy all chunks and clear SDF edits.  After calling this,
 	## call build_initial() again to regenerate terrain.
+	# Wait for any pending background tasks to finish
+	while _pending.size() > 0:
+		_harvest_results()
 	for bp: Vector3i in _chunks.keys():
 		_unload_chunk(bp)
 	_chunks.clear()
+	_pending.clear()
 	_dirty_queue.clear()
 	sdf_grid.clear()
 	_initial_load_done = false
@@ -162,16 +202,89 @@ func reset() -> void:
 #  Internals
 # ------------------------------------------------------------------
 
-func _generate_and_mesh(bp: Vector3i) -> void:
-	if not sdf_grid.has_chunk(bp):
-		sdf_grid.generate_chunk(bp)
-	# Neighbor chunks needed for skirt/padding are generated on the fly
-	# by sdf_grid.fill_buffer() if they don't exist yet.
+func _ensure_sdf_with_neighbors(bp: Vector3i) -> void:
+	## Generate SDF data for a chunk and its immediate neighbors.
+	## Neighbors are needed for the mesher's padding region.
+	## This is cheap (~0.5ms/chunk) and must run on main thread
+	## so the data is stable when workers read it.
+	for dz in range(-1, 2):
+		for dy in range(-1, 2):
+			for dx in range(-1, 2):
+				var nbp := bp + Vector3i(dx, dy, dz)
+				if not sdf_grid.has_chunk(nbp):
+					sdf_grid.generate_chunk(nbp)
 
-	var chunk := TerrainChunk.new(bp)
-	add_child(chunk)
-	chunk.build(sdf_grid, _mesher, _terrain_body)
-	_chunks[bp] = chunk
+
+func _acquire_mesher() -> TerrainMesher:
+	_mesher_mutex.lock()
+	var m: TerrainMesher = _mesher_pool.pop_back() if not _mesher_pool.is_empty() else null
+	_mesher_mutex.unlock()
+	return m
+
+
+func _release_mesher(m: TerrainMesher) -> void:
+	_mesher_mutex.lock()
+	_mesher_pool.append(m)
+	_mesher_mutex.unlock()
+
+
+func _submit_chunk(bp: Vector3i) -> void:
+	## Fill the VoxelBuffer on the main thread (GDScript, accesses sdf_grid),
+	## then submit the filled buffer to a worker for C++ meshing.
+	_pending[bp] = true
+
+	# Main thread: fill buffer (GDScript loop, not thread-safe)
+	var region_min := _mesher.get_region_min(bp)
+	var bsize := _mesher.get_buf_size()
+	var buffer := VoxelBuffer.new()
+	buffer.create(bsize.x, bsize.y, bsize.z)
+	buffer.set_channel_depth(VoxelBuffer.CHANNEL_SDF, VoxelBuffer.DEPTH_16_BIT)
+	buffer.fill_f(1.0, VoxelBuffer.CHANNEL_SDF)
+	sdf_grid.fill_buffer(buffer, region_min, bsize)
+
+	# Worker thread: C++ meshing + face extraction only
+	var material := _mesher._material
+	var sys := self
+	WorkerThreadPool.add_task(func():
+		var mesher := sys._acquire_mesher()
+		if mesher == null:
+			mesher = TerrainMesher.new(material)
+
+		var mesh: Mesh = mesher._mesher.build_mesh(buffer, [])
+		var faces := PackedVector3Array()
+		if mesh != null and mesh.get_surface_count() > 0:
+			var array_mesh: ArrayMesh = mesh as ArrayMesh
+			if array_mesh and material:
+				for i in array_mesh.get_surface_count():
+					array_mesh.surface_set_material(i, material)
+			faces = mesh.get_faces()
+		else:
+			mesh = null
+
+		sys._release_mesher(mesher)
+
+		sys._results_mutex.lock()
+		sys._results.append({ "block_pos": bp, "mesh": mesh, "faces": faces })
+		sys._results_mutex.unlock()
+	)
+
+
+func _harvest_results() -> void:
+	## Apply completed chunk results to the scene tree (main thread only).
+	_results_mutex.lock()
+	var batch := _results.duplicate()
+	_results.clear()
+	_results_mutex.unlock()
+
+	var offset := _mesher.get_mesh_offset()
+	for data: Dictionary in batch:
+		var bp: Vector3i = data["block_pos"]
+		_pending.erase(bp)
+
+		var chunk := TerrainChunk.new(bp)
+		add_child(chunk)
+		chunk.apply_data(data["mesh"], data["faces"], offset, _terrain_body)
+		_chunks[bp] = chunk
 
 
 func _unload_chunk(bp: Vector3i) -> void:
@@ -205,6 +318,19 @@ func _count_visible_chunks() -> int:
 		if _chunks[bp].state == TerrainChunk.State.READY:
 			count += 1
 	return count
+
+
+func rebuild_all_debug_collision() -> void:
+	## Toggle debug collision visualization on all loaded chunks.
+	print("[TerrainSystem] rebuild_all_debug_collision called, %d chunks, show=%s" % [_chunks.size(), GameManager.debug_show_collision])
+	for bp: Vector3i in _chunks:
+		var chunk: TerrainChunk = _chunks[bp]
+		if chunk._collision_shape and chunk._collision_shape.shape:
+			chunk._update_debug_collision_mesh(
+				chunk._collision_shape.shape as ConcavePolygonShape3D,
+				chunk._collision_shape.position)
+		elif chunk._debug_collision_mesh:
+			chunk._debug_collision_mesh.visible = false
 
 
 # ------------------------------------------------------------------
@@ -368,3 +494,162 @@ func _extract_boundary_verts(faces: PackedVector3Array, axis_idx: int, boundary_
 			if not dupe:
 				verts.append(v)
 	return verts
+
+
+# ------------------------------------------------------------------
+#  Debug: mesh-based collision gap detection at chunk boundaries
+# ------------------------------------------------------------------
+
+func debug_raycast_boundary_gaps(around_pos: Vector3 = Vector3.ZERO, radius: float = 64.0) -> void:
+	## Check actual mesh triangles for coverage gaps at chunk boundaries.
+	## For each sample point along a boundary, tests whether any triangle
+	## from either adjacent chunk covers that XZ position (vertical ray
+	## through the triangle in XZ projection). No physics raycasts used —
+	## operates directly on the ConcavePolygonShape3D face data.
+	print("\n[TerrainMeshGapCheck] Checking mesh coverage at boundaries around (%.0f, %.0f, %.0f) r=%.0f..." % [
+		around_pos.x, around_pos.y, around_pos.z, radius])
+
+	var sample_step := 0.5  # spacing along the boundary (meters)
+	# Offsets perpendicular to boundary: negative = chunk A side, positive = chunk B side
+	var offsets: Array[float] = [-2.0, -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, 2.0]
+
+	var total_samples := 0
+	var total_gaps := 0
+	var gap_details: Array[String] = []
+
+	# Check each loaded chunk pair sharing a boundary
+	var axes := [Vector3i(1, 0, 0), Vector3i(0, 0, 1)]  # X and Z boundaries
+	for bp: Vector3i in _chunks:
+		var world_center := Vector3(bp * CHUNK_SIZE) + Vector3(8, 8, 8)
+		if world_center.distance_to(around_pos) > radius:
+			continue
+
+		for axis in axes:
+			var neighbor_bp: Vector3i = bp + axis
+			if not _chunks.has(neighbor_bp):
+				continue
+
+			var chunk_a: TerrainChunk = _chunks[bp]
+			var chunk_b: TerrainChunk = _chunks[neighbor_bp]
+			var faces_a := _get_world_faces(chunk_a)
+			var faces_b := _get_world_faces(chunk_b)
+			# Merge all triangles from both chunks into one list
+			var all_faces := PackedVector3Array()
+			all_faces.append_array(faces_a)
+			all_faces.append_array(faces_b)
+			if all_faces.is_empty():
+				continue
+
+			# Determine boundary position and sample axes
+			var boundary_val: float
+			var is_x_boundary: bool  # true = X boundary, false = Z boundary
+			if axis.x != 0:
+				boundary_val = float(neighbor_bp.x * CHUNK_SIZE)
+				is_x_boundary = true
+			else:
+				boundary_val = float(neighbor_bp.z * CHUNK_SIZE)
+				is_x_boundary = false
+
+			# Determine the range along the boundary to sample
+			# Use the chunk's Y range for vertical, and the perpendicular axis range
+			var along_min: float
+			var along_max: float
+			if is_x_boundary:
+				# Boundary is at X=boundary_val, sample along Z
+				along_min = float(bp.z * CHUNK_SIZE)
+				along_max = float(bp.z * CHUNK_SIZE + CHUNK_SIZE)
+			else:
+				# Boundary is at Z=boundary_val, sample along X
+				along_min = float(bp.x * CHUNK_SIZE)
+				along_max = float(bp.x * CHUNK_SIZE + CHUNK_SIZE)
+
+			var along := along_min
+			while along < along_max:
+				for offset in offsets:
+					var sample_x: float
+					var sample_z: float
+					if is_x_boundary:
+						sample_x = boundary_val + offset
+						sample_z = along
+					else:
+						sample_x = along
+						sample_z = boundary_val + offset
+
+					# Check if terrain surface exists here (skip air-only regions)
+					var expected_y := sdf_grid.get_height_from_noise(sample_x, sample_z)
+					var chunk_min_y := float(bp.y * CHUNK_SIZE)
+					var chunk_max_y := float(bp.y * CHUNK_SIZE + CHUNK_SIZE)
+					if expected_y < chunk_min_y - 2.0 or expected_y > chunk_max_y + 2.0:
+						continue  # surface not in this chunk's Y range
+
+					# Check if any triangle covers this XZ point
+					var hit := _mesh_covers_xz(all_faces, sample_x, sample_z, expected_y, 10.0)
+					total_samples += 1
+
+					if not hit:
+						total_gaps += 1
+						var axis_name := "X" if is_x_boundary else "Z"
+						if gap_details.size() < 20:
+							gap_details.append(
+								"  GAP at %s=%.0f offset=%.1f  (%.1f, %.1f) expected_y=%.1f  chunks=%s↔%s" % [
+									axis_name, boundary_val, offset,
+									sample_x, sample_z, expected_y,
+									chunk_a.name, chunk_b.name])
+				along += sample_step
+
+	# Report
+	if total_gaps == 0:
+		print("[TerrainMeshGapCheck] PASS — %d sample points, 0 gaps." % total_samples)
+	else:
+		print("[TerrainMeshGapCheck] FAIL — %d samples, %d gaps:" % [total_samples, total_gaps])
+		for line in gap_details:
+			print(line)
+		if total_gaps > gap_details.size():
+			print("  ... and %d more." % (total_gaps - gap_details.size()))
+	print("[TerrainMeshGapCheck] Done.\n")
+
+
+func _mesh_covers_xz(faces: PackedVector3Array, px: float, pz: float, expected_y: float, y_tolerance: float) -> bool:
+	## Check if any triangle in the face array covers the XZ point (px, pz).
+	## A triangle "covers" the point if (px, pz) falls within the triangle's
+	## XZ projection AND the triangle's Y at that point is within y_tolerance
+	## of expected_y. faces is a flat array of vertices (3 per triangle).
+	var tri_count: int = faces.size() / 3
+	for t in tri_count:
+		var i: int = t * 3
+		var v0 := faces[i]
+		var v1 := faces[i + 1]
+		var v2 := faces[i + 2]
+
+		# Quick AABB reject in XZ
+		var min_x := minf(v0.x, minf(v1.x, v2.x))
+		var max_x := maxf(v0.x, maxf(v1.x, v2.x))
+		if px < min_x or px > max_x:
+			continue
+		var min_z := minf(v0.z, minf(v1.z, v2.z))
+		var max_z := maxf(v0.z, maxf(v1.z, v2.z))
+		if pz < min_z or pz > max_z:
+			continue
+
+		# Point-in-triangle test in XZ using sign of cross products
+		var d1 := (px - v1.x) * (v0.z - v1.z) - (v0.x - v1.x) * (pz - v1.z)
+		var d2 := (px - v2.x) * (v1.z - v2.z) - (v1.x - v2.x) * (pz - v2.z)
+		var d3 := (px - v0.x) * (v2.z - v0.z) - (v2.x - v0.x) * (pz - v0.z)
+		var has_neg := (d1 < 0.0) or (d2 < 0.0) or (d3 < 0.0)
+		var has_pos := (d1 > 0.0) or (d2 > 0.0) or (d3 > 0.0)
+		if has_neg and has_pos:
+			continue  # point outside triangle
+
+		# Point is inside triangle XZ projection — compute Y via barycentric
+		var area := d1 + d2 + d3
+		if absf(area) < 0.0001:
+			continue  # degenerate triangle
+		var u := d2 / area  # weight for v0
+		var v := d3 / area  # weight for v1
+		var w := d1 / area  # weight for v2
+		var hit_y := u * v0.y + v * v1.y + w * v2.y
+
+		if absf(hit_y - expected_y) < y_tolerance:
+			return true
+
+	return false

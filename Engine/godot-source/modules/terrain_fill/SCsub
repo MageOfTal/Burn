@@ -1,0 +1,8 @@
+Import("env")
+Import("env_modules")
+
+env_tf = env_modules.Clone()
+
+module_obj = []
+env_tf.add_source_files(module_obj, "*.cpp")
+env.modules_sources += module_obj

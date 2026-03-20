@@ -3,19 +3,19 @@ extends RefCounted
 
 ## Wraps VoxelMesherTransvoxel to build terrain meshes from SDF data.
 ## Produces a single mesh per chunk used for both rendering and collision.
+##
+## Two build paths:
+##   build()      — synchronous, used for dirty chunk rebuilds (craters)
+##   build_data() — thread-safe, returns raw data without touching scene tree
 
 const CHUNK_SIZE := 16
-const SKIRT := 0  # no overlap — Jolt's boundary_edges_active=false (default)
-# handles boundary edges without needing skirt.  SKIRT>0 caused overlapping
-# collision bodies whose double-contact resolution produced massive impulses.
+const SKIRT := 0
 
 var _mesher: VoxelMesherTransvoxel
 var _min_pad: int
 var _max_pad: int
 var _material: Material
 
-## Buffer size for chunks (includes skirt + padding on all sides).
-## buf_side = CHUNK_SIZE + 2*SKIRT + min_pad + max_pad
 var buf_side: int
 
 
@@ -36,15 +36,11 @@ func get_max_pad() -> int:
 
 
 func get_mesh_offset() -> Vector3:
-	## Local offset from chunk origin to position the mesh correctly.
-	## Mesh vertices are in buffer-local space; buffer starts at
-	## chunk_origin - (SKIRT + min_pad) in each axis.
 	var off: float = -float(_min_pad + SKIRT)
 	return Vector3(off, off, off)
 
 
 func get_region_min(block_pos: Vector3i) -> Vector3i:
-	## World-space origin of the buffer region for a given chunk.
 	var pad: int = _min_pad + SKIRT
 	return Vector3i(
 		block_pos.x * CHUNK_SIZE - pad,
@@ -56,9 +52,10 @@ func get_buf_size() -> Vector3i:
 	return Vector3i(buf_side, buf_side, buf_side)
 
 
-func build(sdf_grid: TerrainSDFGrid, block_pos: Vector3i) -> Array:
-	## Build visual mesh + collision shape for a chunk.
-	## Returns [ArrayMesh_or_null, ConcavePolygonShape3D_or_null].
+func build_data(sdf_grid: TerrainSDFGrid, block_pos: Vector3i) -> Dictionary:
+	## Thread-safe: generates mesh + collision faces from SDF data.
+	## Returns { "mesh": ArrayMesh or null, "faces": PackedVector3Array }.
+	## Does not touch the scene tree — safe to call from any thread.
 	var region_min := get_region_min(block_pos)
 	var bsize := get_buf_size()
 
@@ -68,26 +65,30 @@ func build(sdf_grid: TerrainSDFGrid, block_pos: Vector3i) -> Array:
 	buffer.fill_f(1.0, VoxelBuffer.CHANNEL_SDF)
 	sdf_grid.fill_buffer(buffer, region_min, bsize)
 
-	# Build visual mesh (full buffer, includes overlap for seamless visuals)
 	var mesh: Mesh = _mesher.build_mesh(buffer, [])
 	if mesh == null or mesh.get_surface_count() == 0:
-		return [null, null]
+		return { "mesh": null, "faces": PackedVector3Array() }
 
 	var array_mesh: ArrayMesh = mesh as ArrayMesh
 	if array_mesh and _material:
 		for i in array_mesh.get_surface_count():
 			array_mesh.surface_set_material(i, _material)
 
-	# Collision: reuse the visual mesh faces directly.
-	# The visual mesh extends slightly into neighboring chunks' padding region
-	# (~1-2 cells), creating a small overlap zone at chunk boundaries. This is
-	# acceptable — Jolt handles the doubled contacts gracefully, and the
-	# alternative (aggressive per-vertex clipping) creates GAPS at boundaries
-	# that physics bodies fall through when the surface sits near a chunk edge.
-	var shape: ConcavePolygonShape3D = null
 	var faces := mesh.get_faces()
+	return { "mesh": mesh, "faces": faces }
+
+
+func build(sdf_grid: TerrainSDFGrid, block_pos: Vector3i) -> Array:
+	## Synchronous build. Used for dirty rebuilds (craters) where latency matters.
+	## Returns [ArrayMesh_or_null, ConcavePolygonShape3D_or_null].
+	var data := build_data(sdf_grid, block_pos)
+	if data["mesh"] == null:
+		return [null, null]
+
+	var shape: ConcavePolygonShape3D = null
+	var faces: PackedVector3Array = data["faces"]
 	if not faces.is_empty():
 		shape = ConcavePolygonShape3D.new()
 		shape.set_faces(faces)
 
-	return [mesh, shape]
+	return [data["mesh"], shape]

@@ -19,6 +19,9 @@ var state: int = State.PENDING
 var _mesh_instance: MeshInstance3D
 var _collision_shape: CollisionShape3D
 var _terrain_body: StaticBody3D  # shared body from TerrainSystem
+var _debug_collision_mesh: MeshInstance3D
+
+static var _debug_material: StandardMaterial3D
 
 
 func _init(p_block_pos: Vector3i) -> void:
@@ -64,12 +67,105 @@ func build(sdf_grid: TerrainSDFGrid, mesher: TerrainMesher, terrain_body: Static
 	else:
 		remove_collision()
 
+	_update_debug_collision_mesh(shape, position + offset)
+
+	state = State.READY
+	return true
+
+
+func _update_debug_collision_mesh(shape: ConcavePolygonShape3D, col_pos: Vector3) -> void:
+	if not GameManager.debug_show_collision:
+		if _debug_collision_mesh:
+			_debug_collision_mesh.visible = false
+		return
+	if shape == null:
+		if _debug_collision_mesh:
+			_debug_collision_mesh.visible = false
+		return
+
+	if _debug_material == null:
+		_debug_material = StandardMaterial3D.new()
+		_debug_material.albedo_color = Color(1.0, 0.0, 0.0, 0.25)
+		_debug_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		_debug_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+		_debug_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		_debug_material.no_depth_test = true
+
+	var faces: PackedVector3Array = shape.get_faces()
+	if faces.is_empty():
+		return
+
+	# Convert triangles to wireframe lines
+	var tri_count: int = faces.size() / 3
+	var lines := PackedVector3Array()
+	lines.resize(tri_count * 6)  # 3 edges * 2 verts per triangle
+	for t in tri_count:
+		var i: int = t * 3
+		var li: int = t * 6
+		lines[li]     = faces[i]
+		lines[li + 1] = faces[i + 1]
+		lines[li + 2] = faces[i + 1]
+		lines[li + 3] = faces[i + 2]
+		lines[li + 4] = faces[i + 2]
+		lines[li + 5] = faces[i]
+
+	var mesh := ArrayMesh.new()
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = lines
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, arrays)
+
+	if _debug_collision_mesh == null:
+		_debug_collision_mesh = MeshInstance3D.new()
+		_debug_collision_mesh.name = "DebugCol"
+		_debug_collision_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		add_child(_debug_collision_mesh)
+	_debug_collision_mesh.mesh = mesh
+	_debug_collision_mesh.material_override = _debug_material
+	_debug_collision_mesh.position = col_pos - position
+	_debug_collision_mesh.visible = true
+
+
+func apply_data(mesh: Mesh, faces: PackedVector3Array, mesh_offset: Vector3, terrain_body: StaticBody3D) -> bool:
+	## Apply pre-computed mesh + collision data (from background thread).
+	## Only does scene tree operations — safe for main thread only.
+	_terrain_body = terrain_body
+
+	if mesh == null:
+		_clear_visuals()
+		remove_collision()
+		state = State.READY
+		return false
+
+	if _mesh_instance == null:
+		_mesh_instance = MeshInstance3D.new()
+		_mesh_instance.name = "Mesh"
+		add_child(_mesh_instance)
+	_mesh_instance.mesh = mesh
+	_mesh_instance.position = mesh_offset
+
+	if not faces.is_empty():
+		if _collision_shape == null:
+			_collision_shape = CollisionShape3D.new()
+			_collision_shape.name = "Col_%d_%d_%d" % [block_pos.x, block_pos.y, block_pos.z]
+			_terrain_body.add_child(_collision_shape)
+		var shape := ConcavePolygonShape3D.new()
+		shape.set_faces(faces)
+		_collision_shape.shape = shape
+		_collision_shape.position = position + mesh_offset
+	else:
+		remove_collision()
+
+	_update_debug_collision_mesh(
+		_collision_shape.shape as ConcavePolygonShape3D if _collision_shape else null,
+		position + mesh_offset)
+
 	state = State.READY
 	return true
 
 
 func rebuild(sdf_grid: TerrainSDFGrid, mesher: TerrainMesher) -> bool:
-	## Rebuild after SDF modification (crater).
+	## Rebuild after SDF modification (crater). Synchronous.
 	return build(sdf_grid, mesher, _terrain_body)
 
 

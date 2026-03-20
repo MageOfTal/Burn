@@ -384,72 +384,50 @@ func _build_main_panel() -> void:
 	# ── Player Physics ─────────────────────────────────────────────────
 	_add_section_header("Player Physics", vbox)
 
-	_surface_press_button = _add_check("Disable Surface Press", GameManager.debug_disable_surface_press, vbox)
-	_surface_press_button.toggled.connect(_on_surface_press_toggled)
-
 	_speed_50_button = _add_check("Speed 50", GameManager.debug_speed_50, vbox)
 	_speed_50_button.toggled.connect(_on_speed_50_toggled)
 
-	var _no_gravity_sweep_button = _add_check("No Gravity Sweep", GameManager.debug_no_gravity_sweep, vbox)
-	_no_gravity_sweep_button.toggled.connect(func(p): GameManager.debug_no_gravity_sweep = p)
+	_add_check("No Slope Projection", GameManager.debug_no_slope_projection, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_slope_projection = p)
+	_add_check("No Landing Restore", GameManager.debug_no_landing_restore, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_landing_restore = p)
+	_add_check("Always Ground Move", GameManager.debug_always_ground_move, vbox) \
+		.toggled.connect(func(p): GameManager.debug_always_ground_move = p)
+	_add_check("Show Terrain Collision", GameManager.debug_show_collision, vbox) \
+		.toggled.connect(func(p): GameManager.debug_show_collision = p)
 
-	var _sweep_1m_button = _add_check("Sweep 1m", GameManager.debug_sweep_1m, vbox)
-	_sweep_1m_button.toggled.connect(func(p): GameManager.debug_sweep_1m = p)
-
-	var _no_slope_proj_button = _add_check("No Slope Projection", GameManager.debug_no_slope_projection, vbox)
-	_no_slope_proj_button.toggled.connect(func(p): GameManager.debug_no_slope_projection = p)
-
-	var _sweep_grounds_button = _add_check("Sweep Sets Grounded", GameManager.debug_sweep_sets_grounded, vbox)
-	_sweep_grounds_button.toggled.connect(func(p): GameManager.debug_sweep_sets_grounded = p)
-
-	var _no_landing_button = _add_check("No Landing Restore", GameManager.debug_no_landing_restore, vbox)
-	_no_landing_button.toggled.connect(func(p): GameManager.debug_no_landing_restore = p)
-
-	var _sweep_before_button = _add_check("Sweep Before Move", GameManager.debug_sweep_before_move, vbox)
-	_sweep_before_button.toggled.connect(func(p): GameManager.debug_sweep_before_move = p)
-
-	var _always_ground_button = _add_check("Always Ground Move", GameManager.debug_always_ground_move, vbox)
-	_always_ground_button.toggled.connect(func(p): GameManager.debug_always_ground_move = p)
-
-	var _sweep_prephys_button = _add_check("Sweep In PrePhys", GameManager.debug_sweep_in_prephys, vbox)
-	_sweep_prephys_button.toggled.connect(func(p): GameManager.debug_sweep_in_prephys = p)
-
-	var _show_col_button = _add_check("Show Terrain Collision", GameManager.debug_show_collision, vbox)
-	_show_col_button.toggled.connect(func(p): GameManager.debug_show_collision = p)
-
-	var _no_contact_unground_button = _add_check("No Contact Unground", GameManager.debug_no_contact_unground, vbox)
-	_no_contact_unground_button.toggled.connect(func(p): GameManager.debug_no_contact_unground = p)
-
-	var _no_jump_unground_button = _add_check("No Jump Unground", GameManager.debug_no_jump_unground, vbox)
-	_no_jump_unground_button.toggled.connect(func(p): GameManager.debug_no_jump_unground = p)
-
-	var _no_force_airborne_button = _add_check("No Force Airborne", GameManager.debug_no_force_airborne, vbox)
-	_no_force_airborne_button.toggled.connect(func(p): GameManager.debug_no_force_airborne = p)
-
-	# ── Grounding Flicker Diagnostics ──────────────────────────────────
+	# ── Solver Diagnostics ─────────────────────────────────────────────
 	vbox.add_child(HSeparator.new())
-	_add_section_header("Grounding Flicker Diag", vbox)
+	_add_section_header("Solver Diagnostics", vbox)
 
-	var _gf_press_button = _add_check("Surface Press (vel.y bias)", GameManager.debug_grounding_surface_press, vbox)
-	_gf_press_button.toggled.connect(func(p): GameManager.debug_grounding_surface_press = p)
-
-	var _gf_press_strength = _add_labeled_input("Press Strength (m/s)", str(GameManager.debug_grounding_press_strength), vbox)
-	_gf_press_strength.text_submitted.connect(func(t): GameManager.debug_grounding_press_strength = clampf(float(t), 0.1, 20.0))
-
-	var _gf_no_snap_ground = _add_check("No Snap→Grounded", GameManager.debug_grounding_no_snap_ground, vbox)
-	_gf_no_snap_ground.toggled.connect(func(p): GameManager.debug_grounding_no_snap_ground = p)
-
-	var _gf_no_perp_strip = _add_check("No Perpendicular Strip", GameManager.debug_grounding_no_perp_strip, vbox)
-	_gf_no_perp_strip.toggled.connect(func(p): GameManager.debug_grounding_no_perp_strip = p)
-
-	var _gf_extend_snap = _add_check("Extend Snap Range (0.5m)", GameManager.debug_grounding_extend_snap, vbox)
-	_gf_extend_snap.toggled.connect(func(p): GameManager.debug_grounding_extend_snap = p)
-
-	var _gf_no_pos_corr = _add_check("No Landing Pos Correction", GameManager.debug_grounding_no_pos_correction, vbox)
-	_gf_no_pos_corr.toggled.connect(func(p): GameManager.debug_grounding_no_pos_correction = p)
-
-	var _gf_log = _add_check("Log Grounding Transitions", GameManager.debug_grounding_log, vbox)
-	_gf_log.toggled.connect(func(p): GameManager.debug_grounding_log = p)
+	_add_check("Log Physics (grounding, snap, impulse)", GameManager.debug_grounding_log, vbox) \
+		.toggled.connect(func(p): GameManager.debug_grounding_log = p)
+	_add_check("Player Zero Friction", GameManager.debug_player_zero_friction, vbox) \
+		.toggled.connect(func(p): GameManager.debug_player_zero_friction = p)
+	_add_check("No Floor Speed Restore", GameManager.debug_no_floor_speed_restore, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_floor_speed_restore = p)
+	_add_check("No Dynamic Impulse Correction", GameManager.debug_no_dynamic_speed_restore, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_dynamic_speed_restore = p)
+	_add_check("No Wall Projection", GameManager.debug_no_wall_proj, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_wall_proj = p)
+	_add_check("Wall Proj on Dynamic Bodies", GameManager.debug_wall_proj_dynamic, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wall_proj_dynamic = p)
+	_add_check("No Wall Speed Scaling", GameManager.debug_no_wall_speed_scale, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_wall_speed_scale = p)
+	_add_check("Restore Full Speed (ignore solver)", GameManager.debug_restore_full_speed, vbox) \
+		.toggled.connect(func(p): GameManager.debug_restore_full_speed = p)
+	_add_check("No Dime Stop", GameManager.debug_no_dime_stop, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_dime_stop = p)
+	_add_check("Restore Even With Walls", GameManager.debug_restore_with_walls, vbox) \
+		.toggled.connect(func(p): GameManager.debug_restore_with_walls = p)
+	_add_check("Instant Acceleration", GameManager.debug_instant_accel, vbox) \
+		.toggled.connect(func(p): GameManager.debug_instant_accel = p)
+	_add_check("Extend Snap Range (0.5m)", GameManager.debug_grounding_extend_snap, vbox) \
+		.toggled.connect(func(p): GameManager.debug_grounding_extend_snap = p)
+	_add_check("Surface Press (vel.y bias)", GameManager.debug_grounding_surface_press, vbox) \
+		.toggled.connect(func(p): GameManager.debug_grounding_surface_press = p)
+	var _press_input = _add_labeled_input("Press Strength", str(GameManager.debug_grounding_press_strength), vbox)
+	_press_input.text_submitted.connect(func(t): GameManager.debug_grounding_press_strength = clampf(float(t), 0.1, 20.0))
 
 	vbox.add_child(HSeparator.new())
 

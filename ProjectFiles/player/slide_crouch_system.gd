@@ -124,6 +124,7 @@ func start_slide() -> void:
 
 
 func process_slide(delta: float) -> void:
+	Profiler.begin("slide_system")
 	## Server-only: physics-based slide.
 	## Uses real inclined-plane physics: a = g * (sin(angle)*alignment - friction*cos(angle))
 	## Sliding posture is retained when going airborne passively (ramps, ledges).
@@ -133,7 +134,7 @@ func process_slide(delta: float) -> void:
 	var gravity: float = player.gravity
 
 	# --- Jump out of slide: keep all horizontal momentum, end slide, stand up ---
-	if player._frame_jump and on_floor:
+	if player._frame_jump and on_floor and has_headroom():
 		player.velocity.x = _slide_velocity.x
 		player.velocity.z = _slide_velocity.z
 		player.velocity.y = player.movement.slope_compensated_jump_y()
@@ -150,6 +151,7 @@ func process_slide(delta: float) -> void:
 		# Queue slide-on-land so holding shift will re-enter slide/crouch on landing
 		if player.player_input.action_slide:
 			queue_slide_on_land()
+		Profiler.end("slide_system")
 		return
 
 	# --- Airborne: retain slide posture, apply gravity, skip ground physics ---
@@ -166,6 +168,7 @@ func process_slide(delta: float) -> void:
 		# Only end slide in air if the player released shift
 		if not player.player_input.action_slide:
 			end_slide()
+		Profiler.end("slide_system")
 		return
 
 	# --- Just landed: reset airborne state, refresh floor normal ---
@@ -179,6 +182,7 @@ func process_slide(delta: float) -> void:
 		_slide_smoothed_normal = player.get_floor_normal()
 		if _slide_velocity.length() < 0.5:
 			end_slide()
+			Profiler.end("slide_system")
 			return
 
 	# --- Smooth the floor normal to prevent jitter on procedural terrain ---
@@ -298,6 +302,7 @@ func process_slide(delta: float) -> void:
 
 	if should_end:
 		end_slide()
+	Profiler.end("slide_system")
 
 
 func end_slide() -> void:
@@ -386,6 +391,7 @@ func start_crouch() -> void:
 
 
 func process_crouch(delta: float) -> void:
+	Profiler.begin("crouch_system")
 	## Server-only: crouched movement with reduced speed.
 
 	var on_floor := player.is_on_floor()
@@ -394,10 +400,12 @@ func process_crouch(delta: float) -> void:
 	if not on_floor:
 		if not player.player_input.action_slide:
 			end_crouch()
+		Profiler.end("crouch_system")
 		return
 
 	if not player.player_input.action_slide and has_headroom():
 		end_crouch()
+		Profiler.end("crouch_system")
 		return
 
 	# Allow jumping out of crouch
@@ -406,6 +414,7 @@ func process_crouch(delta: float) -> void:
 		player.velocity.y = player.movement.slope_compensated_jump_y()
 
 		player.movement.force_airborne()
+		Profiler.end("crouch_system")
 		return
 
 	var shoe_bonus: float = player.inventory.get_shoe_speed_bonus() if player.inventory else 0.0
@@ -428,6 +437,7 @@ func process_crouch(delta: float) -> void:
 	if on_floor and player.movement._has_floor_contact:
 		var n: Vector3 = player.movement._floor_normal
 		player.velocity.y = -(n.x * player.velocity.x + n.z * player.velocity.z) / n.y
+	Profiler.end("crouch_system")
 
 
 func end_crouch() -> void:

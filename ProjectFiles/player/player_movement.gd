@@ -44,6 +44,7 @@ var _is_grounded: bool = false
 var _floor_normal: Vector3 = Vector3.UP
 var _was_grounded: bool = false
 var _last_grounded_time: float = 0.0
+var _last_jolt_grounded_time: float = 0.0
 
 var _has_floor_contact: bool = false
 var _has_jumpable_contact: bool = false
@@ -103,6 +104,8 @@ var _dbg_prev_set_vel_y: float = 0.0                  # vel.y we set last frame 
 # ======================================================================
 
 func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
+	Profiler.begin("movement_integrate")
+
 	# ── Drift diagnostics: measure how Jolt moved position vs our intent ──
 	_dbg_pos_drift = state.transform.origin - _dbg_prev_pos - _dbg_prev_set_vel * state.step
 	_dbg_vel_delta = state.linear_velocity - _dbg_prev_set_vel
@@ -123,6 +126,8 @@ func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	# No contacts = airborne.
 	_is_grounded = state.is_grounded_by_contact()
 	state.clear_grounded_by_contact()
+	if _is_grounded:
+		_last_jolt_grounded_time = Time.get_ticks_msec() / 1000.0
 
 	# Maintain horizontal velocity on walkable contacts (like Unreal's
 	# MaintainHorizontalGroundVelocity). The solver deflects horizontal
@@ -131,24 +136,66 @@ func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	# contacts are walkable floors. If there are wall contacts, the solver's
 	# horizontal changes are wanted (wall sliding), so keep them.
 	if _is_grounded:
-		var has_wall := false
+		var has_static_wall := false
+		var has_dynamic := false
 		for i in state.get_contact_count():
+			var collider := state.get_contact_collider_object(i)
 			if state.get_contact_local_normal(i).angle_to(Vector3.UP) > FLOOR_MAX_ANGLE:
-				has_wall = true
-				break
-		if not has_wall:
-			# Restore our horizontal direction but keep the solver's speed.
-			# Floor contacts change direction (bad), wall contacts change
-			# speed (good). Restoring direction fixes floor deflection
-			# without fighting wall-slide speed reduction.
+				if collider is RigidBody3D:
+					has_dynamic = true
+				else:
+					has_static_wall = true
+					break
+		if (not has_static_wall or GameManager.debug_restore_with_walls) and not GameManager.debug_no_floor_speed_restore:
 			var set_h := Vector3(_dbg_prev_set_vel.x, 0.0, _dbg_prev_set_vel.z)
 			var jolt_speed := Vector2(state.linear_velocity.x, state.linear_velocity.z).length()
-			if set_h.length() > 0.01:
-				var intended_dir := set_h.normalized()
-				var vel := state.linear_velocity
-				vel.x = intended_dir.x * jolt_speed
-				vel.z = intended_dir.z * jolt_speed
-				state.linear_velocity = vel
+			var set_speed := Vector2(set_h.x, set_h.z).length()
+
+			# Per-contact breakdown: show every contact's contribution
+			if GameManager.debug_grounding_log and (has_dynamic or set_speed - jolt_speed > 0.3):
+				var total_h_impulse := 0.0
+				for i in state.get_contact_count():
+					var collider := state.get_contact_collider_object(i)
+					var impulse := state.get_contact_impulse(i)
+					var normal := state.get_contact_local_normal(i)
+					var h_impulse := Vector2(impulse.x, impulse.z).length()
+					total_h_impulse += h_impulse
+					var body_type := "static"
+					var body_mass := 0.0
+					if collider is RigidBody3D:
+						body_type = "dynamic(%.0fkg)" % (collider as RigidBody3D).mass
+						body_mass = (collider as RigidBody3D).mass
+					elif collider is VoxelLodTerrain:
+						body_type = "terrain"
+					print("[CONTACT %d/%d] %s n=(%.2f,%.2f,%.2f) imp=(%.1f,%.1f,%.1f) h_imp=%.2f dv=%.3f" % [
+						i, state.get_contact_count(), body_type,
+						normal.x, normal.y, normal.z,
+						impulse.x, impulse.y, impulse.z,
+						h_impulse, h_impulse / player.mass])
+				var explained := total_h_impulse / player.mass
+				print("[SOLVER] set=%.2f jolt=%.2f loss=%.2f explained=%.2f unexplained=%.2f restore_to=%.2f" % [
+					set_speed, jolt_speed, set_speed - jolt_speed, explained,
+					(set_speed - jolt_speed) - explained,
+					maxf(set_speed - (total_h_impulse / player.mass if not GameManager.debug_no_dynamic_speed_restore else 0.0), 0.0)])
+
+			# Restore intended velocity + dynamic body impulses.
+			# Start from what we intended (undoes floor deflection),
+			# then add back the dynamic body impulse vector (preserves
+			# explosion pushes, grapple pulls, toad bumps).
+			var dynamic_delta := Vector3.ZERO
+			if not GameManager.debug_no_dynamic_speed_restore:
+				for i in state.get_contact_count():
+					var collider := state.get_contact_collider_object(i)
+					if collider is RigidBody3D:
+						var imp := state.get_contact_impulse(i)
+						dynamic_delta += Vector3(imp.x, 0.0, imp.z) / player.mass
+			var restore_h := set_h + dynamic_delta
+			if GameManager.debug_restore_full_speed:
+				restore_h = set_h
+			var vel := state.linear_velocity
+			vel.x = restore_h.x
+			vel.z = restore_h.z
+			state.linear_velocity = vel
 
 	# Read pre-impulse vel.y from Jolt contact listener (the velocity that
 	# would have penetrated past the walkable surface). Used as snap budget.
@@ -224,6 +271,7 @@ func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	_dbg_cur["int_prev_contact_count"] = _dbg_prev_contact_count
 
 	_dbg_prev_contact_count = _contact_count
+	Profiler.end("movement_integrate")
 
 
 # ======================================================================
@@ -231,6 +279,7 @@ func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 # ======================================================================
 
 func pre_physics_step(delta: float) -> void:
+	Profiler.begin("movement_pre_step")
 	# NOTE: _was_grounded is saved at end of frame in post_physics_step,
 	# NOT here. on_integrate_forces already updated _is_grounded before
 	# this runs, so copying here would make both values identical and
@@ -283,7 +332,7 @@ func pre_physics_step(delta: float) -> void:
 	# may still overlap the floor for a frame or two.
 	if _post_jump_rising:
 		_post_jump_timer -= delta
-		if _post_jump_timer <= 0.0:
+		if _post_jump_timer <= 0.0 or player.velocity.y <= 0.0:
 			_post_jump_rising = false
 		else:
 			_is_grounded = false
@@ -318,6 +367,7 @@ func pre_physics_step(delta: float) -> void:
 		if _is_grounded and n.distance_to(_best_contact_normal) < 0.01:
 			continue
 		_obstacle_normals.append(Vector2(n.x, n.z))
+	Profiler.end("movement_pre_step")
 
 
 # ======================================================================
@@ -354,6 +404,7 @@ func apply_gravity(delta: float) -> void:
 # ======================================================================
 
 func process_normal_movement(delta: float) -> void:
+	Profiler.begin("movement_normal")
 	var input_dir: Vector2 = player.player_input.input_direction
 	var direction := (player.transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized() \
 		if input_dir.length() > 0.1 else Vector3.ZERO
@@ -363,12 +414,15 @@ func process_normal_movement(delta: float) -> void:
 	# this scales both max speed and current speed so wall sliding feels
 	# like normal movement at a reduced rate.
 	var wall_speed_fraction: float = 1.0
-	if direction != Vector3.ZERO and _is_grounded:
+	if direction != Vector3.ZERO and _is_grounded and not GameManager.debug_no_wall_proj:
 		# Find the wall we're pressing most into
 		var best_into: float = 0.0
 		var best_wall_nh := Vector3.ZERO
 		for c in _contacts:
 			if not c["is_walkable"]:
+				# Dynamic bodies aren't walls — the solver handles the collision
+				if c["body"] is RigidBody3D and not GameManager.debug_wall_proj_dynamic:
+					continue
 				var wall_n: Vector3 = c["normal"]
 				var wall_nh := Vector3(wall_n.x, 0.0, wall_n.z)
 				if wall_nh.length_squared() > 0.01:
@@ -387,6 +441,9 @@ func process_normal_movement(delta: float) -> void:
 				direction = Vector3.ZERO
 				wall_speed_fraction = 0.0
 
+		if GameManager.debug_no_wall_speed_scale:
+			wall_speed_fraction = 1.0
+
 	# Calculate effective max speed with all bonuses
 	var shoe_bonus: float = player.inventory.get_shoe_speed_bonus() if player.inventory else 0.0
 	var heat_mult: float = player.heat_system.get_speed_multiplier()
@@ -403,6 +460,8 @@ func process_normal_movement(delta: float) -> void:
 		max_speed = 50.0 * wall_speed_fraction
 
 	var accel: float = WALK_ACCEL if _is_grounded else AIR_ACCELERATION
+	if GameManager.debug_instant_accel:
+		accel = 9999.0
 
 	# Current horizontal velocity
 	var hvel := Vector3(player.velocity.x, 0.0, player.velocity.z)
@@ -490,6 +549,7 @@ func process_normal_movement(delta: float) -> void:
 		_dbg_prev_wall_nh = _dbg_wall_nh
 	else:
 		_dbg_prev_wall_nh = Vector3.ZERO
+	Profiler.end("movement_normal")
 
 
 
@@ -518,7 +578,7 @@ func _do_snap(snap_dist: float) -> bool:
 		var rest := space.get_rest_info(collision_params)
 		if rest and rest.normal.angle_to(Vector3.UP) <= FLOOR_MAX_ANGLE:
 			var collider := instance_from_id(rest.collider_id)
-			if collider is StaticBody3D:
+			if collider is StaticBody3D or collider is VoxelLodTerrain:
 				if _dbg_log:
 					print("[SNAP] HIT static dist=%.4f safe=%.4f unsafe=%.4f normal=(%.2f,%.2f,%.2f)" % [
 						snap_dist, result[0], result[1], rest.normal.x, rest.normal.y, rest.normal.z])
@@ -539,6 +599,10 @@ func _do_snap(snap_dist: float) -> bool:
 			elif collider is RigidBody3D:
 				if _dbg_log:
 					print("[SNAP] HIT dynamic — skipped")
+				return false
+			else:
+				if _dbg_log:
+					print("[SNAP] HIT unknown body: %s" % collider.get_class())
 				return false
 		else:
 			if _dbg_log:
@@ -567,8 +631,13 @@ func _update_overlap_debug() -> void:
 			var col = instance_from_id(r.collider_id)
 			var shape_name := "?"
 			if col is CollisionObject3D:
-				var owner_id: int = col.shape_find_owner(r.shape)
-				var shape_node: Node = col.shape_owner_get_owner(owner_id)
+				# Guard against shapes mid-registration (terrain threading)
+				var owner_id: int = -1
+				var shape_node: Node = null
+				if col.get_shape_owners().size() > 0:
+					owner_id = col.shape_find_owner(r.shape) if r.shape >= 0 else -1
+				if owner_id >= 0:
+					shape_node = col.shape_owner_get_owner(owner_id)
 				if shape_node:
 					shape_name = shape_node.name
 					var spos: Vector3 = shape_node.global_position if shape_node is Node3D else Vector3.ZERO
@@ -603,7 +672,7 @@ func _process_ground_movement(hvel: Vector3, hspeed: float, direction: Vector3, 
 	# Dime stop: below DIME_STOP_SPEED, strip any velocity component opposing
 	# the new input direction. Moving NE and pressing W kills the east component
 	# but keeps north. Moving E and pressing W zeroes everything.
-	if hspeed > 0.01 and hspeed <= DIME_STOP_SPEED:
+	if hspeed > 0.01 and hspeed <= DIME_STOP_SPEED and not GameManager.debug_no_dime_stop:
 		var vel_along_input := hvel.dot(hdir)
 		if vel_along_input < 0.0:
 			hvel -= hdir * vel_along_input
@@ -664,10 +733,12 @@ func _process_air_movement(hvel: Vector3, hspeed: float, direction: Vector3, max
 # ======================================================================
 
 func apply_snap_and_gravity(delta: float) -> void:
+	Profiler.begin("movement_snap_gravity")
 	## Snap to ground when briefly airborne, otherwise apply gravity.
 	## Called AFTER all movement branches (slide/crouch/normal) so it
 	## runs unconditionally every frame.
 	if _is_grounded:
+		Profiler.end("movement_snap_gravity")
 		return
 	# Save airborne hvel NOW, before the snap might ground us.
 	# This is fresh — the movement code just set the horizontal velocity.
@@ -682,13 +753,14 @@ func apply_snap_and_gravity(delta: float) -> void:
 		# First sweep: kinematic — where gravity would put us in one frame.
 		# First sweep: kinematic — where gravity would put us in one frame.
 		var kinematic := player.velocity.y * delta - 0.5 * player.gravity * delta * delta
-		var recently_grounded := (Time.get_ticks_msec() / 1000.0 - _last_grounded_time) < 0.25
+		var recently_jolt_grounded := (Time.get_ticks_msec() / 1000.0 - _last_jolt_grounded_time) < 0.25
 		var snap_dist := minf(kinematic, -0.5 * player.gravity * delta * delta)
-		if recently_grounded:
+		if recently_jolt_grounded:
 			snap_dist -= 0.05
 		if GameManager.debug_grounding_extend_snap:
 			snap_dist = minf(snap_dist, -0.5)
 		if _do_snap(snap_dist):
+			Profiler.end("movement_snap_gravity")
 			return
 		# Debug: measure actual distance to ground when both sweeps miss.
 		if GameManager.debug_grounding_log and _was_grounded:
@@ -709,6 +781,7 @@ func apply_snap_and_gravity(delta: float) -> void:
 					snap_dist, player.velocity.y])
 	# Gravity: always applies when airborne (whether jumping or falling)
 	player.velocity.y -= player.gravity * delta
+	Profiler.end("movement_snap_gravity")
 
 
 # ======================================================================

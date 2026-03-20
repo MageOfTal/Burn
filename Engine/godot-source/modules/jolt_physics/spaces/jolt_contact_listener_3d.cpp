@@ -61,7 +61,7 @@ void JoltContactListener3D::reset_mass_scale_diag() {
 	MassScaleDiag::angled_scale.store(0, std::memory_order_relaxed);
 }
 
-void JoltContactListener3D::_try_ground_custom_integrator(const JPH::Body &p_body1, const JPH::Body &p_body2, const JPH::ContactManifold &p_manifold, JPH::ContactSettings &p_settings) {
+void JoltContactListener3D::_try_ground_custom_integrator(const JPH::Body &p_body1, const JPH::Body &p_body2, const JPH::ContactManifold &p_manifold) {
 	constexpr float WALKABLE_COS = 0.6428f; // cos(50 degrees)
 	constexpr float JUMPABLE_COS = 0.0872f; // cos(85 degrees)
 

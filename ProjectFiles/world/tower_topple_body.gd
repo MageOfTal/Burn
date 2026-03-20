@@ -36,7 +36,7 @@ var tower_position: Vector3 = Vector3.ZERO
 
 var _topple_timer: float = 0.0
 var _has_impacted: bool = false
-## Track the tower VoxelTerrain node so we can ignore collisions with it
+## Track the tower's terrain node so we can ignore collisions with it
 var _tower_terrain: Node = null
 ## Track spawn height to detect when the body has fallen significantly
 var _spawn_y: float = 0.0
@@ -54,7 +54,7 @@ func _ready() -> void:
 	var tower := _find_tower()
 	if tower:
 		for child in tower.get_children():
-			if child is VoxelTerrain:
+			if child is VoxelTerrain or child is VoxelLodTerrain or child.name == "TerrainSystem":
 				_tower_terrain = child
 				break
 

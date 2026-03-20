@@ -61,7 +61,7 @@ func _ready() -> void:
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = Color(0.25, 0.65, 0.35)
 
-	# --- Custom terrain system (replaces VoxelTerrain) ---
+	# --- Custom terrain system (shared StaticBody3D, full collision everywhere) ---
 	_terrain_system = TerrainSystem.new()
 	_terrain_system.name = "TerrainSystem"
 	add_child(_terrain_system)
@@ -132,35 +132,47 @@ func _ready() -> void:
 func _spawn_heavy_structures() -> void:
 	## Spread heavy wall/ramp spawning across frames.
 	## Called from network_manager after all synchronous setup is done.
+	var t_total := Time.get_ticks_msec()
 	var rng := _structure_rng
 	var structures_node := Node3D.new()
 	structures_node.name = "Structures"
 	add_child(structures_node)
 
-	# Build terrain chunks before spawning structures (need collision for raycasts)
+	var t_terrain := Time.get_ticks_msec()
 	await _terrain_system.build_initial()
+	print("[STARTUP] Terrain build: %dms" % (Time.get_ticks_msec() - t_terrain))
 
 	# Pre-compute tower position so walls/ramps can respect the exclusion zone.
-	# The tower itself is spawned last (it awaits voxel generation).
 	_precompute_tower_position(rng)
 
 	if not GameManager.debug_skip_structures:
+		var t := Time.get_ticks_msec()
 		await _spawn_walls_batched(rng, structures_node)
+		print("[STARTUP] Walls: %dms" % (Time.get_ticks_msec() - t))
+		t = Time.get_ticks_msec()
 		await _spawn_ramps_batched(rng, structures_node)
+		print("[STARTUP] Ramps: %dms" % (Time.get_ticks_msec() - t))
+		t = Time.get_ticks_msec()
 		await _spawn_smooth_ramps_batched(rng, structures_node)
+		print("[STARTUP] Smooth ramps: %dms" % (Time.get_ticks_msec() - t))
+		t = Time.get_ticks_msec()
 		await _spawn_obj_structures_batched(rng, structures_node)
+		print("[STARTUP] Obj structures: %dms" % (Time.get_ticks_msec() - t))
+		t = Time.get_ticks_msec()
 		await _spawn_tower(rng, structures_node)
+		print("[STARTUP] Tower: %dms" % (Time.get_ticks_msec() - t))
 	else:
 		print("[SeedWorld] Skipping structures (debug toggle)")
-		await get_tree().process_frame  # Yield once so signal timing stays consistent
+		await get_tree().process_frame
 	_spawn_dummies(rng)
 
 	_spawn_test_platforms()
 	_spawn_sine_ramps()
+	_spawn_test_cube()
 
 	structures_complete = true
 	world_generation_complete.emit()
-	print("[SeedWorld] World generation complete — all structures placed")
+	print("[STARTUP] Total: %dms" % (Time.get_ticks_msec() - t_total))
 
 
 func reset_world() -> void:
@@ -714,6 +726,39 @@ func _spawn_test_platforms() -> void:
 	var top_y := ground_y + wall_height
 	print("[TestPlatforms] Upright wall + 40° ramp at x=%.0f z=%.0f — top at y=%.1f" % [
 		pos_x, pos_z, top_y])
+
+
+func _spawn_test_cube() -> void:
+	## DEBUG: Giant heavy RigidBody3D cube for wall-slide testing.
+	var pos := Vector3(30, 0, 0)
+	var ground_y := get_height_from_noise(pos.x, pos.z)
+
+	var cube := RigidBody3D.new()
+	cube.name = "TestCube"
+	cube.mass = 50000.0
+	cube.can_sleep = false
+	cube.lock_rotation = true
+	cube.collision_layer = CollisionLayers.WORLD
+	cube.collision_mask = CollisionLayers.WORLD
+	cube.position = Vector3(pos.x, ground_y + 15.0, pos.z)
+
+	var shape := BoxShape3D.new()
+	shape.size = Vector3(20, 20, 20)
+	var col := CollisionShape3D.new()
+	col.shape = shape
+	cube.add_child(col)
+
+	var mesh := MeshInstance3D.new()
+	var box := BoxMesh.new()
+	box.size = shape.size
+	mesh.mesh = box
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.9, 0.3, 0.1)
+	mesh.material_override = mat
+	cube.add_child(mesh)
+
+	add_child(cube)
+	print("[TestCube] 50000kg cube at (%.0f, %.1f, %.0f) — 20m, no gravity" % [pos.x, ground_y + 15.0, pos.z])
 
 
 func _spawn_sine_ramps() -> void:
