@@ -15,6 +15,7 @@ const VIEW_DISTANCE := 256.0
 const LOAD_BUDGET_INIT := 50   # chunks per yield during initial build
 const LOAD_BUDGET_PLAY := 2    # chunks to submit per frame
 const REBUILD_BUDGET := 4      # dirty chunk rebuilds per frame
+const BAKE_PATH := "res://terrain/terrain_bake.bin"
 
 var sdf_grid: TerrainSDFGrid
 var _mesher: TerrainMesher
@@ -72,24 +73,25 @@ func setup(noise: FastNoiseLite, height_range: float, material: Material) -> voi
 # ------------------------------------------------------------------
 
 func build_initial() -> void:
-	## Generate and mesh all chunks in view. Submits work to thread pool
-	## and yields while waiting for results.
+	## Load full bake if available (instant), otherwise generate + bake.
+	if await _load_full_bake():
+		_initial_load_done = true
+		call_deferred("debug_raycast_boundary_gaps", Vector3.ZERO, 64.0)
+		return
+
+	# No bake — generate from scratch
 	var positions: Array[Vector3] = [Vector3.ZERO]
 	var info: Dictionary = _streaming.update(positions, {})
 	var to_load: Array[Vector3i] = info["to_load"]
 
 	print("[TerrainSystem] Initial build: %d chunks to generate" % to_load.size())
 
-	# Pre-generate all SDF data on main thread (cheap, ~0.5ms each).
-	# Workers need read access to neighbor chunks for buffer fill.
 	for bp: Vector3i in to_load:
 		_ensure_sdf_with_neighbors(bp)
 
-	# Submit all chunks to thread pool
 	for bp: Vector3i in to_load:
 		_submit_chunk(bp)
 
-	# Harvest results until all done
 	while _pending.size() > 0:
 		_harvest_results()
 		await get_tree().process_frame
@@ -99,7 +101,108 @@ func build_initial() -> void:
 		_chunks.size(),
 		_count_visible_chunks()])
 
+	_save_full_bake()
 	call_deferred("debug_raycast_boundary_gaps", Vector3.ZERO, 64.0)
+
+
+func _save_full_bake() -> void:
+	## Save SDF + collision faces per chunk. Skips ALL generation on next load.
+	var t := Time.get_ticks_msec()
+
+	# SDF grid (needed for runtime deformation + streaming)
+	var sdf_data: Dictionary = {}
+	for bp: Vector3i in sdf_grid._chunks:
+		sdf_data[bp] = sdf_grid._chunks[bp]
+
+	# Per-chunk collision faces (PackedVector3Array serializes cleanly)
+	var chunk_faces: Dictionary = {}
+	for bp: Vector3i in _chunks:
+		var chunk: TerrainChunk = _chunks[bp]
+		if chunk._collision_shape and chunk._collision_shape.shape:
+			var shape: ConcavePolygonShape3D = chunk._collision_shape.shape as ConcavePolygonShape3D
+			if shape:
+				chunk_faces[bp] = shape.get_faces()
+
+	var save_dict: Dictionary = {
+		"version": 1,
+		"sdf": sdf_data,
+		"faces": chunk_faces,
+		"mesh_offset": _mesher.get_mesh_offset(),
+	}
+
+	var f := FileAccess.open(BAKE_PATH, FileAccess.WRITE)
+	if f:
+		f.store_var(save_dict, true)
+		f.close()
+		print("[TerrainSystem] Baked %d chunks (%d with geometry) in %dms" % [
+			sdf_data.size(), chunk_faces.size(), Time.get_ticks_msec() - t])
+
+
+func _load_full_bake() -> bool:
+	## Load pre-baked terrain. Rebuilds meshes from faces (fast, no SDF/meshing).
+	if not FileAccess.file_exists(BAKE_PATH):
+		return false
+
+	var t := Time.get_ticks_msec()
+	var f := FileAccess.open(BAKE_PATH, FileAccess.READ)
+	if not f:
+		return false
+
+	var save_dict = f.get_var(true)
+	f.close()
+
+	if not save_dict is Dictionary or not save_dict.has("version"):
+		print("[TerrainSystem] Bake file outdated — regenerating")
+		return false
+
+	# Restore SDF grid
+	var sdf_data: Dictionary = save_dict["sdf"]
+	for bp in sdf_data:
+		sdf_grid._chunks[bp] = sdf_data[bp]
+
+	# Restore chunks from faces — build mesh from faces directly
+	var chunk_faces: Dictionary = save_dict["faces"]
+	var offset: Vector3 = save_dict.get("mesh_offset", _mesher.get_mesh_offset())
+	var loaded := 0
+
+	for bp: Vector3i in chunk_faces:
+		var faces: PackedVector3Array = chunk_faces[bp]
+		if faces.is_empty():
+			continue
+
+		# Build mesh from faces (triangles → ArrayMesh)
+		var mesh := ArrayMesh.new()
+		var arrays := []
+		arrays.resize(Mesh.ARRAY_MAX)
+		arrays[Mesh.ARRAY_VERTEX] = faces
+		# Compute normals from triangles
+		var normals := PackedVector3Array()
+		normals.resize(faces.size())
+		for i in range(0, faces.size(), 3):
+			var a: Vector3 = faces[i]
+			var b: Vector3 = faces[i + 1]
+			var c: Vector3 = faces[i + 2]
+			var n := (b - a).cross(c - a).normalized()
+			normals[i] = n
+			normals[i + 1] = n
+			normals[i + 2] = n
+		arrays[Mesh.ARRAY_NORMAL] = normals
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+		if _mesher._material:
+			mesh.surface_set_material(0, _mesher._material)
+
+		var chunk := TerrainChunk.new(bp)
+		add_child(chunk)
+		chunk.apply_data(mesh, faces, offset, _terrain_body)
+		_chunks[bp] = chunk
+		loaded += 1
+
+		if loaded % 500 == 0:
+			await get_tree().process_frame
+
+	print("[TerrainSystem] Loaded bake: %d chunks in %dms" % [
+		loaded, Time.get_ticks_msec() - t])
+	return true
 
 
 # ------------------------------------------------------------------
@@ -196,6 +299,10 @@ func reset() -> void:
 	_dirty_queue.clear()
 	sdf_grid.clear()
 	_initial_load_done = false
+	# Delete bake so next build regenerates fresh
+	if FileAccess.file_exists(BAKE_PATH):
+		DirAccess.remove_absolute(BAKE_PATH)
+		print("[TerrainSystem] Deleted bake file")
 
 
 # ------------------------------------------------------------------
