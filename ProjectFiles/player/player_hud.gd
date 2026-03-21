@@ -87,6 +87,7 @@ var _victory_screen: HUDVictoryScreen = null
 ## Debug: grounded state indicator (top-right dot)
 var _ground_dot: ColorRect = null
 var _overlap_dot: ColorRect = null
+var _skid_dot: ColorRect = null
 ## Debug: momentum launch indicator (white circle, flashes black)
 var _launch_dot: ColorRect = null
 
@@ -242,6 +243,18 @@ func setup(player: Player) -> void:
 	_overlap_dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(_overlap_dot)
 
+	# Debug: skid state indicator (purple = skidding, red = normal)
+	_skid_dot = ColorRect.new()
+	_skid_dot.custom_minimum_size = Vector2(20, 20)
+	_skid_dot.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	_skid_dot.offset_left = -30
+	_skid_dot.offset_right = -10
+	_skid_dot.offset_top = 60
+	_skid_dot.offset_bottom = 80
+	_skid_dot.color = Color.RED
+	_skid_dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_skid_dot)
+
 	# Debug: momentum launch indicator (white, flashes black on launch)
 	_launch_dot = ColorRect.new()
 	_launch_dot.custom_minimum_size = Vector2(20, 20)
@@ -378,6 +391,9 @@ func _process(delta: float) -> void:
 	# Debug: overlap dot — blue = overlapping, red = not overlapping
 	if _overlap_dot and _player.movement:
 		_overlap_dot.color = Color.BLUE if _player.movement._dbg_is_overlapping else Color.RED
+	# Debug: skid dot — purple = skidding, red = normal
+	if _skid_dot and _player.movement:
+		_skid_dot.color = Color.PURPLE if _player.movement._dbg_is_skidding else Color.RED
 	# Debug: momentum launch dot — white normally, black when momentum launch fires
 	if _launch_dot and _player.movement:
 		_launch_dot.color = Color.BLACK if _player.movement._momentum_launch_flash > 0.0 else Color.WHITE

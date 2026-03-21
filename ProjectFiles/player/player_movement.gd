@@ -17,7 +17,7 @@ class_name PlayerMovement
 
 const SPEED := 9.0
 const JUMP_VELOCITY := 10.5
-const WALK_ACCEL: float = 30.33
+const WALK_ACCEL: float = 45.0
 const AIR_ACCELERATION := 15.0
 
 const FLOOR_MAX_ANGLE: float = 0.8727  ## 50° — walkable
@@ -97,6 +97,7 @@ var _dbg_pos_drift: Vector3 = Vector3.ZERO       # position drift from Jolt (com
 var _dbg_vel_delta: Vector3 = Vector3.ZERO        # velocity change by Jolt
 var _dbg_prev_wall_nh: Vector3 = Vector3.ZERO     # previous frame's primary wall normal (horizontal)
 var _dbg_is_overlapping: bool = false             # is the capsule overlapping something
+var _dbg_is_skidding: bool = false               # is the player in skid mode this frame
 var _dbg_prev_set_vel_y: float = 0.0                  # vel.y we set last frame (for ground snap)
 
 
@@ -709,6 +710,7 @@ func _update_overlap_debug() -> void:
 
 
 func _process_ground_movement(hvel: Vector3, hspeed: float, direction: Vector3, max_speed: float, accel: float, delta: float) -> Vector3:
+	_dbg_is_skidding = false
 	if direction == Vector3.ZERO:
 		# No input: instant stop (below skid threshold)
 		if hspeed <= SKID_THRESHOLD:
@@ -724,9 +726,11 @@ func _process_ground_movement(hvel: Vector3, hspeed: float, direction: Vector3, 
 	# No hdir wall projection — Jolt handles wall contacts via the
 	# contact solver. We just accelerate toward the input direction.
 
-	# Check if we're in skid territory
-	if hspeed >= SKID_THRESHOLD:
-		# SKID: can only steer and decelerate
+	# Skid: above SKID_THRESHOLD or above max_speed (overspeed from landing,
+	# boost, etc). Skid steers toward input and decelerates via friction,
+	# naturally bringing speed back to max_speed where normal movement takes over.
+	if hspeed >= SKID_THRESHOLD or hspeed > max_speed:
+		_dbg_is_skidding = true
 		return _process_skid(hvel, hspeed, hdir, delta)
 
 	# Dime stop: project input onto any wall contact surface (static or dynamic).
@@ -765,27 +769,27 @@ func _process_ground_movement(hvel: Vector3, hspeed: float, direction: Vector3, 
 		var new_toward := minf(vel_toward_target + speed_add, max_speed)
 		hvel += hdir * (new_toward - vel_toward_target)
 
-	# Clamp to max speed (only if we're accelerating, not if external forces pushed us)
+	# Clamp to max speed. Always clamp if acceleration ran this frame (new_speed > hspeed).
+	# Also clamp if we entered from skid (hspeed was above max but accel brought it close).
 	var new_speed := hvel.length()
-	if new_speed > max_speed and new_speed > hspeed:
+	if new_speed > max_speed:
 		hvel = hvel.normalized() * max_speed
 
 	return hvel
 
 
 func _process_skid(hvel: Vector3, hspeed: float, input_dir: Vector3, delta: float) -> Vector3:
-	## Skid mode: player can only steer their current velocity direction
-	## and decelerate. Cannot accelerate toward movement direction.
-	var current_dir := hvel.normalized()
+	## Skid mode: steer + decelerate. Steering uses the same acceleration
+	## as normal movement — add accel along input, normalize back to current
+	## speed. This makes skid turning feel identical to ground turning.
+	# Steer: add acceleration along input, then normalize to preserve speed
+	hvel += input_dir * WALK_ACCEL * delta
+	hvel = hvel.normalized() * hspeed
 
-	# Steer: rotate velocity direction toward input
-	var steer_amount := SKID_STEER_STRENGTH * delta
-	var new_dir := current_dir.lerp(input_dir, clampf(steer_amount, 0.0, 1.0)).normalized()
-
-	# Friction: strong ground friction decelerates
+	# Friction: decelerate toward max speed
 	var new_speed := maxf(hspeed - SKID_FRICTION * delta, 0.0)
 
-	return new_dir * new_speed
+	return hvel.normalized() * new_speed
 
 
 func _process_air_movement(hvel: Vector3, hspeed: float, direction: Vector3, max_speed: float, accel: float, delta: float) -> Vector3:
@@ -803,13 +807,12 @@ func _process_air_movement(hvel: Vector3, hspeed: float, direction: Vector3, max
 		var speed_add := accel * delta
 		var new_toward := minf(vel_toward_target + speed_add, max_speed)
 		hvel += hdir * (new_toward - vel_toward_target)
-
-	# Don't let air acceleration push total speed above max.
-	# Without this, turning in the air adds perpendicular velocity that
-	# exceeds max_speed, and on landing the ground code can't steer.
-	var new_speed := hvel.length()
-	if new_speed > max_speed:
-		hvel = hvel.normalized() * max_speed
+		# Don't let movement input increase speed. Cap to whatever we started
+		# with or max_speed, whichever is higher. Preserves external boosts.
+		var speed_cap := maxf(max_speed, hspeed)
+		var new_air_speed := hvel.length()
+		if new_air_speed > speed_cap:
+			hvel *= speed_cap / new_air_speed
 
 	return hvel
 
