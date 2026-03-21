@@ -71,6 +71,7 @@ var _f9_was_pressed: bool = false
 
 ## Performance graph
 var _perf_graph: HUDPerfGraph = null
+var _y_graph: HUDYGraph = null
 var _graph_tps: float = 60.0          ## Exact TPS from last completed window
 var _tps_window_start_us: int = 0     ## Wall-clock usec at start of current window
 var _tps_window_ticks: int = 0        ## Physics ticks counted since window start
@@ -82,6 +83,12 @@ var _forfeit_ring: HUDForfeitRing = null
 var _demon_vignette: HUDDemonVignette = null
 var _zone_vignette: HUDZoneVignette = null
 var _victory_screen: HUDVictoryScreen = null
+
+## Debug: grounded state indicator (top-right dot)
+var _ground_dot: ColorRect = null
+var _overlap_dot: ColorRect = null
+## Debug: momentum launch indicator (white circle, flashes black)
+var _launch_dot: ColorRect = null
 
 
 func setup(player: Player) -> void:
@@ -204,6 +211,49 @@ func setup(player: Player) -> void:
 	_perf_graph.visible = GameManager.show_fps_hud
 	add_child(_perf_graph)
 
+	# Player Y graph (right of perf graph)
+	_y_graph = HUDYGraph.new()
+	_y_graph.set_anchors_preset(Control.PRESET_TOP_LEFT)
+	_y_graph.offset_left = 286.0  # 10 + perf graph width (268) + 8 gap
+	_y_graph.offset_top = 28
+	_y_graph.visible = GameManager.show_fps_hud
+	add_child(_y_graph)
+
+	# Debug: grounded state dot (top-right corner)
+	_ground_dot = ColorRect.new()
+	_ground_dot.custom_minimum_size = Vector2(20, 20)
+	_ground_dot.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	_ground_dot.offset_left = -30
+	_ground_dot.offset_right = -10
+	_ground_dot.offset_top = 10
+	_ground_dot.offset_bottom = 30
+	_ground_dot.color = Color.RED
+	_ground_dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_ground_dot)
+
+	_overlap_dot = ColorRect.new()
+	_overlap_dot.custom_minimum_size = Vector2(20, 20)
+	_overlap_dot.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	_overlap_dot.offset_left = -30
+	_overlap_dot.offset_right = -10
+	_overlap_dot.offset_top = 35
+	_overlap_dot.offset_bottom = 55
+	_overlap_dot.color = Color.RED
+	_overlap_dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_overlap_dot)
+
+	# Debug: momentum launch indicator (white, flashes black on launch)
+	_launch_dot = ColorRect.new()
+	_launch_dot.custom_minimum_size = Vector2(20, 20)
+	_launch_dot.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	_launch_dot.offset_left = -55
+	_launch_dot.offset_right = -35
+	_launch_dot.offset_top = 10
+	_launch_dot.offset_bottom = 30
+	_launch_dot.color = Color.WHITE
+	_launch_dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_launch_dot)
+
 
 func _build_bottom_bar() -> void:
 	## Build the bottom bar: shoe box on the left, 6 weapon boxes to the right.
@@ -321,6 +371,16 @@ func _process(delta: float) -> void:
 	_update_bottom_bar()
 	_update_zone_display()
 	_update_fps_hud(delta)
+
+	# Debug: grounded dot — green = on floor, red = airborne
+	if _ground_dot and _player.movement:
+		_ground_dot.color = Color.GREEN if _player.movement._is_grounded else Color.RED
+	# Debug: overlap dot — blue = overlapping, red = not overlapping
+	if _overlap_dot and _player.movement:
+		_overlap_dot.color = Color.BLUE if _player.movement._dbg_is_overlapping else Color.RED
+	# Debug: momentum launch dot — white normally, black when momentum launch fires
+	if _launch_dot and _player.movement:
+		_launch_dot.color = Color.BLACK if _player.movement._momentum_launch_flash > 0.0 else Color.WHITE
 
 	# Delegate to widgets
 	if _compass:
@@ -544,6 +604,8 @@ func _update_fps_hud(delta: float) -> void:
 	if effective_delta < 0.001:
 		if _perf_graph:
 			_perf_graph.visible = GameManager.show_fps_hud
+		if _y_graph:
+			_y_graph.visible = GameManager.show_fps_hud
 		return
 
 	if _perf_graph:
@@ -551,6 +613,11 @@ func _update_fps_hud(delta: float) -> void:
 		if _perf_graph.visible:
 			var tick_ms: float = GameManager.last_tick_gdscript_us / 1000.0
 			_perf_graph.push_sample(minf(1.0 / effective_delta, 1000.0), _graph_tps, tick_ms, frame_ms)
+
+	if _y_graph:
+		_y_graph.visible = GameManager.show_fps_hud
+		if _y_graph.visible and _player:
+			_y_graph.push_sample(_player.global_position.y)
 
 	if _fps_hud_label == null:
 		return

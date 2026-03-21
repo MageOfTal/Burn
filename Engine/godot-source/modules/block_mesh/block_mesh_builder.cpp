@@ -245,6 +245,11 @@ void BlockMeshBuilder::_bind_methods() {
 			D_METHOD("calc_integrity_components", "block_grid", "num_x", "num_y", "num_z", "total_blocks"),
 			&BlockMeshBuilder::calc_integrity_components);
 	ClassDB::bind_method(
+			D_METHOD("calc_stress_integrity_components", "block_grid", "ground_mask",
+					"num_x", "num_y", "num_z",
+					"total_blocks", "max_load", "horizontal_transfer"),
+			&BlockMeshBuilder::calc_stress_integrity_components);
+	ClassDB::bind_method(
 			D_METHOD("build_cluster", "block_hp", "num_x", "num_y", "num_z", "block_size", "cluster_body", "hit_body", "hit_shape", "include_uvs"),
 			&BlockMeshBuilder::build_cluster,
 			DEFVAL(true), DEFVAL(true));
@@ -255,6 +260,17 @@ void BlockMeshBuilder::_bind_methods() {
 	ClassDB::bind_method(
 			D_METHOD("bulk_configure_debris", "nodes", "block_positions", "blast_centers", "counts", "speeds", "mass", "material"),
 			&BlockMeshBuilder::bulk_configure_debris);
+	ClassDB::bind_method(
+			D_METHOD("build_collision_faces", "block_grid", "num_x", "num_y", "num_z", "block_size"),
+			&BlockMeshBuilder::build_collision_faces);
+	ClassDB::bind_method(
+			D_METHOD("bulk_spawn_debris", "block_positions", "blast_centers", "counts", "speeds",
+					"mass", "material", "shape", "mesh", "space", "scenario",
+					"collision_layer", "collision_mask"),
+			&BlockMeshBuilder::bulk_spawn_debris);
+	ClassDB::bind_method(
+			D_METHOD("debris_friction_callback", "state", "userdata"),
+			&BlockMeshBuilder::debris_friction_callback);
 }
 
 // Helper: check if grid cell is occupied (out-of-bounds = empty).
@@ -1002,6 +1018,485 @@ Array BlockMeshBuilder::calc_integrity_components(
 	return components;
 }
 
+// ── Force-equilibrium structural stress solver ──
+//
+// Physics model: each block is a rigid body subject to gravity. Adjacent blocks
+// share a contact face that can transmit compression, tension, and shear forces,
+// each bounded by material strength limits. Grounded blocks (marked in
+// p_ground_mask) provide unlimited reaction forces — they're resting on terrain.
+//
+// The solver finds the force distribution satisfying Newton's first law
+// (sum of forces = 0) at every block. It uses iterative Gauss-Seidel
+// relaxation: each block distributes its unresolved force to its contacts,
+// preferring contacts aligned with the force direction (so gravity naturally
+// flows downward through compression before resorting to shear/tension).
+//
+// If a block's contacts cannot absorb its load (all at capacity), the block
+// fails. Failed blocks can't support neighbors, triggering cascading collapse.
+// Failed + disconnected blocks are grouped into components for detachment.
+
+Array BlockMeshBuilder::calc_stress_integrity_components(
+		const PackedByteArray &p_block_grid,
+		const PackedByteArray &p_ground_mask,
+		int p_num_x, int p_num_y, int p_num_z,
+		int p_total_blocks,
+		float p_max_load,
+		float p_horizontal_transfer) {
+	const int grid_size = p_num_x * p_num_y * p_num_z;
+	ERR_FAIL_COND_V_MSG(p_block_grid.size() != grid_size, Array(),
+			"calc_stress_integrity_components: grid size mismatch");
+	ERR_FAIL_COND_V(p_total_blocks <= 0, Array());
+
+	// Ground mask: if provided, use it. Otherwise fall back to y=0.
+	const bool has_ground_mask = p_ground_mask.size() == grid_size;
+	const uint8_t *ground_mask = has_ground_mask ? p_ground_mask.ptr() : nullptr;
+
+	uint64_t t_start = OS::get_singleton()->get_ticks_usec();
+
+	const uint8_t *grid = p_block_grid.ptr();
+	const int nx = p_num_x;
+	const int ny = p_num_y;
+	const int nz = p_num_z;
+	const int ny_nz = ny * nz;
+
+	// Material limits (in units of block-weight).
+	// p_max_load: how many blocks of weight a single face can bear in compression.
+	// Tension and shear are fractions of compressive strength (realistic for most materials).
+	const float compressive_limit = p_max_load;
+	const float tensile_limit = p_max_load * 0.3f;  // ~30% of compressive (concrete/stone)
+	const float shear_limit = p_max_load * 0.4f;     // ~40% of compressive
+
+	// Horizontal transfer: how readily load spreads sideways (0 = vertical only, 1 = full).
+	const float h_transfer = CLAMP(p_horizontal_transfer, 0.0f, 1.0f);
+
+	// ── Phase 1: Ground BFS — seed from terrain-contacting blocks ──
+	// Marks all blocks reachable from grounded blocks as ground-connected.
+	uint8_t *visited = (uint8_t *)memalloc(grid_size);
+	memset(visited, 0, grid_size);
+
+	// is_ground[idx]: true if this block is a fixed anchor (terrain contact).
+	uint8_t *is_ground = (uint8_t *)memalloc(grid_size);
+	memset(is_ground, 0, grid_size);
+
+	int *bfs_queue = (int *)memalloc(p_total_blocks * sizeof(int));
+	int head = 0, tail = 0;
+
+	if (has_ground_mask) {
+		// Seed from ground_mask: any occupied block marked as grounded.
+		for (int idx = 0; idx < grid_size; idx++) {
+			if (grid[idx] == 1 && ground_mask[idx] == 1) {
+				visited[idx] = 1;
+				is_ground[idx] = 1;
+				bfs_queue[tail++] = idx;
+			}
+		}
+	} else {
+		// Fallback: y=0 blocks are ground (legacy behavior).
+		for (int bx = 0; bx < nx; bx++) {
+			int base = bx * ny_nz;
+			for (int bz = 0; bz < nz; bz++) {
+				int idx = base + bz; // y=0
+				if (grid[idx] == 1) {
+					visited[idx] = 1;
+					is_ground[idx] = 1;
+					bfs_queue[tail++] = idx;
+				}
+			}
+		}
+	}
+
+	int visited_count = tail;
+	while (head < tail) {
+		if (visited_count == p_total_blocks) break;
+		const int ci = bfs_queue[head++];
+		const int bx = ci / ny_nz;
+		const int rem = ci % ny_nz;
+		const int by = rem / nz;
+		const int bz = rem % nz;
+
+		// 6-neighbor BFS
+		if (bx + 1 < nx) { int ni = ci + ny_nz;  if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+		if (bx > 0)      { int ni = ci - ny_nz;  if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+		if (by + 1 < ny)  { int ni = ci + nz;     if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+		if (by > 0)       { int ni = ci - nz;     if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+		if (bz + 1 < nz)  { int ni = ci + 1;      if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+		if (bz > 0)       { int ni = ci - 1;      if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+	}
+
+	uint64_t t_bfs = OS::get_singleton()->get_ticks_usec();
+
+	// Blocks not reached by ground-BFS are already unsupported (disconnected).
+	// The stress solver only runs on ground-connected blocks to find overloaded ones.
+
+	// ── Phase 2: Force equilibrium solver on ground-connected blocks ──
+	//
+	// Each block has a residual force vector (initially gravity = (0, -1, 0) in
+	// block-weight units). The solver iteratively distributes each block's residual
+	// to its contacts. Ground blocks absorb unlimited force. Contacts have limits.
+	//
+	// Contact force decomposition per face:
+	//   Face normal n (unit vector from block toward neighbor).
+	//   Force F applied at contact, decomposed into:
+	//     F_n = dot(F, n) * n   — normal component (compression if positive, tension if negative)
+	//     F_t = F - F_n          — tangential component (shear)
+
+	// Per-block residual force (3 floats: x, y, z).
+	float *residual = (float *)memalloc(grid_size * 3 * sizeof(float));
+	memset(residual, 0, grid_size * 3 * sizeof(float));
+
+	// Per-contact accumulated force magnitude for limit checking.
+	// 6 contacts per cell (±X, ±Y, ±Z). Store positive-direction contacts only
+	// (each contact is stored once, on the lower-index block's side).
+	// Contact indexing: for direction d (0-5), contact lives on the block with
+	// the lower flat index. We track compression and shear usage per contact.
+	// To keep it simple: per-block, per-direction, track how much of the limit is used.
+	float *contact_compression = (float *)memalloc(grid_size * 6 * sizeof(float));
+	float *contact_shear = (float *)memalloc(grid_size * 6 * sizeof(float));
+	memset(contact_compression, 0, grid_size * 6 * sizeof(float));
+	memset(contact_shear, 0, grid_size * 6 * sizeof(float));
+
+	// failed[idx] = 1 if block has been marked as stress-failed.
+	uint8_t *failed = (uint8_t *)memalloc(grid_size);
+	memset(failed, 0, grid_size);
+
+	// Initialize residual: gravity on every ground-connected, non-ground block.
+	// Ground blocks (terrain-contacting) have zero residual (anchored).
+	for (int idx = 0; idx < grid_size; idx++) {
+		if (grid[idx] != 1 || visited[idx] != 1) continue;
+		if (!is_ground[idx]) {
+			residual[idx * 3 + 1] = -1.0f; // gravity: 1 block-weight downward
+		}
+	}
+
+	// Neighbor direction table: +X, -X, +Y, -Y, +Z, -Z
+	// Normal vectors (from block toward neighbor):
+	const float dir_normals[6][3] = {
+		{ 1, 0, 0}, {-1, 0, 0}, { 0, 1, 0}, { 0,-1, 0}, { 0, 0, 1}, { 0, 0,-1}
+	};
+	const int dir_offsets[6] = { ny_nz, -ny_nz, nz, -nz, 1, -1 };
+
+	// Process order: build a list of ground-connected non-ground blocks sorted
+	// bottom-to-top (by Y) for faster convergence — load flows downward first.
+	int *process_order = (int *)memalloc(p_total_blocks * sizeof(int));
+	int process_count = 0;
+	for (int by = 0; by < ny; by++) {
+		for (int bx = 0; bx < nx; bx++) {
+			for (int bz = 0; bz < nz; bz++) {
+				int idx = bx * ny_nz + by * nz + bz;
+				if (grid[idx] == 1 && visited[idx] == 1 && !is_ground[idx]) {
+					process_order[process_count++] = idx;
+				}
+			}
+		}
+	}
+
+	const int MAX_ITERATIONS = 40;
+	const float RESIDUAL_EPSILON = 0.01f; // below this, block is in equilibrium
+
+	int solver_iters = 0;
+	for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+		solver_iters = iter + 1;
+		bool any_change = false;
+
+		for (int pi = 0; pi < process_count; pi++) {
+			const int idx = process_order[pi];
+			if (failed[idx]) continue;
+
+			float rx = residual[idx * 3 + 0];
+			float ry = residual[idx * 3 + 1];
+			float rz = residual[idx * 3 + 2];
+			float rmag = sqrtf(rx * rx + ry * ry + rz * rz);
+			if (rmag < RESIDUAL_EPSILON) continue;
+
+			const int bx = idx / ny_nz;
+			const int rem = idx % ny_nz;
+			const int by = rem / nz;
+			const int bz = rem % nz;
+
+			// Compute alignment weight for each active contact.
+			// Contacts aligned with the residual direction absorb more force.
+			// This ensures gravity flows downward through compression first.
+			float weights[6] = {};
+			int neighbor_idx[6] = {};
+			bool neighbor_valid[6] = {};
+			float total_weight = 0.0f;
+			int active_contacts = 0;
+
+			for (int d = 0; d < 6; d++) {
+				// Bounds check
+				bool in_bounds = true;
+				if (d == 0 && bx + 1 >= nx) in_bounds = false;
+				if (d == 1 && bx <= 0)       in_bounds = false;
+				if (d == 2 && by + 1 >= ny) in_bounds = false;
+				if (d == 3 && by <= 0)       in_bounds = false;
+				if (d == 4 && bz + 1 >= nz) in_bounds = false;
+				if (d == 5 && bz <= 0)       in_bounds = false;
+
+				if (!in_bounds) { neighbor_valid[d] = false; continue; }
+
+				int ni = idx + dir_offsets[d];
+				if (grid[ni] != 1 || failed[ni]) { neighbor_valid[d] = false; continue; }
+				// Disconnected blocks can't be supports
+				if (visited[ni] != 1) { neighbor_valid[d] = false; continue; }
+
+				neighbor_idx[d] = ni;
+				neighbor_valid[d] = true;
+				active_contacts++;
+
+				// Alignment: dot(residual_dir, face_normal)
+				// Positive = residual points toward neighbor (compression transfer)
+				float dot = (rx * dir_normals[d][0] + ry * dir_normals[d][1] + rz * dir_normals[d][2]) / rmag;
+
+				// Vertical contacts (±Y) get full weight.
+				// Horizontal contacts are scaled by h_transfer.
+				bool is_vertical = (d == 2 || d == 3);
+				float dir_scale = is_vertical ? 1.0f : h_transfer;
+
+				// Weight = max(alignment, small_base) * direction_scale
+				// The small base ensures even poorly-aligned contacts participate slightly.
+				weights[d] = MAX(dot, 0.05f) * dir_scale;
+				total_weight += weights[d];
+			}
+
+			if (active_contacts == 0) {
+				// No contacts at all — block fails.
+				failed[idx] = 1;
+				residual[idx * 3 + 0] = 0.0f;
+				residual[idx * 3 + 1] = 0.0f;
+				residual[idx * 3 + 2] = 0.0f;
+				any_change = true;
+				continue;
+			}
+
+			if (total_weight < 1e-6f) total_weight = 1.0f;
+
+			// Distribute residual to contacts, proportional to weight.
+			float absorbed_x = 0.0f, absorbed_y = 0.0f, absorbed_z = 0.0f;
+
+			for (int d = 0; d < 6; d++) {
+				if (!neighbor_valid[d]) continue;
+				float frac = weights[d] / total_weight;
+
+				// Force this contact should carry (fraction of residual)
+				float fx = rx * frac;
+				float fy = ry * frac;
+				float fz = rz * frac;
+
+				// Decompose into normal and shear relative to face.
+				float nx_d = dir_normals[d][0];
+				float ny_d = dir_normals[d][1];
+				float nz_d = dir_normals[d][2];
+				float fn = fx * nx_d + fy * ny_d + fz * nz_d; // normal component (signed)
+				float sx = fx - fn * nx_d;
+				float sy = fy - fn * ny_d;
+				float sz = fz - fn * nz_d;
+				float shear_mag = sqrtf(sx * sx + sy * sy + sz * sz);
+
+				// Clamp normal: positive = compression, negative = tension.
+				float fn_clamped = fn;
+				int ci = idx * 6 + d;
+				if (fn > 0.0f) {
+					float remaining = compressive_limit - contact_compression[ci];
+					if (remaining < 0.0f) remaining = 0.0f;
+					fn_clamped = MIN(fn, remaining);
+				} else {
+					float remaining = tensile_limit + contact_compression[ci]; // compression is positive, tension goes negative
+					if (remaining < 0.0f) remaining = 0.0f;
+					fn_clamped = MAX(fn, -remaining);
+				}
+
+				// Clamp shear.
+				float shear_clamped = shear_mag;
+				float shear_remaining = shear_limit - contact_shear[ci];
+				if (shear_remaining < 0.0f) shear_remaining = 0.0f;
+				shear_clamped = MIN(shear_mag, shear_remaining);
+
+				// Reconstruct clamped force vector.
+				float tfx = fn_clamped * nx_d;
+				float tfy = fn_clamped * ny_d;
+				float tfz = fn_clamped * nz_d;
+				if (shear_mag > 1e-6f) {
+					float shear_scale = shear_clamped / shear_mag;
+					tfx += sx * shear_scale;
+					tfy += sy * shear_scale;
+					tfz += sz * shear_scale;
+				}
+
+				// Update contact force tracking.
+				if (fn_clamped > 0.0f) {
+					contact_compression[ci] += fn_clamped;
+				} else {
+					contact_compression[ci] += fn_clamped; // goes negative for tension
+				}
+				contact_shear[ci] += shear_clamped;
+
+				absorbed_x += tfx;
+				absorbed_y += tfy;
+				absorbed_z += tfz;
+
+				// Transfer to neighbor (Newton's 3rd law).
+				int ni = neighbor_idx[d];
+				if (!is_ground[ni]) { // don't load ground blocks
+					residual[ni * 3 + 0] += tfx;
+					residual[ni * 3 + 1] += tfy;
+					residual[ni * 3 + 2] += tfz;
+				}
+			}
+
+			// Subtract absorbed force from residual.
+			residual[idx * 3 + 0] -= absorbed_x;
+			residual[idx * 3 + 1] -= absorbed_y;
+			residual[idx * 3 + 2] -= absorbed_z;
+
+			float new_rmag = sqrtf(
+					residual[idx * 3 + 0] * residual[idx * 3 + 0] +
+					residual[idx * 3 + 1] * residual[idx * 3 + 1] +
+					residual[idx * 3 + 2] * residual[idx * 3 + 2]);
+
+			if (new_rmag != rmag) any_change = true;
+
+			// If residual is still large and we couldn't absorb enough, block may fail.
+			// (We give it more iterations before declaring failure.)
+		}
+
+		if (!any_change) break;
+	}
+
+	// ── Phase 3: Mark stress-failed blocks ──
+	// Blocks with significant unresolved residual after solver convergence have
+	// no valid force distribution — they can't be held in equilibrium.
+	int stress_failed = 0;
+	for (int pi = 0; pi < process_count; pi++) {
+		int idx = process_order[pi];
+		if (failed[idx]) { stress_failed++; continue; }
+		float rx = residual[idx * 3 + 0];
+		float ry = residual[idx * 3 + 1];
+		float rz = residual[idx * 3 + 2];
+		float rmag = sqrtf(rx * rx + ry * ry + rz * rz);
+		if (rmag > 0.5f) { // >50% of a block-weight unresolved
+			failed[idx] = 1;
+			visited[idx] = 0; // mark as unsupported for component phase
+			stress_failed++;
+		}
+	}
+
+	// Also unmark any block already disconnected from ground BFS.
+	// (visited[idx] == 0 for disconnected blocks is already set.)
+	// Propagate: blocks above a failed block that have no other support also fail.
+	// Single upward pass: if a block's only downward neighbor is failed, it fails too.
+	bool cascade = true;
+	while (cascade) {
+		cascade = false;
+		for (int pi = process_count - 1; pi >= 0; pi--) { // top-down
+			int idx = process_order[pi];
+			if (failed[idx]) continue;
+
+			int bx = idx / ny_nz;
+			int rem = idx % ny_nz;
+			int by = rem / nz;
+			int bz = rem % nz;
+
+			// Check: does this block have at least one non-failed support below or beside?
+			bool has_support = false;
+			for (int d = 0; d < 6; d++) {
+				bool in_bounds = true;
+				if (d == 0 && bx + 1 >= nx) in_bounds = false;
+				if (d == 1 && bx <= 0)       in_bounds = false;
+				if (d == 2 && by + 1 >= ny) in_bounds = false;
+				if (d == 3 && by <= 0)       in_bounds = false;
+				if (d == 4 && bz + 1 >= nz) in_bounds = false;
+				if (d == 5 && bz <= 0)       in_bounds = false;
+				if (!in_bounds) continue;
+
+				int ni = idx + dir_offsets[d];
+				if (grid[ni] == 1 && visited[ni] == 1 && !failed[ni]) {
+					has_support = true;
+					break;
+				}
+			}
+			if (!has_support) {
+				failed[idx] = 1;
+				visited[idx] = 0;
+				stress_failed++;
+				cascade = true;
+			}
+		}
+	}
+
+	uint64_t t_solver = OS::get_singleton()->get_ticks_usec();
+
+	// If no blocks failed (stress or disconnected), early exit.
+	int total_unsupported = 0;
+	for (int idx = 0; idx < grid_size; idx++) {
+		if (grid[idx] == 1 && visited[idx] == 0) total_unsupported++;
+	}
+	// Also count stress-failed blocks that were previously visited
+	for (int idx = 0; idx < grid_size; idx++) {
+		if (grid[idx] == 1 && failed[idx] && visited[idx] == 1) {
+			visited[idx] = 0;
+			total_unsupported++;
+		}
+	}
+
+	if (total_unsupported == 0) {
+		memfree(visited); memfree(bfs_queue); memfree(residual);
+		memfree(contact_compression); memfree(contact_shear);
+		memfree(failed); memfree(process_order); memfree(is_ground);
+		print_line(vformat("[StressIntegrity_C] blocks=%d  all_stable  iters=%d  bfs=%dus  solver=%dus",
+				p_total_blocks, solver_iters,
+				(int)(t_bfs - t_start), (int)(t_solver - t_bfs)));
+		return Array();
+	}
+
+	// ── Phase 4: Component BFS on unsupported blocks (visited==0, grid==1) ──
+	Array components;
+	head = 0; tail = 0;
+
+	for (int idx = 0; idx < grid_size; idx++) {
+		if (grid[idx] != 1 || visited[idx] != 0) continue;
+
+		head = 0; tail = 0;
+		bfs_queue[tail++] = idx;
+		visited[idx] = 2;
+
+		while (head < tail) {
+			const int ci = bfs_queue[head++];
+			const int cbx = ci / ny_nz;
+			const int crem = ci % ny_nz;
+			const int cby = crem / nz;
+			const int cbz = crem % nz;
+
+			if (cbx + 1 < nx) { int ni = ci + ny_nz; if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+			if (cbx > 0)      { int ni = ci - ny_nz; if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+			if (cby + 1 < ny) { int ni = ci + nz;    if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+			if (cby > 0)      { int ni = ci - nz;    if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+			if (cbz + 1 < nz) { int ni = ci + 1;     if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+			if (cbz > 0)      { int ni = ci - 1;     if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+		}
+
+		TypedArray<Vector3i> component;
+		component.resize(tail);
+		for (int j = 0; j < tail; j++) {
+			const int cj = bfs_queue[j];
+			component[j] = Vector3i(cj / ny_nz, (cj % ny_nz) / nz, cj % nz);
+		}
+		components.push_back(component);
+	}
+
+	memfree(visited); memfree(bfs_queue); memfree(residual);
+	memfree(contact_compression); memfree(contact_shear);
+	memfree(failed); memfree(process_order); memfree(is_ground);
+
+	uint64_t t_end = OS::get_singleton()->get_ticks_usec();
+	print_line(vformat("[StressIntegrity_C] blocks=%d  stress_failed=%d  disconnected=%d  components=%d  iters=%d  bfs=%dus  solver=%dus  components=%dus  total=%dus",
+			p_total_blocks, stress_failed, total_unsupported - stress_failed,
+			components.size(), solver_iters,
+			(int)(t_bfs - t_start), (int)(t_solver - t_bfs),
+			(int)(t_end - t_solver), (int)(t_end - t_start)));
+
+	return components;
+}
+
 Dictionary BlockMeshBuilder::build_cluster(
 		const Dictionary &p_block_hp,
 		int p_num_x, int p_num_y, int p_num_z,
@@ -1496,4 +1991,307 @@ void BlockMeshBuilder::bulk_configure_debris(
 			// gravity transitions from 0→nonzero (first active physics frame).
 		}
 	}
+}
+
+// ── Debris angle-dependent friction callback ──
+// Matches debris_body.gd: full friction on floors (≤50° from up),
+// fading to zero at 90°, none on ceilings.
+
+void BlockMeshBuilder::debris_friction_callback(PhysicsDirectBodyState3D *p_state, const Variant &p_userdata) {
+	static constexpr real_t FRICTION_DECEL = 8.0f;
+	static constexpr real_t COS_FULL = 0.6427876f; // cos(50°)
+
+	int count = p_state->get_contact_count();
+	if (count == 0) {
+		return;
+	}
+
+	real_t best = 0.0f;
+	for (int i = 0; i < count; i++) {
+		real_t up_dot = p_state->get_contact_local_normal(i).dot(Vector3(0, 1, 0));
+		if (up_dot <= 0.0f) {
+			continue;
+		}
+		if (up_dot >= COS_FULL) {
+			best = 1.0f;
+			break;
+		}
+		best = MAX(best, up_dot / COS_FULL);
+	}
+
+	if (best <= 0.0f) {
+		return;
+	}
+
+	real_t decel = best * FRICTION_DECEL * p_state->get_step();
+
+	Vector3 vel = p_state->get_linear_velocity();
+	real_t speed = vel.length();
+	if (speed > 0.01f) {
+		p_state->set_linear_velocity(vel * MAX((speed - decel) / speed, 0.0f));
+	}
+
+	Vector3 ang = p_state->get_angular_velocity();
+	real_t ang_speed = ang.length();
+	if (ang_speed > 0.01f) {
+		p_state->set_angular_velocity(ang * MAX((ang_speed - decel) / ang_speed, 0.0f));
+	}
+}
+
+// ── Spawn debris as raw server RIDs (no Godot nodes) ──
+
+Dictionary BlockMeshBuilder::bulk_spawn_debris(
+		const PackedVector3Array &p_block_positions,
+		const PackedVector3Array &p_blast_centers,
+		const PackedInt32Array &p_counts,
+		const PackedFloat32Array &p_speeds,
+		real_t p_mass,
+		const Ref<Material> &p_material,
+		const RID &p_shape,
+		const RID &p_mesh,
+		const RID &p_space,
+		const RID &p_scenario,
+		int p_collision_layer,
+		int p_collision_mask) {
+	const int n_blocks = p_block_positions.size();
+	ERR_FAIL_COND_V_MSG(p_blast_centers.size() != n_blocks, Dictionary(), "blast_centers size mismatch");
+	ERR_FAIL_COND_V_MSG(p_counts.size() != n_blocks, Dictionary(), "counts size mismatch");
+	ERR_FAIL_COND_V_MSG(p_speeds.size() != n_blocks, Dictionary(), "speeds size mismatch");
+
+	int total_count = 0;
+	const int32_t *counts = p_counts.ptr();
+	for (int i = 0; i < n_blocks; i++) {
+		total_count += counts[i];
+	}
+
+	Dictionary result;
+	Array body_rids;
+	Array instance_rids;
+	if (total_count == 0) {
+		result["body_rids"] = body_rids;
+		result["instance_rids"] = instance_rids;
+		return result;
+	}
+
+	body_rids.resize(total_count);
+	instance_rids.resize(total_count);
+
+	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
+	RenderingServer *rs = RenderingServer::get_singleton();
+	ERR_FAIL_NULL_V(ps, result);
+	ERR_FAIL_NULL_V(rs, result);
+
+	const RID mat_rid = p_material.is_valid() ? p_material->get_rid() : RID();
+	const bool has_mat = mat_rid.is_valid();
+
+	const real_t cone_cos = Math::cos(Math::deg_to_rad((real_t)35.0));
+	const real_t scatter_scale = (real_t)1.0 - cone_cos;
+
+	const Vector3 *block_pos_ptr = p_block_positions.ptr();
+	const Vector3 *blast_ptr = p_blast_centers.ptr();
+	const real_t *speeds_ptr = p_speeds.ptr();
+
+	int idx = 0;
+	for (int b = 0; b < n_blocks; b++) {
+		const Vector3 &block_pos = block_pos_ptr[b];
+		const Vector3 &blast_center = blast_ptr[b];
+		const int count = counts[b];
+		const real_t speed = speeds_ptr[b];
+
+		Vector3 toward = blast_center - block_pos;
+		if (toward.length_squared() < (real_t)0.01) {
+			toward = Vector3(Math::randf() * 2.0f - 1.0f, 1.0f, Math::randf() * 2.0f - 1.0f);
+		}
+		toward.normalize();
+
+		for (int i = 0; i < count; i++) {
+			// Random scatter within 35-degree cone, biased upward.
+			Vector3 scatter = Vector3(
+					Math::randf() * 2.0f - 1.0f,
+					Math::randf() * 2.0f - 1.0f,
+					Math::randf() * 2.0f - 1.0f)
+									 .normalized();
+			Vector3 impulse_dir = (toward + scatter * scatter_scale).normalized();
+			impulse_dir.y = MAX(impulse_dir.y, (real_t)0.15);
+
+			Vector3 spawn_pos = block_pos + impulse_dir * 0.2f + Vector3(
+					Math::randf() * 0.2f - 0.1f,
+					Math::randf() * 0.2f - 0.1f,
+					Math::randf() * 0.2f - 0.1f);
+
+			Transform3D xform(Basis(), spawn_pos);
+
+			// ── Create physics body ──
+			// Order matters for Jolt: configure params before adding to space,
+			// set transform + velocity after, then force-wake.
+			RID body = ps->body_create();
+			ps->body_set_mode(body, PhysicsServer3D::BODY_MODE_RIGID);
+			ps->body_set_collision_layer(body, p_collision_layer);
+			ps->body_set_collision_mask(body, p_collision_mask);
+			ps->body_set_param(body, PhysicsServer3D::BODY_PARAM_MASS, p_mass);
+			ps->body_set_param(body, PhysicsServer3D::BODY_PARAM_GRAVITY_SCALE, 1.0);
+			ps->body_set_param(body, PhysicsServer3D::BODY_PARAM_LINEAR_DAMP, 0.0);
+			ps->body_set_param(body, PhysicsServer3D::BODY_PARAM_ANGULAR_DAMP, 0.0);
+			ps->body_add_shape(body, p_shape);
+			// Enable contact reporting for friction callback.
+			ps->body_set_max_contacts_reported(body, 3);
+			// Register angle-dependent friction callback.
+			ps->body_set_force_integration_callback(body,
+					Callable(this, "debris_friction_callback"));
+			// Add to space, then set state (Jolt ignores state on spaceless bodies).
+			ps->body_set_space(body, p_space);
+			ps->body_set_state(body, PhysicsServer3D::BODY_STATE_TRANSFORM, xform);
+			ps->body_set_state(body, PhysicsServer3D::BODY_STATE_LINEAR_VELOCITY,
+					Variant(impulse_dir * speed));
+			ps->body_set_state(body, PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY,
+					Variant(Vector3(
+							Math::randf() * 8.0f - 4.0f,
+							Math::randf() * 8.0f - 4.0f,
+							Math::randf() * 8.0f - 4.0f)));
+			// Force-wake so Jolt doesn't auto-sleep before first step.
+			ps->body_set_state(body, PhysicsServer3D::BODY_STATE_SLEEPING, false);
+
+			// ── Create visual instance ──
+			RID instance = rs->instance_create();
+			rs->instance_set_base(instance, p_mesh);
+			rs->instance_set_scenario(instance, p_scenario);
+			rs->instance_set_transform(instance, xform);
+			rs->instance_set_visible(instance, true);
+			if (has_mat) {
+				rs->instance_geometry_set_material_override(instance, mat_rid);
+			}
+			// No shadow casting for tiny debris cubes.
+			rs->instance_geometry_set_cast_shadows_setting(instance,
+					RenderingServer::SHADOW_CASTING_SETTING_OFF);
+
+			body_rids[idx] = body;
+			instance_rids[idx] = instance;
+			idx++;
+		}
+	}
+
+	result["body_rids"] = body_rids;
+	result["instance_rids"] = instance_rids;
+	return result;
+}
+
+// ── Build collision triangle faces from flat occupancy grid ──
+// Matches the GDScript _build_faces_from_grid() output exactly.
+// Centroid is zero (grid-centered).
+
+PackedVector3Array BlockMeshBuilder::build_collision_faces(
+		const PackedByteArray &p_block_grid,
+		int p_num_x, int p_num_y, int p_num_z,
+		float p_block_size) {
+	const int total = p_num_x * p_num_y * p_num_z;
+	ERR_FAIL_COND_V(p_block_grid.size() != total, PackedVector3Array());
+
+	const uint8_t *grid = p_block_grid.ptr();
+	const int nx = p_num_x, ny = p_num_y, nz = p_num_z;
+	const int ny_nz = ny * nz;
+	const real_t bs = p_block_size;
+	const real_t hs = bs * 0.5f;
+	const real_t hx = nx * bs * 0.5f;
+	const real_t hy = ny * bs * 0.5f;
+	const real_t hz = nz * bs * 0.5f;
+
+	// Count occupied for allocation.
+	int block_count = 0;
+	for (int i = 0; i < total; i++) {
+		if (grid[i]) {
+			block_count++;
+		}
+	}
+	if (block_count == 0) {
+		return PackedVector3Array();
+	}
+
+	PackedVector3Array faces;
+	faces.resize(block_count * 36); // worst case: 6 faces * 2 tris * 3 verts
+	Vector3 *w = faces.ptrw();
+	int fi = 0;
+
+	for (int bx = 0; bx < nx; bx++) {
+		for (int by = 0; by < ny; by++) {
+			for (int bz = 0; bz < nz; bz++) {
+				if (!grid[bx * ny_nz + by * nz + bz]) {
+					continue;
+				}
+
+				const real_t cx = (bx + 0.5f) * bs - hx;
+				const real_t cy = (by + 0.5f) * bs - hy;
+				const real_t cz = (bz + 0.5f) * bs - hz;
+
+				// +X
+				if (!_grid_occupied(grid, bx + 1, by, bz, nx, ny, nz)) {
+					const real_t x = cx + hs;
+					w[fi]     = Vector3(x, cy - hs, cz - hs);
+					w[fi + 1] = Vector3(x, cy - hs, cz + hs);
+					w[fi + 2] = Vector3(x, cy + hs, cz + hs);
+					w[fi + 3] = Vector3(x, cy - hs, cz - hs);
+					w[fi + 4] = Vector3(x, cy + hs, cz + hs);
+					w[fi + 5] = Vector3(x, cy + hs, cz - hs);
+					fi += 6;
+				}
+				// -X
+				if (!_grid_occupied(grid, bx - 1, by, bz, nx, ny, nz)) {
+					const real_t x = cx - hs;
+					w[fi]     = Vector3(x, cy - hs, cz + hs);
+					w[fi + 1] = Vector3(x, cy - hs, cz - hs);
+					w[fi + 2] = Vector3(x, cy + hs, cz - hs);
+					w[fi + 3] = Vector3(x, cy - hs, cz + hs);
+					w[fi + 4] = Vector3(x, cy + hs, cz - hs);
+					w[fi + 5] = Vector3(x, cy + hs, cz + hs);
+					fi += 6;
+				}
+				// +Y
+				if (!_grid_occupied(grid, bx, by + 1, bz, nx, ny, nz)) {
+					const real_t y = cy + hs;
+					w[fi]     = Vector3(cx - hs, y, cz - hs);
+					w[fi + 1] = Vector3(cx + hs, y, cz - hs);
+					w[fi + 2] = Vector3(cx + hs, y, cz + hs);
+					w[fi + 3] = Vector3(cx - hs, y, cz - hs);
+					w[fi + 4] = Vector3(cx + hs, y, cz + hs);
+					w[fi + 5] = Vector3(cx - hs, y, cz + hs);
+					fi += 6;
+				}
+				// -Y
+				if (!_grid_occupied(grid, bx, by - 1, bz, nx, ny, nz)) {
+					const real_t y = cy - hs;
+					w[fi]     = Vector3(cx - hs, y, cz + hs);
+					w[fi + 1] = Vector3(cx + hs, y, cz + hs);
+					w[fi + 2] = Vector3(cx + hs, y, cz - hs);
+					w[fi + 3] = Vector3(cx - hs, y, cz + hs);
+					w[fi + 4] = Vector3(cx + hs, y, cz - hs);
+					w[fi + 5] = Vector3(cx - hs, y, cz - hs);
+					fi += 6;
+				}
+				// +Z
+				if (!_grid_occupied(grid, bx, by, bz + 1, nx, ny, nz)) {
+					const real_t z = cz + hs;
+					w[fi]     = Vector3(cx + hs, cy - hs, z);
+					w[fi + 1] = Vector3(cx - hs, cy - hs, z);
+					w[fi + 2] = Vector3(cx - hs, cy + hs, z);
+					w[fi + 3] = Vector3(cx + hs, cy - hs, z);
+					w[fi + 4] = Vector3(cx - hs, cy + hs, z);
+					w[fi + 5] = Vector3(cx + hs, cy + hs, z);
+					fi += 6;
+				}
+				// -Z
+				if (!_grid_occupied(grid, bx, by, bz - 1, nx, ny, nz)) {
+					const real_t z = cz - hs;
+					w[fi]     = Vector3(cx - hs, cy - hs, z);
+					w[fi + 1] = Vector3(cx + hs, cy - hs, z);
+					w[fi + 2] = Vector3(cx + hs, cy + hs, z);
+					w[fi + 3] = Vector3(cx - hs, cy - hs, z);
+					w[fi + 4] = Vector3(cx + hs, cy + hs, z);
+					w[fi + 5] = Vector3(cx - hs, cy + hs, z);
+					fi += 6;
+				}
+			}
+		}
+	}
+
+	faces.resize(fi);
+	return faces;
 }

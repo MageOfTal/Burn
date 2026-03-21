@@ -58,6 +58,9 @@ var debug_no_slope_projection: bool = false    # Disable slope projection entire
 var debug_no_landing_restore: bool = false     # Disable airborne hvel restore on landing
 var debug_always_ground_move: bool = false     # Force ground movement even when airborne
 var debug_show_collision: bool = false         # Show terrain collision meshes as transparent red
+var debug_show_block_hits: bool = false       # Show wireframe box at hit/missed block shapes
+var debug_dynamic_contact_log: bool = false  # F10: log velocity restore vs dynamic body contacts
+var debug_dynamic_speed_scale: bool = true   # Scale speed by approach angle against dynamic bodies
 var debug_no_jump_unground: bool = false       # Don't unground on jump
 var debug_no_force_airborne: bool = false      # Don't force airborne
 

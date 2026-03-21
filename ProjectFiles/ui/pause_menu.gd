@@ -248,6 +248,9 @@ func _build_main_panel() -> void:
 	_explosion_rays_button = _add_check("Show Explosion Rays (Wall Blocks)", false, vbox)
 	_explosion_rays_button.toggled.connect(_on_explosion_rays_toggled)
 
+	_add_check("Show Block Hits", GameManager.debug_show_block_hits, vbox).toggled.connect(
+		func(pressed: bool): GameManager.debug_show_block_hits = pressed)
+
 	_lagger_delay_input = _add_scale_input("Lagger Delay (ms)",
 		GameManager.debug_lagger_delay_ms,
 		_on_lagger_delay_submitted, _on_lagger_delay_focus_lost, vbox)
@@ -414,6 +417,8 @@ func _build_main_panel() -> void:
 		.toggled.connect(func(p): GameManager.debug_wall_proj_dynamic = p)
 	_add_check("No Wall Speed Scaling", GameManager.debug_no_wall_speed_scale, vbox) \
 		.toggled.connect(func(p): GameManager.debug_no_wall_speed_scale = p)
+	_add_check("Dynamic Body Speed Scaling", GameManager.debug_dynamic_speed_scale, vbox) \
+		.toggled.connect(func(p): GameManager.debug_dynamic_speed_scale = p)
 	_add_check("Restore Full Speed (ignore solver)", GameManager.debug_restore_full_speed, vbox) \
 		.toggled.connect(func(p): GameManager.debug_restore_full_speed = p)
 	_add_check("No Dime Stop", GameManager.debug_no_dime_stop, vbox) \

@@ -90,6 +90,8 @@ const DBG_AFTER_FRAMES := 3
 # ── Debug: previous-frame tracking for deltas ──
 var _dbg_prev_set_vel: Vector3 = Vector3.ZERO   # velocity we SET last frame
 var _dbg_prev_pos: Vector3 = Vector3.ZERO        # position last frame
+var _jolt_solved_hvel: Vector3 = Vector3.ZERO    # post-solver horizontal velocity (before restore)
+var _dynamic_wall_fraction: float = 0.0          # 0 = dynamic body didn't resist, 1 = fully resisted (wall-like)
 var _dbg_prev_contact_count: int = 0
 var _dbg_pos_drift: Vector3 = Vector3.ZERO       # position drift from Jolt (computed early in on_integrate_forces)
 var _dbg_vel_delta: Vector3 = Vector3.ZERO        # velocity change by Jolt
@@ -135,6 +137,36 @@ func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	# wrong for characters. Restore our horizontal velocity when the only
 	# contacts are walkable floors. If there are wall contacts, the solver's
 	# horizontal changes are wanted (wall sliding), so keep them.
+	# Save Jolt's post-solver horizontal velocity before the restore overwrites it.
+	_jolt_solved_hvel = Vector3(state.linear_velocity.x, 0.0, state.linear_velocity.z)
+
+	# Compute how "wall-like" dynamic body contacts are this frame.
+	# For each dynamic wall contact, measure what fraction of the into-wall
+	# velocity Jolt absorbed. A fully immovable body absorbs 100% (fraction=1).
+	# A light pushable body absorbs little (fraction≈0).
+	_dynamic_wall_fraction = 0.0
+	var prev_h := Vector3(_dbg_prev_set_vel.x, 0.0, _dbg_prev_set_vel.z)
+	for i in state.get_contact_count():
+		var collider := state.get_contact_collider_object(i)
+		if not (collider is RigidBody3D):
+			continue
+		var normal := state.get_contact_local_normal(i)
+		if normal.angle_to(Vector3.UP) <= FLOOR_MAX_ANGLE:
+			continue
+		var normal_h := Vector3(normal.x, 0.0, normal.z)
+		if normal_h.length_squared() < 0.01:
+			continue
+		normal_h = normal_h.normalized()
+		# How fast we were going into this wall (negative = into wall)
+		var into_set: float = -prev_h.dot(normal_h)
+		if into_set < 0.1:
+			continue
+		# How fast we're going into the wall after Jolt solved
+		var into_solved: float = -_jolt_solved_hvel.dot(normal_h)
+		# Fraction absorbed: if Jolt took us from 5 into-wall to 0, that's 1.0
+		var absorbed: float = (into_set - maxf(into_solved, 0.0)) / into_set
+		_dynamic_wall_fraction = maxf(_dynamic_wall_fraction, clampf(absorbed, 0.0, 1.0))
+
 	if _is_grounded:
 		var has_static_wall := false
 		var has_dynamic := false
@@ -193,9 +225,16 @@ func on_integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 			if GameManager.debug_restore_full_speed:
 				restore_h = set_h
 			var vel := state.linear_velocity
+			var pre_restore := Vector2(vel.x, vel.z)
 			vel.x = restore_h.x
 			vel.z = restore_h.z
 			state.linear_velocity = vel
+			if has_dynamic and GameManager.debug_dynamic_contact_log:
+				var post_restore := Vector2(vel.x, vel.z)
+				print("[DYN_RESTORE] set_h=(%.2f,%.2f) dyn_delta=(%.2f,%.2f) jolt=(%.2f,%.2f) -> restored=(%.2f,%.2f)  speed: %.2f->%.2f" % [
+					set_h.x, set_h.z, dynamic_delta.x, dynamic_delta.z,
+					pre_restore.x, pre_restore.y, post_restore.x, post_restore.y,
+					pre_restore.length(), post_restore.length()])
 
 	# Read pre-impulse vel.y from Jolt contact listener (the velocity that
 	# would have penetrated past the walkable surface). Used as snap budget.
@@ -413,25 +452,31 @@ func process_normal_movement(delta: float) -> void:
 	# surface. The projected length is the cosine of the approach angle —
 	# this scales both max speed and current speed so wall sliding feels
 	# like normal movement at a reduced rate.
+	# Static walls: project direction + scale speed.
+	# Dynamic bodies: only scale speed (Jolt handles the contact).
 	var wall_speed_fraction: float = 1.0
 	if direction != Vector3.ZERO and _is_grounded and not GameManager.debug_no_wall_proj:
-		# Find the wall we're pressing most into
+		# Find the wall we're pressing most into (static walls for projection)
 		var best_into: float = 0.0
 		var best_wall_nh := Vector3.ZERO
+		var best_dyn_into: float = 0.0
+		var best_dyn_wall_nh := Vector3.ZERO
 		for c in _contacts:
 			if not c["is_walkable"]:
-				# Dynamic bodies aren't walls — the solver handles the collision
-				if c["body"] is RigidBody3D and not GameManager.debug_wall_proj_dynamic:
-					continue
 				var wall_n: Vector3 = c["normal"]
 				var wall_nh := Vector3(wall_n.x, 0.0, wall_n.z)
 				if wall_nh.length_squared() > 0.01:
 					wall_nh = wall_nh.normalized()
 					var into_wall := direction.dot(wall_nh)
-					if into_wall < best_into:
-						best_into = into_wall
-						best_wall_nh = wall_nh
-		# Project input along that wall
+					if c["body"] is RigidBody3D and not GameManager.debug_wall_proj_dynamic:
+						if into_wall < best_dyn_into:
+							best_dyn_into = into_wall
+							best_dyn_wall_nh = wall_nh
+					else:
+						if into_wall < best_into:
+							best_into = into_wall
+							best_wall_nh = wall_nh
+		# Project input along static wall
 		if best_into < 0.0:
 			direction -= best_wall_nh * best_into
 			wall_speed_fraction = direction.length()
@@ -440,6 +485,14 @@ func process_normal_movement(delta: float) -> void:
 			else:
 				direction = Vector3.ZERO
 				wall_speed_fraction = 0.0
+
+		# Dynamic body speed scaling: scale by approach angle, weighted by
+		# how much the body actually resisted us. A light pushable block
+		# barely resists (fraction≈0, no scaling). A massive immovable cube
+		# fully resists (fraction≈1, full cosine scaling like a static wall).
+		if best_dyn_into < 0.0 and wall_speed_fraction == 1.0:
+			var cosine_frac: float = (direction - best_dyn_wall_nh * best_dyn_into).length()
+			wall_speed_fraction = lerpf(1.0, cosine_frac, _dynamic_wall_fraction)
 
 		if GameManager.debug_no_wall_speed_scale:
 			wall_speed_fraction = 1.0
@@ -466,6 +519,19 @@ func process_normal_movement(delta: float) -> void:
 	# Current horizontal velocity
 	var hvel := Vector3(player.velocity.x, 0.0, player.velocity.z)
 	var hspeed := hvel.length()
+
+	# Landing redirect: on the frame we land, if input direction differs from
+	# velocity direction, project velocity onto input. Kills perpendicular
+	# momentum from turning in the air so you go where you're pressing.
+	if _is_grounded and not _was_grounded and direction != Vector3.ZERO and hspeed > 0.1:
+		var forward_speed: float = hvel.dot(direction)
+		var old_hvel := hvel
+		hvel = direction * maxf(forward_speed, 0.0)
+		hspeed = hvel.length()
+		player.velocity.x = hvel.x
+		player.velocity.z = hvel.z
+		print("[LAND_REDIRECT] old=(%.2f,%.2f) dir=(%.2f,%.2f) fwd=%.2f new=(%.2f,%.2f)" % [
+			old_hvel.x, old_hvel.z, direction.x, direction.z, forward_speed, hvel.x, hvel.z])
 	# Cap current speed to wall-adjusted max so hitting a wall at an angle
 	# immediately reduces speed to the trigonometric fraction
 	if wall_speed_fraction < 1.0 and hspeed > max_speed:
@@ -590,9 +656,19 @@ func _do_snap(snap_dist: float) -> bool:
 					_is_grounded = true
 					_floor_normal = rest.normal
 					_has_floor_contact = true
-				# Landing: restore airborne hvel + slope-project vel.y
-				player.velocity.x = _airborne_hvel.x
-				player.velocity.z = _airborne_hvel.z
+				# Landing: restore airborne hvel projected onto current input
+				# direction, then slope-project vel.y.
+				var snap_input: Vector2 = player.player_input.input_direction
+				var snap_dir := (player.transform.basis * Vector3(snap_input.x, 0, snap_input.y))
+				snap_dir.y = 0.0
+				if snap_dir.length_squared() > 0.01:
+					snap_dir = snap_dir.normalized()
+					var snap_fwd: float = maxf(_airborne_hvel.dot(snap_dir), 0.0)
+					player.velocity.x = snap_dir.x * snap_fwd
+					player.velocity.z = snap_dir.z * snap_fwd
+				else:
+					player.velocity.x = _airborne_hvel.x
+					player.velocity.z = _airborne_hvel.z
 				var n: Vector3 = rest.normal
 				player.velocity.y = -(n.x * player.velocity.x + n.z * player.velocity.z) / n.y
 				return true
@@ -624,14 +700,13 @@ func _update_overlap_debug() -> void:
 	overlap_params.exclude = [player.get_rid()]
 	var overlap_results := overlap_space.intersect_shape(overlap_params, 8)
 	_dbg_is_overlapping = not overlap_results.is_empty()
-	if _dbg_is_overlapping:
+	if _dbg_is_overlapping and GameManager.debug_dynamic_contact_log:
 		var ppos := player.global_position
 		var vel_y := player.linear_velocity.y
 		for r in overlap_results:
 			var col = instance_from_id(r.collider_id)
 			var shape_name := "?"
 			if col is CollisionObject3D:
-				# Guard against shapes mid-registration (terrain threading)
 				var owner_id: int = -1
 				var shape_node: Node = null
 				if col.get_shape_owners().size() > 0:
@@ -669,14 +744,33 @@ func _process_ground_movement(hvel: Vector3, hspeed: float, direction: Vector3, 
 		# SKID: can only steer and decelerate
 		return _process_skid(hvel, hspeed, hdir, delta)
 
-	# Dime stop: below DIME_STOP_SPEED, strip any velocity component opposing
-	# the new input direction. Moving NE and pressing W kills the east component
-	# but keeps north. Moving E and pressing W zeroes everything.
-	if hspeed > 0.01 and hspeed <= DIME_STOP_SPEED and not GameManager.debug_no_dime_stop:
-		var vel_along_input := hvel.dot(hdir)
-		if vel_along_input < 0.0:
-			hvel -= hdir * vel_along_input
-			hspeed = hvel.length()
+	# Dime stop: project input onto any wall contact surface (static or dynamic).
+	# If the wall-projected input opposes the current velocity, dime stop.
+	# Wall-projected dime stop fires at any speed (below skid) because wall
+	# sliding speed isn't capped the same way on dynamic bodies.
+	# Non-wall dime stop uses DIME_STOP_SPEED threshold.
+	if not GameManager.debug_no_dime_stop:
+		var check_dir := hdir
+		var wall_projected := false
+		for c in _contacts:
+			if c["is_walkable"]:
+				continue
+			var wn: Vector3 = c["normal"]
+			var wnh := Vector3(wn.x, 0.0, wn.z)
+			if wnh.length_squared() > 0.01:
+				wnh = wnh.normalized()
+				var into := check_dir.dot(wnh)
+				if into < 0.0:
+					check_dir = check_dir - wnh * into
+					if check_dir.length_squared() > 0.001:
+						check_dir = check_dir.normalized()
+						wall_projected = true
+					break
+		if wall_projected or hspeed <= DIME_STOP_SPEED:
+			var vel_along := hvel.dot(check_dir)
+			if vel_along < 0.0:
+				hvel -= check_dir * vel_along
+				hspeed = hvel.length()
 
 	# Accelerate toward input direction up to max speed
 	var vel_toward_target := hvel.dot(hdir)

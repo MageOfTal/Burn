@@ -169,6 +169,7 @@ func _spawn_heavy_structures() -> void:
 	_spawn_test_platforms()
 	_spawn_sine_ramps()
 	_spawn_test_cube()
+	_spawn_push_blocks()
 
 	structures_complete = true
 	world_generation_complete.emit()
@@ -822,6 +823,54 @@ func _spawn_test_cube() -> void:
 
 	add_child(cube)
 	print("[TestCube] 50000kg cube at (%.0f, %.1f, %.0f) — 20m, no gravity" % [pos.x, ground_y + 15.0, pos.z])
+
+
+func _spawn_push_blocks() -> void:
+	## DEBUG: Row of pushable RigidBody3D blocks past the toad bowl area.
+	## Twice player height (3.6m), half player mass (40kg).
+	var count := 8
+	var block_size := Vector3(1.5, 3.6, 1.5)
+	var block_mass := 40.0
+	var start_z := 40.0
+	var spacing := 3.0
+
+	var container := Node3D.new()
+	container.name = "PushBlocks"
+	add_child(container)
+
+	for i in count:
+		var x := float(i - count / 2) * spacing
+		var z := start_z
+		var ground_y := get_height_from_noise(x, z)
+
+		var body := RigidBody3D.new()
+		body.name = "PushBlock_%d" % i
+		body.mass = block_mass
+		body.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_SMOOTH
+		body.collision_mask = CollisionLayers.DEFAULT_PHYSICS
+		body.contact_monitor = false
+		body.lock_rotation = false
+
+		var shape := BoxShape3D.new()
+		shape.size = block_size
+		var col := CollisionShape3D.new()
+		col.shape = shape
+		body.add_child(col)
+
+		var mesh := MeshInstance3D.new()
+		var box := BoxMesh.new()
+		box.size = block_size
+		mesh.mesh = box
+		var mat := StandardMaterial3D.new()
+		mat.albedo_color = Color(0.2, 0.6, 0.9)
+		mesh.material_override = mat
+		body.add_child(mesh)
+
+		body.position = Vector3(x, ground_y + block_size.y * 0.5, z)
+		container.add_child(body)
+
+	print("[PushBlocks] Spawned %d blocks (%.0fkg, %.1fm tall) at z=%.0f" % [
+		count, block_mass, block_size.y, start_z])
 
 
 func _spawn_sine_ramps() -> void:

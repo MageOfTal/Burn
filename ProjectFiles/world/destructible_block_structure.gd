@@ -39,6 +39,7 @@ var _num_z: int = 0
 ## Flat occupancy grid: 1 = block exists, 0 = empty. Indexed via _grid_idx().
 ## Avoids Dictionary hashing in BFS inner loops (~20x faster than Dictionary.has()).
 var _block_grid: PackedByteArray = PackedByteArray()
+var _ground_mask: PackedByteArray = PackedByteArray()  ## 1 = terrain-contacting (anchor)
 var _block_hp: float = 35.0
 var _structure_material: StandardMaterial3D = null
 
@@ -55,8 +56,10 @@ var _compound_body_script: GDScript = preload("res://world/compound_hit_body.gd"
 
 ## Greedy mesh — single MeshInstance3D for the entire structure
 var _mesh_instance: MeshInstance3D = null
+var _foundation_mesh_instance: MeshInstance3D = null  ## Separate stone-colored mesh for foundation
 var _mesh_dirty: bool = false
 var _integrity_check_pending: bool = false
+var _foundation_pending: bool = false
 
 ## Smooth collision — single StaticBody3D for player physics (layer 12, bit 2048).
 ## Compound hit body handles weapon raycasts on layer 11 (bit 1024).
@@ -126,6 +129,265 @@ func _should_spawn_block(_bx: int, _by: int, _bz: int) -> bool:
 	return true
 
 
+const FOUNDATION_HP := 35.0  ## Stone-tier HP for foundation blocks
+
+## Grid marking foundation blocks (1 = foundation). Same indexing as _block_grid.
+## Used by _deferred_build_foundation to build a separate stone-colored mesh.
+var _foundation_grid: PackedByteArray = PackedByteArray()
+
+func _build_foundation() -> void:
+	## Raycast downward from the lowest block in each column to find terrain,
+	## then extend the grid downward so foundation blocks reach into terrain.
+	var space_state := get_world_3d().direct_space_state
+	if space_state == null:
+		print("[Foundation] %s  SKIP: no space_state" % name)
+		return
+
+	# For each (bx, bz) column, find the lowest occupied block and raycast down.
+	var max_extra_rows := 0
+	var column_depths: PackedInt32Array = PackedInt32Array()
+	var column_lowest_y: PackedInt32Array = PackedInt32Array()  # lowest occupied y per column
+	column_depths.resize(_num_x * _num_z)
+	column_lowest_y.resize(_num_x * _num_z)
+	column_depths.fill(0)
+	column_lowest_y.fill(-1)
+
+	var ray_count := 0
+	var hit_count := 0
+
+	for bx in _num_x:
+		for bz in _num_z:
+			# Find lowest occupied block in this column
+			var lowest_y := -1
+			for by in _num_y:
+				if _block_grid[_grid_idx(bx, by, bz)]:
+					lowest_y = by
+					break
+			if lowest_y < 0:
+				continue
+			column_lowest_y[bx * _num_z + bz] = lowest_y
+
+			# World position of the bottom face of the lowest block
+			var local_pos := _block_local_pos(Vector3i(bx, lowest_y, bz))
+			var world_pos: Vector3 = global_transform * (local_pos - Vector3(0, BLOCK_SIZE * 0.5, 0))
+
+			var query := PhysicsRayQueryParameters3D.new()
+			query.from = world_pos + Vector3(0, 0.01, 0)
+			query.to = world_pos - Vector3(0, 20.0, 0)
+			query.collision_mask = CollisionLayers.WORLD
+			ray_count += 1
+
+			var result := space_state.intersect_ray(query)
+			if result:
+				hit_count += 1
+				var hit_y: float = result["position"].y
+				var gap: float = world_pos.y - hit_y
+				var rows: int = ceili(gap / BLOCK_SIZE) + 1
+				if rows > 0:
+					column_depths[bx * _num_z + bz] = rows
+					max_extra_rows = maxi(max_extra_rows, rows)
+
+	print("[Foundation] %s  rays=%d  hits=%d  max_extra=%d  pos=%s" % [
+		name, ray_count, hit_count, max_extra_rows, str(global_position)])
+
+	if max_extra_rows == 0:
+		return
+
+	# Expand the grid: shift all existing blocks up by max_extra_rows.
+	var old_num_y := _num_y
+	_num_y += max_extra_rows
+	var new_grid_size := _num_x * _num_y * _num_z
+	var new_grid := PackedByteArray()
+	new_grid.resize(new_grid_size)
+	new_grid.fill(0)
+	_foundation_grid.resize(new_grid_size)
+	_foundation_grid.fill(0)
+
+	# Copy existing blocks shifted up
+	var new_hp_dict: Dictionary = {}
+	for key: Vector3i in _block_hp_dict:
+		var new_key := Vector3i(key.x, key.y + max_extra_rows, key.z)
+		new_hp_dict[new_key] = _block_hp_dict[key]
+		new_grid[_grid_idx_raw(new_key.x, new_key.y, new_key.z, _num_y, _num_z)] = 1
+
+	# Fill foundation columns: from y=0 up to (max_extra_rows + lowest_y - 1)
+	# so foundation connects to the lowest existing block in each column.
+	var foundation_count := 0
+	for bx in _num_x:
+		for bz in _num_z:
+			var ci := bx * _num_z + bz
+			var depth: int = column_depths[ci]
+			var lowest_y: int = column_lowest_y[ci]
+			if lowest_y < 0:
+				continue  # no blocks in this column
+			# Fill from y=0 up to (max_extra_rows + lowest_y - 1) in new grid coords.
+			# The old lowest_y shifted up becomes (lowest_y + max_extra_rows).
+			# Foundation fills from y=0 to (lowest_y + max_extra_rows - 1).
+			var fill_top: int = lowest_y + max_extra_rows  # exclusive
+			if depth <= 0:
+				# No raycast hit — fill full depth if column had blocks
+				fill_top = maxi(fill_top, max_extra_rows)
+			for by in fill_top:
+				var idx := _grid_idx_raw(bx, by, bz, _num_y, _num_z)
+				if not new_grid[idx]:  # don't overwrite existing blocks
+					new_hp_dict[Vector3i(bx, by, bz)] = FOUNDATION_HP
+					new_grid[idx] = 1
+					_foundation_grid[idx] = 1
+					foundation_count += 1
+
+	_block_hp_dict = new_hp_dict
+	_block_grid = new_grid
+
+	# Build ground mask: lowest occupied block per column is the terrain anchor.
+	_ground_mask.resize(new_grid_size)
+	_ground_mask.fill(0)
+	for bx in _num_x:
+		for bz in _num_z:
+			for by in _num_y:
+				if new_grid[_grid_idx_raw(bx, by, bz, _num_y, _num_z)]:
+					_ground_mask[_grid_idx_raw(bx, by, bz, _num_y, _num_z)] = 1
+					break
+
+	# Shift structure down to keep original blocks at the same world position.
+	global_position.y -= max_extra_rows * BLOCK_SIZE * 0.5
+
+	print("[Foundation] %s  extra_rows=%d  new_num_y=%d  foundation_blocks=%d  total_blocks=%d  shift=%.2f" % [
+		name, max_extra_rows, _num_y, foundation_count, _block_hp_dict.size(),
+		max_extra_rows * BLOCK_SIZE * 0.5])
+
+
+static func _grid_idx_raw(bx: int, by: int, bz: int, num_y: int, num_z: int) -> int:
+	return bx * num_y * num_z + by * num_z + bz
+
+
+func _build_ground_mask() -> void:
+	## Raycast down from the bottom block of each column to check terrain contact.
+	## Blocks whose bottom face is within half a BLOCK_SIZE of terrain are grounded.
+	_ground_mask.resize(_num_x * _num_y * _num_z)
+	_ground_mask.fill(0)
+
+	if not is_inside_tree():
+		return
+	var space_state := get_world_3d().direct_space_state
+	if space_state == null:
+		return
+
+	var grounded := 0
+	for bx in _num_x:
+		for bz in _num_z:
+			# Find lowest occupied block in this column
+			for by in _num_y:
+				var idx := _grid_idx(bx, by, bz)
+				if not _block_grid[idx]:
+					continue
+				# Raycast from bottom face of this block
+				var local_pos := _block_local_pos(Vector3i(bx, by, bz))
+				var bottom_world: Vector3 = global_transform * (local_pos - Vector3(0, BLOCK_SIZE * 0.5, 0))
+				var query := PhysicsRayQueryParameters3D.new()
+				query.from = bottom_world + Vector3(0, 0.01, 0)
+				query.to = bottom_world - Vector3(0, BLOCK_SIZE, 0)
+				query.collision_mask = CollisionLayers.WORLD
+				var result := space_state.intersect_ray(query)
+				if result:
+					_ground_mask[idx] = 1
+					grounded += 1
+				break  # only check lowest block per column
+
+	if grounded > 0:
+		print("[GroundMask] %s  grounded=%d/%d columns" % [name, grounded, _num_x * _num_z])
+
+
+static var _foundation_material: StandardMaterial3D
+
+func _deferred_build_foundation() -> void:
+	## Called after first physics step so terrain collision is available.
+	## Builds foundation, ground mask, and rebuilds mesh/collision/hitbody.
+	var _t_foundation_total := Time.get_ticks_usec()
+	var old_num_y := _num_y
+	var _t_build := Time.get_ticks_usec()
+	_build_foundation()
+	var _t_build_us := Time.get_ticks_usec() - _t_build
+
+	# If foundation didn't expand, just compute ground mask from raycasts.
+	if _num_y == old_num_y:
+		var _t_gm := Time.get_ticks_usec()
+		_build_ground_mask()
+		var _t_gm_us := Time.get_ticks_usec() - _t_gm
+		var _t_foundation_us := Time.get_ticks_usec() - _t_foundation_total
+		print("[PERF] _deferred_build_foundation %s (no expand): build=%dus ground_mask=%dus total=%dus" % [
+			name, _t_build_us, _t_gm_us, _t_foundation_us])
+		return
+
+	# Grid expanded — rebuild everything.
+	# Build structure-only grid (exclude foundation blocks) for the main mesh.
+	var _t_mesh_rebuild := Time.get_ticks_usec()
+	var struct_grid := PackedByteArray()
+	struct_grid.resize(_block_grid.size())
+	for i in _block_grid.size():
+		struct_grid[i] = _block_grid[i] if not _foundation_grid[i] else 0
+
+	# Rebuild main mesh (structure blocks only, keeps original material)
+	if _mesh_instance:
+		_mesh_instance.mesh = BlockMeshBuilder.build_block_mesh(
+			struct_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, Vector3.ZERO, true)
+	var _t_mesh_rebuild_us := Time.get_ticks_usec() - _t_mesh_rebuild
+
+	# Build foundation mesh (stone color)
+	var _t_foundation_mesh := Time.get_ticks_usec()
+	if _foundation_material == null:
+		_foundation_material = StandardMaterial3D.new()
+		_foundation_material.albedo_color = Color(0.55, 0.55, 0.50)  # Stone color
+	if _foundation_mesh_instance == null:
+		_foundation_mesh_instance = MeshInstance3D.new()
+		_foundation_mesh_instance.name = "FoundationMesh"
+		_foundation_mesh_instance.material_override = _foundation_material
+		_foundation_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		add_child(_foundation_mesh_instance)
+	_foundation_mesh_instance.mesh = BlockMeshBuilder.build_block_mesh(
+		_foundation_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, Vector3.ZERO, true)
+	var _t_foundation_mesh_us := Time.get_ticks_usec() - _t_foundation_mesh
+
+	# Rebuild collision from full grid (both structure + foundation)
+	var _t_col_rebuild := Time.get_ticks_usec()
+	_cached_faces = PackedVector3Array()
+	_rebuild_smooth_collision_mesh()
+	var _t_col_rebuild_us := Time.get_ticks_usec() - _t_col_rebuild
+
+	# Rebuild compound hit body with all block positions
+	var _t_hitbody := Time.get_ticks_usec()
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		_compound_hit_body.queue_free()
+	_compound_hit_body = StaticBody3D.new()
+	_compound_hit_body.set_script(_compound_body_script)
+	_compound_hit_body.name = "CompoundHitBody"
+	_compound_hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
+	_compound_hit_body.collision_mask = 0
+	_compound_hit_body.parent_wall = self
+
+	var positions := PackedVector3Array()
+	_shape_to_key.clear()
+	_key_to_shape.clear()
+	positions.resize(_block_hp_dict.size())
+	_shape_to_key.resize(_block_hp_dict.size())
+	var idx := 0
+	for key: Vector3i in _block_hp_dict:
+		positions[idx] = _block_local_pos(key)
+		_shape_to_key[idx] = key
+		_key_to_shape[key] = idx
+		idx += 1
+	BlockMeshBuilder.bulk_add_shapes(
+		_compound_hit_body.get_rid(), _block_shape.get_rid(), positions)
+	_compound_hit_body._shape_to_key = _shape_to_key
+	add_child(_compound_hit_body)
+	PhysicsServer3D.body_set_shielding_tag(_compound_hit_body.get_rid(), 1)
+	_update_compound_shielding_hp()
+	var _t_hitbody_us := Time.get_ticks_usec() - _t_hitbody
+
+	var _t_foundation_us := Time.get_ticks_usec() - _t_foundation_total
+	print("[PERF] _deferred_build_foundation %s (expanded): build=%dus mesh=%dus foundation_mesh=%dus collision=%dus hitbody=%dus total=%dus blocks=%d" % [
+		name, _t_build_us, _t_mesh_rebuild_us, _t_foundation_mesh_us, _t_col_rebuild_us, _t_hitbody_us, _t_foundation_us, _block_hp_dict.size()])
+
+
 func _create_structure_material(tier_info: Dictionary) -> StandardMaterial3D:
 	## Create the material for the greedy mesh. Default: flat color from tier info.
 	## Subclasses override to add textures, custom shaders, etc.
@@ -154,6 +416,16 @@ func _get_block_mass() -> float:
 func _grid_idx(bx: int, by: int, bz: int) -> int:
 	## Flat index into _block_grid for grid coordinate (bx, by, bz).
 	return bx * _num_y * _num_z + by * _num_z + bz
+
+
+func _clear_block_grids(bx: int, by: int, bz: int) -> void:
+	## Clear occupancy, ground mask, and foundation grid at (bx, by, bz).
+	var idx := _grid_idx(bx, by, bz)
+	_block_grid[idx] = 0
+	if idx < _ground_mask.size():
+		_ground_mask[idx] = 0
+	if idx < _foundation_grid.size():
+		_foundation_grid[idx] = 0
 
 
 # ======================================================================
@@ -198,6 +470,8 @@ func _ready() -> void:
 	# Initialize flat occupancy grid (used by BFS and column scanning)
 	_block_grid.resize(_num_x * _num_y * _num_z)
 	_block_grid.fill(0)
+	_ground_mask.resize(_num_x * _num_y * _num_z)
+	_ground_mask.fill(0)
 
 	# Build block HP dict and flat occupancy grid
 	var t_blocks := Time.get_ticks_usec()
@@ -217,6 +491,10 @@ func _ready() -> void:
 					if _should_spawn_block(bx, by, bz):
 						_block_hp_dict[Vector3i(bx, by, bz)] = _block_hp
 						_block_grid[_grid_idx(bx, by, bz)] = 1
+		# Foundation and ground mask need terrain collision for raycasting.
+		# Wait until after the first physics step so Jolt has flushed shapes.
+		if not is_detach:
+			_foundation_pending = true
 
 	# Build compound hit body (one StaticBody3D with N shapes, layer 11).
 	_compound_hit_body = StaticBody3D.new()
@@ -289,7 +567,7 @@ func _ready() -> void:
 		var count := float(_block_hp_dict.size())
 		_fall_ray_local = Vector3(sum_x / count, min_y, sum_z / count)
 
-	set_physics_process(_is_falling)
+	set_physics_process(_is_falling or _foundation_pending)
 
 	# Disable per-frame processing — only needed when _mesh_dirty is set
 	set_process(false)
@@ -320,6 +598,13 @@ const DETACH_FALL_GRAVITY := 17.5  ## Same as player gravity (m/s²)
 
 func _physics_process(delta: float) -> void:
 	Profiler.begin("destructible_physics")
+	if _foundation_pending:
+		_foundation_pending = false
+		_deferred_build_foundation()
+		if not _is_falling:
+			set_physics_process(false)
+			Profiler.end("destructible_physics")
+			return
 	if not _is_falling:
 		set_physics_process(false)
 		Profiler.end("destructible_physics")
@@ -364,6 +649,83 @@ func _clear_physics_before_free() -> void:
 		_collision_body.collision_mask = 0
 	if _compound_hit_body and is_instance_valid(_compound_hit_body):
 		_compound_hit_body.collision_layer = 0
+
+
+# ======================================================================
+#  Debug visualization — hit block wireframe
+# ======================================================================
+
+static var _debug_hit_mat: StandardMaterial3D
+static var _debug_miss_mat: StandardMaterial3D
+static var _debug_hitbox_mat: StandardMaterial3D
+
+static func _get_debug_mat(color: Color) -> StandardMaterial3D:
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = color
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.no_depth_test = true
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	return mat
+
+static func debug_draw_block_hit(scene_root: Node, world_pos: Vector3, block_size: float,
+		hit: bool, label: String = "") -> void:
+	## Draw a wireframe cube at world_pos. Green = hit, red = miss. Fades after 2s.
+	if not GameManager.debug_show_block_hits:
+		return
+	if _debug_hit_mat == null:
+		_debug_hit_mat = _get_debug_mat(Color(0, 1, 0, 0.6))
+		_debug_miss_mat = _get_debug_mat(Color(1, 0, 0, 0.6))
+		_debug_hitbox_mat = _get_debug_mat(Color(1, 1, 0, 0.25))
+
+	var hs := block_size * 0.5
+
+	# Wireframe box
+	var lines := PackedVector3Array()
+	var corners: Array[Vector3] = [
+		Vector3(-hs, -hs, -hs), Vector3( hs, -hs, -hs),
+		Vector3( hs,  hs, -hs), Vector3(-hs,  hs, -hs),
+		Vector3(-hs, -hs,  hs), Vector3( hs, -hs,  hs),
+		Vector3( hs,  hs,  hs), Vector3(-hs,  hs,  hs),
+	]
+	var edges: Array[int] = [0,1, 1,2, 2,3, 3,0, 4,5, 5,6, 6,7, 7,4, 0,4, 1,5, 2,6, 3,7]
+	lines.resize(edges.size())
+	for i in edges.size():
+		lines[i] = corners[edges[i]]
+
+	var mesh := ArrayMesh.new()
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = lines
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, arrays)
+
+	var inst := MeshInstance3D.new()
+	inst.mesh = mesh
+	inst.material_override = _debug_hit_mat if hit else _debug_miss_mat
+	inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	inst.global_position = world_pos
+	scene_root.add_child(inst)
+
+	# Also draw a small solid cube for visibility
+	var solid := BoxMesh.new()
+	solid.size = Vector3.ONE * block_size * 0.3
+	var solid_inst := MeshInstance3D.new()
+	solid_inst.mesh = solid
+	solid_inst.material_override = _debug_hit_mat if hit else _debug_miss_mat
+	solid_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	solid_inst.global_position = world_pos
+	scene_root.add_child(solid_inst)
+
+	if label != "":
+		print("[BLOCK_HIT] %s  pos=%s  hit=%s" % [label, str(world_pos), str(hit)])
+
+	# Auto-remove after 2 seconds
+	var tree := scene_root.get_tree()
+	if tree:
+		tree.create_timer(2.0).timeout.connect(func():
+			if is_instance_valid(inst): inst.queue_free()
+			if is_instance_valid(solid_inst): solid_inst.queue_free()
+		)
 
 
 # ======================================================================
@@ -420,6 +782,8 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 	if not _block_hp_dict.has(key):
 		return
 
+	Profiler.begin("struct_damage_block")
+	var t_dmg_total := Time.get_ticks_usec()
 	_last_attacker_id = _attacker_id
 	_block_hp_dict[key] -= amount
 	_update_compound_shielding_hp()
@@ -438,24 +802,40 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 				blast_origin = attacker.global_position
 
 		# Server: destroy block, sync to clients. Debris spawns on all peers via RPC.
+		var t_disable := Time.get_ticks_usec()
 		_disable_hit_shape(key)
 		_block_hp_dict.erase(key)
-		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+		_clear_block_grids(key.x, key.y, key.z)
+		var t_disable_us := Time.get_ticks_usec() - t_disable
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
 		_cached_faces = PackedVector3Array()
+		var t_col := Time.get_ticks_usec()
 		_rebuild_smooth_collision_mesh()
+		var t_col_us := Time.get_ticks_usec() - t_col
 		var spd := DebrisHelper.calc_hitscan_speed(ok_frac)
+		var t_rpc := Time.get_ticks_usec()
 		_sync_block_destroyed.rpc(key, block_pos, blast_origin, debris_count, spd)
+		var t_rpc_us := Time.get_ticks_usec() - t_rpc
 
 		# Host also spawns debris locally (RPC is call_remote, host needs it too).
+		var t_debris := Time.get_ticks_usec()
 		_spawn_debris(block_pos, blast_origin, debris_count, spd)
+		var t_debris_us := Time.get_ticks_usec() - t_debris
 
+		var dmg_us := Time.get_ticks_usec() - t_dmg_total
+		print("[PERF] _damage_block %s key=%s: disable=%dus smooth_col=%dus rpc=%dus debris=%dus total=%dus blocks=%d" % [
+			name, str(key), t_disable_us, t_col_us, t_rpc_us, t_debris_us, dmg_us, _block_hp_dict.size()])
+		GameManager.tick_add("damage_block", dmg_us)
+
+		Profiler.end("struct_damage_block")
 		# Defer structural integrity check to end of frame so multi-pellet
 		# damage (shotgun) applies all hits before checking for detachment.
 		if not _integrity_check_pending:
 			_integrity_check_pending = true
 			call_deferred("_deferred_integrity_check")
+		return
+	Profiler.end("struct_damage_block")
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -463,18 +843,27 @@ func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 		blast_center: Vector3 = Vector3.ZERO, debris_count: int = 0,
 		debris_speed: float = 8.0) -> void:
 	## Client-side: remove a destroyed block, rebuild mesh, and spawn cosmetic debris.
+	var _t_sync := Time.get_ticks_usec()
 	if _block_hp_dict.has(key):
 		_disable_hit_shape(key)
 		_block_hp_dict.erase(key)
-		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+		_clear_block_grids(key.x, key.y, key.z)
 		_mesh_dirty = true
 		set_process(true)
 		_cached_faces = PackedVector3Array()
+		var _t_col := Time.get_ticks_usec()
 		_rebuild_smooth_collision_mesh()
+		var _t_col_us := Time.get_ticks_usec() - _t_col
 
 	# Spawn cosmetic debris on the client.
+	var _t_debris := Time.get_ticks_usec()
 	if debris_count > 0:
 		_spawn_debris(block_pos, blast_center, debris_count, debris_speed)
+	var _t_debris_us := Time.get_ticks_usec() - _t_debris
+	var _t_sync_us := Time.get_ticks_usec() - _t_sync
+	if _t_sync_us > 200:
+		print("[PERF] _sync_block_destroyed(client) %s key=%s: total=%dus blocks=%d" % [
+			name, str(key), _t_sync_us, _block_hp_dict.size()])
 
 
 func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attacker_id: int, exclude_rids: Array[RID] = [], impact_speed: float = INF) -> void:
@@ -487,6 +876,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	if not multiplayer.is_server():
 		return
 
+	Profiler.begin("struct_take_damage_at")
 	_last_attacker_id = _attacker_id
 	var t_total := Time.get_ticks_usec()
 
@@ -541,7 +931,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		var key: Vector3i = destroyed_keys[i]
 		_disable_hit_shape(key)
 		_block_hp_dict.erase(key)
-		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+		_clear_block_grids(key.x, key.y, key.z)
 	if destroyed_keys.size() > 0 and _compound_hit_body and is_instance_valid(_compound_hit_body):
 		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 	var t_erase_end := Time.get_ticks_usec()
@@ -625,6 +1015,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		_total_us,
 	])
 	GameManager.tick_add("take_damage_at", _total_us)
+	Profiler.end("struct_take_damage_at")
 
 	# If all blocks gone, remove the structure node entirely
 	if _block_hp_dict.is_empty():
@@ -643,11 +1034,15 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	## Breakthrough explosions are handled by the caller using per-block momentum.
 	## Returns { "absorbed": float, "block_destroyed": bool, "block_key": Vector3i,
 	##           "block_pos": Vector3 }
+	Profiler.begin("struct_momentum_dmg")
+	var _t_momentum_total := Time.get_ticks_usec()
 	var empty_result := { "absorbed": 0.0, "block_destroyed": false,
 		"block_key": Vector3i.ZERO, "block_pos": Vector3.ZERO }
 	if not multiplayer.is_server():
+		Profiler.end("struct_momentum_dmg")
 		return empty_result
 	if _block_hp_dict.is_empty():
+		Profiler.end("struct_momentum_dmg")
 		return empty_result
 
 	_last_attacker_id = p_attacker_id
@@ -660,6 +1055,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	var target_key := Vector3i(gx, gy, gz)
 
 	# If exact key doesn't exist, find the nearest block within 2 cells
+	var _t_search := Time.get_ticks_usec()
 	if not _block_hp_dict.has(target_key):
 		var best_key := Vector3i(-1, -1, -1)
 		var best_dist_sq := 999.0
@@ -673,8 +1069,10 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 							best_dist_sq = d
 							best_key = candidate
 		if best_dist_sq > 998.0:
+			Profiler.end("struct_momentum_dmg")
 			return empty_result
 		target_key = best_key
+	var _t_search_us := Time.get_ticks_usec() - _t_search
 
 	var hp_before: float = _block_hp_dict[target_key]
 	var absorbed: float = minf(damage, hp_before)
@@ -684,31 +1082,45 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	if _block_hp_dict[target_key] > 0.0:
 		_update_compound_shielding_hp()
 		var block_pos_local := _block_local_pos(target_key)
+		Profiler.end("struct_momentum_dmg")
 		return { "absorbed": absorbed, "block_destroyed": false,
 			"block_key": target_key, "block_pos": global_transform * block_pos_local }
 
 	# Block destroyed
 	var block_pos: Vector3 = global_transform * _block_local_pos(target_key)
 	var ok_frac := clampf(-_block_hp_dict[target_key] / _block_hp, 0.0, 1.0)
+	var _t_erase := Time.get_ticks_usec()
 	_disable_hit_shape(target_key)
 	_block_hp_dict.erase(target_key)
-	_block_grid[_grid_idx(target_key.x, target_key.y, target_key.z)] = 0
+	_clear_block_grids(target_key.x, target_key.y, target_key.z)
+	var _t_erase_us := Time.get_ticks_usec() - _t_erase
 	_mesh_dirty = true
 	set_process(true)
+	var _t_col := Time.get_ticks_usec()
 	_rebuild_smooth_collision_mesh()
+	var _t_col_us := Time.get_ticks_usec() - _t_col
 	_update_compound_shielding_hp()
 
 	# Sync destruction + debris to clients
 	var debris_count := randi_range(1, 2)
 	var spd := DebrisHelper.calc_momentum_speed(impact_speed)
+	var _t_rpc := Time.get_ticks_usec()
 	_sync_block_destroyed.rpc(target_key, block_pos, hit_world_pos, debris_count, spd)
+	var _t_rpc_us := Time.get_ticks_usec() - _t_rpc
+	var _t_debris := Time.get_ticks_usec()
 	_spawn_debris(block_pos, hit_world_pos, debris_count, spd)
+	var _t_debris_us := Time.get_ticks_usec() - _t_debris
 
 	# Defer structural integrity check to end of frame
 	if not _block_hp_dict.is_empty() and not _integrity_check_pending:
 		_integrity_check_pending = true
 		call_deferred("_deferred_integrity_check")
 
+	var _t_momentum_us := Time.get_ticks_usec() - _t_momentum_total
+	print("[PERF] take_momentum_damage_at %s key=%s: search=%dus erase=%dus smooth_col=%dus rpc=%dus debris=%dus total=%dus blocks=%d" % [
+		name, str(target_key), _t_search_us, _t_erase_us, _t_col_us, _t_rpc_us, _t_debris_us, _t_momentum_us, _block_hp_dict.size()])
+	GameManager.tick_add("momentum_damage", _t_momentum_us)
+	Profiler.end("struct_momentum_dmg")
 	return { "absorbed": absorbed, "block_destroyed": true,
 		"block_key": target_key, "block_pos": block_pos }
 
@@ -741,16 +1153,29 @@ func _spawn_debris(block_pos: Vector3, blast_center: Vector3, count: int,
 func _deferred_integrity_check() -> void:
 	## Runs at end of frame after all damage in this tick is applied.
 	_integrity_check_pending = false
+	var t0 := Time.get_ticks_usec()
 	_check_structural_integrity()
+	var us := Time.get_ticks_usec() - t0
+	print("[PERF] _deferred_integrity_check %s: %dus  blocks=%d" % [name, us, _block_hp_dict.size()])
+	GameManager.tick_add("deferred_integrity", us)
 	if _block_hp_dict.is_empty():
 		_clear_physics_before_free()
 		queue_free()
 
 
+## Stress model parameters (in units of block-weight).
+## max_load: how many blocks of weight one face can bear in compression.
+##   A 1-wide pillar snaps when it exceeds this height.
+##   Tensile strength = 30% of this. Shear strength = 40% of this.
+## horizontal_transfer: how readily load spreads sideways (0–1).
+##   0 = load only flows vertically. 1 = full lateral distribution.
+var stress_max_load: float = 15.0
+var stress_horizontal_transfer: float = 0.6
+
 func _check_structural_integrity() -> void:
-	## Server-only: find blocks not connected to ground and detach them.
-	## Single C++ call does ground-BFS + component finding (replaces old
-	## calc_structural_integrity + GDScript _find_connected_components).
+	## Server-only: force-equilibrium stress solver + connectivity check.
+	## Finds blocks that are either disconnected from ground OR cannot be
+	## held in static equilibrium within material strength limits.
 	if not multiplayer.is_server():
 		return
 	if _block_hp_dict.is_empty():
@@ -758,15 +1183,20 @@ func _check_structural_integrity() -> void:
 	if _is_detached_structure:
 		return
 
+	Profiler.begin("struct_integrity")
 	var t_si_total := Time.get_ticks_usec()
 
-	# C++ ground-BFS + component finding in one native call.
-	# Returns Array of TypedArray[Vector3i] — one per disconnected component.
-	var components: Array = BlockMeshBuilder.calc_integrity_components(
-		_block_grid, _num_x, _num_y, _num_z, _block_hp_dict.size())
+	# C++ force-equilibrium solver: ground-BFS + iterative stress solve + components.
+	# Pass ground_mask so the solver knows which blocks are terrain-anchored.
+	var _t_solver := Time.get_ticks_usec()
+	var components: Array = BlockMeshBuilder.calc_stress_integrity_components(
+		_block_grid, _ground_mask, _num_x, _num_y, _num_z, _block_hp_dict.size(),
+		stress_max_load, stress_horizontal_transfer)
+	var _t_solver_us := Time.get_ticks_usec() - _t_solver
 
 	if components.is_empty():
 		GameManager.tick_add("structural_integrity", Time.get_ticks_usec() - t_si_total)
+		Profiler.end("struct_integrity")
 		return
 
 	var t_detach := Time.get_ticks_usec()
@@ -774,11 +1204,12 @@ func _check_structural_integrity() -> void:
 	var t_detach_end := Time.get_ticks_usec()
 
 	var si_us := Time.get_ticks_usec() - t_si_total
-	print("[StructuralIntegrity] %s  blocks=%d  components=%d  detach=%dus  total=%dus" % [
+	print("[StructuralIntegrity] %s  blocks=%d  components=%d  solver=%dus  detach=%dus  total=%dus" % [
 		name, _block_hp_dict.size(), components.size(),
-		t_detach_end - t_detach, si_us,
+		_t_solver_us, t_detach_end - t_detach, si_us,
 	])
 	GameManager.tick_add("structural_integrity", si_us)
+	Profiler.end("struct_integrity")
 
 
 func _detach_clusters(components: Array) -> void:
@@ -834,7 +1265,7 @@ func _detach_clusters(components: Array) -> void:
 		if _block_hp_dict.has(key):
 			_disable_hit_shape(key)
 			_block_hp_dict.erase(key)
-			_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+			_clear_block_grids(key.x, key.y, key.z)
 	if has_compound:
 		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 	_update_compound_shielding_hp()
@@ -844,14 +1275,25 @@ func _detach_clusters(components: Array) -> void:
 	var t_col := Time.get_ticks_usec()
 	_mesh_dirty = true
 	set_process(true)
+	_cached_faces = PackedVector3Array()
 	_rebuild_smooth_collision_mesh()
 	var t_col_end := Time.get_ticks_usec()
 
-	# ── RPC each cluster to all peers ──
+	# ── Single batched RPC for all clusters ──
 	var t_rpc := Time.get_ticks_usec()
-	for data in cluster_data:
-		_sync_cluster_detach.rpc(data["keys"], data["hps"], data["centroid"], data["mass"],
-			_last_attacker_id, _num_x, _num_y, _num_z, _get_block_mass())
+	var all_keys: Array = []
+	var all_hps: Array = []
+	var all_centroids := PackedVector3Array()
+	var all_masses := PackedFloat32Array()
+	all_centroids.resize(cluster_data.size())
+	all_masses.resize(cluster_data.size())
+	for i in cluster_data.size():
+		all_keys.append(cluster_data[i]["keys"])
+		all_hps.append(cluster_data[i]["hps"])
+		all_centroids[i] = cluster_data[i]["centroid"]
+		all_masses[i] = cluster_data[i]["mass"]
+	_sync_cluster_detach_batch.rpc(all_keys, all_hps, all_centroids, all_masses,
+		_last_attacker_id, _num_x, _num_y, _num_z, _get_block_mass())
 	var t_rpc_end := Time.get_ticks_usec()
 
 	print("[DetachClusters] %s  components=%d  blocks=%d  collect=%dus  erase=%dus  collision=%dus  rpc=%dus  total=%dus" % [
@@ -883,7 +1325,7 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 			if _block_hp_dict.has(key):
 				_disable_hit_shape(key)
 				_block_hp_dict.erase(key)
-				_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
+				_clear_block_grids(key.x, key.y, key.z)
 		if _compound_hit_body and is_instance_valid(_compound_hit_body):
 			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 
@@ -915,6 +1357,57 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 		t_spawn_end - t_spawn,
 		sync_total,
 	])
+
+
+@rpc("authority", "call_local", "reliable")
+func _sync_cluster_detach_batch(all_keys: Array, all_hps: Array,
+		all_centroids: PackedVector3Array, all_masses: PackedFloat32Array,
+		attacker_id: int, grid_num_x: int, grid_num_y: int,
+		grid_num_z: int, mass_per_block: float) -> void:
+	## All peers: remove ALL detached blocks once, rebuild collision once,
+	## then spawn all falling clusters. Replaces N individual _sync_cluster_detach RPCs.
+	var t_batch_total := Time.get_ticks_usec()
+	var n_clusters := all_keys.size()
+
+	# Client: erase all blocks from all clusters in one bulk session.
+	var t_client_cleanup := Time.get_ticks_usec()
+	if not multiplayer.is_server():
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
+		for cluster_keys: Array in all_keys:
+			for key_variant in cluster_keys:
+				var key: Vector3i = key_variant
+				if _block_hp_dict.has(key):
+					_disable_hit_shape(key)
+					_block_hp_dict.erase(key)
+					_clear_block_grids(key.x, key.y, key.z)
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
+		_mesh_dirty = true
+		set_process(true)
+		_cached_faces = PackedVector3Array()
+		_rebuild_smooth_collision_mesh()
+	var t_client_cleanup_us := Time.get_ticks_usec() - t_client_cleanup
+
+	# Spawn each cluster.
+	var t_spawn := Time.get_ticks_usec()
+	for i in n_clusters:
+		var cluster_keys: Array = all_keys[i]
+		var cluster_hps: Array = all_hps[i]
+		var typed_keys: Array[Vector3i] = []
+		var typed_hps: Array[float] = []
+		for j in cluster_keys.size():
+			typed_keys.append(cluster_keys[j] as Vector3i)
+			typed_hps.append(float(cluster_hps[j]))
+		if not GameManager.debug_disable_detached_structures:
+			_spawn_falling_cluster(typed_keys, typed_hps, all_centroids[i],
+				all_masses[i], attacker_id, grid_num_x, grid_num_y, grid_num_z,
+				mass_per_block)
+	var t_spawn_us := Time.get_ticks_usec() - t_spawn
+
+	var t_batch_us := Time.get_ticks_usec() - t_batch_total
+	print("[SyncClusterDetachBatch] %s  clusters=%d  client_cleanup=%dus  spawn=%dus  total=%dus" % [
+		name, n_clusters, t_client_cleanup_us, t_spawn_us, t_batch_us])
 
 
 func _spawn_detached_structure(block_keys: Array[Vector3i],
@@ -1240,22 +1733,37 @@ func _rebuild_smooth_collision_mesh() -> void:
 	if _collision_body == null or not is_instance_valid(_collision_body):
 		return
 
+	var _t_smooth_total := Time.get_ticks_usec()
 	var body_rid := _collision_body.get_rid()
+	var _t_clear := Time.get_ticks_usec()
 	PhysicsServer3D.body_clear_shapes(body_rid)
+	var _t_clear_us := Time.get_ticks_usec() - _t_clear
 
+	var _t_free := Time.get_ticks_usec()
 	if _smooth_shape_rid.is_valid():
 		PhysicsServer3D.free_rid(_smooth_shape_rid)
 		_smooth_shape_rid = RID()
+	var _t_free_us := Time.get_ticks_usec() - _t_free
 
 	# If cached faces are stale (destruction path), rebuild from grid
+	var _t_faces := Time.get_ticks_usec()
 	if _cached_faces.is_empty():
-		_cached_faces = _build_faces_from_grid()
+		_cached_faces = BlockMeshBuilder.build_collision_faces(_block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE)
+	var _t_faces_us := Time.get_ticks_usec() - _t_faces
 	if _cached_faces.is_empty():
 		return
 
+	var _t_create := Time.get_ticks_usec()
 	_smooth_shape_rid = PhysicsServer3D.concave_polygon_shape_create()
 	PhysicsServer3D.shape_set_data(_smooth_shape_rid, {"faces": _cached_faces, "backface_collision": false})
 	PhysicsServer3D.body_add_shape(body_rid, _smooth_shape_rid)
+	var _t_create_us := Time.get_ticks_usec() - _t_create
+
+	var _t_smooth_us := Time.get_ticks_usec() - _t_smooth_total
+	if _t_smooth_us > 200:
+		print("[PERF] _rebuild_smooth_collision %s: clear=%dus free=%dus faces=%dus(%d tris) create=%dus total=%dus" % [
+			name, _t_clear_us, _t_free_us, _t_faces_us, _cached_faces.size() / 3, _t_create_us, _t_smooth_us])
+	GameManager.tick_add("smooth_collision", _t_smooth_us)
 
 
 # ======================================================================
@@ -1274,14 +1782,48 @@ func _rebuild_greedy_mesh() -> void:
 		return
 	if _block_hp_dict.is_empty():
 		_mesh_instance.mesh = null
+		if _foundation_mesh_instance:
+			_foundation_mesh_instance.mesh = null
 		_cached_faces = PackedVector3Array()
 		return
-	var centroid := Vector3(_num_x, _num_y, _num_z) * BLOCK_SIZE * 0.5
-	_mesh_instance.mesh = BlockMeshBuilder.build_block_mesh(
-		_block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, centroid, true)
-	# Build collision faces from the block grid directly — never touch the mesh.
-	# The grid is a flat array with O(1) lookups, no GPU readback.
-	_cached_faces = _build_faces_from_grid()
+
+	var _t_greedy_total := Time.get_ticks_usec()
+	# If we have a foundation grid, build separate meshes for structure vs foundation.
+	if _foundation_grid.size() == _block_grid.size():
+		var _t_split := Time.get_ticks_usec()
+		var struct_grid := PackedByteArray()
+		struct_grid.resize(_block_grid.size())
+		for i in _block_grid.size():
+			struct_grid[i] = _block_grid[i] if not _foundation_grid[i] else 0
+		var _t_split_us := Time.get_ticks_usec() - _t_split
+		var _t_struct_mesh := Time.get_ticks_usec()
+		_mesh_instance.mesh = BlockMeshBuilder.build_block_mesh(
+			struct_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, Vector3.ZERO, true)
+		var _t_struct_mesh_us := Time.get_ticks_usec() - _t_struct_mesh
+		var _t_foundation_mesh_us := 0
+		if _foundation_mesh_instance:
+			var _t_fm := Time.get_ticks_usec()
+			_foundation_mesh_instance.mesh = BlockMeshBuilder.build_block_mesh(
+				_foundation_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, Vector3.ZERO, true)
+			_t_foundation_mesh_us = Time.get_ticks_usec() - _t_fm
+		var _t_greedy_us := Time.get_ticks_usec() - _t_greedy_total
+		if _t_greedy_us > 200:
+			print("[PERF] _rebuild_greedy_mesh %s (split): grid_split=%dus struct_mesh=%dus foundation_mesh=%dus total=%dus blocks=%d" % [
+				name, _t_split_us, _t_struct_mesh_us, _t_foundation_mesh_us, _t_greedy_us, _block_hp_dict.size()])
+	else:
+		var _t_mesh := Time.get_ticks_usec()
+		_mesh_instance.mesh = BlockMeshBuilder.build_block_mesh(
+			_block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, Vector3.ZERO, true)
+		var _t_mesh_us := Time.get_ticks_usec() - _t_mesh
+		if _t_mesh_us > 200:
+			print("[PERF] _rebuild_greedy_mesh %s: mesh=%dus blocks=%d" % [name, _t_mesh_us, _block_hp_dict.size()])
+
+	# Build collision faces from the full block grid (both structure + foundation).
+	var _t_faces := Time.get_ticks_usec()
+	_cached_faces = BlockMeshBuilder.build_collision_faces(_block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE)
+	var _t_faces_us := Time.get_ticks_usec() - _t_faces
+	var _t_greedy_total_us := Time.get_ticks_usec() - _t_greedy_total
+	GameManager.tick_add("greedy_mesh_rebuild", _t_greedy_total_us)
 
 
 func _build_faces_from_grid() -> PackedVector3Array:
@@ -1292,6 +1834,9 @@ func _build_faces_from_grid() -> PackedVector3Array:
 	var fi := 0
 	var bs := BLOCK_SIZE
 	var hs := bs * 0.5
+	# Must match BlockMeshBuilder.build_block_mesh with centroid=ZERO:
+	# C++ uses (bx + 0.5 - half) * bs, where half = num * 0.5
+	# Same as _block_local_pos: (bx + 0.5 - num * 0.5) * bs
 	var half_x := _num_x * bs * 0.5
 	var half_y := _num_y * bs * 0.5
 	var half_z := _num_z * bs * 0.5

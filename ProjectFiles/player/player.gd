@@ -305,11 +305,11 @@ func _physics_process(delta: float) -> void:
 		print("[WALL_DEBUG] === %s ===" % ("ENABLED" if _debug_wall else "DISABLED"))
 	if not Input.is_key_pressed(KEY_F9):
 		_debug_wall_key_held = false
-	# DEBUG: F10 toggles movement data capture for the local player
+	# DEBUG: F10 toggles dynamic contact logging
 	if peer_id == multiplayer.get_unique_id() and Input.is_key_pressed(KEY_F10) and not _capture_key_held:
-		capture_movement = not capture_movement
+		GameManager.debug_dynamic_contact_log = not GameManager.debug_dynamic_contact_log
 		_capture_key_held = true
-		print("\n=== CAPTURE %s ===" % ("START" if capture_movement else "STOP"))
+		print("[F10] Dynamic contact log: %s" % ("ON" if GameManager.debug_dynamic_contact_log else "OFF"))
 	if not Input.is_key_pressed(KEY_F10):
 		_capture_key_held = false
 

@@ -206,21 +206,35 @@ func _exit_tree() -> void:
 # ======================================================================
 
 func _process(_delta: float) -> void:
+	Profiler.begin("cluster_mesh_rebuild")
 	## Deferred mesh/shape rebuild after block destruction.
 	if _mesh_dirty:
 		_mesh_dirty = false
 		var _t0 := Time.get_ticks_usec()
 		_rebuild_visuals()
-		GameManager.frame_add("cluster_mesh", Time.get_ticks_usec() - _t0)
+		var _t_us := Time.get_ticks_usec() - _t0
+		GameManager.frame_add("cluster_mesh", _t_us)
 		set_process(false)
+	Profiler.end("cluster_mesh_rebuild")
 
 
 func _physics_process(delta: float) -> void:
+	Profiler.begin("falling_cluster")
 	var _t0 := Time.get_ticks_usec()
 	super._physics_process(delta)
 
+	# Sync compound hit body transform so hitscan raycasts hit the correct
+	# position.  Jolt threaded physics can desync child StaticBody3D from
+	# parent RigidBody3D by at least one frame.
+	if _compound_hit_body and is_instance_valid(_compound_hit_body):
+		PhysicsServer3D.body_set_state(
+			_compound_hit_body.get_rid(),
+			PhysicsServer3D.BODY_STATE_TRANSFORM,
+			global_transform)
+
 	if not multiplayer.is_server():
 		GameManager.tick_add("cluster_tick", Time.get_ticks_usec() - _t0)
+		Profiler.end("falling_cluster")
 		return
 
 	# Log per-tick contact count (reset after logging)
@@ -233,11 +247,12 @@ func _physics_process(delta: float) -> void:
 	if linear_velocity.length() < SETTLE_SPEED:
 		_settle_timer += delta
 		if _settle_timer >= SETTLE_TIME:
-			freeze = true
+			sleeping = true
 	else:
 		_settle_timer = 0.0
 
 	GameManager.tick_add("cluster_tick", Time.get_ticks_usec() - _t0)
+	Profiler.end("falling_cluster")
 
 
 # ======================================================================
@@ -252,6 +267,8 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 	if not grid.has_block(key):
 		return
 
+	Profiler.begin("cluster_damage_block")
+	var _t_dmg_total := Time.get_ticks_usec()
 	grid.block_hp[key] -= amount
 	_update_compound_shielding_hp()
 
@@ -265,9 +282,18 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 			var attacker := players_node.get_node_or_null(str(_attacker_id))
 			if attacker and is_instance_valid(attacker):
 				blast_pos = attacker.global_position
+		var _t_erase := Time.get_ticks_usec()
 		grid.erase_block(key)
 		_disable_hit_shape(key)
+		var _t_erase_us := Time.get_ticks_usec() - _t_erase
+		var _t_abd := Time.get_ticks_usec()
 		_after_blocks_destroyed([key], blast_pos, [spd])
+		var _t_abd_us := Time.get_ticks_usec() - _t_abd
+		var _t_dmg_us := Time.get_ticks_usec() - _t_dmg_total
+		print("[PERF] cluster._damage_block %s key=%s: erase=%dus after_destroyed=%dus total=%dus blocks=%d" % [
+			name, str(key), _t_erase_us, _t_abd_us, _t_dmg_us, grid.block_count()])
+		GameManager.tick_add("cluster_damage_block", _t_dmg_us)
+	Profiler.end("cluster_damage_block")
 
 
 func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
@@ -278,6 +304,8 @@ func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
 	if grid == null or grid.is_empty():
 		return
 
+	Profiler.begin("cluster_take_damage")
+	var _t_td_total := Time.get_ticks_usec()
 	var per_block: float = amount / float(grid.block_count())
 	var destroyed_keys: Array[Vector3i] = []
 
@@ -288,6 +316,7 @@ func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
 
 	if not destroyed_keys.is_empty():
 		# Bulk mode: disable all shapes in one commit instead of N rebuilds.
+		var _t_erase := Time.get_ticks_usec()
 		if _compound_hit_body and is_instance_valid(_compound_hit_body):
 			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
 		for key in destroyed_keys:
@@ -295,7 +324,14 @@ func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
 			_disable_hit_shape(key)
 		if _compound_hit_body and is_instance_valid(_compound_hit_body):
 			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
+		var _t_erase_us := Time.get_ticks_usec() - _t_erase
+		var _t_abd := Time.get_ticks_usec()
 		_after_blocks_destroyed(destroyed_keys)
+		var _t_abd_us := Time.get_ticks_usec() - _t_abd
+		var _t_td_us := Time.get_ticks_usec() - _t_td_total
+		print("[PERF] cluster.take_damage %s: %d destroyed, erase=%dus after_destroyed=%dus total=%dus" % [
+			name, destroyed_keys.size(), _t_erase_us, _t_abd_us, _t_td_us])
+	Profiler.end("cluster_take_damage")
 
 
 func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
@@ -309,6 +345,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 	if grid == null or grid.is_empty():
 		return
 
+	Profiler.begin("cluster_take_damage_at")
 	var _t_take_damage_at := Time.get_ticks_usec()
 
 	var space_state: PhysicsDirectSpaceState3D = null
@@ -410,11 +447,14 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 		var total_us := Time.get_ticks_usec() - _t_take_damage_at
 		print("[ClusterPerf] take_damage_at %s: %d blocks hit, %d destroyed, raycasts=%dus after_destroyed=%dus total=%dus" % [
 			name, dbg_blocks_hit, destroyed_keys.size(), _t_raycast_total, _t_abd_us, total_us])
+		GameManager.tick_add("cluster_take_damage_at", total_us)
 	else:
 		var total_us := Time.get_ticks_usec() - _t_take_damage_at
-		if total_us > 500:
+		if total_us > 200:
 			print("[ClusterPerf] take_damage_at %s (no destroys): %d blocks hit, raycasts=%dus total=%dus" % [
 				name, dbg_blocks_hit, _t_raycast_total, total_us])
+		GameManager.tick_add("cluster_take_damage_at", total_us)
+	Profiler.end("cluster_take_damage_at")
 
 
 func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
@@ -424,14 +464,19 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	## the caller using per-block momentum at remaining speed.
 	## Returns { "absorbed": float, "block_destroyed": bool, "block_key": Vector3i,
 	##           "block_pos": Vector3 }
+	Profiler.begin("cluster_momentum_dmg")
+	var _t_momentum_total := Time.get_ticks_usec()
 	var empty_result := { "absorbed": 0.0, "block_destroyed": false,
 		"block_key": Vector3i.ZERO, "block_pos": Vector3.ZERO }
 	if not multiplayer.is_server():
+		Profiler.end("cluster_momentum_dmg")
 		return empty_result
 	if grid == null or grid.is_empty():
+		Profiler.end("cluster_momentum_dmg")
 		return empty_result
 
 	# Find nearest block to hit position
+	var _t_search := Time.get_ticks_usec()
 	var best_key := Vector3i(-1, -1, -1)
 	var best_dist_sq := 999999.0
 	for key: Vector3i in grid.block_hp:
@@ -440,8 +485,10 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 		if d < best_dist_sq:
 			best_dist_sq = d
 			best_key = key
+	var _t_search_us := Time.get_ticks_usec() - _t_search
 
 	if best_dist_sq > 999998.0:
+		Profiler.end("cluster_momentum_dmg")
 		return empty_result
 
 	var block_world := global_transform * grid.block_local_pos(best_key)
@@ -451,15 +498,25 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	grid.block_hp[best_key] -= damage
 	if grid.block_hp[best_key] > 0.0:
 		_update_compound_shielding_hp()
+		Profiler.end("cluster_momentum_dmg")
 		return { "absorbed": absorbed, "block_destroyed": false,
 			"block_key": best_key, "block_pos": block_world }
 
 	# Block destroyed — compute momentum speed before erasing
 	var momentum_spd := DebrisHelper.calc_momentum_speed(_impact_speed)
+	var _t_erase := Time.get_ticks_usec()
 	grid.erase_block(best_key)
 	_disable_hit_shape(best_key)
+	var _t_erase_us := Time.get_ticks_usec() - _t_erase
+	var _t_abd := Time.get_ticks_usec()
 	_after_blocks_destroyed([best_key], hit_world_pos, [momentum_spd])
+	var _t_abd_us := Time.get_ticks_usec() - _t_abd
 
+	var _t_momentum_us := Time.get_ticks_usec() - _t_momentum_total
+	print("[PERF] cluster.take_momentum_damage_at %s: search=%dus erase=%dus after_destroyed=%dus total=%dus blocks=%d" % [
+		name, _t_search_us, _t_erase_us, _t_abd_us, _t_momentum_us, grid.block_count()])
+	GameManager.tick_add("cluster_momentum_damage", _t_momentum_us)
+	Profiler.end("cluster_momentum_dmg")
 	return { "absorbed": absorbed, "block_destroyed": true,
 		"block_key": best_key, "block_pos": block_world }
 
@@ -477,19 +534,23 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i],
 	## blast_origin: explosion/attacker/impact position for debris direction (INF = random).
 	## precomputed_speeds: per-block speeds from caller (empty = fallback to hitscan).
 	## is_explosion: true = mirror debris away from blast; false = direct toward origin.
+	Profiler.begin("cluster_after_destroyed")
 	var _t_abd_start := Time.get_ticks_usec()
 
 	# Wake up frozen/settled clusters so they (and any fragments) fall properly.
-	# Without this, a settled cluster that gets split stays frozen in mid-air.
-	if multiplayer.is_server() and freeze:
-		freeze = false
+	# Wake sleeping clusters so they (and any fragments) fall properly.
+	if multiplayer.is_server() and sleeping:
+		sleeping = false
 		_settle_timer = 0.0
 
+	var _t_mass := Time.get_ticks_usec()
 	_update_mass()
+	var _t_mass_us := Time.get_ticks_usec() - _t_mass
 	_mesh_dirty = true
 	set_process(true)
 
 	# Compute world positions and use precomputed speeds (or fallback)
+	var _t_prep := Time.get_ticks_usec()
 	var block_positions: Array[Vector3] = []
 	var debris_speeds: Array[float] = []
 	var has_speeds := precomputed_speeds.size() == destroyed_keys.size()
@@ -501,8 +562,10 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i],
 			debris_speeds.append(precomputed_speeds[i])
 		else:
 			debris_speeds.append(DebrisHelper.calc_hitscan_speed(0.0))
+	var _t_prep_us := Time.get_ticks_usec() - _t_prep
 
 	# Sync to clients (call_remote — server rebuilds via _process)
+	var _t_rpc := Time.get_ticks_usec()
 	var keys_variant: Array = []
 	var positions_variant: Array = []
 	var speeds_variant: Array = []
@@ -512,11 +575,18 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i],
 		speeds_variant.append(debris_speeds[i])
 	_sync_blocks_destroyed.rpc(keys_variant, positions_variant, speeds_variant,
 		blast_origin, is_explosion)
+	var _t_rpc_us := Time.get_ticks_usec() - _t_rpc
 
 	# Host also spawns debris locally (RPC is call_remote)
+	var _t_debris := Time.get_ticks_usec()
 	_spawn_debris_for_blocks(block_positions, debris_speeds, blast_origin, is_explosion)
+	var _t_debris_us := Time.get_ticks_usec() - _t_debris
 
 	if grid.is_empty():
+		var total_us := Time.get_ticks_usec() - _t_abd_start
+		print("[ClusterPerf] _after_blocks_destroyed %s (empty): mass=%dus prep=%dus rpc=%dus debris=%dus total=%dus" % [
+			name, _t_mass_us, _t_prep_us, _t_rpc_us, _t_debris_us, total_us])
+		Profiler.end("cluster_after_destroyed")
 		_clear_physics_before_free()
 		queue_free()
 		return
@@ -526,9 +596,10 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i],
 	_check_cluster_integrity()
 	var _t_integrity_us := Time.get_ticks_usec() - _t_integrity
 	var total_us := Time.get_ticks_usec() - _t_abd_start
-	if total_us > 100:
-		print("[ClusterPerf] _after_blocks_destroyed %s: %d keys destroyed, %d remaining, integrity=%dus total=%dus" % [
-			name, destroyed_keys.size(), grid.block_count(), _t_integrity_us, total_us])
+	print("[ClusterPerf] _after_blocks_destroyed %s: %d destroyed, %d remaining, mass=%dus prep=%dus rpc=%dus debris=%dus integrity=%dus total=%dus" % [
+		name, destroyed_keys.size(), grid.block_count(), _t_mass_us, _t_prep_us, _t_rpc_us, _t_debris_us, _t_integrity_us, total_us])
+	GameManager.tick_add("cluster_after_destroyed", total_us)
+	Profiler.end("cluster_after_destroyed")
 
 
 func _update_mass() -> void:
@@ -575,6 +646,7 @@ func _spawn_debris_for_blocks(block_positions: Array[Vector3],
 	## blast_origin: hit/attacker position (INF = random scatter).
 	## is_explosion: if true, mirrors per-block away from blast (like structures).
 	##   If false, passes blast_origin directly as blast_center (hitscan/momentum).
+	var _t_spawn_debris := Time.get_ticks_usec()
 	var mat: StandardMaterial3D = null
 	if _mesh_instance and _mesh_instance.material_override:
 		mat = _mesh_instance.material_override
@@ -590,11 +662,13 @@ func _spawn_debris_for_blocks(block_positions: Array[Vector3],
 	batch_centers.resize(n_blocks)
 	batch_counts.resize(n_blocks)
 	batch_speeds.resize(n_blocks)
+	var total_debris := 0
 	for i in n_blocks:
 		var pos: Vector3 = block_positions[i]
 		batch_positions[i] = pos
 		batch_speeds[i] = debris_speeds[i] if i < debris_speeds.size() else 8.0
 		batch_counts[i] = randi_range(1, 2)
+		total_debris += batch_counts[i]
 		if has_blast:
 			if is_explosion:
 				batch_centers[i] = pos + (pos - blast_origin)
@@ -602,9 +676,15 @@ func _spawn_debris_for_blocks(block_positions: Array[Vector3],
 				batch_centers[i] = blast_origin
 		else:
 			batch_centers[i] = pos + Vector3(randf_range(-1, 1), 0, randf_range(-1, 1)).normalized() * 0.5
+	var _t_batch := Time.get_ticks_usec()
 	DebrisHelper.spawn_debris_batch(
 		batch_positions, batch_centers, batch_counts, batch_speeds,
 		mat, {"lifetime": _debris_lifetime, "mass": _debris_mass})
+	var _t_batch_us := Time.get_ticks_usec() - _t_batch
+	var _t_spawn_us := Time.get_ticks_usec() - _t_spawn_debris
+	if _t_spawn_us > 100:
+		print("[PERF] cluster._spawn_debris_for_blocks %s: %d blocks, %d debris, batch=%dus total=%dus" % [
+			name, n_blocks, total_debris, _t_batch_us, _t_spawn_us])
 
 
 # ======================================================================
@@ -620,12 +700,15 @@ func _check_cluster_integrity() -> void:
 	if grid.block_count() < 2:
 		return
 
+	Profiler.begin("cluster_integrity")
 	var _t_integrity_start := Time.get_ticks_usec()
+	var _t_bfs_start := Time.get_ticks_usec()
 	var components := grid.find_all_components()
 
-	var _t_bfs_us := Time.get_ticks_usec() - _t_integrity_start
+	var _t_bfs_us := Time.get_ticks_usec() - _t_bfs_start
 
 	if components.size() <= 1:
+		Profiler.end("cluster_integrity")
 		return
 
 	# Keep the largest component in self, split off the rest
@@ -648,8 +731,11 @@ func _check_cluster_integrity() -> void:
 	if not all_fragment_keys.is_empty():
 		_sync_fragment_split_batch.rpc(all_fragment_keys)
 	var _t_splits_us := Time.get_ticks_usec() - _t_splits
-	print("[ClusterPerf] _check_cluster_integrity %s: %d blocks, %d components, %d splits, bfs=%dus splits=%dus" % [
-		name, grid.block_count(), components.size(), all_fragment_keys.size(), _t_bfs_us, _t_splits_us])
+	var _t_integrity_us := Time.get_ticks_usec() - _t_integrity_start
+	print("[ClusterPerf] _check_cluster_integrity %s: %d blocks, %d components, %d splits, bfs=%dus splits=%dus total=%dus" % [
+		name, grid.block_count(), components.size(), all_fragment_keys.size(), _t_bfs_us, _t_splits_us, _t_integrity_us])
+	GameManager.tick_add("cluster_integrity", _t_integrity_us)
+	Profiler.end("cluster_integrity")
 
 
 @rpc("authority", "call_local", "reliable")
@@ -914,18 +1000,23 @@ func _on_body_entered(body: Node) -> void:
 	if not multiplayer.is_server():
 		return
 
+	Profiler.begin("cluster_contact")
 	_contacts_this_tick += 1
 	var _t_contact := Time.get_ticks_usec()
+
+	var body_class := body.get_class() if not (body is FallingBlockCluster) else "FallingBlockCluster"
 
 	# --- Cluster-vs-cluster: only higher instance_id processes to avoid double ---
 	if body is FallingBlockCluster:
 		if get_instance_id() < body.get_instance_id():
+			Profiler.end("cluster_contact")
 			return
 		_handle_cluster_vs_cluster(body)
 		var us := Time.get_ticks_usec() - _t_contact
 		GameManager.tick_add("cluster_contact", us)
-		if us > 100:
-			print("[ClusterPerf] _on_body_entered cluster_vs_cluster %s->%s took %dus" % [name, body.name, us])
+		print("[CONTACT] %s->%s (cluster_vs_cluster) %dus  vel=%.1f blocks=%d" % [
+			name, body.name, us, linear_velocity.length(), grid.block_count()])
+		Profiler.end("cluster_contact")
 		return
 
 	# --- Structure damage (momentum carving) ---
@@ -934,16 +1025,18 @@ func _on_body_entered(body: Node) -> void:
 		_handle_structure_hit(body, target_structure)
 		var us := Time.get_ticks_usec() - _t_contact
 		GameManager.tick_add("cluster_contact", us)
-		if us > 100:
-			print("[ClusterPerf] _on_body_entered structure_hit %s->%s took %dus" % [name, target_structure.name, us])
+		print("[CONTACT] %s->%s (structure_hit) %dus  vel=%.1f blocks=%d" % [
+			name, target_structure.name, us, linear_velocity.length(), grid.block_count()])
+		Profiler.end("cluster_contact")
 		return
 
-	# --- Generic damageable body (player, etc.) — momentum-based structure damage ---
+	# --- Generic damageable body (player, terrain, etc.) ---
 	_handle_generic_hit(body)
 	var us := Time.get_ticks_usec() - _t_contact
 	GameManager.tick_add("cluster_contact", us)
-	if us > 100:
-		print("[ClusterPerf] _on_body_entered generic_hit %s->%s took %dus" % [name, body.name, us])
+	print("[CONTACT] %s->%s (%s) %dus  vel=%.1f blocks=%d" % [
+		name, body.name, body_class, us, linear_velocity.length(), grid.block_count()])
+	Profiler.end("cluster_contact")
 
 
 func _compute_impact(body: Node, other_velocity: Vector3 = Vector3.ZERO) -> Dictionary:
