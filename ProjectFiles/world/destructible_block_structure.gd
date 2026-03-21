@@ -1210,16 +1210,18 @@ func _add_cluster_column_shape(cluster: RigidBody3D,
 
 func _build_smooth_collision() -> void:
 	## Create the smooth collision body with a ConcavePolygonShape3D (trimesh).
-	## Jolt's MeshShape has built-in internal edge smoothing: coplanar adjacent
-	## triangles share "inactive" edges that don't generate ghost contacts.
-	## This eliminates the speed-eating ghost collisions that compound box shapes
-	## suffer from at block boundaries.
+	var t0 := Time.get_ticks_usec()
 	_collision_body = StaticBody3D.new()
 	_collision_body.name = "SmoothCollision"
 	_collision_body.collision_layer = CollisionLayers.WALL_SMOOTH
 	_collision_body.collision_mask = 0
 	add_child(_collision_body)
+	var t1 := Time.get_ticks_usec()
 	_rebuild_smooth_collision_mesh()
+	var t2 := Time.get_ticks_usec()
+	if t2 - t0 > 3000:
+		print("[SMOOTH_COL] %s body=%dus shape=%dus faces=%d" % [
+			name, t1 - t0, t2 - t1, _cached_faces.size() / 3])
 
 
 func _rebuild_smooth_collision_mesh() -> void:
@@ -1237,12 +1239,11 @@ func _rebuild_smooth_collision_mesh() -> void:
 	if _mesh_instance == null or _mesh_instance.mesh == null:
 		return
 
-	var faces := _mesh_instance.mesh.get_faces()
-	if faces.is_empty():
+	if _cached_faces.is_empty():
 		return
 
 	_smooth_shape_rid = PhysicsServer3D.concave_polygon_shape_create()
-	PhysicsServer3D.shape_set_data(_smooth_shape_rid, {"faces": faces, "backface_collision": false})
+	PhysicsServer3D.shape_set_data(_smooth_shape_rid, {"faces": _cached_faces, "backface_collision": false})
 	PhysicsServer3D.body_add_shape(body_rid, _smooth_shape_rid)
 
 
@@ -1255,12 +1256,24 @@ func _rebuild_smooth_collision_mesh() -> void:
 # exposed block face = 1 quad = 2 triangles. This is still a HUGE
 # improvement: 1 MeshInstance per structure instead of 1 per block.
 
+var _cached_faces: PackedVector3Array = PackedVector3Array()
+
 func _rebuild_greedy_mesh() -> void:
+	_cached_faces = PackedVector3Array()
 	if _mesh_instance == null:
 		return
 	if _block_hp_dict.is_empty():
 		_mesh_instance.mesh = null
 		return
 	var centroid := Vector3(_num_x, _num_y, _num_z) * BLOCK_SIZE * 0.5
-	_mesh_instance.mesh = BlockMeshBuilder.build_block_mesh(
+	var mesh: ArrayMesh = BlockMeshBuilder.build_block_mesh(
 		_block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, centroid, true)
+	_mesh_instance.mesh = mesh
+	# Cache faces from surface arrays (instant) instead of get_faces() (10-30ms GPU readback)
+	if mesh and mesh.get_surface_count() > 0:
+		var arrays := mesh.surface_get_arrays(0)
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
+		_cached_faces.resize(indices.size())
+		for i in indices.size():
+			_cached_faces[i] = verts[indices[i]]
