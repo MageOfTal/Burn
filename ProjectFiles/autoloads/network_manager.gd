@@ -188,8 +188,10 @@ func host_game(port: int = NetConstants.DEFAULT_PORT) -> Error:
 	return OK
 
 
+var _host_start_time: int = 0
+
 func _start_host() -> void:
-	var t_host := Time.get_ticks_msec()
+	_host_start_time = Time.get_ticks_msec()
 	print("[Server] _start_host() — beginning host setup...")
 	_show_loading_screen("Loading game map...")
 	var t := Time.get_ticks_msec()
@@ -207,6 +209,7 @@ func _start_host() -> void:
 
 func _on_structures_complete_lobby() -> void:
 	## Callback: heavy structures finished building. Enter lobby.
+	print("[STARTUP] Host button → lobby: %dms" % (Time.get_ticks_msec() - _host_start_time))
 	_hide_loading_screen()
 	# Register host as lobby-ready
 	_lobby_ready_peers.clear()

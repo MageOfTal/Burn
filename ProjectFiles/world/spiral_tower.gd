@@ -223,11 +223,11 @@ func _build_tower() -> void:
 	# Paint the spiral shape using spheres along the core and ramp paths
 	await _paint_tower_shape()
 
-	# Remove the temporary viewer — once painted, the tower data is stored
-	# by VoxelStreamMemory and no longer needs active streaming.
+	# Keep the viewer — VoxelTerrain needs it to render blocks, not just stream them.
+	# The viewer stays at the tower center so all tower blocks remain visible.
 	if _temp_viewer and is_instance_valid(_temp_viewer):
-		_temp_viewer.queue_free()
-		print("[SpiralTower] Removed temporary VoxelViewer")
+		_temp_viewer.name = "TowerViewer"
+		print("[SpiralTower] Keeping VoxelViewer for rendering")
 
 	_is_built = true
 	generation_complete.emit()

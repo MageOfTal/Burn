@@ -20,6 +20,7 @@ var _mesh_instance: MeshInstance3D
 var _collision_shape: CollisionShape3D
 var _terrain_body: StaticBody3D  # shared body from TerrainSystem
 var _debug_collision_mesh: MeshInstance3D
+var _bake_mesh_arrays: Array = []  # saved for baking (verts, normals, indices)
 
 static var _debug_material: StandardMaterial3D
 

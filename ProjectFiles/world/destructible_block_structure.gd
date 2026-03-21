@@ -1236,9 +1236,9 @@ func _rebuild_smooth_collision_mesh() -> void:
 		PhysicsServer3D.free_rid(_smooth_shape_rid)
 		_smooth_shape_rid = RID()
 
-	if _mesh_instance == null or _mesh_instance.mesh == null:
-		return
-
+	# If cached faces are stale (destruction path), rebuild from grid
+	if _cached_faces.is_empty():
+		_cached_faces = _build_faces_from_grid()
 	if _cached_faces.is_empty():
 		return
 
