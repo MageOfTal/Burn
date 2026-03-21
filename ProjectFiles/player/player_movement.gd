@@ -520,18 +520,6 @@ func process_normal_movement(delta: float) -> void:
 	var hvel := Vector3(player.velocity.x, 0.0, player.velocity.z)
 	var hspeed := hvel.length()
 
-	# Landing redirect: on the frame we land, if input direction differs from
-	# velocity direction, project velocity onto input. Kills perpendicular
-	# momentum from turning in the air so you go where you're pressing.
-	if _is_grounded and not _was_grounded and direction != Vector3.ZERO and hspeed > 0.1:
-		var forward_speed: float = hvel.dot(direction)
-		var old_hvel := hvel
-		hvel = direction * maxf(forward_speed, 0.0)
-		hspeed = hvel.length()
-		player.velocity.x = hvel.x
-		player.velocity.z = hvel.z
-		print("[LAND_REDIRECT] old=(%.2f,%.2f) dir=(%.2f,%.2f) fwd=%.2f new=(%.2f,%.2f)" % [
-			old_hvel.x, old_hvel.z, direction.x, direction.z, forward_speed, hvel.x, hvel.z])
 	# Cap current speed to wall-adjusted max so hitting a wall at an angle
 	# immediately reduces speed to the trigonometric fraction
 	if wall_speed_fraction < 1.0 and hspeed > max_speed:
@@ -572,6 +560,13 @@ func process_normal_movement(delta: float) -> void:
 		hvel = _process_air_movement(hvel, hspeed, direction, max_speed, accel, delta)
 
 	_dbg_cur["move_hvel_after"] = hvel
+
+	if GameManager.debug_dynamic_contact_log:
+		var angle := rad_to_deg(atan2(direction.x, direction.z)) if direction != Vector3.ZERO else -999.0
+		var vel_angle := rad_to_deg(atan2(hvel.x, hvel.z)) if hvel.length() > 0.1 else -999.0
+		var rot_deg := rad_to_deg(player.rotation.y)
+		print("[DIR] rot=%.0f dir_angle=%.0f vel_angle=%.0f hspeed=%.1f grounded=%s" % [
+			rot_deg, angle, vel_angle, hvel.length(), str(_is_grounded)])
 
 	player.velocity.x = hvel.x
 	player.velocity.z = hvel.z
@@ -656,19 +651,9 @@ func _do_snap(snap_dist: float) -> bool:
 					_is_grounded = true
 					_floor_normal = rest.normal
 					_has_floor_contact = true
-				# Landing: restore airborne hvel projected onto current input
-				# direction, then slope-project vel.y.
-				var snap_input: Vector2 = player.player_input.input_direction
-				var snap_dir := (player.transform.basis * Vector3(snap_input.x, 0, snap_input.y))
-				snap_dir.y = 0.0
-				if snap_dir.length_squared() > 0.01:
-					snap_dir = snap_dir.normalized()
-					var snap_fwd: float = maxf(_airborne_hvel.dot(snap_dir), 0.0)
-					player.velocity.x = snap_dir.x * snap_fwd
-					player.velocity.z = snap_dir.z * snap_fwd
-				else:
-					player.velocity.x = _airborne_hvel.x
-					player.velocity.z = _airborne_hvel.z
+				# Landing: restore airborne hvel + slope-project vel.y
+				player.velocity.x = _airborne_hvel.x
+				player.velocity.z = _airborne_hvel.z
 				var n: Vector3 = rest.normal
 				player.velocity.y = -(n.x * player.velocity.x + n.z * player.velocity.z) / n.y
 				return true
@@ -766,11 +751,11 @@ func _process_ground_movement(hvel: Vector3, hspeed: float, direction: Vector3, 
 						check_dir = check_dir.normalized()
 						wall_projected = true
 					break
-		if wall_projected or hspeed <= DIME_STOP_SPEED:
-			var vel_along := hvel.dot(check_dir)
-			if vel_along < 0.0:
-				hvel -= check_dir * vel_along
-				hspeed = hvel.length()
+		var vel_along := hvel.dot(check_dir)
+		var just_landed := _is_grounded and not _was_grounded
+		if vel_along < 0.0 and (wall_projected or just_landed or hspeed <= DIME_STOP_SPEED):
+			hvel -= check_dir * vel_along
+			hspeed = hvel.length()
 
 	# Accelerate toward input direction up to max speed
 	var vel_toward_target := hvel.dot(hdir)
@@ -818,6 +803,13 @@ func _process_air_movement(hvel: Vector3, hspeed: float, direction: Vector3, max
 		var speed_add := accel * delta
 		var new_toward := minf(vel_toward_target + speed_add, max_speed)
 		hvel += hdir * (new_toward - vel_toward_target)
+
+	# Don't let air acceleration push total speed above max.
+	# Without this, turning in the air adds perpendicular velocity that
+	# exceeds max_speed, and on landing the ground code can't steer.
+	var new_speed := hvel.length()
+	if new_speed > max_speed:
+		hvel = hvel.normalized() * max_speed
 
 	return hvel
 
