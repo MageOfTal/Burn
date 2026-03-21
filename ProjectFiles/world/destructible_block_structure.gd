@@ -56,6 +56,7 @@ var _compound_body_script: GDScript = preload("res://world/compound_hit_body.gd"
 ## Greedy mesh — single MeshInstance3D for the entire structure
 var _mesh_instance: MeshInstance3D = null
 var _mesh_dirty: bool = false
+var _integrity_check_pending: bool = false
 
 ## Smooth collision — single StaticBody3D for player physics (layer 12, bit 2048).
 ## Compound hit body handles weapon raycasts on layer 11 (bit 1024).
@@ -442,6 +443,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
+		_cached_faces = PackedVector3Array()
 		_rebuild_smooth_collision_mesh()
 		var spd := DebrisHelper.calc_hitscan_speed(ok_frac)
 		_sync_block_destroyed.rpc(key, block_pos, blast_origin, debris_count, spd)
@@ -449,12 +451,11 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		# Host also spawns debris locally (RPC is call_remote, host needs it too).
 		_spawn_debris(block_pos, blast_origin, debris_count, spd)
 
-		# Check if destroying this block left floating islands
-		_check_structural_integrity()
-
-		if _block_hp_dict.is_empty():
-			_clear_physics_before_free()
-			queue_free()
+		# Defer structural integrity check to end of frame so multi-pellet
+		# damage (shotgun) applies all hits before checking for detachment.
+		if not _integrity_check_pending:
+			_integrity_check_pending = true
+			call_deferred("_deferred_integrity_check")
 
 
 @rpc("authority", "call_remote", "reliable")
@@ -468,6 +469,7 @@ func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)
+		_cached_faces = PackedVector3Array()
 		_rebuild_smooth_collision_mesh()
 
 	# Spawn cosmetic debris on the client.
@@ -600,6 +602,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	if destroyed_keys.size() > 0:
 		_mesh_dirty = true
 		set_process(true)
+		_cached_faces = PackedVector3Array()
 		_rebuild_smooth_collision_mesh()
 	var t_columns_end := Time.get_ticks_usec()
 
@@ -701,12 +704,10 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	_sync_block_destroyed.rpc(target_key, block_pos, hit_world_pos, debris_count, spd)
 	_spawn_debris(block_pos, hit_world_pos, debris_count, spd)
 
-	# Structural integrity check (may detach more blocks)
-	if not _block_hp_dict.is_empty():
-		_check_structural_integrity()
-	if _block_hp_dict.is_empty():
-		_clear_physics_before_free()
-		queue_free()
+	# Defer structural integrity check to end of frame
+	if not _block_hp_dict.is_empty() and not _integrity_check_pending:
+		_integrity_check_pending = true
+		call_deferred("_deferred_integrity_check")
 
 	return { "absorbed": absorbed, "block_destroyed": true,
 		"block_key": target_key, "block_pos": block_pos }
@@ -736,6 +737,15 @@ func _spawn_debris(block_pos: Vector3, blast_center: Vector3, count: int,
 # After any block destruction, checks if remaining blocks are still connected
 # to the ground row (y=0). Unsupported blocks detach as FallingBlockCluster
 # physics objects that fall, deal contact damage, and sync across network.
+
+func _deferred_integrity_check() -> void:
+	## Runs at end of frame after all damage in this tick is applied.
+	_integrity_check_pending = false
+	_check_structural_integrity()
+	if _block_hp_dict.is_empty():
+		_clear_physics_before_free()
+		queue_free()
+
 
 func _check_structural_integrity() -> void:
 	## Server-only: find blocks not connected to ground and detach them.
@@ -879,6 +889,7 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 
 		_mesh_dirty = true
 		set_process(true)
+		_cached_faces = PackedVector3Array()
 		_rebuild_smooth_collision_mesh()
 	var t_client_cleanup_end := Time.get_ticks_usec()
 
