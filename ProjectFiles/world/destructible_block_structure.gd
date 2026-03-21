@@ -1259,21 +1259,77 @@ func _rebuild_smooth_collision_mesh() -> void:
 var _cached_faces: PackedVector3Array = PackedVector3Array()
 
 func _rebuild_greedy_mesh() -> void:
-	_cached_faces = PackedVector3Array()
 	if _mesh_instance == null:
 		return
 	if _block_hp_dict.is_empty():
 		_mesh_instance.mesh = null
+		_cached_faces = PackedVector3Array()
 		return
 	var centroid := Vector3(_num_x, _num_y, _num_z) * BLOCK_SIZE * 0.5
-	var mesh: ArrayMesh = BlockMeshBuilder.build_block_mesh(
+	_mesh_instance.mesh = BlockMeshBuilder.build_block_mesh(
 		_block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, centroid, true)
-	_mesh_instance.mesh = mesh
-	# Cache faces from surface arrays (instant) instead of get_faces() (10-30ms GPU readback)
-	if mesh and mesh.get_surface_count() > 0:
-		var arrays := mesh.surface_get_arrays(0)
-		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-		var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
-		_cached_faces.resize(indices.size())
-		for i in indices.size():
-			_cached_faces[i] = verts[indices[i]]
+	# Build collision faces from the block grid directly — never touch the mesh.
+	# The grid is a flat array with O(1) lookups, no GPU readback.
+	_cached_faces = _build_faces_from_grid()
+
+
+func _build_faces_from_grid() -> PackedVector3Array:
+	## Build collision triangle faces from the flat occupancy grid.
+	## Uses O(1) array lookups — no Dictionary, no GPU readback.
+	var faces := PackedVector3Array()
+	faces.resize(_block_hp_dict.size() * 36)
+	var fi := 0
+	var bs := BLOCK_SIZE
+	var hs := bs * 0.5
+	var half_x := _num_x * bs * 0.5
+	var half_y := _num_y * bs * 0.5
+	var half_z := _num_z * bs * 0.5
+	var ny_nz := _num_y * _num_z
+
+	for bx in _num_x:
+		for by in _num_y:
+			for bz in _num_z:
+				if not _block_grid[bx * ny_nz + by * _num_z + bz]:
+					continue
+				var cx: float = (bx + 0.5) * bs - half_x
+				var cy: float = (by + 0.5) * bs - half_y
+				var cz: float = (bz + 0.5) * bs - half_z
+
+				# +X
+				if bx + 1 >= _num_x or not _block_grid[(bx + 1) * ny_nz + by * _num_z + bz]:
+					var x := cx + hs
+					faces[fi] = Vector3(x, cy - hs, cz - hs); faces[fi+1] = Vector3(x, cy - hs, cz + hs); faces[fi+2] = Vector3(x, cy + hs, cz + hs)
+					faces[fi+3] = Vector3(x, cy - hs, cz - hs); faces[fi+4] = Vector3(x, cy + hs, cz + hs); faces[fi+5] = Vector3(x, cy + hs, cz - hs)
+					fi += 6
+				# -X
+				if bx - 1 < 0 or not _block_grid[(bx - 1) * ny_nz + by * _num_z + bz]:
+					var x := cx - hs
+					faces[fi] = Vector3(x, cy - hs, cz + hs); faces[fi+1] = Vector3(x, cy - hs, cz - hs); faces[fi+2] = Vector3(x, cy + hs, cz - hs)
+					faces[fi+3] = Vector3(x, cy - hs, cz + hs); faces[fi+4] = Vector3(x, cy + hs, cz - hs); faces[fi+5] = Vector3(x, cy + hs, cz + hs)
+					fi += 6
+				# +Y
+				if by + 1 >= _num_y or not _block_grid[bx * ny_nz + (by + 1) * _num_z + bz]:
+					var y := cy + hs
+					faces[fi] = Vector3(cx - hs, y, cz - hs); faces[fi+1] = Vector3(cx + hs, y, cz - hs); faces[fi+2] = Vector3(cx + hs, y, cz + hs)
+					faces[fi+3] = Vector3(cx - hs, y, cz - hs); faces[fi+4] = Vector3(cx + hs, y, cz + hs); faces[fi+5] = Vector3(cx - hs, y, cz + hs)
+					fi += 6
+				# -Y
+				if by - 1 < 0 or not _block_grid[bx * ny_nz + (by - 1) * _num_z + bz]:
+					var y := cy - hs
+					faces[fi] = Vector3(cx - hs, y, cz + hs); faces[fi+1] = Vector3(cx + hs, y, cz + hs); faces[fi+2] = Vector3(cx + hs, y, cz - hs)
+					faces[fi+3] = Vector3(cx - hs, y, cz + hs); faces[fi+4] = Vector3(cx + hs, y, cz - hs); faces[fi+5] = Vector3(cx - hs, y, cz - hs)
+					fi += 6
+				# +Z
+				if bz + 1 >= _num_z or not _block_grid[bx * ny_nz + by * _num_z + bz + 1]:
+					var z := cz + hs
+					faces[fi] = Vector3(cx + hs, cy - hs, z); faces[fi+1] = Vector3(cx - hs, cy - hs, z); faces[fi+2] = Vector3(cx - hs, cy + hs, z)
+					faces[fi+3] = Vector3(cx + hs, cy - hs, z); faces[fi+4] = Vector3(cx - hs, cy + hs, z); faces[fi+5] = Vector3(cx + hs, cy + hs, z)
+					fi += 6
+				# -Z
+				if bz - 1 < 0 or not _block_grid[bx * ny_nz + by * _num_z + bz - 1]:
+					var z := cz - hs
+					faces[fi] = Vector3(cx - hs, cy - hs, z); faces[fi+1] = Vector3(cx + hs, cy - hs, z); faces[fi+2] = Vector3(cx + hs, cy + hs, z)
+					faces[fi+3] = Vector3(cx - hs, cy - hs, z); faces[fi+4] = Vector3(cx + hs, cy + hs, z); faces[fi+5] = Vector3(cx - hs, cy + hs, z)
+					fi += 6
+	faces.resize(fi)
+	return faces

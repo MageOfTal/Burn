@@ -186,6 +186,11 @@ func reset_world() -> void:
 		_terrain_system.reset()
 		print("[SeedWorld] Terrain system reset (craters cleared)")
 
+	# Clear structure bakes (positions change on reset due to RNG)
+	for path in [WALL_BAKE_PATH, RAMP_BAKE_PATH]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
+
 	# --- 2. Destroy all structures (walls, ramps, tower) ---
 	var structures := get_node_or_null("Structures")
 	if structures:
@@ -341,76 +346,55 @@ func _apply_crater(world_pos: Vector3, radius: float) -> void:
 #  Structure spawning (walls, ramps, spawns, loot, dummies)
 # ======================================================================
 
+const WALL_BAKE_PATH := "res://terrain/wall_bake.bin"
+
 func _spawn_walls_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn destructible walls, yielding every few walls to keep the
-	## loading screen responsive and let the engine process frames.
 	var wall_scene := preload("res://world/destructible_wall.tscn")
-	var wall_sizes := [
-		Vector3(10, 4, 1),
-		Vector3(8, 3, 1),
-		Vector3(12, 5, 1),
-		Vector3(6, 3, 2),
-		Vector3(14, 4, 1),
-	]
-	var tier_weights := [0.30, 0.35, 0.25, 0.10]
+
+	# Try loading baked wall parameters
+	var wall_params: Array = _load_wall_bake()
+	if wall_params.is_empty():
+		wall_params = _generate_wall_params(rng)
+		_save_wall_bake(wall_params)
+
+	var t_total := Time.get_ticks_usec()
+	var t_inst := 0
+	var t_add := 0
 	var spawned := 0
 
-	for i in num_walls:
-		var wall_size: Vector3 = wall_sizes[rng.randi() % wall_sizes.size()]
-		var y_rot := rng.randf_range(0, TAU)
-
-		var roll := rng.randf()
-		var tier: int = 0
-		var cumulative := 0.0
-		for t in tier_weights.size():
-			cumulative += tier_weights[t]
-			if roll <= cumulative:
-				tier = t
-				break
-
-		var pos := _get_random_ground_pos(rng, wall_size.y * 0.5, 30.0)
-		if pos == Vector3.INF:
-			continue
-
-		# Skip if inside tower exclusion zone
-		if _tower_position != Vector3.INF:
-			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
-			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
-				continue
-
+	for p in wall_params:
+		var t0 := Time.get_ticks_usec()
 		var wall: Node3D = wall_scene.instantiate()
 		wall.name = "Wall_%d" % spawned
-		wall.wall_size = wall_size
-		wall.wall_tier = tier
-		wall.position = pos
-		wall.rotation.y = y_rot
+		wall.wall_size = p["size"]
+		wall.wall_tier = p["tier"]
+		wall.position = p["pos"]
+		wall.rotation.y = p["rot"]
+		var t1 := Time.get_ticks_usec()
 		parent.add_child(wall)
+		var t2 := Time.get_ticks_usec()
+		t_inst += t1 - t0
+		t_add += t2 - t1
 		spawned += 1
 
 		if spawned % 50 == 0:
 			await get_tree().process_frame
 
-	print("[SeedWorld] Spawned %d walls" % spawned)
+	print("[SeedWorld] Spawned %d walls (inst=%dms add=%dms total=%dms)" % [
+		spawned, t_inst / 1000, t_add / 1000, (Time.get_ticks_usec() - t_total) / 1000])
 
 
-func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn destructible ramps, yielding every batch to spread load.
-	var ramp_scene := preload("res://world/destructible_ramp.tscn")
-	var ramp_sizes := [
-		Vector3(4, 0.5, 8),
-		Vector3(3, 0.5, 6),
-		Vector3(5, 0.5, 10),
-		Vector3(3, 0.5, 5),
+func _generate_wall_params(rng: RandomNumberGenerator) -> Array:
+	var wall_sizes := [
+		Vector3(10, 4, 1), Vector3(8, 3, 1), Vector3(12, 5, 1),
+		Vector3(6, 3, 2), Vector3(14, 4, 1),
 	]
-	var angles_deg := [15.0, 20.0, 25.0, 30.0]
-	var tier_weights := [0.35, 0.35, 0.20, 0.10]
-	var spawned := 0
+	var tier_weights := [0.30, 0.35, 0.25, 0.10]
+	var params: Array = []
 
-	for i in num_ramps:
-		var ramp_size: Vector3 = ramp_sizes[rng.randi() % ramp_sizes.size()]
-		var ramp_angle: float = angles_deg[rng.randi() % angles_deg.size()]
+	for i in num_walls:
+		var wall_size: Vector3 = wall_sizes[rng.randi() % wall_sizes.size()]
 		var y_rot := rng.randf_range(0, TAU)
-
 		var roll := rng.randf()
 		var tier: int = 0
 		var cumulative := 0.0
@@ -419,32 +403,112 @@ func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 			if roll <= cumulative:
 				tier = t
 				break
-
-		var pos := _get_random_ground_pos(rng, 0.3, 25.0)
+		var pos := _get_random_ground_pos(rng, wall_size.y * 0.5, 30.0)
 		if pos == Vector3.INF:
 			continue
-
-		# Skip if inside tower exclusion zone
 		if _tower_position != Vector3.INF:
 			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
 			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
 				continue
+		params.append({"size": wall_size, "tier": tier, "pos": pos, "rot": y_rot})
 
+	return params
+
+
+func _save_wall_bake(params: Array) -> void:
+	var f := FileAccess.open(WALL_BAKE_PATH, FileAccess.WRITE)
+	if f:
+		f.store_var(params, true)
+		f.close()
+
+
+func _load_wall_bake() -> Array:
+	if not FileAccess.file_exists(WALL_BAKE_PATH):
+		return []
+	var f := FileAccess.open(WALL_BAKE_PATH, FileAccess.READ)
+	if not f:
+		return []
+	var data = f.get_var(true)
+	f.close()
+	if data is Array:
+		return data
+	return []
+
+
+const RAMP_BAKE_PATH := "res://terrain/ramp_bake.bin"
+
+func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
+	var ramp_scene := preload("res://world/destructible_ramp.tscn")
+
+	var ramp_params: Array = _load_ramp_bake()
+	if ramp_params.is_empty():
+		ramp_params = _generate_ramp_params(rng)
+		_save_ramp_bake(ramp_params)
+
+	var spawned := 0
+	for p in ramp_params:
 		var ramp: Node3D = ramp_scene.instantiate()
 		ramp.name = "Ramp_%d" % spawned
-		ramp.ramp_size = ramp_size
-		ramp.ramp_tier = tier
-		ramp.position = pos
-		ramp.rotation.y = y_rot
-		ramp.rotation.x = deg_to_rad(ramp_angle)
+		ramp.ramp_size = p["size"]
+		ramp.ramp_tier = p["tier"]
+		ramp.position = p["pos"]
+		ramp.rotation.y = p["rot_y"]
+		ramp.rotation.x = p["rot_x"]
 		parent.add_child(ramp)
 		spawned += 1
-
-		# Yield every 5 ramps (each builds a block grid like walls)
-		if spawned % 5 == 0:
+		if spawned % 50 == 0:
 			await get_tree().process_frame
 
 	print("[SeedWorld] Spawned %d destructible ramps" % spawned)
+
+
+func _generate_ramp_params(rng: RandomNumberGenerator) -> Array:
+	var ramp_sizes := [
+		Vector3(4, 0.5, 8), Vector3(3, 0.5, 6),
+		Vector3(5, 0.5, 10), Vector3(3, 0.5, 5),
+	]
+	var angles_deg := [15.0, 20.0, 25.0, 30.0]
+	var tier_weights := [0.35, 0.35, 0.20, 0.10]
+	var params: Array = []
+	for i in num_ramps:
+		var ramp_size: Vector3 = ramp_sizes[rng.randi() % ramp_sizes.size()]
+		var ramp_angle: float = angles_deg[rng.randi() % angles_deg.size()]
+		var y_rot := rng.randf_range(0, TAU)
+		var roll := rng.randf()
+		var tier: int = 0
+		var cumulative := 0.0
+		for t in tier_weights.size():
+			cumulative += tier_weights[t]
+			if roll <= cumulative:
+				tier = t
+				break
+		var pos := _get_random_ground_pos(rng, 0.3, 25.0)
+		if pos == Vector3.INF:
+			continue
+		if _tower_position != Vector3.INF:
+			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
+			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
+				continue
+		params.append({"size": ramp_size, "tier": tier, "pos": pos, "rot_y": y_rot, "rot_x": deg_to_rad(ramp_angle)})
+	return params
+
+
+func _save_ramp_bake(params: Array) -> void:
+	var f := FileAccess.open(RAMP_BAKE_PATH, FileAccess.WRITE)
+	if f:
+		f.store_var(params, true)
+		f.close()
+
+
+func _load_ramp_bake() -> Array:
+	if not FileAccess.file_exists(RAMP_BAKE_PATH):
+		return []
+	var f := FileAccess.open(RAMP_BAKE_PATH, FileAccess.READ)
+	if not f:
+		return []
+	var data = f.get_var(true)
+	f.close()
+	return data if data is Array else []
 
 
 func _spawn_smooth_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
