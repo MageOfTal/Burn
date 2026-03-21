@@ -387,8 +387,7 @@ func _spawn_walls_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 		parent.add_child(wall)
 		spawned += 1
 
-		# Yield every 5 walls so the loading screen stays responsive
-		if spawned % 5 == 0:
+		if spawned % 50 == 0:
 			await get_tree().process_frame
 
 	print("[SeedWorld] Spawned %d walls" % spawned)

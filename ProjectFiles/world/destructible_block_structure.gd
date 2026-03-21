@@ -64,9 +64,10 @@ var _collision_body: StaticBody3D = null
 
 ## Temporary storage for hit bodies being reparented to a falling cluster.
 ## Populated by _detach_clusters(), consumed by _sync_cluster_detach() (call_local).
-## Column shape tracking — direct PhysicsServer3D RIDs (no CollisionShape3D nodes).
-var _col_shape_rids: Dictionary = {}    # Vector2i → Array[RID]
-var _col_shape_xforms: Dictionary = {}  # Vector2i → Array[Transform3D]
+## Smooth collision mesh shape RID (ConcavePolygonShape3D / trimesh).
+## Jolt's MeshShape has internal edge smoothing — eliminates ghost collisions
+## at block boundaries that compound box shapes suffer from.
+var _smooth_shape_rid: RID = RID()
 
 ## Cached debris config from subclass (populated in _ready)
 var _debris_size: float = 0.15
@@ -293,7 +294,14 @@ func _ready() -> void:
 	set_process(false)
 
 
+func _exit_tree() -> void:
+	if _smooth_shape_rid.is_valid():
+		PhysicsServer3D.free_rid(_smooth_shape_rid)
+		_smooth_shape_rid = RID()
+
+
 func _process(_delta: float) -> void:
+	Profiler.begin("destructible_mesh")
 	# Deferred mesh rebuild: blocks were destroyed, rebuild once then sleep
 	if _mesh_dirty:
 		_mesh_dirty = false
@@ -304,13 +312,16 @@ func _process(_delta: float) -> void:
 		print("[GreedyMesh] %s  blocks=%d  time=%dus" % [name, _block_hp_dict.size(), _mesh_us])
 		GameManager.frame_add("greedy_mesh", _mesh_us)
 		set_process(false)
+	Profiler.end("destructible_mesh")
 
 
 const DETACH_FALL_GRAVITY := 17.5  ## Same as player gravity (m/s²)
 
 func _physics_process(delta: float) -> void:
+	Profiler.begin("destructible_physics")
 	if not _is_falling:
 		set_physics_process(false)
+		Profiler.end("destructible_physics")
 		return
 
 	_fall_velocity += DETACH_FALL_GRAVITY * delta
@@ -340,6 +351,7 @@ func _physics_process(delta: float) -> void:
 		if global_position.y < -200:
 			_clear_physics_before_free()
 			queue_free()
+	Profiler.end("destructible_physics")
 
 
 func _clear_physics_before_free() -> void:
@@ -430,7 +442,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
-		_rebuild_column_batched(key.x, key.z)
+		_rebuild_smooth_collision_mesh()
 		var spd := DebrisHelper.calc_hitscan_speed(ok_frac)
 		_sync_block_destroyed.rpc(key, block_pos, blast_origin, debris_count, spd)
 
@@ -456,7 +468,7 @@ func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 		_block_grid[_grid_idx(key.x, key.y, key.z)] = 0
 		_mesh_dirty = true
 		set_process(true)
-		_rebuild_column_batched(key.x, key.z)
+		_rebuild_smooth_collision_mesh()
 
 	# Spawn cosmetic debris on the client.
 	if debris_count > 0:
@@ -585,27 +597,10 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	var t_debris_end := Time.get_ticks_usec()
 
 	var t_columns := Time.get_ticks_usec()
-	var num_columns_rebuilt := 0
-	var col_body_rid := RID()
-	var t_col_rebuild := Time.get_ticks_usec()
 	if destroyed_keys.size() > 0:
 		_mesh_dirty = true
 		set_process(true)
-		col_body_rid = _collision_body.get_rid()
-		PhysicsServer3D.body_set_shapes_bulk_mode(col_body_rid, true)
-		var rebuilt_columns: Dictionary = {}
-		for key in destroyed_keys:
-			var col_key := Vector2i(key.x, key.z)
-			if not rebuilt_columns.has(col_key):
-				rebuilt_columns[col_key] = true
-				_rebuild_column(key.x, key.z)
-				num_columns_rebuilt += 1
-	var t_col_rebuild_end := Time.get_ticks_usec()
-	var t_col_commit := Time.get_ticks_usec()
-	if destroyed_keys.size() > 0:
-		_commit_all_shapes()
-		PhysicsServer3D.body_set_shapes_bulk_mode(col_body_rid, false)
-	var t_col_commit_end := Time.get_ticks_usec()
+		_rebuild_smooth_collision_mesh()
 	var t_columns_end := Time.get_ticks_usec()
 
 	# Batch structural integrity check after all blocks destroyed this frame
@@ -616,12 +611,12 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 
 	var t_total_end := Time.get_ticks_usec()
 	var _total_us := t_total_end - t_total
-	print("[TakeDamageAt] %s  blocks=%d  pass1=%dus(query=%d calc=%d)  erase=%dus  debris=%dus(rpcs=%d spawned=%d rpc_time=%d spawn_time=%d)  columns=%dus(%d rebuild=%d commit=%d)  integrity=%dus  destroyed=%d  total=%dus" % [
+	print("[TakeDamageAt] %s  blocks=%d  pass1=%dus(query=%d calc=%d)  erase=%dus  debris=%dus(rpcs=%d spawned=%d rpc_time=%d spawn_time=%d)  collision=%dus  integrity=%dus  destroyed=%d  total=%dus" % [
 		name, _block_hp_dict.size(),
 		t_pass1_end - t_pass1, t_query_setup_end - t_query_setup, t_calc_explosion_end - t_calc_explosion,
 		t_erase_end - t_erase,
 		t_debris_end - t_debris, rpc_count, debris_spawn_count, t_debris_rpcs_end - t_debris_rpcs, t_debris_spawn_end - t_debris_spawn,
-		t_columns_end - t_columns, num_columns_rebuilt, t_col_rebuild_end - t_col_rebuild, t_col_commit_end - t_col_commit,
+		t_columns_end - t_columns,
 		t_integrity_end - t_integrity,
 		destroyed_keys.size(),
 		_total_us,
@@ -697,7 +692,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	_block_grid[_grid_idx(target_key.x, target_key.y, target_key.z)] = 0
 	_mesh_dirty = true
 	set_process(true)
-	_rebuild_column_batched(target_key.x, target_key.z)
+	_rebuild_smooth_collision_mesh()
 	_update_compound_shielding_hp()
 
 	# Sync destruction + debris to clients
@@ -835,22 +830,11 @@ func _detach_clusters(components: Array) -> void:
 	_update_compound_shielding_hp()
 	var t_erase_end := Time.get_ticks_usec()
 
-	# ── Rebuild columns: single bulk-mode session, deduplicated ──
+	# ── Rebuild smooth collision mesh ──
 	var t_col := Time.get_ticks_usec()
 	_mesh_dirty = true
 	set_process(true)
-	var body_rid := _collision_body.get_rid()
-	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, true)
-	var rebuilt_columns: Dictionary = {}
-	var num_col_rebuilt := 0
-	for key in all_valid_keys:
-		var col_key := Vector2i(key.x, key.z)
-		if not rebuilt_columns.has(col_key):
-			rebuilt_columns[col_key] = true
-			_rebuild_column(key.x, key.z)
-			num_col_rebuilt += 1
-	_commit_all_shapes()
-	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, false)
+	_rebuild_smooth_collision_mesh()
 	var t_col_end := Time.get_ticks_usec()
 
 	# ── RPC each cluster to all peers ──
@@ -860,11 +844,11 @@ func _detach_clusters(components: Array) -> void:
 			_last_attacker_id, _num_x, _num_y, _num_z, _get_block_mass())
 	var t_rpc_end := Time.get_ticks_usec()
 
-	print("[DetachClusters] %s  components=%d  blocks=%d  collect=%dus  erase=%dus  columns=%dus(%d)  rpc=%dus  total=%dus" % [
+	print("[DetachClusters] %s  components=%d  blocks=%d  collect=%dus  erase=%dus  collision=%dus  rpc=%dus  total=%dus" % [
 		name, cluster_data.size(), all_valid_keys.size(),
 		t_collect_end - t_collect,
 		t_erase_end - t_erase,
-		t_col_end - t_col, num_col_rebuilt,
+		t_col_end - t_col,
 		t_rpc_end - t_rpc,
 		Time.get_ticks_usec() - t_total,
 	])
@@ -895,18 +879,7 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 
 		_mesh_dirty = true
 		set_process(true)
-		if _collision_body != null and is_instance_valid(_collision_body):
-			var body_rid := _collision_body.get_rid()
-			PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, true)
-			var rebuilt_columns: Dictionary = {}
-			for key_variant in block_keys:
-				var key: Vector3i = key_variant
-				var col_key := Vector2i(key.x, key.z)
-				if not rebuilt_columns.has(col_key):
-					rebuilt_columns[col_key] = true
-					_rebuild_column(key.x, key.z)
-			_commit_all_shapes()
-			PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, false)
+		_rebuild_smooth_collision_mesh()
 	var t_client_cleanup_end := Time.get_ticks_usec()
 
 	var t_type_convert := Time.get_ticks_usec()
@@ -1236,113 +1209,41 @@ func _add_cluster_column_shape(cluster: RigidBody3D,
 # column when blocks are destroyed.
 
 func _build_smooth_collision() -> void:
-	## Create the smooth collision body and populate all column shapes.
+	## Create the smooth collision body with a ConcavePolygonShape3D (trimesh).
+	## Jolt's MeshShape has built-in internal edge smoothing: coplanar adjacent
+	## triangles share "inactive" edges that don't generate ghost contacts.
+	## This eliminates the speed-eating ghost collisions that compound box shapes
+	## suffer from at block boundaries.
 	_collision_body = StaticBody3D.new()
 	_collision_body.name = "SmoothCollision"
 	_collision_body.collision_layer = CollisionLayers.WALL_SMOOTH
 	_collision_body.collision_mask = 0
 	add_child(_collision_body)
-
-	var body_rid := _collision_body.get_rid()
-	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, true)
-	for bx in _num_x:
-		for bz in _num_z:
-			_build_column_shapes(bx, bz)
-	_commit_all_shapes()
-	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, false)
+	_rebuild_smooth_collision_mesh()
 
 
-func _rebuild_column(bx: int, bz: int) -> void:
-	## Free old shape RIDs for this column and build new shape data.
-	## Does NOT touch the body — call _commit_all_shapes() after.
-	var col_key := Vector2i(bx, bz)
-	if _col_shape_rids.has(col_key):
-		for rid: RID in _col_shape_rids[col_key]:
-			PhysicsServer3D.free_rid(rid)
-	_build_column_shapes(bx, bz)
-
-
-func _rebuild_column_batched(bx: int, bz: int) -> void:
-	## Rebuild a single column with bulk shape mode (single compound rebuild).
+func _rebuild_smooth_collision_mesh() -> void:
+	## Rebuild the trimesh collision shape from the greedy mesh faces.
 	if _collision_body == null or not is_instance_valid(_collision_body):
 		return
-	var body_rid := _collision_body.get_rid()
-	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, true)
-	_rebuild_column(bx, bz)
-	_commit_all_shapes()
-	PhysicsServer3D.body_set_shapes_bulk_mode(body_rid, false)
 
-
-func _commit_all_shapes() -> void:
-	## Clear all shapes from body and re-add from tracked RIDs.
-	if _collision_body == null or not is_instance_valid(_collision_body):
-		return
 	var body_rid := _collision_body.get_rid()
 	PhysicsServer3D.body_clear_shapes(body_rid)
-	for col_key: Vector2i in _col_shape_rids:
-		var rids: Array = _col_shape_rids[col_key]
-		var xforms: Array = _col_shape_xforms[col_key]
-		for i in rids.size():
-			PhysicsServer3D.body_add_shape(body_rid, rids[i], xforms[i])
 
+	if _smooth_shape_rid.is_valid():
+		PhysicsServer3D.free_rid(_smooth_shape_rid)
+		_smooth_shape_rid = RID()
 
-func _build_column_shapes(bx: int, bz: int) -> void:
-	## Scan blocks in this column, find contiguous Y runs, create shape RIDs.
-	if _collision_body == null or not is_instance_valid(_collision_body):
+	if _mesh_instance == null or _mesh_instance.mesh == null:
 		return
 
-	var col_key := Vector2i(bx, bz)
-	var rids: Array[RID] = []
-	var xforms: Array[Transform3D] = []
-
-	# Collect which Y indices still have blocks in this column (flat array lookup)
-	var y_present: Array[int] = []
-	var base_idx := bx * _num_y * _num_z + bz
-	for by in _num_y:
-		if _block_grid[base_idx + by * _num_z] == 1:
-			y_present.append(by)
-
-	if y_present.is_empty():
-		_col_shape_rids[col_key] = rids
-		_col_shape_xforms[col_key] = xforms
+	var faces := _mesh_instance.mesh.get_faces()
+	if faces.is_empty():
 		return
 
-	# Find contiguous runs
-	var run_start: int = y_present[0]
-	var run_end: int = y_present[0]
-
-	for i in range(1, y_present.size()):
-		if y_present[i] == run_end + 1:
-			run_end = y_present[i]
-		else:
-			_add_column_shape_rid(rids, xforms, bx, bz, run_start, run_end)
-			run_start = y_present[i]
-			run_end = y_present[i]
-
-	# Emit final run
-	_add_column_shape_rid(rids, xforms, bx, bz, run_start, run_end)
-
-	_col_shape_rids[col_key] = rids
-	_col_shape_xforms[col_key] = xforms
-
-
-func _add_column_shape_rid(rids: Array[RID], xforms: Array[Transform3D],
-		bx: int, bz: int, by_start: int, by_end: int) -> void:
-	## Create a box shape RID for a contiguous vertical run (no scene tree nodes).
-	var run_count: int = by_end - by_start + 1
-	var run_height: float = run_count * BLOCK_SIZE
-	var half_extents := Vector3(BLOCK_SIZE * 0.5, run_height * 0.5, BLOCK_SIZE * 0.5)
-
-	var shape_rid := PhysicsServer3D.box_shape_create()
-	PhysicsServer3D.shape_set_data(shape_rid, half_extents)
-
-	# Position in structure local space (same coordinate system as _spawn_block)
-	var cx: float = (bx + 0.5 - _num_x * 0.5) * BLOCK_SIZE
-	var cy: float = ((by_start + by_end) * 0.5 + 0.5 - _num_y * 0.5) * BLOCK_SIZE
-	var cz: float = (bz + 0.5 - _num_z * 0.5) * BLOCK_SIZE
-
-	rids.append(shape_rid)
-	xforms.append(Transform3D(Basis.IDENTITY, Vector3(cx, cy, cz)))
+	_smooth_shape_rid = PhysicsServer3D.concave_polygon_shape_create()
+	PhysicsServer3D.shape_set_data(_smooth_shape_rid, {"faces": faces, "backface_collision": false})
+	PhysicsServer3D.body_add_shape(body_rid, _smooth_shape_rid)
 
 
 # ======================================================================
@@ -1357,144 +1258,9 @@ func _add_column_shape_rid(rids: Array[RID], xforms: Array[Transform3D],
 func _rebuild_greedy_mesh() -> void:
 	if _mesh_instance == null:
 		return
-
 	if _block_hp_dict.is_empty():
 		_mesh_instance.mesh = null
 		return
-
-	var block_count := _block_hp_dict.size()
-	var max_verts := block_count * 24  # 6 faces * 4 verts
-	var max_idx := block_count * 36    # 6 faces * 6 indices
-
-	var verts := PackedVector3Array()
-	verts.resize(max_verts)
-	var norms := PackedVector3Array()
-	norms.resize(max_verts)
-	var uv_arr := PackedVector2Array()
-	uv_arr.resize(max_verts)
-	var idx := PackedInt32Array()
-	idx.resize(max_idx)
-
-	var vi := 0
-	var ii := 0
-	var half_x := _num_x * BLOCK_SIZE * 0.5
-	var half_y := _num_y * BLOCK_SIZE * 0.5
-	var half_z := _num_z * BLOCK_SIZE * 0.5
-	var bs := BLOCK_SIZE
-	var hs := bs * 0.5
-
-	for key: Vector3i in _block_hp_dict:
-		var bx: int = key.x
-		var by: int = key.y
-		var bz: int = key.z
-
-		var cx: float = (bx + 0.5) * bs - half_x
-		var cy: float = (by + 0.5) * bs - half_y
-		var cz: float = (bz + 0.5) * bs - half_z
-
-		# +X face
-		if not _block_hp_dict.has(Vector3i(bx + 1, by, bz)):
-			var n := Vector3.RIGHT
-			var x := cx + hs
-			var p0 := Vector3(x, cy - hs, cz - hs)
-			var p1 := Vector3(x, cy - hs, cz + hs)
-			var p2 := Vector3(x, cy + hs, cz + hs)
-			var p3 := Vector3(x, cy + hs, cz - hs)
-			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
-			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
-			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
-			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-
-		# -X face
-		if not _block_hp_dict.has(Vector3i(bx - 1, by, bz)):
-			var n := Vector3.LEFT
-			var x := cx - hs
-			var p0 := Vector3(x, cy - hs, cz + hs)
-			var p1 := Vector3(x, cy - hs, cz - hs)
-			var p2 := Vector3(x, cy + hs, cz - hs)
-			var p3 := Vector3(x, cy + hs, cz + hs)
-			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
-			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
-			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
-			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-
-		# +Y face (top)
-		if not _block_hp_dict.has(Vector3i(bx, by + 1, bz)):
-			var n := Vector3.UP
-			var y := cy + hs
-			var p0 := Vector3(cx - hs, y, cz - hs)
-			var p1 := Vector3(cx + hs, y, cz - hs)
-			var p2 := Vector3(cx + hs, y, cz + hs)
-			var p3 := Vector3(cx - hs, y, cz + hs)
-			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
-			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
-			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
-			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-
-		# -Y face (bottom)
-		if not _block_hp_dict.has(Vector3i(bx, by - 1, bz)):
-			var n := Vector3.DOWN
-			var y := cy - hs
-			var p0 := Vector3(cx - hs, y, cz + hs)
-			var p1 := Vector3(cx + hs, y, cz + hs)
-			var p2 := Vector3(cx + hs, y, cz - hs)
-			var p3 := Vector3(cx - hs, y, cz - hs)
-			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
-			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
-			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
-			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-
-		# +Z face
-		if not _block_hp_dict.has(Vector3i(bx, by, bz + 1)):
-			var n := Vector3.BACK
-			var z := cz + hs
-			var p0 := Vector3(cx + hs, cy - hs, z)
-			var p1 := Vector3(cx - hs, cy - hs, z)
-			var p2 := Vector3(cx - hs, cy + hs, z)
-			var p3 := Vector3(cx + hs, cy + hs, z)
-			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
-			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
-			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
-			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-
-		# -Z face
-		if not _block_hp_dict.has(Vector3i(bx, by, bz - 1)):
-			var n := Vector3.FORWARD
-			var z := cz - hs
-			var p0 := Vector3(cx - hs, cy - hs, z)
-			var p1 := Vector3(cx + hs, cy - hs, z)
-			var p2 := Vector3(cx + hs, cy + hs, z)
-			var p3 := Vector3(cx - hs, cy + hs, z)
-			var face_uvs := _compute_quad_uvs(n, p0, p1, p2, p3)
-			verts[vi] = p0; verts[vi + 1] = p1; verts[vi + 2] = p2; verts[vi + 3] = p3
-			norms[vi] = n; norms[vi + 1] = n; norms[vi + 2] = n; norms[vi + 3] = n
-			uv_arr[vi] = face_uvs[0]; uv_arr[vi + 1] = face_uvs[1]; uv_arr[vi + 2] = face_uvs[2]; uv_arr[vi + 3] = face_uvs[3]
-			idx[ii] = vi; idx[ii + 1] = vi + 1; idx[ii + 2] = vi + 2
-			idx[ii + 3] = vi; idx[ii + 4] = vi + 2; idx[ii + 5] = vi + 3
-			vi += 4; ii += 6
-
-	verts.resize(vi); norms.resize(vi); uv_arr.resize(vi); idx.resize(ii)
-	var arrays := []
-	arrays.resize(Mesh.ARRAY_MAX)
-	arrays[Mesh.ARRAY_VERTEX] = verts
-	arrays[Mesh.ARRAY_NORMAL] = norms
-	arrays[Mesh.ARRAY_TEX_UV] = uv_arr
-	arrays[Mesh.ARRAY_INDEX] = idx
-	var mesh := ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-	_mesh_instance.mesh = mesh
+	var centroid := Vector3(_num_x, _num_y, _num_z) * BLOCK_SIZE * 0.5
+	_mesh_instance.mesh = BlockMeshBuilder.build_block_mesh(
+		_block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, centroid, true)
