@@ -21,6 +21,10 @@ ProjectFiles/export/
 ProjectFiles/*.exe
 ProjectFiles/*.pck
 
+# --- Webview addons (unused, contain large redistributables) ---
+ProjectFiles/addons/godot_cef/
+ProjectFiles/addons/godot_wry/
+
 # --- Engine: ignore everything, then whitelist patched files + binaries ---
 # Must un-ignore each directory level for negation to work.
 Engine/**
