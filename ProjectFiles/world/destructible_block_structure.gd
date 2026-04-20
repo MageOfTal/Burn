@@ -1284,6 +1284,11 @@ func _check_structural_integrity() -> void:
 		return
 	if _is_detached_structure:
 		return
+	if _foundation_pending:
+		# _ground_mask is still zero-initialized; solver would treat all blocks
+		# as unanchored and detach the entire structure. Skip until the first
+		# physics tick has populated it via _deferred_build_foundation().
+		return
 
 	Profiler.begin("struct_integrity")
 	var t_si_total := Time.get_ticks_usec()

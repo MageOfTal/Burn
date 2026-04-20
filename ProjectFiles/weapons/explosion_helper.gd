@@ -262,13 +262,14 @@ static func do_explosion(
 
 	var t_explosion_total_end := Time.get_ticks_usec()
 	var explosion_us := t_explosion_total_end - t_explosion_total
-	print("[DoExplosion] sphere=%dus(%d results)  damage=%dus(players=%d structs=%d objs=%d)  player_scan=%dus(%d)  impulse=%d  total=%dus" % [
-		t_sphere_end - t_sphere, results.size(),
-		t_pass1_process_end - t_pass1_process, pass1_players, pass1_structures, pass1_objects,
-		t_pass2_players_end - t_pass2_players, pass2_players,
-		impulse_count,
-		explosion_us,
-	])
+	if GameManager.debug_explosion_diagnostics:
+		print("[DoExplosion] sphere=%dus(%d results)  damage=%dus(players=%d structs=%d objs=%d)  player_scan=%dus(%d)  impulse=%d  total=%dus" % [
+			t_sphere_end - t_sphere, results.size(),
+			t_pass1_process_end - t_pass1_process, pass1_players, pass1_structures, pass1_objects,
+			t_pass2_players_end - t_pass2_players, pass2_players,
+			impulse_count,
+			explosion_us,
+		])
 	GameManager.tick_add("do_explosion", explosion_us)
 	Profiler.end("do_explosion")
 

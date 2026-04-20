@@ -57,11 +57,14 @@ func _process(delta: float) -> void:
 # ── Public API: systems call these ──────────────────────────────────
 
 func begin(timer_name: String) -> void:
+	if _frame_timers.has(timer_name):
+		push_warning("Profiler.begin('%s') called twice without matching end() — first interval lost" % timer_name)
 	_frame_timers[timer_name] = Time.get_ticks_usec()
 
 
 func end(timer_name: String) -> void:
 	if not _frame_timers.has(timer_name):
+		push_warning("Profiler.end('%s') called without matching begin()" % timer_name)
 		return
 	var elapsed: int = Time.get_ticks_usec() - _frame_timers[timer_name]
 	_frame_timers.erase(timer_name)
