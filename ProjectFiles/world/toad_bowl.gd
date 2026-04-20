@@ -4,14 +4,11 @@ extends Node3D
 ## persistent toads that bounce around forever, never despawning.
 ## Used to test player push physics without needing the toad dimension.
 ##
-## The bowl is an actual semi-sphere built from rings of angled collision panels
-## that approximate a smooth concave interior. Toads bounce off the curved walls
-## and stay contained. A ramp leads up to the rim so the player can walk in.
+## The bowl is a smooth concave hemisphere using trimesh collision (no seams).
+## Toads bounce off the curved walls and stay contained. A ramp leads up to the
+## rim so the player can walk in.
 
 const BOWL_RADIUS: float = 8.0      ## Radius of the hemisphere
-const RING_COUNT: int = 6           ## Latitude rings from bottom pole to equator (rim)
-const SEGMENTS_PER_RING: int = 24   ## Panels around each ring
-const PANEL_THICKNESS: float = 0.4  ## Collision panel thickness
 const TOAD_COUNT: int = 60          ## Number of persistent toads
 const TOAD_SCALE: float = 0.35      ## Collision radius
 const _ToadBody := preload("res://world/toad_body.gd")
@@ -57,21 +54,13 @@ func build(center: Vector3) -> void:
 
 
 func _build_hemisphere() -> void:
-	## Build a concave hemisphere from rings of box collision panels (invisible)
-	## with a single smooth SphereMesh visual on top.
-	##
-	## Each ring is at a latitude angle from 0 (bottom pole) to PI/2 (equator/rim).
-	## Panels are positioned on the sphere surface and angled to face inward.
-	## The collision panels approximate the smooth concave interior.
+	## Build a smooth concave hemisphere with trimesh collision (no panel seams).
+	## Visual mesh and collision share the same geometry.
 	##
 	## Coordinate system: bowl center (bottom pole) is at local origin (0,0,0).
-	## The hemisphere opens upward. A point on the sphere at latitude phi and
-	## longitude theta is:
-	##   x = R * sin(phi) * cos(theta)
-	##   z = R * sin(phi) * sin(theta)
-	##   y = R * (1 - cos(phi))     [shifted so bottom pole is at Y=0]
+	## The hemisphere opens upward, rim (equator) at Y = BOWL_RADIUS.
 
-	# --- Smooth visual mesh: procedural hemisphere (inside faces only) ---
+	# --- Step 1: Create visual mesh ---
 	var bowl_mat := StandardMaterial3D.new()
 	bowl_mat.albedo_color = Color(0.2, 0.5, 0.15)  # Earthy green
 
@@ -81,44 +70,70 @@ func _build_hemisphere() -> void:
 	visual.material_override = bowl_mat
 	visual.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(visual)
+	print("[ToadBowl] Step 1: Visual mesh added, surfaces=%d" % visual.mesh.get_surface_count())
 
-	# --- Invisible collision panels (same as before, but no visual meshes) ---
-	for ring_i in RING_COUNT:
-		var phi: float = (float(ring_i) + 1.0) / float(RING_COUNT) * (PI / 2.0)
-		var phi_next: float = (float(ring_i) + 2.0) / float(RING_COUNT) * (PI / 2.0)
-		if ring_i == RING_COUNT - 1:
-			phi_next = PI / 2.0  # Stop exactly at the equator — no overshoot, open top
+	# --- Step 2: Extract raw arrays from mesh (same data we put in) ---
+	var arrays := visual.mesh.surface_get_arrays(0)
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
+	print("[ToadBowl] Step 2: Extracted %d verts, %d indices from mesh" % [verts.size(), indices.size()])
 
-		var ring_r: float = BOWL_RADIUS * sin(phi)
-		var ring_y: float = BOWL_RADIUS * (1.0 - cos(phi))
-		var arc_len: float = BOWL_RADIUS * (phi_next - phi)
-		var tilt_angle: float = phi
+	if verts.size() == 0 or indices.size() == 0:
+		push_error("[ToadBowl] ERROR: mesh arrays are empty!")
+		return
 
-		var segs: int = maxi(8, SEGMENTS_PER_RING)
-		var panel_width: float = 2.0 * ring_r * sin(PI / segs)
+	# --- Step 3: Build collision faces from verts + indices (same as sine ramps) ---
+	var faces := PackedVector3Array()
+	faces.resize(indices.size())
+	for t in range(indices.size()):
+		faces[t] = verts[indices[t]]
+	print("[ToadBowl] Step 3: Built %d face verts (%d triangles)" % [faces.size(), faces.size() / 3])
 
-		for seg_i in segs:
-			var mid_theta: float = TAU * (seg_i + 0.5) / segs
+	# Print bounds to verify geometry covers the right space
+	var min_pos := faces[0]
+	var max_pos := faces[0]
+	for i in range(1, faces.size()):
+		min_pos.x = minf(min_pos.x, faces[i].x)
+		min_pos.y = minf(min_pos.y, faces[i].y)
+		min_pos.z = minf(min_pos.z, faces[i].z)
+		max_pos.x = maxf(max_pos.x, faces[i].x)
+		max_pos.y = maxf(max_pos.y, faces[i].y)
+		max_pos.z = maxf(max_pos.z, faces[i].z)
+	print("[ToadBowl] Step 3: Bounds min=%s max=%s" % [min_pos, max_pos])
 
-			var px: float = cos(mid_theta) * ring_r
-			var pz: float = sin(mid_theta) * ring_r
-			var py: float = ring_y
+	# Sample triangles: first, middle, last
+	print("[ToadBowl]   tri[0]: %s, %s, %s" % [faces[0], faces[1], faces[2]])
+	var mid: int = (faces.size() / 3 / 2) * 3
+	print("[ToadBowl]   tri[%d]: %s, %s, %s" % [mid / 3, faces[mid], faces[mid + 1], faces[mid + 2]])
+	var last: int = faces.size() - 3
+	print("[ToadBowl]   tri[%d]: %s, %s, %s" % [last / 3, faces[last], faces[last + 1], faces[last + 2]])
 
-			var body := StaticBody3D.new()
-			body.collision_layer = CollisionLayers.WORLD
-			body.collision_mask = 0
+	# --- Step 4: Create ConcavePolygonShape3D ---
+	var col_shape := ConcavePolygonShape3D.new()
+	col_shape.backface_collision = true
+	col_shape.set_faces(faces)
 
-			var col := CollisionShape3D.new()
-			var shape := BoxShape3D.new()
-			shape.size = Vector3(panel_width, arc_len, PANEL_THICKNESS)
-			col.shape = shape
-			body.add_child(col)
+	# Verify faces were stored
+	var stored := col_shape.get_faces()
+	print("[ToadBowl] Step 4: ConcavePolygonShape3D created, backface=%s, stored_faces=%d (expected %d)" % [
+		col_shape.backface_collision, stored.size(), faces.size()])
 
-			body.position = Vector3(px, py, pz)
-			body.rotation.y = -mid_theta
-			body.rotation.x = -(PI / 2.0 - tilt_angle)
+	# --- Step 5: Create collision body ---
+	var col_node := CollisionShape3D.new()
+	col_node.shape = col_shape
 
-			add_child(body)
+	var col_body := StaticBody3D.new()
+	col_body.collision_layer = CollisionLayers.WORLD
+	col_body.collision_mask = 0
+	col_body.name = "BowlCollision"
+	col_body.add_child(col_node)
+	add_child(col_body)
+
+	print("[ToadBowl] Step 5: BowlCollision added — layer=%d mask=%d local_pos=%s global_pos=%s" % [
+		col_body.collision_layer, col_body.collision_mask,
+		col_body.position, col_body.global_position])
+	print("[ToadBowl]   col_node.shape is null: %s, disabled: %s" % [
+		col_node.shape == null, col_node.disabled])
 
 
 func _build_ramp() -> void:
@@ -136,7 +151,7 @@ func _build_ramp() -> void:
 	var ramp_len: float = sqrt(rise * rise + run * run)
 	var ramp_angle: float = atan2(rise, run)
 	var ramp_width: float = 3.5
-	var ramp_thickness: float = 0.3
+	var ramp_thickness: float = 0.6  # Must exceed capsule radius 0.4 to prevent phase-through
 
 	var body := StaticBody3D.new()
 	body.collision_layer = CollisionLayers.WORLD
@@ -207,7 +222,7 @@ func _spawn_toads() -> void:
 
 		# Higher bounce so they stay lively in the bowl
 		var phys_mat := PhysicsMaterial.new()
-		phys_mat.bounce = 0.7
+		phys_mat.bounce = 0.3
 		phys_mat.friction = 0.3
 		toad.physics_material_override = phys_mat
 

@@ -69,6 +69,7 @@ public:
 
 	inline static float collision_margin_fraction;
 	inline static float active_edge_threshold_cos;
+	inline static bool boundary_edges_active;
 
 	inline static JoltJointWorldNode joint_world_node;
 

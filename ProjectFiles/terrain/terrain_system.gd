@@ -62,6 +62,8 @@ func setup(noise: FastNoiseLite, height_range: float, material: Material) -> voi
 	_terrain_body.collision_layer = CollisionLayers.WORLD
 	_terrain_body.collision_mask = 0
 	add_child(_terrain_body)
+	# Tag 3 = TERRAIN in the shielding system — infinite absorption (impassable).
+	PhysicsServer3D.body_set_shielding_tag(_terrain_body.get_rid(), 3)
 
 	# Create a pool of meshers for background threads (one per worker)
 	for i in MESHER_POOL_SIZE:
@@ -246,9 +248,14 @@ func _process(_delta: float) -> void:
 		_stream_frame = 0
 		Profiler.begin("terrain_stream_update")
 		var positions := _get_player_positions()
-		var info: Dictionary = _streaming.update(positions, _chunks)
-		_stream_to_unload = info["to_unload"]
-		_stream_to_load = info["to_load"]
+		var loaded_keys: Array = _chunks.keys()
+		var pos_packed := PackedVector3Array(positions)
+		var min_by := -1
+		var max_by := int(ceil(_height_range / 16.0)) + 1
+		var info: Dictionary = BlockMeshBuilder.calc_streaming_update(
+			pos_packed, loaded_keys, VIEW_DISTANCE, 16, min_by, max_by)
+		_stream_to_unload.assign(info["to_unload"])
+		_stream_to_load.assign(info["to_load"])
 		# Unload immediately (cheap)
 		for bp: Vector3i in _stream_to_unload:
 			if not _pending.has(bp):

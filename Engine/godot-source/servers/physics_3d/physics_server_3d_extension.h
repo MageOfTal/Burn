@@ -160,7 +160,7 @@ public:
 	virtual PackedFloat32Array calc_ray_shielding_batch(const RayParameters &p_base_params, const PackedVector3Array &p_to_points, const TypedArray<RID> &p_target_bodies, const PackedFloat32Array &p_max_absorptions) override {
 		return PackedFloat32Array();
 	}
-	virtual Dictionary calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp) override {
+	virtual Dictionary calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp, const RID &p_compound_body = RID()) override {
 		return Dictionary();
 	}
 	virtual PackedInt32Array calc_structural_integrity(const PackedByteArray &p_block_grid, int p_num_x, int p_num_y, int p_num_z, int p_total_blocks) override {

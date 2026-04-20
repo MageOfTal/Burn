@@ -146,10 +146,6 @@ func enter(attacker: Player, victim: Player) -> void:
 	_apply_toad_collision(attacker)
 	_apply_toad_collision(victim)
 
-	# Disable VoxelViewers (no voxel terrain at Y=-500)
-	_set_voxel_viewer_enabled(attacker, false)
-	_set_voxel_viewer_enabled(victim, false)
-
 	# Teleport players to the toad arena — spread them out per pair
 	var pair_offset := Vector3(randf_range(-8, 8), 0, randf_range(-8, 8))
 	var attacker_pos := _arena_center + pair_offset + Vector3(-3, 0, 0)
@@ -196,7 +192,9 @@ func _register_player(player: Player, overworld_pos: Vector3) -> void:
 
 
 func _physics_process(delta: float) -> void:
+	Profiler.begin("toad_dimension")
 	if not multiplayer.is_server():
+		Profiler.end("toad_dimension")
 		return
 
 	# Tick each player's individual exit timer
@@ -236,6 +234,7 @@ func _physics_process(delta: float) -> void:
 	# If nobody is in the dimension, despawn all toads immediately
 	if not anyone_inside and not _toads_despawning and _shared_toads_container and _shared_toads_container.get_child_count() > 0:
 		_clear_all_toads()
+	Profiler.end("toad_dimension")
 
 
 func _process(_delta: float) -> void:
@@ -257,9 +256,6 @@ func _exit_player(peer_id: int) -> void:
 
 		# Restore original collision layers
 		_restore_collision(data)
-
-		# Re-enable VoxelViewer for terrain streaming
-		_set_voxel_viewer_enabled(data.player, true)
 
 		if data.player.is_alive:
 			data.player.global_position = _get_safe_return_pos(data.saved_pos)
@@ -298,16 +294,6 @@ func _restore_collision(data: PlayerToadData) -> void:
 	if is_instance_valid(data.player):
 		data.player.collision_layer = data.saved_collision_layer
 		data.player.collision_mask = data.saved_collision_mask
-
-
-func _set_voxel_viewer_enabled(player: Player, enabled: bool) -> void:
-	## Enable/disable the VoxelViewer child to prevent streaming at Y=-500.
-	var viewer := player.get_node_or_null("VoxelViewer")
-	if viewer:
-		viewer.set_process(enabled)
-		viewer.set_physics_process(enabled)
-		if viewer.has_method("set_enabled"):
-			viewer.set_enabled(enabled)
 
 
 # ======================================================================
@@ -1092,7 +1078,6 @@ func reset() -> void:
 		if is_instance_valid(data.player):
 			data.player.in_toad_dimension = false
 			_restore_collision(data)
-			_set_voxel_viewer_enabled(data.player, true)
 
 	_players.clear()
 	_rain_duration = 0.0

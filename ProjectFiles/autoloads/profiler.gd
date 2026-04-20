@@ -86,11 +86,22 @@ func _refresh() -> void:
 	_physics_active = int(Performance.get_monitor(Performance.PHYSICS_3D_ACTIVE_OBJECTS))
 	_physics_pairs = int(Performance.get_monitor(Performance.PHYSICS_3D_COLLISION_PAIRS))
 
+	# GPU rendering breakdown
+	var gpu_time_ms := Performance.get_monitor(Performance.TIME_NAVIGATION_PROCESS) * 1000.0  # approximate
+	var render_ms := _frame_time_ms - _physics_time_ms
+
+	# RenderingServer stats
+	var rs := RenderingServer
+	var vram_tex := rs.get_rendering_info(rs.RENDERING_INFO_TEXTURE_MEM_USED) / (1024 * 1024)
+	var vram_buf := rs.get_rendering_info(rs.RENDERING_INFO_BUFFER_MEM_USED) / (1024 * 1024)
+	var vram_total := rs.get_rendering_info(rs.RENDERING_INFO_VIDEO_MEM_USED) / (1024 * 1024)
+
 	var text := "[b]PROFILER (F11)[/b]\n"
-	text += "[color=yellow]FPS: %.0f  Frame: %.1fms  Physics: %.1fms[/color]\n" % [
-		_fps, _frame_time_ms, _physics_time_ms]
+	text += "[color=yellow]FPS: %.0f  Frame: %.1fms  Physics: %.1fms  Render: %.1fms[/color]\n" % [
+		_fps, _frame_time_ms, _physics_time_ms, render_ms]
 	text += "Draw calls: %d  Primitives: %dk  Objects: %d\n" % [
 		_render_draw_calls, _render_primitives / 1000, _render_objects]
+	text += "VRAM: %dMB (tex=%dMB buf=%dMB)\n" % [vram_total, vram_tex, vram_buf]
 	text += "Physics bodies: %d  Pairs: %d\n" % [_physics_active, _physics_pairs]
 	text += "\n[b]System Timings[/b] (avg / worst / calls)\n"
 
@@ -117,9 +128,9 @@ func _refresh() -> void:
 	_label.text = text
 
 	# Print to log for offline analysis
-	var log_line := "[PROFILER] FPS=%.0f frame=%.1fms phys=%.1fms draws=%d prims=%dk bodies=%d pairs=%d" % [
-		_fps, _frame_time_ms, _physics_time_ms, _render_draw_calls,
-		_render_primitives / 1000, _physics_active, _physics_pairs]
+	var log_line := "[PROFILER] FPS=%.0f frame=%.1fms phys=%.1fms render=%.1fms draws=%d prims=%dk objs=%d vram=%dMB bodies=%d pairs=%d" % [
+		_fps, _frame_time_ms, _physics_time_ms, render_ms, _render_draw_calls,
+		_render_primitives / 1000, _render_objects, vram_total, _physics_active, _physics_pairs]
 	for timer_name in sorted_names:
 		var t: Dictionary = _timers[timer_name]
 		if t["count"] == 0:

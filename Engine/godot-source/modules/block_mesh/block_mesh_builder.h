@@ -118,15 +118,31 @@ public:
 	/// (compression, tension, shear), bounded by material limits from p_max_load.
 	/// p_ground_mask: same size as p_block_grid. 1 = block is terrain-supported
 	///   (provides unlimited reaction force). If empty, falls back to y=0 as ground.
+	/// p_external_load: same size as p_block_grid. Extra downward force per block
+	///   in block-weights (e.g. player mass / block_mass on contact blocks).
+	///   If empty, only self-weight (1.0 per block) is used.
 	/// p_max_load: max compression per face in block-weights (tensile=30%, shear=40%).
 	/// p_horizontal_transfer: lateral load distribution factor (0=vertical only, 1=full).
 	Array calc_stress_integrity_components(
 			const PackedByteArray &p_block_grid,
 			const PackedByteArray &p_ground_mask,
+			const PackedFloat32Array &p_external_load,
 			int p_num_x, int p_num_y, int p_num_z,
 			int p_total_blocks,
 			float p_max_load,
 			float p_horizontal_transfer);
+
+	/// Terrain streaming: compute which chunks to load/unload.
+	/// All math done natively — no GDScript Dictionary overhead.
+	/// p_player_positions: world positions of all players.
+	/// p_loaded_chunks: Vector3i array of currently loaded chunk positions.
+	/// Returns Dictionary { "to_load": Array[Vector3i], "to_unload": Array[Vector3i] }
+	Dictionary calc_streaming_update(
+			const PackedVector3Array &p_player_positions,
+			const Array &p_loaded_chunks,
+			float p_view_distance,
+			int p_chunk_size,
+			int p_min_by, int p_max_by);
 
 	/// Build collision triangle faces from a flat occupancy grid.
 	/// For each occupied cell, emits triangles for exposed faces (neighbor check).

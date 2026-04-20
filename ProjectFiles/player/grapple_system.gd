@@ -146,6 +146,8 @@ var _contact_center_mat: StandardMaterial3D = null         # Bright cyan (center
 var _contact_cloud_mat: StandardMaterial3D = null          # Dim cyan (cloud points)
 var _contact_arc_mat: StandardMaterial3D = null            # Green-blue (arc contacts)
 var _contact_sphere_mat: StandardMaterial3D = null         # White semi-transparent (radius sphere)
+var _safe_zone_mat: StandardMaterial3D = null              # Green semi-transparent (no-sever radius)
+var _safe_zone_mesh_instance: MeshInstance3D = null
 
 ## Pill debug state — set by server obstruction check, read by client visuals.
 ## 0 = clear, 1 = blocked.  Index 0 = left half (swing direction), 1 = right half.
@@ -221,6 +223,12 @@ func setup(p: Player) -> void:
 	_contact_sphere_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	_contact_sphere_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	_contact_sphere_mat.no_depth_test = true
+
+	_safe_zone_mat = StandardMaterial3D.new()
+	_safe_zone_mat.albedo_color = Color(0.2, 1.0, 0.3, 0.25)
+	_safe_zone_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_safe_zone_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	_safe_zone_mat.no_depth_test = true
 
 	# Pre-create half-capsule shapes for pill obstruction checks
 	_left_half_shape = ConvexPolygonShape3D.new()
@@ -713,10 +721,10 @@ func _is_rope_obstructed() -> bool:
 	var space_state := player.get_world_3d().direct_space_state
 	var player_chest: Vector3 = player.global_position + Vector3(0, 1.2, 0)
 
-	# Exclude self, anchor collider, and all other players
+	# Exclude self and all other players (NOT the anchor collider — the
+	# ROPE_LOS_MARGIN safe zone handles near-anchor hits, and excluding a
+	# large monolithic body like terrain would make the entire body invisible).
 	var excludes: Array[RID] = [player.get_rid()]
-	if _anchor_collider_rid.is_valid():
-		excludes.append(_anchor_collider_rid)
 	for peer_id in NetworkManager.players:
 		var other_player: Player = NetworkManager.players[peer_id]
 		if other_player and other_player != player:
@@ -773,6 +781,7 @@ func _is_rope_obstructed() -> bool:
 		_center_sweep_shape.points = PackedVector3Array([
 			prev_chest + offset, player_chest + offset, anchor_point + offset,
 			prev_chest - offset, player_chest - offset, anchor_point - offset])
+		_center_sweep_query.shape = _center_sweep_shape
 		_center_sweep_query.transform = Transform3D.IDENTITY
 		_center_sweep_query.exclude = excludes
 		var sweep_overlaps := space_state.intersect_shape(_center_sweep_query, 8)
@@ -1345,7 +1354,7 @@ func _do_release(with_boost: bool) -> void:
 	# When boosted on the ground, force airborne so the upward velocity
 	# component actually launches the player instead of being pinned to the floor.
 	if boosted and player.is_on_floor():
-		player.movement._is_grounded = false
+		player.movement.force_airborne()
 
 	_show_grapple_release.rpc(release_pos)
 	if boosted:
@@ -1493,6 +1502,21 @@ func client_process_visuals(_delta: float) -> void:
 		_build_pill_visual(player_hand)
 		_build_contact_debug_visual()
 
+	# --- Safe zone sphere (independent toggle) ---
+	_free_visual(_safe_zone_mesh_instance)
+	_safe_zone_mesh_instance = null
+	if GameManager.debug_grapple_safe_zone:
+		var sz_im := ImmediateMesh.new()
+		_safe_zone_mesh_instance = MeshInstance3D.new()
+		_safe_zone_mesh_instance.mesh = sz_im
+		_safe_zone_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_safe_zone_mesh_instance.top_level = true
+		_safe_zone_mesh_instance.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+		_draw_debug_sphere_wireframe(sz_im, _safe_zone_mat, anchor_point, ROPE_LOS_MARGIN, 24, 12)
+		var scene_root := get_tree().current_scene
+		if scene_root:
+			scene_root.add_child(_safe_zone_mesh_instance)
+
 
 func _build_rope_ribbon(im: ImmediateMesh, from: Vector3, to: Vector3, cam_pos: Vector3) -> void:
 	var rope_vec: Vector3 = to - from
@@ -1535,6 +1559,8 @@ func cleanup() -> void:
 	_pill_mesh_instance = null
 	_free_visual(_contact_mesh_instance)
 	_contact_mesh_instance = null
+	_free_visual(_safe_zone_mesh_instance)
+	_safe_zone_mesh_instance = null
 
 
 # ======================================================================

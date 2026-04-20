@@ -75,10 +75,20 @@ var _col_shape_count: int = 0          ## Number of shapes added to this body
 
 var _settle_timer: float = 0.0
 var _mesh_dirty: bool = false
-## Cached child node ref for mesh rebuild (set in init_cluster_blocks)
+## Visual: either a MeshInstance3D node (old path) or a RenderingServer RID (fast path).
 var _mesh_instance: MeshInstance3D = null
+var _visual_rid: RID = RID()  ## RenderingServer instance (fast path, no node)
+var _visual_mesh_ref: Mesh = null  ## Mesh resource ref (prevents GC — keeps RID valid)
 ## Per-tick contact counter — tracks how many body_entered signals fire per physics frame
 var _contacts_this_tick: int = 0
+
+## Stress solver: periodic structural integrity check with external forces.
+var _stress_check_timer: float = 0.0
+const STRESS_CHECK_INTERVAL := 0.5  ## seconds between stress checks while contacts exist
+const CLUSTER_MAX_LOAD := 12.0      ## max compression per face in block-weights
+const CLUSTER_H_TRANSFER := 0.6     ## lateral load distribution
+var _has_ground_contact: bool = false
+var _active_body_contacts: Dictionary = {}  ## body_rid -> mass (for external load)
 
 # ======================================================================
 #  Debris config — set by structure before add_child via set_debris_config()
@@ -115,7 +125,7 @@ func init_cluster_blocks(block_hp_dict: Dictionary, num_x: int, num_y: int,
 	if _mesh_instance == null:
 		_mesh_instance = MeshInstance3D.new()
 		_mesh_instance.name = "ClusterMesh"
-		_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		add_child(_mesh_instance)
 
 	# Create shared hit shape and compound hit body (need RIDs for build_cluster)
@@ -170,10 +180,40 @@ func init_cluster_blocks(block_hp_dict: Dictionary, num_x: int, num_y: int,
 		name, block_hp_dict.size(), _t_init_us])
 
 
+var _cached_material: StandardMaterial3D = null
+
 func set_material(mat: StandardMaterial3D) -> void:
 	## Set the material for the cluster mesh.
+	_cached_material = mat
 	if _mesh_instance:
 		_mesh_instance.material_override = mat
+	elif _visual_rid.is_valid() and mat:
+		RenderingServer.instance_geometry_set_material_override(_visual_rid, mat.get_rid())
+
+
+func get_cluster_material() -> StandardMaterial3D:
+	if _cached_material:
+		return _cached_material
+	if _mesh_instance and _mesh_instance.material_override:
+		return _mesh_instance.material_override
+	return null
+
+
+func set_visual_mesh(mesh: Mesh) -> void:
+	## Set the mesh on the RenderingServer visual instance (fast path).
+	if not _visual_rid.is_valid():
+		return
+	_visual_mesh_ref = mesh  # prevent GC — mesh RID must stay valid
+	if mesh:
+		RenderingServer.instance_set_base(_visual_rid, mesh.get_rid())
+
+
+func init_visual_rid(scenario: RID) -> void:
+	## Create a RenderingServer visual instance instead of a MeshInstance3D node.
+	_visual_rid = RenderingServer.instance_create()
+	RenderingServer.instance_set_scenario(_visual_rid, scenario)
+	RenderingServer.instance_geometry_set_cast_shadows_setting(
+		_visual_rid, RenderingServer.SHADOW_CASTING_SETTING_ON)
 
 
 func set_debris_config(size: float, lifetime: float, dmass: float,
@@ -189,6 +229,7 @@ func set_debris_config(size: float, lifetime: float, dmass: float,
 func _ready() -> void:
 	if multiplayer.is_server():
 		body_entered.connect(_on_body_entered)
+		body_exited.connect(_on_body_exited)
 	else:
 		freeze = true
 		freeze_mode = RigidBody3D.FREEZE_MODE_KINEMATIC
@@ -196,7 +237,6 @@ func _ready() -> void:
 
 
 func _exit_tree() -> void:
-	# Clear shape references so BoxShape3D resources are freed.
 	_col_shapes.clear()
 	_col_shape_count = 0
 
@@ -232,24 +272,32 @@ func _physics_process(delta: float) -> void:
 			PhysicsServer3D.BODY_STATE_TRANSFORM,
 			global_transform)
 
+	# Sync visual RID transform (fast path — no MeshInstance3D node)
+	if _visual_rid.is_valid():
+		RenderingServer.instance_set_transform(_visual_rid, global_transform)
+
 	if not multiplayer.is_server():
 		GameManager.tick_add("cluster_tick", Time.get_ticks_usec() - _t0)
 		Profiler.end("falling_cluster")
 		return
 
-	# Log per-tick contact count (reset after logging)
-	if _contacts_this_tick > 0:
-		print("[ClusterPerf] %s: %d body_entered contacts this tick, vel=%.1f angvel=%.1f" % [
-			name, _contacts_this_tick, linear_velocity.length(), angular_velocity.length()])
-		_contacts_this_tick = 0
+	_contacts_this_tick = 0
 
 	# Freeze on settle: if moving slowly for long enough, stop simulating
 	if linear_velocity.length() < SETTLE_SPEED:
 		_settle_timer += delta
 		if _settle_timer >= SETTLE_TIME:
 			sleeping = true
+			set_physics_process(false)
 	else:
 		_settle_timer = 0.0
+
+	# Periodic stress check while contacts exist
+	if not _active_body_contacts.is_empty() or _has_ground_contact:
+		_stress_check_timer += delta
+		if _stress_check_timer >= STRESS_CHECK_INTERVAL:
+			_stress_check_timer = 0.0
+			_check_cluster_stress()
 
 	GameManager.tick_add("cluster_tick", Time.get_ticks_usec() - _t0)
 	Profiler.end("falling_cluster")
@@ -647,9 +695,7 @@ func _spawn_debris_for_blocks(block_positions: Array[Vector3],
 	## is_explosion: if true, mirrors per-block away from blast (like structures).
 	##   If false, passes blast_origin directly as blast_center (hitscan/momentum).
 	var _t_spawn_debris := Time.get_ticks_usec()
-	var mat: StandardMaterial3D = null
-	if _mesh_instance and _mesh_instance.material_override:
-		mat = _mesh_instance.material_override
+	var mat := get_cluster_material()
 	if mat == null:
 		return
 	var has_blast := blast_origin != Vector3.INF
@@ -690,6 +736,107 @@ func _spawn_debris_for_blocks(block_positions: Array[Vector3],
 # ======================================================================
 #  Cluster fragmentation — split disconnected groups into child clusters
 # ======================================================================
+
+func _check_cluster_stress() -> void:
+	## Run force-equilibrium stress solver on this cluster.
+	## Builds ground mask from bottom blocks touching terrain,
+	## external load from active body contacts, and splits overloaded sections.
+	if not multiplayer.is_server():
+		return
+	if grid == null or grid.block_count() < 2:
+		return
+
+	var t0 := Time.get_ticks_usec()
+	var block_grid: PackedByteArray = grid.block_grid
+	var num_x: int = grid.num_x
+	var num_y: int = grid.num_y
+	var num_z: int = grid.num_z
+	var ny_nz := num_y * num_z
+
+	# Build ground mask: raycast down from bottom blocks to find terrain.
+	var ground_mask := PackedByteArray()
+	ground_mask.resize(block_grid.size())
+	ground_mask.fill(0)
+	_has_ground_contact = false
+
+	var space_state := get_world_3d().direct_space_state
+	if space_state:
+		var query := PhysicsRayQueryParameters3D.new()
+		query.collision_mask = CollisionLayers.WORLD
+		query.exclude = [get_rid()]
+		for bx in num_x:
+			for bz in num_z:
+				for by in num_y:
+					var idx := bx * ny_nz + by * num_z + bz
+					if not block_grid[idx]:
+						continue
+					var local_pos := grid.block_local_pos(Vector3i(bx, by, bz))
+					var bottom := global_transform * (local_pos - Vector3(0, BlockGridManager.BLOCK_SIZE * 0.5, 0))
+					query.from = bottom + Vector3(0, 0.01, 0)
+					query.to = bottom - Vector3(0, BlockGridManager.BLOCK_SIZE * 0.5, 0)
+					var result := space_state.intersect_ray(query)
+					if result:
+						ground_mask[idx] = 1
+						_has_ground_contact = true
+					break  # only check lowest per column
+
+	if not _has_ground_contact:
+		return  # floating — no stress, just connectivity
+
+	# Build external load: distribute contact body masses to nearest blocks.
+	var external_load := PackedFloat32Array()
+	external_load.resize(block_grid.size())
+	external_load.fill(0.0)
+	var block_mass := _mass_per_block
+
+	for body_rid in _active_body_contacts:
+		var body_mass: float = _active_body_contacts[body_rid]
+		# Find nearest block to the contact body's position
+		var body_node = instance_from_id(body_rid.get_id()) if body_rid.is_valid() else null
+		if body_node == null or not is_instance_valid(body_node):
+			continue
+		var body_pos: Vector3 = body_node.global_position if body_node is Node3D else global_position
+		var local_pos: Vector3 = global_transform.affine_inverse() * body_pos
+		var best_idx := -1
+		var best_dist := 999999.0
+		for bx in num_x:
+			for by in num_y:
+				for bz in num_z:
+					var idx := bx * ny_nz + by * num_z + bz
+					if not block_grid[idx]:
+						continue
+					var bp := grid.block_local_pos(Vector3i(bx, by, bz))
+					var d := local_pos.distance_squared_to(bp)
+					if d < best_dist:
+						best_dist = d
+						best_idx = idx
+		if best_idx >= 0:
+			external_load[best_idx] += body_mass / block_mass
+
+	# Run stress solver
+	var components: Array = BlockMeshBuilder.calc_stress_integrity_components(
+		block_grid, ground_mask, external_load,
+		num_x, num_y, num_z, grid.block_count(),
+		CLUSTER_MAX_LOAD, CLUSTER_H_TRANSFER)
+
+	var us := Time.get_ticks_usec() - t0
+	if not components.is_empty():
+		print("[ClusterStress] %s  %d components failed  %dus" % [name, components.size(), us])
+		# Convert stress-failed blocks to destroyed blocks
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
+		var destroyed_keys: Array[Vector3i] = []
+		for component in components:
+			for key in component:
+				if grid.has_block(key):
+					destroyed_keys.append(key)
+					grid.erase_block(key)
+					_disable_hit_shape(key)
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
+		if not destroyed_keys.is_empty():
+			_after_blocks_destroyed(destroyed_keys)
+
 
 func _check_cluster_integrity() -> void:
 	## Server-only: if remaining blocks form multiple disconnected groups,
@@ -893,8 +1040,9 @@ func _sync_fragment_split_batch(all_fragment_keys: Array) -> void:
 		child._update_compound_shielding_hp()
 
 		# Material and debris config
-		if _mesh_instance and _mesh_instance.material_override:
-			child.set_material(_mesh_instance.material_override.duplicate())
+		var mat := get_cluster_material()
+		if mat:
+			child.set_material(mat)
 		child.set_debris_config(_debris_size, _debris_lifetime, _debris_mass,
 			_debris_name, _block_hp_max)
 
@@ -961,8 +1109,9 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 	var _t_init := Time.get_ticks_usec()
 	child.init_cluster_blocks(block_hp_dict, grid.num_x, grid.num_y, grid.num_z,
 		_mass_per_block)
-	if _mesh_instance and _mesh_instance.material_override:
-		child.set_material(_mesh_instance.material_override.duplicate())
+	var mat := get_cluster_material()
+	if mat:
+		child.set_material(mat)
 	child.set_debris_config(_debris_size, _debris_lifetime, _debris_mass,
 		_debris_name, _block_hp_max)
 	var _t_init_us := Time.get_ticks_usec() - _t_init
@@ -996,47 +1145,26 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 #  Contact damage — momentum-based carving
 # ======================================================================
 
+func _on_body_exited(body: Node) -> void:
+	if body is PhysicsBody3D:
+		_active_body_contacts.erase(body.get_rid())
+
+
 func _on_body_entered(body: Node) -> void:
 	if not multiplayer.is_server():
 		return
 
-	Profiler.begin("cluster_contact")
-	_contacts_this_tick += 1
-	var _t_contact := Time.get_ticks_usec()
+	# Track contact for stress solver (mass of contacting body)
+	if body is RigidBody3D:
+		_active_body_contacts[body.get_rid()] = body.mass
+	elif body is Player:
+		_active_body_contacts[body.get_rid()] = 80.0  # player mass
 
-	var body_class := body.get_class() if not (body is FallingBlockCluster) else "FallingBlockCluster"
-
-	# --- Cluster-vs-cluster: only higher instance_id processes to avoid double ---
-	if body is FallingBlockCluster:
-		if get_instance_id() < body.get_instance_id():
-			Profiler.end("cluster_contact")
-			return
-		_handle_cluster_vs_cluster(body)
-		var us := Time.get_ticks_usec() - _t_contact
-		GameManager.tick_add("cluster_contact", us)
-		print("[CONTACT] %s->%s (cluster_vs_cluster) %dus  vel=%.1f blocks=%d" % [
-			name, body.name, us, linear_velocity.length(), grid.block_count()])
-		Profiler.end("cluster_contact")
-		return
-
-	# --- Structure damage (momentum carving) ---
-	var target_structure := _find_structure(body)
-	if target_structure:
-		_handle_structure_hit(body, target_structure)
-		var us := Time.get_ticks_usec() - _t_contact
-		GameManager.tick_add("cluster_contact", us)
-		print("[CONTACT] %s->%s (structure_hit) %dus  vel=%.1f blocks=%d" % [
-			name, target_structure.name, us, linear_velocity.length(), grid.block_count()])
-		Profiler.end("cluster_contact")
-		return
-
-	# --- Generic damageable body (player, terrain, etc.) ---
-	_handle_generic_hit(body)
-	var us := Time.get_ticks_usec() - _t_contact
-	GameManager.tick_add("cluster_contact", us)
-	print("[CONTACT] %s->%s (%s) %dus  vel=%.1f blocks=%d" % [
-		name, body.name, body_class, us, linear_velocity.length(), grid.block_count()])
-	Profiler.end("cluster_contact")
+	# Wake up settled clusters so physics + stress checks resume
+	if sleeping:
+		sleeping = false
+		_settle_timer = 0.0
+		set_physics_process(true)
 
 
 func _compute_impact(body: Node, other_velocity: Vector3 = Vector3.ZERO) -> Dictionary:
@@ -1229,8 +1357,13 @@ func _rebuild_visuals() -> void:
 		return
 	var _t0 := Time.get_ticks_usec()
 	# Rebuild mesh
+	var new_mesh: Mesh = grid.build_mesh()
 	if _mesh_instance:
-		_mesh_instance.mesh = grid.build_mesh()
+		_mesh_instance.mesh = new_mesh
+	elif _visual_rid.is_valid():
+		_visual_mesh_ref = new_mesh
+		if new_mesh:
+			RenderingServer.instance_set_base(_visual_rid, new_mesh.get_rid())
 	var _t_mesh_us := Time.get_ticks_usec() - _t0
 
 	# Rebuild collision shapes (remove old, create new)
@@ -1381,6 +1514,8 @@ func _clear_physics_before_free() -> void:
 	collision_mask = 0
 	if _compound_hit_body and is_instance_valid(_compound_hit_body):
 		_compound_hit_body.collision_layer = 0
+	if _visual_rid.is_valid():
+		RenderingServer.instance_set_visible(_visual_rid, false)
 
 
 func _find_structure(node: Node) -> DestructibleBlockStructure:

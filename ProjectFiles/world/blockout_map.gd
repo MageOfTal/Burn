@@ -718,6 +718,7 @@ func _start_zone() -> void:
 
 
 func _process(delta: float) -> void:
+	Profiler.begin("blockout_map")
 	# Update zone visual to match current zone radius
 	if _zone_mesh and has_node("/root/ZoneManager"):
 		var zm := get_node("/root/ZoneManager")
@@ -757,6 +758,7 @@ func _process(delta: float) -> void:
 						ey = seed_world.get_height_from_noise(ex, ez)
 					emitter.global_position = Vector3(ex, ey, ez)
 					emitter.emitting = r > 0.5
+	Profiler.end("blockout_map")
 
 
 # ======================================================================
@@ -910,6 +912,7 @@ func _build_static_platform(center: Vector3, size: Vector3, mat: StandardMateria
 	body.collision_layer = CollisionLayers.WORLD
 	body.collision_mask = 0
 	body.position = mesh_inst.position
+	PhysicsServer3D.body_set_shielding_tag(body.get_rid(), 3)
 	var col := CollisionShape3D.new()
 	var shape := BoxShape3D.new()
 	shape.size = size
@@ -967,6 +970,7 @@ func _build_ramp(ground_pos: Vector3, platform_pos: Vector3, width: float, mat: 
 	ramp_body.collision_mask = 0
 	ramp_body.position = ramp_center
 	ramp_body.rotation = Vector3(ramp_angle, y_rot, 0)
+	PhysicsServer3D.body_set_shielding_tag(ramp_body.get_rid(), 3)
 	var ramp_col := CollisionShape3D.new()
 	var ramp_shape := BoxShape3D.new()
 	ramp_shape.size = ramp_box.size
@@ -1028,6 +1032,7 @@ func spawn_test_ramps() -> void:
 		body.collision_mask = 0
 		body.position = ramp_pos
 		body.rotation.x = angle_rad
+		PhysicsServer3D.body_set_shielding_tag(body.get_rid(), 3)
 		var col := CollisionShape3D.new()
 		var shape := BoxShape3D.new()
 		shape.size = box_mesh.size
@@ -1159,12 +1164,60 @@ func spawn_test_ramps() -> void:
 	curve_inst.position = curve_base
 	add_child(curve_inst)
 
+	# Collision: top (walkable) surface ONLY — no side walls, caps, or bottom.
+	# Including all faces causes conflicting normals at edges (capsule touches
+	# top + cap simultaneously → ejection). Same fix as sine ramps: single-sided
+	# trimesh with backface_collision for both-side response.
+	var col_faces := PackedVector3Array()
+	col_faces.resize(curve_segments * 6)  # 2 triangles × 3 verts per segment
+	for seg_i in range(curve_segments):
+		var t0: float = (float(seg_i) / curve_segments) * max_rad
+		var t1: float = (float(seg_i + 1) / curve_segments) * max_rad
+
+		var il0 := Vector3(-half_w, r_in * (1.0 - cos(t0)), r_in * sin(t0))
+		var ir0 := Vector3( half_w, r_in * (1.0 - cos(t0)), r_in * sin(t0))
+		var il1 := Vector3(-half_w, r_in * (1.0 - cos(t1)), r_in * sin(t1))
+		var ir1 := Vector3( half_w, r_in * (1.0 - cos(t1)), r_in * sin(t1))
+
+		var base_idx: int = seg_i * 6
+		col_faces[base_idx]     = il0
+		col_faces[base_idx + 1] = il1
+		col_faces[base_idx + 2] = ir1
+		col_faces[base_idx + 3] = il0
+		col_faces[base_idx + 4] = ir1
+		col_faces[base_idx + 5] = ir0
+
+	var col_shape := ConcavePolygonShape3D.new()
+	col_shape.backface_collision = true
+	col_shape.set_faces(col_faces)
+
+	print("[CurvedRamp] Collision: %d faces (%d tris), backface=%s" % [
+		col_faces.size(), col_faces.size() / 3, col_shape.backface_collision])
+	# Debug: print bounds and sample normals
+	var cmin := col_faces[0]
+	var cmax := col_faces[0]
+	for ci in range(1, col_faces.size()):
+		cmin.x = minf(cmin.x, col_faces[ci].x)
+		cmin.y = minf(cmin.y, col_faces[ci].y)
+		cmin.z = minf(cmin.z, col_faces[ci].z)
+		cmax.x = maxf(cmax.x, col_faces[ci].x)
+		cmax.y = maxf(cmax.y, col_faces[ci].y)
+		cmax.z = maxf(cmax.z, col_faces[ci].z)
+	print("[CurvedRamp] Bounds: min=%s max=%s" % [cmin, cmax])
+	# Sample tri normals at bottom (seg 0) and top (last seg)
+	var n0 := (col_faces[1] - col_faces[0]).cross(col_faces[2] - col_faces[0]).normalized()
+	var last_base: int = (curve_segments - 1) * 6
+	var nN := (col_faces[last_base + 1] - col_faces[last_base]).cross(col_faces[last_base + 2] - col_faces[last_base]).normalized()
+	print("[CurvedRamp] Normal at base (seg 0): %s (angle=%.1f°)" % [n0, rad_to_deg(n0.angle_to(Vector3.UP))])
+	print("[CurvedRamp] Normal at top (seg %d): %s (angle=%.1f°)" % [curve_segments - 1, nN, rad_to_deg(nN.angle_to(Vector3.UP))])
+
 	var curve_body := StaticBody3D.new()
 	curve_body.collision_layer = CollisionLayers.WORLD
 	curve_body.collision_mask = 0
 	curve_body.position = curve_base
+	PhysicsServer3D.body_set_shielding_tag(curve_body.get_rid(), 3)
 	var curve_col := CollisionShape3D.new()
-	curve_col.shape = curve_mesh.create_trimesh_shape()
+	curve_col.shape = col_shape
 	curve_body.add_child(curve_col)
 	add_child(curve_body)
 

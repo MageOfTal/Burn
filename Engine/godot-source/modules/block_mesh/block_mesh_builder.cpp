@@ -246,9 +246,13 @@ void BlockMeshBuilder::_bind_methods() {
 			&BlockMeshBuilder::calc_integrity_components);
 	ClassDB::bind_method(
 			D_METHOD("calc_stress_integrity_components", "block_grid", "ground_mask",
-					"num_x", "num_y", "num_z",
+					"external_load", "num_x", "num_y", "num_z",
 					"total_blocks", "max_load", "horizontal_transfer"),
 			&BlockMeshBuilder::calc_stress_integrity_components);
+	ClassDB::bind_method(
+			D_METHOD("calc_streaming_update", "player_positions", "loaded_chunks",
+					"view_distance", "chunk_size", "min_by", "max_by"),
+			&BlockMeshBuilder::calc_streaming_update);
 	ClassDB::bind_method(
 			D_METHOD("build_cluster", "block_hp", "num_x", "num_y", "num_z", "block_size", "cluster_body", "hit_body", "hit_shape", "include_uvs"),
 			&BlockMeshBuilder::build_cluster,
@@ -1018,6 +1022,140 @@ Array BlockMeshBuilder::calc_integrity_components(
 	return components;
 }
 
+// ── Terrain streaming chunk computation ──
+//
+// Replaces GDScript terrain_streaming.gd update() with native code.
+// The GDScript version takes ~15ms due to Dictionary<Vector3i> hashing overhead.
+// This version uses a flat HashSet<uint64_t> with packed integer keys: ~0.5ms.
+
+static inline uint64_t _pack_chunk(int bx, int by, int bz) {
+	// Pack 3 ints into one uint64. Offset by 1024 to handle negatives (range -1024..1023).
+	return (uint64_t((bx + 1024) & 0x7FF) << 22) |
+	       (uint64_t((by + 1024) & 0x7FF) << 11) |
+	       uint64_t((bz + 1024) & 0x7FF);
+}
+
+Dictionary BlockMeshBuilder::calc_streaming_update(
+		const PackedVector3Array &p_player_positions,
+		const Array &p_loaded_chunks,
+		float p_view_distance,
+		int p_chunk_size,
+		int p_min_by, int p_max_by) {
+	uint64_t t_start = OS::get_singleton()->get_ticks_usec();
+
+	const float cs = (float)p_chunk_size;
+	const int range_blocks = (int)Math::ceil(p_view_distance / cs);
+	const float vd_sq = p_view_distance * p_view_distance;
+	const int n_players = p_player_positions.size();
+	const Vector3 *positions = p_player_positions.ptr();
+
+	// Build needed set using packed integer keys in a HashMap.
+	HashMap<uint64_t, bool> needed;
+	needed.reserve(6000);
+
+	for (int pi = 0; pi < n_players; pi++) {
+		const Vector3 &pos = positions[pi];
+		const int cx = (int)Math::floor(pos.x / cs);
+		const int cz = (int)Math::floor(pos.z / cs);
+
+		for (int bx = cx - range_blocks; bx <= cx + range_blocks; bx++) {
+			for (int bz = cz - range_blocks; bz <= cz + range_blocks; bz++) {
+				float dx = ((float)bx + 0.5f) * cs - pos.x;
+				float dz = ((float)bz + 0.5f) * cs - pos.z;
+				if (dx * dx + dz * dz > vd_sq) continue;
+				for (int by = p_min_by; by <= p_max_by; by++) {
+					needed[_pack_chunk(bx, by, bz)] = true;
+				}
+			}
+		}
+	}
+
+	uint64_t t_needed = OS::get_singleton()->get_ticks_usec();
+
+	// Build loaded set from Array of Vector3i.
+	HashMap<uint64_t, bool> loaded;
+	loaded.reserve(p_loaded_chunks.size());
+	for (int i = 0; i < p_loaded_chunks.size(); i++) {
+		Vector3i bp = p_loaded_chunks[i];
+		loaded[_pack_chunk(bp.x, bp.y, bp.z)] = true;
+	}
+
+	// to_load: in needed but not loaded
+	Array to_load;
+	for (const KeyValue<uint64_t, bool> &kv : needed) {
+		if (!loaded.has(kv.key)) {
+			// Unpack
+			int bx = ((int)((kv.key >> 22) & 0x7FF)) - 1024;
+			int by = ((int)((kv.key >> 11) & 0x7FF)) - 1024;
+			int bz = ((int)(kv.key & 0x7FF)) - 1024;
+			to_load.push_back(Vector3i(bx, by, bz));
+		}
+	}
+
+	// to_unload: in loaded but not needed
+	Array to_unload;
+	for (int i = 0; i < p_loaded_chunks.size(); i++) {
+		Vector3i bp = p_loaded_chunks[i];
+		if (!needed.has(_pack_chunk(bp.x, bp.y, bp.z))) {
+			to_unload.push_back(bp);
+		}
+	}
+
+	// Sort to_load by distance to nearest player (closest first).
+	if (to_load.size() > 1 && n_players > 0) {
+		struct SortCtx {
+			const Vector3 *positions;
+			int n_players;
+			float cs;
+		};
+		SortCtx ctx = { positions, n_players, cs };
+
+		// Precompute distances for sort
+		int n = to_load.size();
+		float *dists = (float *)memalloc(n * sizeof(float));
+		Vector3i *chunks = (Vector3i *)memalloc(n * sizeof(Vector3i));
+		for (int i = 0; i < n; i++) {
+			chunks[i] = to_load[i];
+			Vector3 center(
+				((float)chunks[i].x + 0.5f) * cs,
+				((float)chunks[i].y + 0.5f) * cs,
+				((float)chunks[i].z + 0.5f) * cs);
+			float best = 1e18f;
+			for (int pi = 0; pi < n_players; pi++) {
+				float d = center.distance_squared_to(positions[pi]);
+				if (d < best) best = d;
+			}
+			dists[i] = best;
+		}
+		// Simple insertion sort (to_load is usually small)
+		for (int i = 1; i < n; i++) {
+			float d = dists[i];
+			Vector3i c = chunks[i];
+			int j = i - 1;
+			while (j >= 0 && dists[j] > d) {
+				dists[j + 1] = dists[j];
+				chunks[j + 1] = chunks[j];
+				j--;
+			}
+			dists[j + 1] = d;
+			chunks[j + 1] = c;
+		}
+		to_load.clear();
+		for (int i = 0; i < n; i++) {
+			to_load.push_back(chunks[i]);
+		}
+		memfree(dists);
+		memfree(chunks);
+	}
+
+	uint64_t t_end = OS::get_singleton()->get_ticks_usec();
+
+	Dictionary result;
+	result["to_load"] = to_load;
+	result["to_unload"] = to_unload;
+	return result;
+}
+
 // ── Force-equilibrium structural stress solver ──
 //
 // Physics model: each block is a rigid body subject to gravity. Adjacent blocks
@@ -1038,6 +1176,7 @@ Array BlockMeshBuilder::calc_integrity_components(
 Array BlockMeshBuilder::calc_stress_integrity_components(
 		const PackedByteArray &p_block_grid,
 		const PackedByteArray &p_ground_mask,
+		const PackedFloat32Array &p_external_load,
 		int p_num_x, int p_num_y, int p_num_z,
 		int p_total_blocks,
 		float p_max_load,
@@ -1050,6 +1189,10 @@ Array BlockMeshBuilder::calc_stress_integrity_components(
 	// Ground mask: if provided, use it. Otherwise fall back to y=0.
 	const bool has_ground_mask = p_ground_mask.size() == grid_size;
 	const uint8_t *ground_mask = has_ground_mask ? p_ground_mask.ptr() : nullptr;
+
+	// External load: extra downward force per block in block-weights.
+	const bool has_external_load = p_external_load.size() == grid_size;
+	const float *external_load = has_external_load ? p_external_load.ptr() : nullptr;
 
 	uint64_t t_start = OS::get_singleton()->get_ticks_usec();
 
@@ -1159,12 +1302,16 @@ Array BlockMeshBuilder::calc_stress_integrity_components(
 	uint8_t *failed = (uint8_t *)memalloc(grid_size);
 	memset(failed, 0, grid_size);
 
-	// Initialize residual: gravity on every ground-connected, non-ground block.
+	// Initialize residual: gravity + external load on non-ground blocks.
 	// Ground blocks (terrain-contacting) have zero residual (anchored).
 	for (int idx = 0; idx < grid_size; idx++) {
 		if (grid[idx] != 1 || visited[idx] != 1) continue;
 		if (!is_ground[idx]) {
-			residual[idx * 3 + 1] = -1.0f; // gravity: 1 block-weight downward
+			float load = -1.0f; // self-weight: 1 block-weight downward
+			if (has_external_load) {
+				load -= external_load[idx]; // extra downward force
+			}
+			residual[idx * 3 + 1] = load;
 		}
 	}
 
@@ -1193,20 +1340,33 @@ Array BlockMeshBuilder::calc_stress_integrity_components(
 	const int MAX_ITERATIONS = 40;
 	const float RESIDUAL_EPSILON = 0.01f; // below this, block is in equilibrium
 
+	// Active set: blocks with significant residual. Converged blocks are
+	// deactivated, reactivated only if a neighbor transfers force to them.
+	// This skips the majority of blocks in later iterations.
+	uint8_t *active = (uint8_t *)memalloc(grid_size);
+	memset(active, 0, grid_size);
+	for (int pi = 0; pi < process_count; pi++) {
+		active[process_order[pi]] = 1;
+	}
+
 	int solver_iters = 0;
+
 	for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
 		solver_iters = iter + 1;
 		bool any_change = false;
 
 		for (int pi = 0; pi < process_count; pi++) {
 			const int idx = process_order[pi];
-			if (failed[idx]) continue;
+			if (failed[idx] || !active[idx]) continue;
 
 			float rx = residual[idx * 3 + 0];
 			float ry = residual[idx * 3 + 1];
 			float rz = residual[idx * 3 + 2];
 			float rmag = sqrtf(rx * rx + ry * ry + rz * rz);
-			if (rmag < RESIDUAL_EPSILON) continue;
+			if (rmag < RESIDUAL_EPSILON) {
+				active[idx] = 0;
+				continue;
+			}
 
 			const int bx = idx / ny_nz;
 			const int rem = idx % ny_nz;
@@ -1336,10 +1496,11 @@ Array BlockMeshBuilder::calc_stress_integrity_components(
 
 				// Transfer to neighbor (Newton's 3rd law).
 				int ni = neighbor_idx[d];
-				if (!is_ground[ni]) { // don't load ground blocks
+				if (!is_ground[ni]) {
 					residual[ni * 3 + 0] += tfx;
 					residual[ni * 3 + 1] += tfy;
 					residual[ni * 3 + 2] += tfz;
+					active[ni] = 1; // reactivate — received new force
 				}
 			}
 
@@ -1441,7 +1602,7 @@ Array BlockMeshBuilder::calc_stress_integrity_components(
 	if (total_unsupported == 0) {
 		memfree(visited); memfree(bfs_queue); memfree(residual);
 		memfree(contact_compression); memfree(contact_shear);
-		memfree(failed); memfree(process_order); memfree(is_ground);
+		memfree(failed); memfree(process_order); memfree(is_ground); memfree(active);
 		print_line(vformat("[StressIntegrity_C] blocks=%d  all_stable  iters=%d  bfs=%dus  solver=%dus",
 				p_total_blocks, solver_iters,
 				(int)(t_bfs - t_start), (int)(t_solver - t_bfs)));
@@ -1998,6 +2159,12 @@ void BlockMeshBuilder::bulk_configure_debris(
 // fading to zero at 90°, none on ceilings.
 
 void BlockMeshBuilder::debris_friction_callback(PhysicsDirectBodyState3D *p_state, const Variant &p_userdata) {
+	// Sync visual instance transform to physics body (raw RIDs have no auto-sync).
+	RID instance = p_userdata;
+	if (instance.is_valid()) {
+		RenderingServer::get_singleton()->instance_set_transform(instance, p_state->get_transform());
+	}
+
 	static constexpr real_t FRICTION_DECEL = 8.0f;
 	static constexpr real_t COS_FULL = 0.6427876f; // cos(50°)
 
@@ -2133,11 +2300,25 @@ Dictionary BlockMeshBuilder::bulk_spawn_debris(
 			ps->body_set_param(body, PhysicsServer3D::BODY_PARAM_LINEAR_DAMP, 0.0);
 			ps->body_set_param(body, PhysicsServer3D::BODY_PARAM_ANGULAR_DAMP, 0.0);
 			ps->body_add_shape(body, p_shape);
+
+			// ── Create visual instance (before callback registration — needs RID) ──
+			RID instance = rs->instance_create();
+			rs->instance_set_base(instance, p_mesh);
+			rs->instance_set_scenario(instance, p_scenario);
+			rs->instance_set_transform(instance, xform);
+			rs->instance_set_visible(instance, true);
+			if (has_mat) {
+				rs->instance_geometry_set_material_override(instance, mat_rid);
+			}
+			rs->instance_geometry_set_cast_shadows_setting(instance,
+					RenderingServer::SHADOW_CASTING_SETTING_OFF);
+
 			// Enable contact reporting for friction callback.
 			ps->body_set_max_contacts_reported(body, 3);
 			// Register angle-dependent friction callback.
+			// Pass instance RID as userdata for visual sync.
 			ps->body_set_force_integration_callback(body,
-					Callable(this, "debris_friction_callback"));
+					Callable(this, "debris_friction_callback"), instance);
 			// Add to space, then set state (Jolt ignores state on spaceless bodies).
 			ps->body_set_space(body, p_space);
 			ps->body_set_state(body, PhysicsServer3D::BODY_STATE_TRANSFORM, xform);
@@ -2150,19 +2331,6 @@ Dictionary BlockMeshBuilder::bulk_spawn_debris(
 							Math::randf() * 8.0f - 4.0f)));
 			// Force-wake so Jolt doesn't auto-sleep before first step.
 			ps->body_set_state(body, PhysicsServer3D::BODY_STATE_SLEEPING, false);
-
-			// ── Create visual instance ──
-			RID instance = rs->instance_create();
-			rs->instance_set_base(instance, p_mesh);
-			rs->instance_set_scenario(instance, p_scenario);
-			rs->instance_set_transform(instance, xform);
-			rs->instance_set_visible(instance, true);
-			if (has_mat) {
-				rs->instance_geometry_set_material_override(instance, mat_rid);
-			}
-			// No shadow casting for tiny debris cubes.
-			rs->instance_geometry_set_cast_shadows_setting(instance,
-					RenderingServer::SHADOW_CASTING_SETTING_OFF);
 
 			body_rids[idx] = body;
 			instance_rids[idx] = instance;

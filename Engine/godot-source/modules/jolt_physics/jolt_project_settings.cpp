@@ -64,6 +64,7 @@ void JoltProjectSettings::register_settings() {
 
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "physics/jolt_physics_3d/collisions/collision_margin_fraction", PROPERTY_HINT_RANGE, U"0,1,0.00001"), 0.08f);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "physics/jolt_physics_3d/collisions/active_edge_threshold", PROPERTY_HINT_RANGE, U"0,90,0.01,radians_as_degrees"), Math::deg_to_rad(50.0f));
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "physics/jolt_physics_3d/collisions/boundary_edges_active"), false);
 
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "physics/jolt_physics_3d/joints/world_node", PROPERTY_HINT_ENUM, U"Node A,Node B"), JOLT_JOINT_WORLD_NODE_A);
 
@@ -114,6 +115,7 @@ void JoltProjectSettings::read_settings() {
 	collision_margin_fraction = GLOBAL_GET("physics/jolt_physics_3d/collisions/collision_margin_fraction");
 	float active_edge_threshold = GLOBAL_GET("physics/jolt_physics_3d/collisions/active_edge_threshold");
 	active_edge_threshold_cos = Math::cos(active_edge_threshold);
+	boundary_edges_active = GLOBAL_GET("physics/jolt_physics_3d/collisions/boundary_edges_active");
 
 
 

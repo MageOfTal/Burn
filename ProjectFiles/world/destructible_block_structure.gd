@@ -764,6 +764,35 @@ func _update_compound_shielding_hp() -> void:
 	PhysicsServer3D.body_set_shielding_hp(_compound_hit_body.get_rid(), avg)
 
 
+func _diag_identify_shielders(space_state: PhysicsDirectSpaceState3D, from: Vector3, to: Vector3, exclude_rids: Array[RID], target_key: Vector3i) -> void:
+	## Cast intersect_ray_all along the explosion→block path and log every body hit.
+	if not space_state:
+		return
+	var q := PhysicsRayQueryParameters3D.new()
+	q.from = from
+	q.to = to
+	q.collision_mask = CollisionLayers.SHIELDING
+	q.exclude = exclude_rids
+	var hits := space_state.intersect_ray_all(q, 32)
+	var compound_rid: RID = _compound_hit_body.get_rid() if (_compound_hit_body and is_instance_valid(_compound_hit_body)) else RID()
+	print("[ShieldDiag]     ray %s→%s  %d hits:" % [
+		str(from).substr(0, 25), str(to).substr(0, 25), hits.size()])
+	for hit in hits:
+		var collider: Object = hit.get("collider")
+		var rid: RID = hit.get("rid", RID())
+		var pos: Vector3 = hit.get("position", Vector3.ZERO)
+		var shp := PhysicsServer3D.body_get_shielding_hp(rid) if rid.is_valid() else 0.0
+		var is_self := rid == compound_rid
+		var cname: String = collider.name if collider else "null"
+		var cclass: String = collider.get_class() if collider else "null"
+		var layer: int = collider.collision_layer if collider is CollisionObject3D else 0
+		print("[ShieldDiag]       %s (%s) layer=%d shp_hp=%.1f rid=%s %s pos=%s" % [
+			cname, cclass, layer, shp, str(rid).substr(0, 15),
+			"<<SELF>>" if is_self else "", str(pos).substr(0, 25)])
+	if hits.is_empty():
+		print("[ShieldDiag]       NO HITS (mask=%d)" % CollisionLayers.SHIELDING)
+
+
 # ======================================================================
 #  Damage
 # ======================================================================
@@ -871,9 +900,11 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	## Shielding uses flat HP absorption: each wall block or player between the
 	## explosion and a target block absorbs damage equal to its current HP.
 	## exclude_rids: physics bodies to ignore in shielding raycasts (e.g. the rocket).
+	Profiler.begin("struct_take_damage_at")
 	print("[TakeDamageAt-ENTRY] %s  blocks=%d  is_server=%s  hit_pos=%s  global_pos=%s" % [
 		name, _block_hp_dict.size(), str(multiplayer.is_server()), str(hit_pos), str(global_position)])
 	if not multiplayer.is_server():
+		Profiler.end("struct_take_damage_at")
 		return
 
 	Profiler.begin("struct_take_damage_at")
@@ -887,6 +918,8 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	var destroyed_positions: Array[Vector3] = []
 	var destroyed_overkill: Array[float] = []
 	var debug_ray_data: Array = []
+	# Snapshot block HPs before C++ modifies them (for debug ray visualization).
+	var _dbg_old_hp: Dictionary = _block_hp_dict.duplicate() if debug_rays else {}
 
 	# C++ computes damage, shielding, applies HP, and returns destroyed/survived info.
 	var explosion_result: Dictionary = {}
@@ -922,6 +955,76 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 			_block_hp_dict[s_keys[i]] = s_hps[i]
 		_update_compound_shielding_hp()
 	var t_pass1_end := Time.get_ticks_usec()
+
+	# Generate debug ray data directly from C++ results (ground truth).
+	if debug_rays and not explosion_result.is_empty():
+		var diag := GameManager.debug_explosion_diagnostics
+		var self_shield: float = explosion_result.get("self_shield", 0.0)
+		var shielded_out: int = explosion_result.get("shielded_out", 0)
+		if diag:
+			print("[ShieldDiag] %s  self_shield=%.2f  shielded_out=%d" % [name, self_shield, shielded_out])
+
+		# Destroyed blocks: C++ provides raw_dmg, final_dmg, raw absorption per block
+		var d_keys: Array = explosion_result.get("destroyed_keys", [])
+		var d_raw: PackedFloat32Array = explosion_result.get("destroyed_raw_dmg", PackedFloat32Array())
+		var d_final: PackedFloat32Array = explosion_result.get("destroyed_final_dmg", PackedFloat32Array())
+		var d_abs: PackedFloat32Array = explosion_result.get("destroyed_abs", PackedFloat32Array())
+		for i in d_keys.size():
+			var block_pos: Vector3 = global_transform * _block_local_pos(d_keys[i])
+			debug_ray_data.append({
+				"from": hit_pos, "to": block_pos,
+				"raw_dmg": d_raw[i], "final_dmg": d_final[i],
+				"hits": [],
+			})
+			# Log blocks where shielding is unexpectedly high + identify what's shielding
+			if diag and d_raw[i] > 0.0 and d_final[i] < d_raw[i] - 0.01:
+				var ray_abs_val: float = d_abs[i] if d_abs.size() > i else -1.0
+				var effective_abs: float = maxf(ray_abs_val - self_shield, 0.0) if ray_abs_val >= 0.0 else -1.0
+				print("[ShieldDiag]   DESTROYED %s  raw=%.1f  final=%.1f  absorbed=%.1f  ray_abs=%.1f  eff_abs=%.1f  self_shield=%.1f" % [
+					str(d_keys[i]), d_raw[i], d_final[i], d_raw[i] - d_final[i],
+					ray_abs_val, effective_abs, self_shield])
+				_diag_identify_shielders(space_state, hit_pos, block_pos, exclude_rids, d_keys[i])
+
+		# Survived blocks: C++ provides raw_dmg, final_dmg, raw absorption per block
+		var s_keys_dbg: Array = explosion_result.get("survived_keys", [])
+		var s_raw: PackedFloat32Array = explosion_result.get("survived_raw_dmg", PackedFloat32Array())
+		var s_final: PackedFloat32Array = explosion_result.get("survived_final_dmg", PackedFloat32Array())
+		var s_abs: PackedFloat32Array = explosion_result.get("survived_abs", PackedFloat32Array())
+		for i in s_keys_dbg.size():
+			var block_pos: Vector3 = global_transform * _block_local_pos(s_keys_dbg[i])
+			debug_ray_data.append({
+				"from": hit_pos, "to": block_pos,
+				"raw_dmg": s_raw[i], "final_dmg": s_final[i],
+				"hits": [],
+			})
+			if diag and s_raw[i] > 0.0 and s_final[i] < s_raw[i] - 0.01:
+				var ray_abs_val: float = s_abs[i] if s_abs.size() > i else -1.0
+				var effective_abs: float = maxf(ray_abs_val - self_shield, 0.0) if ray_abs_val >= 0.0 else -1.0
+				print("[ShieldDiag]   SURVIVED %s  raw=%.1f  final=%.1f  absorbed=%.1f  ray_abs=%.1f  eff_abs=%.1f  self_shield=%.1f" % [
+					str(s_keys_dbg[i]), s_raw[i], s_final[i], s_raw[i] - s_final[i],
+					ray_abs_val, effective_abs, self_shield])
+				_diag_identify_shielders(space_state, hit_pos, block_pos, exclude_rids, s_keys_dbg[i])
+
+		# Blocks in range but not in either list = fully shielded (final_dmg < 0.5)
+		var _dbg_hit: Dictionary = {}
+		for k in d_keys:
+			_dbg_hit[k] = true
+		for k in s_keys_dbg:
+			_dbg_hit[k] = true
+		for key: Vector3i in _dbg_old_hp:
+			if _dbg_hit.has(key):
+				continue
+			var block_pos: Vector3 = global_transform * _block_local_pos(key)
+			var dist := hit_pos.distance_to(block_pos)
+			if dist > blast_radius:
+				continue
+			var norm_dist := dist / blast_radius
+			var falloff := 1.0 / (1.0 + (norm_dist * 3.0) ** 3)
+			debug_ray_data.append({
+				"from": hit_pos, "to": block_pos,
+				"raw_dmg": amount * falloff, "final_dmg": 0.0,
+				"hits": [],
+			})
 
 	# Erase destroyed blocks — disable compound body shapes (instant vs queue_free).
 	var t_erase := Time.get_ticks_usec()
@@ -1190,7 +1293,8 @@ func _check_structural_integrity() -> void:
 	# Pass ground_mask so the solver knows which blocks are terrain-anchored.
 	var _t_solver := Time.get_ticks_usec()
 	var components: Array = BlockMeshBuilder.calc_stress_integrity_components(
-		_block_grid, _ground_mask, _num_x, _num_y, _num_z, _block_hp_dict.size(),
+		_block_grid, _ground_mask, PackedFloat32Array(),
+		_num_x, _num_y, _num_z, _block_hp_dict.size(),
 		stress_max_load, stress_horizontal_transfer)
 	var _t_solver_us := Time.get_ticks_usec() - _t_solver
 
@@ -1389,25 +1493,134 @@ func _sync_cluster_detach_batch(all_keys: Array, all_hps: Array,
 		_rebuild_smooth_collision_mesh()
 	var t_client_cleanup_us := Time.get_ticks_usec() - t_client_cleanup
 
-	# Spawn each cluster.
+	# Spawn all clusters via batched C++ call (one build_clusters_batch for all).
 	var t_spawn := Time.get_ticks_usec()
+	if GameManager.debug_disable_detached_structures or n_clusters == 0:
+		var t_batch_us := Time.get_ticks_usec() - t_batch_total
+		print("[SyncClusterDetachBatch] %s  clusters=%d  SKIPPED  total=%dus" % [
+			name, n_clusters, t_batch_us])
+		return
+
+	var shared_hit_shape := BoxShape3D.new()
+	shared_hit_shape.size = Vector3.ONE * BLOCK_SIZE
+	var compound_body_script: GDScript = preload("res://world/compound_hit_body.gd")
+
+	# Phase 1: Build HP dicts and create all cluster bodies + hit bodies (need RIDs).
+	var t_create := Time.get_ticks_usec()
+	var hp_dicts: Array = []
+	var clusters: Array = []
+	var cluster_body_rids: Array = []
+	var hit_body_rids: Array = []
+
 	for i in n_clusters:
 		var cluster_keys: Array = all_keys[i]
 		var cluster_hps: Array = all_hps[i]
-		var typed_keys: Array[Vector3i] = []
-		var typed_hps: Array[float] = []
+		var hp_dict: Dictionary = {}
 		for j in cluster_keys.size():
-			typed_keys.append(cluster_keys[j] as Vector3i)
-			typed_hps.append(float(cluster_hps[j]))
-		if not GameManager.debug_disable_detached_structures:
-			_spawn_falling_cluster(typed_keys, typed_hps, all_centroids[i],
-				all_masses[i], attacker_id, grid_num_x, grid_num_y, grid_num_z,
-				mass_per_block)
+			hp_dict[cluster_keys[j] as Vector3i] = float(cluster_hps[j])
+		hp_dicts.append(hp_dict)
+
+		var cluster := RigidBody3D.new()
+		cluster.set_script(FallingBlockClusterScript)
+		cluster.name = "FallingCluster_%s_%d" % [name, randi() % 10000]
+		cluster.mass = all_masses[i]
+		cluster.cluster_mass = all_masses[i]
+		cluster.attacker_id = attacker_id
+		cluster.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_SMOOTH
+		cluster.collision_mask = CollisionLayers.DEFAULT_PHYSICS | CollisionLayers.DEBRIS
+		cluster.contact_monitor = true
+		cluster.max_contacts_reported = 4
+		cluster.gravity_scale = 1.0
+		cluster.continuous_cd = true
+
+		# Grid manager
+		cluster.grid = BlockGridManager.new()
+		cluster.grid.num_x = grid_num_x
+		cluster.grid.num_y = grid_num_y
+		cluster.grid.num_z = grid_num_z
+		cluster.grid.block_hp = hp_dict
+		cluster._mass_per_block = mass_per_block
+
+		# Mesh instance
+		var mesh_inst := MeshInstance3D.new()
+		mesh_inst.name = "ClusterMesh"
+		mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		cluster.add_child(mesh_inst)
+		cluster._mesh_instance = mesh_inst
+
+		# Compound hit body
+		cluster._shared_hit_shape = shared_hit_shape
+		var hit_body := StaticBody3D.new()
+		hit_body.set_script(compound_body_script)
+		hit_body.parent_wall = cluster
+		hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
+		hit_body.collision_mask = 0
+		hit_body.name = "CompoundHitBody"
+		cluster._compound_hit_body = hit_body
+
+		clusters.append(cluster)
+		cluster_body_rids.append(cluster.get_rid())
+		hit_body_rids.append(hit_body.get_rid())
+	var t_create_us := Time.get_ticks_usec() - t_create
+
+	# Phase 2: One batched C++ call — all grids, meshes, collision shapes, hit bodies.
+	var t_build := Time.get_ticks_usec()
+	var results: Array = BlockMeshBuilder.build_clusters_batch(
+		hp_dicts, grid_num_x, grid_num_y, grid_num_z, BLOCK_SIZE,
+		cluster_body_rids, hit_body_rids, shared_hit_shape.get_rid())
+	var t_build_us := Time.get_ticks_usec() - t_build
+
+	# Phase 3: Unpack results, assemble subtrees outside the scene tree.
+	var t_finish := Time.get_ticks_usec()
+	var structures_node := get_parent()
+	var scene_root := get_tree().current_scene
+	var parent_node: Node = structures_node if structures_node else scene_root
+
+	for i in n_clusters:
+		var cluster: FallingBlockCluster = clusters[i]
+		var result: Dictionary = results[i]
+
+		cluster.grid.block_grid = result["block_grid"]
+		cluster.grid.centroid = result["centroid"]
+		cluster._mesh_instance.mesh = result["mesh"]
+		cluster._col_shapes = result["col_shapes"]
+		cluster._col_shape_count = result["col_count"]
+
+		var shape_keys: Array = result["shape_to_key"]
+		cluster._shape_to_key.clear()
+		cluster._key_to_shape.clear()
+		for si in shape_keys.size():
+			var key: Vector3i = shape_keys[si]
+			cluster._shape_to_key.append(key)
+			cluster._key_to_shape[key] = si
+		cluster._compound_hit_body._shape_to_key = cluster._shape_to_key
+
+		# Add hit body as child while cluster is still outside the tree (cheap).
+		cluster.add_child(cluster._compound_hit_body)
+
+		if _structure_material:
+			cluster.set_material(_structure_material)
+		cluster.set_debris_config(_debris_size, _debris_lifetime, _debris_mass,
+			_debris_name, _block_hp)
+
+	# Batch add: add all clusters to the scene tree.
+	# Each add_child triggers enter_tree cascade for cluster + children.
+	var t_tree := Time.get_ticks_usec()
+	for i in n_clusters:
+		var cluster: FallingBlockCluster = clusters[i]
+		parent_node.add_child(cluster)
+		cluster.global_transform = Transform3D(global_transform.basis, all_centroids[i])
+		PhysicsServer3D.body_set_shielding_tag(cluster._compound_hit_body.get_rid(), 1)
+		cluster._update_compound_shielding_hp()
+		PhysicsServer3D.body_set_shielding_tag(cluster.get_rid(), 4)
+		PhysicsServer3D.body_set_shielding_hp(cluster.get_rid(), all_masses[i] * _block_hp / mass_per_block)
+	var t_tree_us := Time.get_ticks_usec() - t_tree
+	var t_finish_us := Time.get_ticks_usec() - t_finish
 	var t_spawn_us := Time.get_ticks_usec() - t_spawn
 
 	var t_batch_us := Time.get_ticks_usec() - t_batch_total
-	print("[SyncClusterDetachBatch] %s  clusters=%d  client_cleanup=%dus  spawn=%dus  total=%dus" % [
-		name, n_clusters, t_client_cleanup_us, t_spawn_us, t_batch_us])
+	print("[SyncClusterDetachBatch] %s  clusters=%d  client_cleanup=%dus  create=%dus  build=%dus  finish=%dus(tree=%d)  spawn=%dus  total=%dus" % [
+		name, n_clusters, t_client_cleanup_us, t_create_us, t_build_us, t_finish_us, t_tree_us, t_spawn_us, t_batch_us])
 
 
 func _spawn_detached_structure(block_keys: Array[Vector3i],

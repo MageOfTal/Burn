@@ -1,13 +1,14 @@
 [gd_resource type="Resource" script_class="WeaponData" format=3 uid="uid://dfvebmw5jwof2"]
 
 [ext_resource type="Script" uid="uid://bd5kpo5ymkl7u" path="res://items/weapon_data.gd" id="1"]
+[ext_resource type="Script" uid="uid://b318yyajowc01" path="res://items/modifier_data.gd" id="1_4slas"]
 [ext_resource type="PackedScene" path="res://weapons/rocket_projectile.tscn" id="2"]
 
 [resource]
 script = ExtResource("1")
 damage = 70.0
 structure_damage = 350.0
-fire_rate = 1.2
+fire_rate = 0.1
 weapon_range = 200.0
 is_hitscan = false
 projectile_scene = ExtResource("2")

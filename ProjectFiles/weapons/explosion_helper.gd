@@ -29,11 +29,20 @@ const DEBUG_RAY_LIFETIME := 4.0
 ## Prevents absurdly fast launches on very light objects (e.g. 0.1 kg bubbles).
 const MAX_IMPULSE_VELOCITY := 50.0
 
-## Persistent sphere shape for physics queries. With threaded physics,
-## PhysicsServer3D.shape_set_data() is deferred — a shape created + configured
-## in the same frame reads radius=0. By reusing a persistent shape, the radius
-## from the previous frame's set_data has already been flushed by Jolt.
-static var _query_sphere := SphereShape3D.new()
+## Persistent sphere shape for physics queries. Pre-created in prewarm()
+## (called from GameManager._ready) so the Jolt shape is registered before
+## the first explosion fires.
+static var _query_sphere: SphereShape3D = null
+
+
+static func prewarm() -> void:
+	## Create the query sphere early so Jolt has it ready before any explosion.
+	## SphereShape3D.new() builds a Jolt shape with radius 0 which Jolt rejects,
+	## so we immediately set a valid radius.
+	if _query_sphere == null:
+		_query_sphere = SphereShape3D.new()
+		_query_sphere.radius = 10.0
+		PhysicsServer3D.shape_set_data(_query_sphere.get_rid(), 10.0)
 
 
 # ======================================================================
@@ -58,9 +67,11 @@ static func do_explosion(
 	## impact_speed: speed of the projectile at detonation (m/s). Passed to debris.
 	## impulse_strength: base impulse (N·s) applied to RigidBody3D objects (before
 	##   falloff). Heavier objects receive less velocity change. 0.0 = no impulse.
+	Profiler.begin("do_explosion")
 	var t_explosion_total := Time.get_ticks_usec()
 	var space_state := world.direct_space_state
 	if space_state == null:
+		Profiler.end("do_explosion")
 		return
 
 	var already_damaged: Array[Node] = []
@@ -72,25 +83,21 @@ static func do_explosion(
 	var _dbg_pass1_structures: Array[String] = []
 
 	# ------------------------------------------------------------------
-	#  Pass 1: Physics sphere query (catches players + rigid bodies)
+	#  Sphere query — finds players, structures, rigid bodies in radius
 	# ------------------------------------------------------------------
 	var t_sphere := Time.get_ticks_usec()
 	var query := PhysicsShapeQueryParameters3D.new()
-	# Reuse persistent sphere shape — see _query_sphere comment above.
-	# The radius set here is deferred (threaded physics), so on the FIRST
-	# explosion call the shape uses its default radius (0.5m). Pass 2's
-	# scene scan catches anything missed. All subsequent calls use the
-	# correct radius from the previous frame's flush.
 	if _query_sphere == null:
-		_query_sphere = SphereShape3D.new()
+		prewarm()  # Fallback if prewarm wasn't called
 	_query_sphere.radius = radius
+	PhysicsServer3D.shape_set_data(_query_sphere.get_rid(), radius)
 	query.shape = _query_sphere
 	query.transform = Transform3D(Basis(), explosion_pos)
 	query.collision_mask = CollisionLayers.WORLD | CollisionLayers.ITEMS | CollisionLayers.BUBBLES | CollisionLayers.ALL_PLAYERS | CollisionLayers.WALL_BLOCKS
 	query.collide_with_bodies = true
 	query.collide_with_areas = true
 
-	var results := space_state.intersect_shape(query, 64)
+	var results := space_state.intersect_shape(query, 2048)
 	var t_sphere_end := Time.get_ticks_usec()
 
 	# --- DEBUG: scan for nearby FallingBlockClusters and dump their shielding state ---
@@ -182,9 +189,7 @@ static func do_explosion(
 			pass1_objects += 1
 	var t_pass1_process_end := Time.get_ticks_usec()
 
-	# --- Pass 2: Direct scene scan (safety net if sphere query misses targets) ---
-	# Jolt's intersect_shape with server-created sphere shapes can silently
-	# return empty results. Iterate Players and Structures directly by distance.
+	# --- Player scene scan (safety net — players move and may be missed by sphere) ---
 	var t_pass2_players := Time.get_ticks_usec()
 	var pass2_players := 0
 	var tree := Engine.get_main_loop() as SceneTree
@@ -209,46 +214,10 @@ static func do_explosion(
 				pass2_players += 1
 	var t_pass2_players_end := Time.get_ticks_usec()
 
-	# -- Destructible structures (walls, ramps, OBJ structures) --
-	var t_pass2_structures := Time.get_ticks_usec()
-	var pass2_structures := 0
-	var pass2_scanned := 0
-	var pass2_skipped := 0
-	if tree and tree.current_scene:
-		var seed_world := tree.current_scene.get_node_or_null("SeedWorld")
-		if seed_world == null:
-			seed_world = tree.current_scene.get_node_or_null("BlockoutMap/SeedWorld")
-		if seed_world:
-			var structures := seed_world.get_node_or_null("Structures")
-			if structures:
-				var _dbg_pass2_structures: Array[String] = []
-				var _dbg_pass2_skipped: Array[String] = []
-				for s in structures.get_children():
-					pass2_scanned += 1
-					if s in already_damaged:
-						continue
-					if not s.has_method("take_damage_at"):
-						continue
-					# Pre-filter: check if any block could be within blast radius.
-					# Use structure_size half-diagonal as the margin so tall/large
-					# OBJ structures aren't skipped when the explosion is near their
-					# edge but far from their center.
-					var margin := 10.0
-					if "structure_size" in s:
-						margin = maxf(s.structure_size.length() * 0.5, 10.0)
-					var dist := explosion_pos.distance_to(s.global_position)
-					if dist > radius + margin:
-						pass2_skipped += 1
-						continue
-					_dbg_pass2_structures.append(s.name)
-					s.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids, impact_speed)
-					already_damaged.append(s)
-					pass2_structures += 1
-
-				if not _dbg_pass2_structures.is_empty() or not _dbg_pass2_skipped.is_empty():
-					print("[Explosion] pass1_structures=%s  pass2_structures=%s" % [
-						str(_dbg_pass1_structures), str(_dbg_pass2_structures)])
-	var t_pass2_structures_end := Time.get_ticks_usec()
+	# --- Full explosion diagnostics: compare sphere results against all scene structures ---
+	if GameManager.debug_explosion_diagnostics:
+		_dump_explosion_diagnostics(explosion_pos, radius, structure_damage,
+			results, already_damaged, exclude_body, space_state, exclude_rids)
 
 	# ------------------------------------------------------------------
 	#  Impulse pass: push RigidBody3D objects away from the blast
@@ -293,15 +262,15 @@ static func do_explosion(
 
 	var t_explosion_total_end := Time.get_ticks_usec()
 	var explosion_us := t_explosion_total_end - t_explosion_total
-	print("[DoExplosion] sphere_query=%dus(%d results)  pass1=%dus(players=%d structs=%d objs=%d)  pass2_players=%dus(%d)  pass2_structs=%dus(scanned=%d skipped=%d hit=%d)  impulse=%d  total=%dus" % [
+	print("[DoExplosion] sphere=%dus(%d results)  damage=%dus(players=%d structs=%d objs=%d)  player_scan=%dus(%d)  impulse=%d  total=%dus" % [
 		t_sphere_end - t_sphere, results.size(),
 		t_pass1_process_end - t_pass1_process, pass1_players, pass1_structures, pass1_objects,
 		t_pass2_players_end - t_pass2_players, pass2_players,
-		t_pass2_structures_end - t_pass2_structures, pass2_scanned, pass2_skipped, pass2_structures,
 		impulse_count,
 		explosion_us,
 	])
 	GameManager.tick_add("do_explosion", explosion_us)
+	Profiler.end("do_explosion")
 
 	# Profile the next 60 ticks (~1 second) to see post-explosion aftermath costs
 	GameManager.start_tick_profile(60)
@@ -447,20 +416,20 @@ static func draw_debug_rays(ray_data: Array) -> void:
 		var final: float = entry["final_dmg"]
 		var absorbed: float = raw - final
 
-		# Color based on shielding, not absolute damage level:
-		#   Green  = no shielding encountered (full damage reaches target)
-		#   Yellow = partial shielding (some damage still gets through)
-		#   Red    = fully blocked by shielding (all damage absorbed)
+		# Color based on shielding fraction (absorbed / raw), ignoring falloff:
+		#   Green  = no shielding (0% absorbed)
+		#   Yellow = partial shielding (some absorbed, some gets through)
+		#   Red    = fully blocked (100% absorbed by shielding)
 		#   Gray   = out of blast range
 		var color: Color
 		if raw <= 0.01:
 			color = Color(0.5, 0.5, 0.5, 0.4)  # Out of range — gray
 		elif absorbed <= 0.01:
 			color = Color(0.2, 1.0, 0.2, 0.6)  # No shielding — green
-		elif final >= 0.5:
-			color = Color(1.0, 1.0, 0.0, 0.6)  # Partial shielding — yellow
-		else:
+		elif absorbed >= raw - 0.01:
 			color = Color(1.0, 0.2, 0.2, 0.6)  # Fully blocked — red
+		else:
+			color = Color(1.0, 1.0, 0.0, 0.6)  # Partial shielding — yellow
 
 		im.surface_set_color(color)
 		im.surface_add_vertex(from)
@@ -554,3 +523,185 @@ static func _make_shielding_query(from: Vector3, exclude_rids: Array[RID]) -> Ph
 	query.collision_mask = CollisionLayers.SHIELDING  # Terrain(1) + players(128/256) + wall blocks(1024)
 	query.exclude = exclude_rids
 	return query
+
+
+# ======================================================================
+#  Explosion diagnostics — full scene dump
+# ======================================================================
+
+static func _dump_explosion_diagnostics(
+	explosion_pos: Vector3, radius: float, structure_damage: float,
+	sphere_results: Array, already_damaged: Array[Node], exclude_body: Node,
+	space_state: PhysicsDirectSpaceState3D, exclude_rids: Array[RID],
+) -> void:
+	## Comprehensive diagnostic: compares what the explosion found against every
+	## block structure in the scene. Flags structures within blast radius that
+	## were NOT damaged and suggests likely causes.
+	print("[ExplosionDiag] ══════════════════════════════════════════════════════")
+	print("[ExplosionDiag] EXPLOSION pos=%s  radius=%.1f  struct_dmg=%.0f" % [
+		str(explosion_pos).substr(0, 40), radius, structure_damage])
+	print("[ExplosionDiag] Sphere query: %d results  |  query mask=%d (WALL_BLOCKS=%d)" % [
+		sphere_results.size(), CollisionLayers.WORLD | CollisionLayers.ITEMS | CollisionLayers.BUBBLES | CollisionLayers.ALL_PLAYERS | CollisionLayers.WALL_BLOCKS,
+		CollisionLayers.WALL_BLOCKS])
+	print("[ExplosionDiag] NOTE: Jolt deferred shapes — first-frame sphere query may use default radius (0.5m)")
+	print("[ExplosionDiag] Already damaged (%d): %s" % [already_damaged.size(),
+		str(already_damaged.map(func(n: Node): return n.name if n else "null"))])
+
+	# Identify which structures the sphere query actually returned colliders for
+	var sphere_structure_ids: Dictionary = {}
+	for result in sphere_results:
+		var collider: Node = result["collider"]
+		if collider == null:
+			continue
+		var cur := collider
+		for _i in 4:
+			if cur == null:
+				break
+			if cur is DestructibleBlockStructure or cur is FallingBlockCluster:
+				sphere_structure_ids[cur.get_instance_id()] = cur
+				break
+			cur = cur.get_parent()
+
+	print("[ExplosionDiag] Sphere query resolved to %d unique structures" % sphere_structure_ids.size())
+
+	# Find ALL structures in scene
+	var tree := Engine.get_main_loop() as SceneTree
+	if not tree or not tree.current_scene:
+		print("[ExplosionDiag] No scene tree!")
+		return
+
+	var structures_node: Node = null
+	var seed_world = tree.current_scene.get_node_or_null("SeedWorld")
+	if seed_world == null:
+		seed_world = tree.current_scene.get_node_or_null("BlockoutMap/SeedWorld")
+	if seed_world:
+		structures_node = seed_world.get_node_or_null("Structures")
+
+	if not structures_node:
+		print("[ExplosionDiag] Structures node NOT FOUND in scene tree!")
+		return
+
+	print("[ExplosionDiag] Structures node: %d children total" % structures_node.get_child_count())
+
+	var missed_count := 0
+	for child in structures_node.get_children():
+		var is_wall := child is DestructibleBlockStructure
+		var is_cluster := child is FallingBlockCluster
+		if not is_wall and not is_cluster:
+			continue
+
+		var dist := explosion_pos.distance_to(child.global_position)
+		if dist > radius + 5.0:
+			continue
+
+		var type_str := "Wall" if is_wall else "Cluster"
+		var in_sphere := sphere_structure_ids.has(child.get_instance_id())
+		var was_damaged := child in already_damaged
+		var in_radius := dist <= radius
+
+		var status := "DAMAGED" if was_damaged else ("IN_SPHERE" if in_sphere else "MISSED")
+		print("[ExplosionDiag] ── %s '%s'  dist=%.1f  %s ──" % [type_str, child.name, dist, status])
+		print("[ExplosionDiag]   pos=%s" % str(child.global_position).substr(0, 40))
+
+		# Compound hit body diagnostics
+		var hit_body: Node = child.get("_compound_hit_body")
+		if hit_body == null:
+			print("[ExplosionDiag]   hit_body: NULL — no shapes for sphere query to find!")
+		elif not is_instance_valid(hit_body):
+			print("[ExplosionDiag]   hit_body: FREED/INVALID")
+		else:
+			var layer: int = hit_body.collision_layer
+			var has_wb := bool(layer & CollisionLayers.WALL_BLOCKS)
+			var key_map: Dictionary = child.get("_key_to_shape")
+			var shape_arr: Array = child.get("_shape_to_key")
+			var n_active: int = key_map.size() if key_map else 0
+			var n_total: int = shape_arr.size() if shape_arr else 0
+			print("[ExplosionDiag]   hit_body: layer=%d WALL_BLOCKS=%s  active_shapes=%d/%d  rid=%s" % [
+				layer, str(has_wb), n_active, n_total, str(hit_body.get_rid())])
+			if not has_wb:
+				print("[ExplosionDiag]   >>> MISSING WALL_BLOCKS LAYER — explosion query CANNOT find this!")
+			if n_active == 0 and n_total > 0:
+				print("[ExplosionDiag]   >>> ALL SHAPES DISABLED — nothing to collide with!")
+
+		if is_wall:
+			var smooth: Node = child.get("_collision_body")
+			if smooth and is_instance_valid(smooth):
+				print("[ExplosionDiag]   smooth_body: layer=%d" % smooth.collision_layer)
+			else:
+				print("[ExplosionDiag]   smooth_body: %s" % ("NULL" if smooth == null else "FREED"))
+			var hp_dict: Dictionary = child.get("_block_hp_dict")
+			print("[ExplosionDiag]   blocks=%d" % (hp_dict.size() if hp_dict else 0))
+
+		if is_cluster:
+			print("[ExplosionDiag]   body_layer=%d  frozen=%s  mass=%.1f" % [
+				child.collision_layer, str(child.freeze), child.cluster_mass])
+			var grid = child.get("grid")
+			print("[ExplosionDiag]   blocks=%d" % (grid.block_hp.size() if grid else 0))
+
+		# ── Critical diagnostic: in radius but not damaged ──
+		if in_radius and not was_damaged and child != exclude_body:
+			missed_count += 1
+			print("[ExplosionDiag]   >>>>>> WITHIN RADIUS (%.1f <= %.1f) BUT NOT DAMAGED! <<<<<<" % [dist, radius])
+
+			if hit_body == null or (hit_body != null and not is_instance_valid(hit_body)):
+				print("[ExplosionDiag]   Likely cause: no valid compound_hit_body")
+			elif not bool(hit_body.collision_layer & CollisionLayers.WALL_BLOCKS):
+				print("[ExplosionDiag]   Likely cause: missing WALL_BLOCKS layer (layer=%d)" % hit_body.collision_layer)
+			elif not in_sphere:
+				print("[ExplosionDiag]   Likely cause: sphere query missed this (deferred shape? shape positions?)")
+				# Test raycast from explosion to structure center
+				if space_state:
+					var test_q := PhysicsRayQueryParameters3D.new()
+					test_q.from = explosion_pos
+					test_q.to = child.global_position
+					test_q.collision_mask = CollisionLayers.WALL_BLOCKS
+					test_q.exclude = exclude_rids
+					var test_hit := space_state.intersect_ray(test_q)
+					if test_hit:
+						var hitter: Node = test_hit.get("collider")
+						print("[ExplosionDiag]   Test ray hit: %s (%s) at %s" % [
+							hitter.name if hitter else "null",
+							hitter.get_class() if hitter else "null",
+							str(test_hit.get("position", Vector3.ZERO)).substr(0, 30)])
+					else:
+						print("[ExplosionDiag]   Test ray from explosion to structure center: NO HIT")
+				# Check if any individual blocks are actually within radius
+				if is_wall:
+					var any_in := false
+					var hp_dict: Dictionary = child.get("_block_hp_dict")
+					if hp_dict:
+						for key: Vector3i in hp_dict:
+							var bpos: Vector3 = child.global_transform * child._block_local_pos(key)
+							if explosion_pos.distance_to(bpos) <= radius:
+								any_in = true
+								break
+					if not any_in:
+						print("[ExplosionDiag]   Note: center in range but NO individual blocks within blast radius")
+				if is_cluster:
+					var grid = child.get("grid")
+					if grid:
+						var any_in := false
+						for key: Vector3i in grid.block_hp:
+							var bpos: Vector3 = child.global_transform * grid.block_local_pos(key)
+							if explosion_pos.distance_to(bpos) <= radius:
+								any_in = true
+								break
+						if not any_in:
+							print("[ExplosionDiag]   Note: center in range but NO individual blocks within blast radius")
+			else:
+				print("[ExplosionDiag]   Likely cause: sphere found it, but _find_damageable or take_damage_at skipped it")
+				# Check if _find_damageable would resolve this
+				if hit_body and is_instance_valid(hit_body):
+					var parent_wall = hit_body.get("parent_wall")
+					if parent_wall == null:
+						print("[ExplosionDiag]   hit_body.parent_wall is NULL — _find_damageable cannot walk to structure")
+					elif not is_instance_valid(parent_wall):
+						print("[ExplosionDiag]   hit_body.parent_wall is INVALID/FREED")
+					elif not parent_wall.has_method("take_damage_at"):
+						print("[ExplosionDiag]   parent_wall has NO take_damage_at method!")
+
+	if missed_count == 0:
+		print("[ExplosionDiag] All nearby structures accounted for")
+	else:
+		print("[ExplosionDiag] >>> %d STRUCTURE(S) IN RADIUS BUT NOT DAMAGED <<<" % missed_count)
+	print("[ExplosionDiag] ══════════════════════════════════════════════════════")

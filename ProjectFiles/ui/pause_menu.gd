@@ -39,6 +39,11 @@ var _explosion_damage_input: LineEdit = null
 var _resistance_scale_input: LineEdit = null
 var _surface_press_button: CheckButton = null
 var _speed_50_button: CheckButton = null
+var _explosion_diag_button: CheckButton = null
+var _structure_layers_button: CheckButton = null
+var _layer_overlay_timer: float = 0.0
+var _layer_labels: Dictionary = {}
+var _hitbox_mesh_node: MeshInstance3D = null
 
 # ── Video Settings panel UI refs ─────────────────────────────────────────
 var _video_panel: PanelContainer = null
@@ -110,6 +115,13 @@ func _input(event: InputEvent) -> void:
 
 
 func _process(delta: float) -> void:
+	if GameManager.debug_show_structure_layers:
+		_layer_overlay_timer += delta
+		if _layer_overlay_timer >= 0.5:
+			_layer_overlay_timer = 0.0
+			_update_structure_layer_labels()
+	elif not _layer_labels.is_empty() or _hitbox_mesh_node != null:
+		_clear_structure_layer_labels()
 	if not is_open:
 		return
 	_fps_timer += delta
@@ -220,6 +232,9 @@ func _build_main_panel() -> void:
 	_grapple_debug_visuals_button = _add_check("Debug Visuals (pill, angles, spheres)", false, vbox)
 	_grapple_debug_visuals_button.toggled.connect(_on_grapple_debug_visuals_toggled)
 
+	_add_check("Show Safe Zone (no-sever radius)", GameManager.debug_grapple_safe_zone, vbox) \
+		.toggled.connect(func(p): GameManager.debug_grapple_safe_zone = p)
+
 	_grapple_horiz_nudge_button = _add_check("Launch Nudge: Include Horizontal", true, vbox)
 	_grapple_horiz_nudge_button.toggled.connect(_on_grapple_horiz_nudge_toggled)
 
@@ -260,6 +275,12 @@ func _build_main_panel() -> void:
 
 	_explosion_repeat_button = _add_check("Explosion Shielding 2000x Repeat", GameManager.debug_explosion_repeat, vbox)
 	_explosion_repeat_button.toggled.connect(_on_explosion_repeat_toggled)
+
+	_explosion_diag_button = _add_check("Explosion Diagnostics (Full Dump)", GameManager.debug_explosion_diagnostics, vbox)
+	_explosion_diag_button.toggled.connect(_on_explosion_diag_toggled)
+
+	_structure_layers_button = _add_check("Show Structure Collision Layers", GameManager.debug_show_structure_layers, vbox)
+	_structure_layers_button.toggled.connect(_on_structure_layers_toggled)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -427,6 +448,14 @@ func _build_main_panel() -> void:
 		.toggled.connect(func(p): GameManager.debug_restore_with_walls = p)
 	_add_check("Instant Acceleration", GameManager.debug_instant_accel, vbox) \
 		.toggled.connect(func(p): GameManager.debug_instant_accel = p)
+
+	# ── Render profiling toggles ──
+	_add_check("No Shadows (perf test)", GameManager.debug_no_shadows, vbox) \
+		.toggled.connect(_on_no_shadows_toggled)
+	_add_check("Hide Clusters (perf test)", GameManager.debug_hide_clusters, vbox) \
+		.toggled.connect(_on_hide_clusters_toggled)
+	_add_scale_input("Shadow Distance", 800.0,
+		_on_shadow_distance_changed, func(): pass, vbox)
 	_add_check("Extend Snap Range (0.5m)", GameManager.debug_grounding_extend_snap, vbox) \
 		.toggled.connect(func(p): GameManager.debug_grounding_extend_snap = p)
 	_add_check("Surface Press (vel.y bias)", GameManager.debug_grounding_surface_press, vbox) \
@@ -1195,6 +1224,216 @@ func _on_explosion_repeat_toggled(pressed: bool) -> void:
 	print("[PauseMenu] Explosion shielding 2000x repeat: %s" % ("ON" if pressed else "OFF"))
 
 
+func _on_explosion_diag_toggled(pressed: bool) -> void:
+	GameManager.debug_explosion_diagnostics = pressed
+	print("[PauseMenu] Explosion diagnostics: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_structure_layers_toggled(pressed: bool) -> void:
+	GameManager.debug_show_structure_layers = pressed
+	if not pressed:
+		_clear_structure_layer_labels()
+	print("[PauseMenu] Structure collision layers: %s" % ("ON" if pressed else "OFF"))
+
+
+func _find_structures_node() -> Node:
+	var tree := get_tree()
+	if not tree or not tree.current_scene:
+		return null
+	var seed_world = tree.current_scene.get_node_or_null("SeedWorld")
+	if seed_world == null:
+		seed_world = tree.current_scene.get_node_or_null("BlockoutMap/SeedWorld")
+	if seed_world:
+		return seed_world.get_node_or_null("Structures")
+	return null
+
+
+func _layer_bits_str(layer: int) -> String:
+	var parts: PackedStringArray = PackedStringArray()
+	if layer & CollisionLayers.WORLD: parts.append("WORLD")
+	if layer & CollisionLayers.ITEMS: parts.append("ITEMS")
+	if layer & CollisionLayers.BUBBLES: parts.append("BUBBLES")
+	if layer & CollisionLayers.RUBBER_BALLS: parts.append("RUBBER_BALLS")
+	if layer & CollisionLayers.TOAD_WALLS: parts.append("TOAD_WALLS")
+	if layer & CollisionLayers.DEBRIS: parts.append("DEBRIS")
+	if layer & CollisionLayers.TOAD_RAIN: parts.append("TOAD_RAIN")
+	if layer & CollisionLayers.PLAYERS_HIT: parts.append("PLAYERS_HIT")
+	if layer & CollisionLayers.TOAD_PLAYERS: parts.append("TOAD_PLAYERS")
+	if layer & CollisionLayers.PLAYERS_PUSH: parts.append("PLAYERS_PUSH")
+	if layer & CollisionLayers.WALL_BLOCKS: parts.append("WALL_BLOCKS")
+	if layer & CollisionLayers.WALL_SMOOTH: parts.append("WALL_SMOOTH")
+	if parts.is_empty(): return "NONE(0)"
+	return "%s(%d)" % ["|".join(parts), layer]
+
+
+func _update_structure_layer_labels() -> void:
+	var structures_node := _find_structures_node()
+	if not structures_node:
+		_clear_structure_layer_labels()
+		return
+
+	var scene_root := get_tree().current_scene
+	if not scene_root:
+		return
+
+	# Create or reuse the hitbox wireframe mesh node
+	if _hitbox_mesh_node == null or not is_instance_valid(_hitbox_mesh_node):
+		_hitbox_mesh_node = MeshInstance3D.new()
+		_hitbox_mesh_node.name = "DebugStructureHitboxes"
+		var mat := StandardMaterial3D.new()
+		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mat.no_depth_test = true
+		mat.vertex_color_use_as_albedo = true
+		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		_hitbox_mesh_node.material_override = mat
+		scene_root.add_child(_hitbox_mesh_node)
+
+	var im: ImmediateMesh
+	if _hitbox_mesh_node.mesh is ImmediateMesh:
+		im = _hitbox_mesh_node.mesh
+		im.clear_surfaces()
+	else:
+		im = ImmediateMesh.new()
+		_hitbox_mesh_node.mesh = im
+
+	const HITBOX_RANGE := 15.0
+	const HITBOX_RANGE_SQ := HITBOX_RANGE * HITBOX_RANGE
+	# Structure center can be offset from its blocks — use generous margin
+	const STRUCT_CULL_RANGE := HITBOX_RANGE + 10.0
+
+	var cam := get_viewport().get_camera_3d()
+	if not cam:
+		return
+	var cam_pos := cam.global_position
+
+	var half := 0.26  # Slightly larger than BLOCK_SIZE/2 so wireframe isn't flush with mesh
+	var seen: Dictionary = {}
+
+	im.surface_begin(Mesh.PRIMITIVE_LINES)
+
+	for child in structures_node.get_children():
+		var is_wall := child is DestructibleBlockStructure
+		var is_cluster := child is FallingBlockCluster
+		if not is_wall and not is_cluster:
+			continue
+
+		# Skip structures too far from camera
+		if cam_pos.distance_to(child.global_position) > STRUCT_CULL_RANGE:
+			continue
+
+		var id := child.get_instance_id()
+		seen[id] = true
+
+		# Determine color from compound hit body status
+		var hit_body: Node = child.get("_compound_hit_body")
+		var has_wall_blocks := false
+		var active_shapes := 0
+		var color := Color(1.0, 0.2, 0.2, 0.6)  # Red = problem
+
+		if hit_body != null and is_instance_valid(hit_body):
+			var layer: int = hit_body.collision_layer
+			has_wall_blocks = bool(layer & CollisionLayers.WALL_BLOCKS)
+			var key_map: Dictionary = child.get("_key_to_shape")
+			active_shapes = key_map.size() if key_map else 0
+			if has_wall_blocks and active_shapes > 0:
+				color = Color(0.2, 1.0, 0.2, 0.5)  # Green = correct
+			elif has_wall_blocks:
+				color = Color(1.0, 1.0, 0.2, 0.5)  # Yellow = layer ok but 0 shapes
+
+		# Draw wireframe cube only for blocks within 15m of camera
+		var xform: Transform3D = child.global_transform
+		if is_wall:
+			var hp_dict: Dictionary = child.get("_block_hp_dict")
+			if hp_dict:
+				for key: Vector3i in hp_dict:
+					var local_pos: Vector3 = child._block_local_pos(key)
+					var world_pos: Vector3 = xform * local_pos
+					if cam_pos.distance_squared_to(world_pos) <= HITBOX_RANGE_SQ:
+						_draw_wire_box_xform(im, xform, local_pos, half, color)
+		elif is_cluster:
+			var grid = child.get("grid")
+			if grid:
+				for key: Vector3i in grid.block_hp:
+					var local_pos: Vector3 = grid.block_local_pos(key)
+					var world_pos: Vector3 = xform * local_pos
+					if cam_pos.distance_squared_to(world_pos) <= HITBOX_RANGE_SQ:
+						_draw_wire_box_xform(im, xform, local_pos, half, color)
+
+		# Tiny label per structure
+		var label: Label3D
+		if _layer_labels.has(id) and is_instance_valid(_layer_labels[id]):
+			label = _layer_labels[id]
+		else:
+			label = Label3D.new()
+			label.name = "DebugLayerLbl_%d" % id
+			label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+			label.no_depth_test = true
+			label.font_size = 24
+			label.outline_size = 6
+			label.pixel_size = 0.004
+			label.outline_modulate = Color.BLACK
+			scene_root.add_child(label)
+			_layer_labels[id] = label
+
+		var type_char := "W" if is_wall else "C"
+		var hit_layer := 0
+		if hit_body and is_instance_valid(hit_body):
+			hit_layer = hit_body.collision_layer
+		var lbl := "[%s] %s  hit:%d  %dshp" % [type_char, child.name, hit_layer, active_shapes]
+		if hit_body == null or (hit_body != null and not is_instance_valid(hit_body)):
+			lbl += "  !!NO HIT BODY"
+		elif not has_wall_blocks:
+			lbl += "  !!MISSING WALL_BLOCKS"
+		if is_cluster:
+			if child.freeze:
+				lbl += "  frozen"
+		label.text = lbl
+		label.modulate = color
+		label.global_position = child.global_position + Vector3(0, 3.0, 0)
+
+	im.surface_end()
+
+	# Remove stale labels (for structures that moved out of range or were freed)
+	var to_remove: Array = []
+	for id in _layer_labels:
+		if not seen.has(id):
+			to_remove.append(id)
+	for id in to_remove:
+		if is_instance_valid(_layer_labels[id]):
+			_layer_labels[id].queue_free()
+		_layer_labels.erase(id)
+
+
+func _draw_wire_box_xform(im: ImmediateMesh, xform: Transform3D, local_center: Vector3, h: float, color: Color) -> void:
+	## Draw wireframe box transformed by xform so it rotates with the structure.
+	var c0 := xform * (local_center + Vector3(-h, -h, -h))
+	var c1 := xform * (local_center + Vector3( h, -h, -h))
+	var c2 := xform * (local_center + Vector3( h, -h,  h))
+	var c3 := xform * (local_center + Vector3(-h, -h,  h))
+	var c4 := xform * (local_center + Vector3(-h,  h, -h))
+	var c5 := xform * (local_center + Vector3( h,  h, -h))
+	var c6 := xform * (local_center + Vector3( h,  h,  h))
+	var c7 := xform * (local_center + Vector3(-h,  h,  h))
+	for edge: Array in [[c0,c1],[c1,c2],[c2,c3],[c3,c0],
+			[c4,c5],[c5,c6],[c6,c7],[c7,c4],
+			[c0,c4],[c1,c5],[c2,c6],[c3,c7]]:
+		im.surface_set_color(color)
+		im.surface_add_vertex(edge[0])
+		im.surface_set_color(color)
+		im.surface_add_vertex(edge[1])
+
+
+func _clear_structure_layer_labels() -> void:
+	for label in _layer_labels.values():
+		if is_instance_valid(label):
+			label.queue_free()
+	_layer_labels.clear()
+	if _hitbox_mesh_node and is_instance_valid(_hitbox_mesh_node):
+		_hitbox_mesh_node.queue_free()
+		_hitbox_mesh_node = null
+	_layer_overlay_timer = 0.0
+
+
 func _on_toad_density_submitted(text: String) -> void:
 	var val := int(text.to_float())
 	if val >= 1:
@@ -1406,3 +1645,35 @@ func _on_reset_pressed() -> void:
 func _on_quit_pressed() -> void:
 	_toggle_menu()
 	NetworkManager.disconnect_game()
+
+
+func _find_sun() -> DirectionalLight3D:
+	var sun := get_tree().current_scene.get_node_or_null("SeedWorld/Sun")
+	if sun == null:
+		sun = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld/Sun")
+	return sun
+
+
+func _on_no_shadows_toggled(pressed: bool) -> void:
+	GameManager.debug_no_shadows = pressed
+	var sun := _find_sun()
+	if sun:
+		sun.shadow_enabled = not pressed
+
+
+func _on_hide_clusters_toggled(pressed: bool) -> void:
+	GameManager.debug_hide_clusters = pressed
+	var structures := get_tree().current_scene.get_node_or_null("SeedWorld/Structures")
+	if structures == null:
+		structures = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld/Structures")
+	if structures:
+		for s in structures.get_children():
+			if s is FallingBlockCluster:
+				s.visible = not pressed
+
+
+func _on_shadow_distance_changed(text: String) -> void:
+	var sun := _find_sun()
+	if sun:
+		sun.directional_shadow_max_distance = float(text)
+		print("[RenderDebug] Shadow distance = %s" % text)

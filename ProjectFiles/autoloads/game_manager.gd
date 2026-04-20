@@ -24,6 +24,7 @@ var debug_shotgun_boost: bool = false        # Double barrel: halved fire rate, 
 var debug_grapple_ground_pump: bool = false
 var debug_grapple_reel_speed: float = 1.2  # Default reel speed (m/s)
 var debug_grapple_visuals: bool = false     # Show pill, angle display, spheres, raycasts
+var debug_grapple_safe_zone: bool = false  # Show ROPE_LOS_MARGIN sphere around anchor
 var debug_grapple_horiz_nudge: bool = true # Launch nudge includes horizontal component toward anchor
 var show_fps_hud: bool = true                # Show FPS counter on gameplay HUD
 var debug_freecam_active: bool = false      # Set by DebugFreecam autoload
@@ -46,6 +47,8 @@ var disable_debris: bool = false                 # Skip spawning cosmetic wall d
 var debug_lagger_delay_ms: float = 2.0           # Lagger weapon: ms to stall per tick/shot
 var debug_lagger_overhead_mode: bool = true      # true = stall every tick, false = stall on fire only
 var debug_explosion_repeat: bool = false         # Run C++ shielding calc 4x for perf testing
+var debug_explosion_diagnostics: bool = false    # Full scene-wide explosion diagnostic dump
+var debug_show_structure_layers: bool = false     # Collision layer overlay on block structures
 
 # Toad dimension debug toggles (set from pause menu)
 var debug_toad_no_physics: bool = false   # Disable all physics for toad rain bodies
@@ -61,6 +64,11 @@ var debug_show_collision: bool = false         # Show terrain collision meshes a
 var debug_show_block_hits: bool = false       # Show wireframe box at hit/missed block shapes
 var debug_dynamic_contact_log: bool = false  # F10: log velocity restore vs dynamic body contacts
 var debug_dynamic_speed_scale: bool = true   # Scale speed by approach angle against dynamic bodies
+
+# Render debug toggles (for profiling — toggle in pause menu to measure impact)
+var debug_no_shadows: bool = false
+var debug_shadow_distance: float = -1.0  # -1 = default, otherwise override
+var debug_hide_clusters: bool = false
 var debug_no_jump_unground: bool = false       # Don't unground on jump
 var debug_no_force_airborne: bool = false      # Don't force airborne
 
@@ -114,6 +122,7 @@ var last_tick_gdscript_us: int = 0       # Total from previous tick (read by HUD
 
 func _ready() -> void:
 	process_physics_priority = -100  # Run before all game nodes
+	ExplosionHelper.prewarm()
 
 
 func start_tick_profile(num_ticks: int) -> void:
