@@ -89,6 +89,7 @@ const CLUSTER_MAX_LOAD := 12.0      ## max compression per face in block-weights
 const CLUSTER_H_TRANSFER := 0.6     ## lateral load distribution
 var _has_ground_contact: bool = false
 var _active_body_contacts: Dictionary = {}  ## body_rid -> mass (for external load)
+var _active_body_nodes: Dictionary = {}     ## body_rid -> Node (parallel to _active_body_contacts; needed because RID->Node isn't recoverable)
 
 # ======================================================================
 #  Debris config — set by structure before add_child via set_debris_config()
@@ -791,8 +792,9 @@ func _check_cluster_stress() -> void:
 
 	for body_rid in _active_body_contacts:
 		var body_mass: float = _active_body_contacts[body_rid]
-		# Find nearest block to the contact body's position
-		var body_node = instance_from_id(body_rid.get_id()) if body_rid.is_valid() else null
+		# Find nearest block to the contact body's position.
+		# RID->Node isn't recoverable from RID alone, so we look up via the parallel _active_body_nodes map.
+		var body_node: Node = _active_body_nodes.get(body_rid)
 		if body_node == null or not is_instance_valid(body_node):
 			continue
 		var body_pos: Vector3 = body_node.global_position if body_node is Node3D else global_position
@@ -1147,7 +1149,9 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 
 func _on_body_exited(body: Node) -> void:
 	if body is PhysicsBody3D:
-		_active_body_contacts.erase(body.get_rid())
+		var rid := body.get_rid()
+		_active_body_contacts.erase(rid)
+		_active_body_nodes.erase(rid)
 
 
 func _on_body_entered(body: Node) -> void:
@@ -1156,9 +1160,13 @@ func _on_body_entered(body: Node) -> void:
 
 	# Track contact for stress solver (mass of contacting body)
 	if body is RigidBody3D:
-		_active_body_contacts[body.get_rid()] = body.mass
+		var rid := body.get_rid()
+		_active_body_contacts[rid] = body.mass
+		_active_body_nodes[rid] = body
 	elif body is Player:
-		_active_body_contacts[body.get_rid()] = 80.0  # player mass
+		var rid := body.get_rid()
+		_active_body_contacts[rid] = 80.0  # player mass
+		_active_body_nodes[rid] = body
 
 	# Wake up settled clusters so physics + stress checks resume
 	if sleeping:

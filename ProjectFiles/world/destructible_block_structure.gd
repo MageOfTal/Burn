@@ -907,7 +907,6 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		Profiler.end("struct_take_damage_at")
 		return
 
-	Profiler.begin("struct_take_damage_at")
 	_last_attacker_id = _attacker_id
 	var t_total := Time.get_ticks_usec()
 
