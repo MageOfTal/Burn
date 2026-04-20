@@ -25,6 +25,9 @@ ProjectFiles/*.pck
 ProjectFiles/addons/godot_cef/
 ProjectFiles/addons/godot_wry/
 
+# --- Generated terrain bake caches (regenerated at runtime if missing) ---
+ProjectFiles/terrain/*.bin
+
 # --- Engine: ignore everything, then whitelist patched files + binaries ---
 # Must un-ignore each directory level for negation to work.
 Engine/**
