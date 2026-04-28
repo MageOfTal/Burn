@@ -1513,7 +1513,6 @@ func client_process_visuals(_delta: float) -> void:
 		_safe_zone_mesh_instance.top_level = true
 		_safe_zone_mesh_instance.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 		_draw_debug_sphere_wireframe(sz_im, _safe_zone_mat, anchor_point, ROPE_LOS_MARGIN, 24, 12)
-		var scene_root := get_tree().current_scene
 		if scene_root:
 			scene_root.add_child(_safe_zone_mesh_instance)
 

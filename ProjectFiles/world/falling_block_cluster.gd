@@ -1149,7 +1149,7 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 
 func _on_body_exited(body: Node) -> void:
 	if body is PhysicsBody3D:
-		var rid := body.get_rid()
+		var rid: RID = body.get_rid()
 		_active_body_contacts.erase(rid)
 		_active_body_nodes.erase(rid)
 
@@ -1160,11 +1160,11 @@ func _on_body_entered(body: Node) -> void:
 
 	# Track contact for stress solver (mass of contacting body)
 	if body is RigidBody3D:
-		var rid := body.get_rid()
+		var rid: RID = body.get_rid()
 		_active_body_contacts[rid] = body.mass
 		_active_body_nodes[rid] = body
 	elif body is Player:
-		var rid := body.get_rid()
+		var rid: RID = body.get_rid()
 		_active_body_contacts[rid] = 80.0  # player mass
 		_active_body_nodes[rid] = body
 

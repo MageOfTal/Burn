@@ -10,10 +10,6 @@
 Tools/
 .claude/
 plan.md
-news-trader/
-assets/
-debug.log
-logger.txt
 
 # --- ProjectFiles ignores (same as before) ---
 ProjectFiles/.godot/
