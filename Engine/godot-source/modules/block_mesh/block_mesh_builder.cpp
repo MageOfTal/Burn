@@ -1738,17 +1738,21 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 	if (!need_full) {
 		Variant v_cc = p_persistent_state.get("contact_compression", Variant());
 		Variant v_cs = p_persistent_state.get("contact_shear", Variant());
+		Variant v_cf = p_persistent_state.get("contact_force", Variant());
 		Variant v_vis = p_persistent_state.get("visited", Variant());
 		if (v_cc.get_type() != Variant::PACKED_FLOAT32_ARRAY ||
 				v_cs.get_type() != Variant::PACKED_FLOAT32_ARRAY ||
+				v_cf.get_type() != Variant::PACKED_FLOAT32_ARRAY ||
 				v_vis.get_type() != Variant::PACKED_BYTE_ARRAY) {
 			need_full = true;
 			fallback_reason = "missing_state_arrays";
 		} else {
 			PackedFloat32Array cc = v_cc;
 			PackedFloat32Array cs = v_cs;
+			PackedFloat32Array cf = v_cf;
 			PackedByteArray vis = v_vis;
 			if (cc.size() != grid_size * 6 || cs.size() != grid_size * 6 ||
+					cf.size() != grid_size * 18 ||
 					vis.size() != grid_size) {
 				need_full = true;
 				fallback_reason = "state_array_size_mismatch";
@@ -1802,8 +1806,18 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 	uint8_t *active = (uint8_t *)memalloc(grid_size);
 	int *bfs_queue = (int *)memalloc(p_total_blocks * sizeof(int));
 	float *residual = (float *)memalloc(grid_size * 3 * sizeof(float));
+	// Per-contact accumulated SCALAR magnitudes — used for compression/shear
+	// limit clamping inside the solver. 6 directions per block.
 	float *contact_compression = (float *)memalloc(grid_size * 6 * sizeof(float));
 	float *contact_shear = (float *)memalloc(grid_size * 6 * sizeof(float));
+	// Per-contact accumulated FORCE VECTORS — used for exact dirty-seed
+	// residual restoration in the localized path. Indexed as
+	// contact_force[idx * 18 + d * 3 + axis], where axis 0=X, 1=Y, 2=Z.
+	// At equilibrium, this is the force `idx` is pushing through its `d` face
+	// to its neighbor in that direction. Storing the full vector (rather than
+	// just compression/shear scalars) is required because shear has a
+	// direction that the scalars discard.
+	float *contact_force = (float *)memalloc(grid_size * 18 * sizeof(float));
 
 	memset(visited, 0, grid_size);
 	memset(is_ground, 0, grid_size);
@@ -1812,6 +1826,7 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 	memset(residual, 0, grid_size * 3 * sizeof(float));
 	memset(contact_compression, 0, grid_size * 6 * sizeof(float));
 	memset(contact_shear, 0, grid_size * 6 * sizeof(float));
+	memset(contact_force, 0, grid_size * 18 * sizeof(float));
 
 	int peak_active = 0;
 
@@ -1876,9 +1891,11 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 		// Copy persistent state into our working arrays.
 		PackedFloat32Array cc_in = p_persistent_state.get("contact_compression", Variant());
 		PackedFloat32Array cs_in = p_persistent_state.get("contact_shear", Variant());
+		PackedFloat32Array cf_in = p_persistent_state.get("contact_force", Variant());
 		PackedByteArray vis_in = p_persistent_state.get("visited", Variant());
 		memcpy(contact_compression, cc_in.ptr(), grid_size * 6 * sizeof(float));
 		memcpy(contact_shear, cs_in.ptr(), grid_size * 6 * sizeof(float));
+		memcpy(contact_force, cf_in.ptr(), grid_size * 18 * sizeof(float));
 		memcpy(visited, vis_in.ptr(), grid_size);
 
 		// Reconstruct is_ground from visited + ground_mask (or y=0 fallback).
@@ -1950,39 +1967,45 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 				int ni = s_idx + dir_offsets[d];
 				if (grid[ni] != 1 || visited[ni] != 1) continue;
 
-				int opp = opposite_dir[d];
-				int n_contact_idx = ni * 6 + opp;
-				float fn_at_n = contact_compression[n_contact_idx];
-				float shear_at_n = contact_shear[n_contact_idx];
-
-				// Reconstruct force vector on N from S. The compression sign
-				// convention is positive=compression. Tensile (fn<0) means
-				// the contact was pulling N toward S; releasing it means N's
-				// load that was counter-acting that pull is freed.
-				// Direction from N toward S is -dir_normals[opp] = dir_normals[d]
-				// (since opp is opposite of d, and dir_normals are unit vectors).
-				// Compression force pushed N AWAY from S, i.e., in -dir_normals[d].
-				// Removing it means N now has unbalanced force in +dir_normals[d].
-				const float *n_normal = dir_normals[opp]; // points from N toward S
-				float released_x = fn_at_n * n_normal[0];
-				float released_y = fn_at_n * n_normal[1];
-				float released_z = fn_at_n * n_normal[2];
-				// Shear we approximate by adding magnitude as residual along the
-				// vertical (dominant for gravity scenarios) — exact direction is
-				// not preserved in our scalar storage. Adding the magnitude up
-				// is a slight overestimate but converges quickly.
-				if (shear_at_n > 0.0f) {
-					released_y += shear_at_n;
-				}
+				// At equilibrium (the persistent state we received), S was
+				// pushing a force vector through its `d` face into N. That
+				// vector is stored in S's contact_force[s_idx*18 + d*3 + axis].
+				//
+				// Sign convention: contact_force[idx, d, .] is the force that
+				// idx is transferring TO its neighbor in direction d (matches
+				// how the inner solver writes it: `tf` is added to neighbor's
+				// residual). So at equilibrium, N's residual gained S's
+				// contact force every iteration; with S removed, N's incoming
+				// flow stops.
+				//
+				// To compute N's new residual: the previous balance had
+				// 0 = gravity_N + force_S_to_N + (other inflows) - sum(N's outflows)
+				// After S vanishes, force_S_to_N drops to 0. To preserve
+				// balance, we'd need outflows to drop by force_S_to_N too.
+				// Until they do, N has new_residual = -force_S_to_N
+				// (the missing contribution shows up as residual that the
+				// solver will redistribute through N's remaining contacts).
+				int s_force_base = s_idx * 18 + d * 3;
+				float released_x = -contact_force[s_force_base + 0];
+				float released_y = -contact_force[s_force_base + 1];
+				float released_z = -contact_force[s_force_base + 2];
 
 				residual[ni * 3 + 0] += released_x;
 				residual[ni * 3 + 1] += released_y;
 				residual[ni * 3 + 2] += released_z;
 				active[ni] = 1;
 
-				// Clear the contact accounting on N's side — that contact is gone.
+				// Also clear N's accounting on its face toward S. N's
+				// contact_compression / contact_shear / contact_force on the
+				// (ni, opp) face is no longer valid — that face is gone.
+				int opp = opposite_dir[d];
+				int n_contact_idx = ni * 6 + opp;
 				contact_compression[n_contact_idx] = 0.0f;
 				contact_shear[n_contact_idx] = 0.0f;
+				int n_force_base = ni * 18 + opp * 3;
+				contact_force[n_force_base + 0] = 0.0f;
+				contact_force[n_force_base + 1] = 0.0f;
+				contact_force[n_force_base + 2] = 0.0f;
 			}
 		}
 
@@ -1998,6 +2021,7 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 			memset(residual, 0, grid_size * 3 * sizeof(float));
 			memset(contact_compression, 0, grid_size * 6 * sizeof(float));
 			memset(contact_shear, 0, grid_size * 6 * sizeof(float));
+			memset(contact_force, 0, grid_size * 18 * sizeof(float));
 			need_full = true;
 			fallback_reason = "active_set_too_large";
 			peak_active = 0;
@@ -2183,6 +2207,12 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 
 				contact_compression[ci] += fn_clamped;
 				contact_shear[ci] += shear_clamped;
+				// Accumulate full force vector for exact dirty-seed restoration
+				// in subsequent localized solves.
+				int cf_base = ci * 3;
+				contact_force[cf_base + 0] += tfx;
+				contact_force[cf_base + 1] += tfy;
+				contact_force[cf_base + 2] += tfz;
 
 				absorbed_x += tfx;
 				absorbed_y += tfy;
@@ -2193,8 +2223,9 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 					residual[ni * 3 + 0] += tfx;
 					residual[ni * 3 + 1] += tfy;
 					residual[ni * 3 + 2] += tfz;
+					bool was_active = (active[ni] != 0);
 					active[ni] = 1;
-					if (active[ni] && peak_active < grid_size) peak_active++;
+					if (!was_active && peak_active < grid_size) peak_active++;
 				}
 			}
 
@@ -2343,12 +2374,15 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 	// Pack persistent state into Dictionary.
 	PackedFloat32Array out_cc;
 	PackedFloat32Array out_cs;
+	PackedFloat32Array out_cf;
 	PackedByteArray out_visited;
 	out_cc.resize(grid_size * 6);
 	out_cs.resize(grid_size * 6);
+	out_cf.resize(grid_size * 18);
 	out_visited.resize(grid_size);
 	memcpy(out_cc.ptrw(), contact_compression, grid_size * 6 * sizeof(float));
 	memcpy(out_cs.ptrw(), contact_shear, grid_size * 6 * sizeof(float));
+	memcpy(out_cf.ptrw(), contact_force, grid_size * 18 * sizeof(float));
 	memcpy(out_visited.ptrw(), visited, grid_size);
 
 	// New last_block_count = total currently-existing blocks MINUS the dirty
@@ -2366,12 +2400,13 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 	Dictionary new_state;
 	new_state["contact_compression"] = out_cc;
 	new_state["contact_shear"] = out_cs;
+	new_state["contact_force"] = out_cf;
 	new_state["visited"] = out_visited;
 	new_state["last_block_count"] = next_block_count;
 
 	memfree(visited); memfree(is_ground); memfree(failed); memfree(active);
 	memfree(bfs_queue); memfree(residual);
-	memfree(contact_compression); memfree(contact_shear);
+	memfree(contact_compression); memfree(contact_shear); memfree(contact_force);
 	memfree(process_order);
 
 	uint64_t t_end = OS::get_singleton()->get_ticks_usec();

@@ -1334,30 +1334,19 @@ func _check_structural_integrity() -> void:
 	Profiler.begin("struct_integrity")
 	var t_si_total := Time.get_ticks_usec()
 
-	# C++ localized stress solver. Pass dirty seeds + persistent state.
+	# Currently calls the existing C++ force-equilibrium full solver. This is
+	# being replaced by an explicit bond-graph connectivity check (see
+	# BOND_GRAPH_PLAN.md). The bond-based system breaks bonds when accumulated
+	# damage exceeds their strength, then runs connectivity BFS to find
+	# detached components. Force-equilibrium stress detection (e.g. tower too
+	# top-heavy for its supports) will be deferred — destruction in v1
+	# requires explicit damage events.
 	var _t_solver := Time.get_ticks_usec()
-	var result: Dictionary = BlockMeshBuilder.calc_stress_integrity_localized(
+	var components: Array = BlockMeshBuilder.calc_stress_integrity_components(
 		_block_grid, _ground_mask, PackedFloat32Array(),
 		_num_x, _num_y, _num_z, _block_hp_dict.size(),
-		stress_max_load, stress_horizontal_transfer,
-		_stress_dirty_seeds, _stress_persistent_state)
+		stress_max_load, stress_horizontal_transfer)
 	var _t_solver_us := Time.get_ticks_usec() - _t_solver
-
-	# Update persistent state and clear dirty seeds for the next call.
-	_stress_persistent_state = result.get("persistent_state", {})
-	_stress_dirty_seeds = PackedInt32Array()
-
-	var components: Array = result.get("components", [])
-	var used_full: bool = result.get("used_full_resolve", false)
-	var active_set: int = result.get("active_set_size", 0)
-
-	# Optional drift validation: every Nth call, also run the full solver and
-	# assert the components match. Catches persistent-state bugs early.
-	if stress_validate_every > 0 and not used_full:
-		_stress_validate_counter += 1
-		if _stress_validate_counter >= stress_validate_every:
-			_stress_validate_counter = 0
-			_validate_stress_against_full(components)
 
 	if components.is_empty():
 		GameManager.tick_add("structural_integrity", Time.get_ticks_usec() - t_si_total)
@@ -1369,8 +1358,8 @@ func _check_structural_integrity() -> void:
 	var t_detach_end := Time.get_ticks_usec()
 
 	var si_us := Time.get_ticks_usec() - t_si_total
-	print("[StructuralIntegrity] %s  blocks=%d  components=%d  active=%d  full_resolve=%s  solver=%dus  detach=%dus  total=%dus" % [
-		name, _block_hp_dict.size(), components.size(), active_set, str(used_full),
+	print("[StructuralIntegrity] %s  blocks=%d  components=%d  solver=%dus  detach=%dus  total=%dus" % [
+		name, _block_hp_dict.size(), components.size(),
 		_t_solver_us, t_detach_end - t_detach, si_us,
 	])
 	GameManager.tick_add("structural_integrity", si_us)
