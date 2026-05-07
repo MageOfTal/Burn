@@ -63,6 +63,7 @@ func _build_hemisphere() -> void:
 	# --- Step 1: Create visual mesh ---
 	var bowl_mat := StandardMaterial3D.new()
 	bowl_mat.albedo_color = Color(0.2, 0.5, 0.15)  # Earthy green
+	bowl_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 
 	var visual := MeshInstance3D.new()
 	visual.name = "BowlVisual"

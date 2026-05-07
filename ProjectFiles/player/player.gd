@@ -81,6 +81,7 @@ var _debug_wall_key_held := false
 ## DEBUG: movement capture (toggle with F10) — gates ALL movement logging
 var capture_movement := false
 var _capture_key_held := false
+var _wedge_log_key_held := false
 
 ## Forfeit (hold P to self-kill)
 var _forfeit_hold_time := 0.0
@@ -312,6 +313,14 @@ func _physics_process(delta: float) -> void:
 		print("[F10] Dynamic contact log: %s" % ("ON" if GameManager.debug_dynamic_contact_log else "OFF"))
 	if not Input.is_key_pressed(KEY_F10):
 		_capture_key_held = false
+	# DEBUG: F12 toggles box-press diagnostic log (player + box + pressed-into + phase)
+	# (Avoiding F8 because Godot editor uses it to stop the running scene.)
+	if peer_id == multiplayer.get_unique_id() and Input.is_key_pressed(KEY_F12) and not _wedge_log_key_held:
+		GameManager.debug_wedge_log = not GameManager.debug_wedge_log
+		_wedge_log_key_held = true
+		print("[F12] Box-press diagnostic: %s" % ("ON" if GameManager.debug_wedge_log else "OFF"))
+	if not Input.is_key_pressed(KEY_F12):
+		_wedge_log_key_held = false
 
 	# Debug freecam: freeze player physics but keep rendering visuals
 	var freecam_frozen: bool = GameManager.debug_freecam_active and peer_id == multiplayer.get_unique_id()
@@ -493,6 +502,13 @@ func _server_process(delta: float) -> void:
 
 	# Slide cooldown
 	slide_crouch.tick_cooldown(delta)
+
+	# Pre-movement snap: if Jolt dropped contact this frame (typical on
+	# compound dynamic bodies at tile boundaries), recover grounding NOW so
+	# begin_movement, slope projection, and walk-acceleration see correct
+	# state. Snap-as-recovery used to run after movement; that left the rest
+	# of the frame branching airborne for one frame.
+	movement.try_snap_to_ground(delta)
 
 	# Grounded velocity management (gravity is applied at the end of movement)
 	movement.begin_movement(delta)

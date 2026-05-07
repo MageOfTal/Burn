@@ -187,7 +187,7 @@ void JoltContactListener3D::_apply_contact_mass_scale(const JPH::Body &p_jolt_bo
 	// lighter body is pushed away instead of acting as an immovable wall.
 
 	constexpr float MASS_RATIO_THRESHOLD = 0.25f;    // 4:1 ratio triggers scaling
-	constexpr float VERTICAL_THRESHOLD = 0.9687f;     // matches observed flat-top contact angle
+	constexpr float VERTICAL_THRESHOLD = 0.9687f;     // ~14° from up — pin only true static-stack sandwich (light body flat on ground under heavy player). Wider thresholds catch impact-driven angled contacts (e.g. landing on the edge of a toad) and wrongly suppress the kinetic push the body should receive.
 
 	if (mass_scale_enabled.load(std::memory_order_relaxed) && p_jolt_body1.IsDynamic() && p_jolt_body2.IsDynamic()) {
 		MassScaleDiag::both_dynamic.fetch_add(1, std::memory_order_relaxed);

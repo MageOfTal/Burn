@@ -444,6 +444,28 @@ func _build_main_panel() -> void:
 		.toggled.connect(func(p): GameManager.debug_restore_full_speed = p)
 	_add_check("No Dime Stop", GameManager.debug_no_dime_stop, vbox) \
 		.toggled.connect(func(p): GameManager.debug_no_dime_stop = p)
+
+	# ── Wedge stability experiments ─────────────────────────────────
+	# Toggle one at a time to compare feel when pushing a box against a wall.
+	vbox.add_child(HSeparator.new())
+	_add_section_header("Wedge Stability (box vs wall)", vbox)
+
+	_add_check("Fix 1: Lerp direction by fraction (default)", GameManager.debug_wedge_lerp_direction, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_lerp_direction = p)
+	_add_check("Fix 2: Hard-kill direction above threshold", GameManager.debug_wedge_hard_kill, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_hard_kill = p)
+	_add_check("Fix 3: Skip velocity write when wedged", GameManager.debug_wedge_skip_inject, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_skip_inject = p)
+	_add_check("Fix 4: Use post-solver velocity as base", GameManager.debug_wedge_postsolver_base, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_postsolver_base = p)
+	_add_check("Box-Press Diagnostic Log (player+box+pressed-into+phase)", GameManager.debug_wedge_log, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_log = p)
+
+	# Fraction lifecycle fixes (the actual root cause: deadband oscillation)
+	_add_check("Fix 5: Decay fraction instead of reset", GameManager.debug_wedge_fraction_decay, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_fraction_decay = p)
+	_add_check("Fix 6: Hold fraction while contact exists", GameManager.debug_wedge_fraction_hold, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_fraction_hold = p)
 	_add_check("Restore Even With Walls", GameManager.debug_restore_with_walls, vbox) \
 		.toggled.connect(func(p): GameManager.debug_restore_with_walls = p)
 	_add_check("Instant Acceleration", GameManager.debug_instant_accel, vbox) \
@@ -458,6 +480,13 @@ func _build_main_panel() -> void:
 		_on_shadow_distance_changed, func(): pass, vbox)
 	_add_check("Extend Snap Range (0.5m)", GameManager.debug_grounding_extend_snap, vbox) \
 		.toggled.connect(func(p): GameManager.debug_grounding_extend_snap = p)
+	_add_check("Dynamic Snap (vel.y × delta launch recovery)", GameManager.debug_dynamic_snap, vbox) \
+		.toggled.connect(func(p): GameManager.debug_dynamic_snap = p)
+	var _snap_budget_input := _add_labeled_input("Snap Budget (m)", str(GameManager.debug_snap_budget), vbox)
+	_snap_budget_input.text_changed.connect(func(t):
+		var v: float = clampf(float(t), 0.0, 1.0)
+		GameManager.debug_snap_budget = v
+		print("[SnapBudget] set to %.3fm" % v))
 	_add_check("Surface Press (vel.y bias)", GameManager.debug_grounding_surface_press, vbox) \
 		.toggled.connect(func(p): GameManager.debug_grounding_surface_press = p)
 	var _press_input = _add_labeled_input("Press Strength", str(GameManager.debug_grounding_press_strength), vbox)

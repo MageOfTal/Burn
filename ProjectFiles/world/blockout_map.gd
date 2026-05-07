@@ -1232,3 +1232,279 @@ func spawn_test_ramps() -> void:
 
 	print("[BlockoutMap] Spawned curved test ramp (0°–%d°, R=%.0fm) at %s" % [
 		int(curve_max_deg), curve_radius, str(curve_base)])
+
+	# --- 60° V ramp: two slabs meeting at apex, valley shape ---
+	# v_base = apex (lowest point). Slabs meet here and rise outward in ±Z.
+	var v_x_offset: float = curve_x_offset + curve_width + 6.0
+	var v_base := base_pos + Vector3(v_x_offset, -1.0, 0.0)
+	var v_angle_deg := 60.0
+	var v_angle_rad: float = deg_to_rad(v_angle_deg)
+	var v_width := 3.0
+	var v_depth := 6.0
+	var v_thickness := 0.3
+
+	var v_mat := StandardMaterial3D.new()
+	v_mat.albedo_color = Color(0.7, 0.4, 0.7, 1.0)
+	v_mat.roughness = 0.7
+
+	# side = +1: slab extends up-and-toward +Z. side = -1: up-and-toward -Z.
+	# Apex (low edge) of each slab sits at v_base; high edge points away.
+	# rot_x is NEGATED relative to sign_f because positive rotation around X
+	# tilts the box's +Z end DOWN (right-hand rule); we want the +Z end UP
+	# for the +Z slab so the apex is at the bottom (V), not the top (tent).
+	for side_i in [1, -1]:
+		var sign_f: float = float(side_i)
+		var rot_x: float = -v_angle_rad * sign_f
+		var center_y: float = sin(v_angle_rad) * v_depth * 0.5
+		var center_z: float = cos(v_angle_rad) * v_depth * 0.5 * sign_f
+		var v_pos := v_base + Vector3(0.0, center_y, center_z)
+
+		var v_mesh := MeshInstance3D.new()
+		var v_box := BoxMesh.new()
+		v_box.size = Vector3(v_width, v_thickness, v_depth)
+		v_mesh.mesh = v_box
+		v_mesh.material_override = v_mat
+		v_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		v_mesh.position = v_pos
+		v_mesh.rotation.x = rot_x
+		add_child(v_mesh)
+
+		var v_body := StaticBody3D.new()
+		v_body.collision_layer = CollisionLayers.WORLD
+		v_body.collision_mask = 0
+		v_body.position = v_pos
+		v_body.rotation.x = rot_x
+		PhysicsServer3D.body_set_shielding_tag(v_body.get_rid(), 3)
+		var v_col := CollisionShape3D.new()
+		var v_shape := BoxShape3D.new()
+		v_shape.size = v_box.size
+		v_col.shape = v_shape
+		v_body.add_child(v_col)
+		add_child(v_body)
+
+	# Label above the V apex, hovering over the highest point
+	var v_label := Label3D.new()
+	v_label.text = "60° V"
+	v_label.font_size = 64
+	v_label.pixel_size = 0.01
+	v_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	v_label.position = v_base + Vector3(0.0, sin(v_angle_rad) * v_depth + 1.5, 0.0)
+	add_child(v_label)
+
+	print("[BlockoutMap] Spawned 60° V ramp at %s" % str(v_base))
+
+
+# ======================================================================
+#  Seesaw — board over a triangular fulcrum, for testing player weight
+#  transfer + rotation tracking on dynamic walkable surfaces.
+# ======================================================================
+
+func spawn_seesaw() -> void:
+	## Long board (RigidBody3D) balanced on a triangular static fulcrum,
+	## sitting on its own flat platform clear of other test geometry.
+	## Walking to either end should pivot the board, lifting the other end.
+	var players_node := get_node_or_null("Players")
+	if players_node == null:
+		return
+	var host_player := players_node.get_node_or_null("1")
+	if host_player == null:
+		return
+
+	var host_pos: Vector3 = host_player.global_position
+	# Place the seesaw area 30m along +X (clear of toad rail cannon at +12,
+	# test ramps at +15) on its own flat platform whose top is level with
+	# the host's foot level (capsule centre is ~0.9m above feet).
+	const PLATFORM_SIZE := Vector3(16.0, 0.5, 14.0)  # X length × Y thick × Z width
+	var feet_y: float = host_pos.y - 0.9
+	var platform_top_y: float = feet_y
+	var platform_center: Vector3 = Vector3(host_pos.x + 30.0, platform_top_y - PLATFORM_SIZE.y * 0.5, host_pos.z)
+
+	# --- Platform (flat StaticBody3D so terrain undulation can't tilt the test) ---
+	var platform := StaticBody3D.new()
+	platform.name = "SeesawPlatform"
+	platform.collision_layer = 1
+	platform.position = platform_center
+
+	var platform_shape := BoxShape3D.new()
+	platform_shape.size = PLATFORM_SIZE
+	var platform_col := CollisionShape3D.new()
+	platform_col.shape = platform_shape
+	platform.add_child(platform_col)
+
+	var platform_mesh := MeshInstance3D.new()
+	var platform_box := BoxMesh.new()
+	platform_box.size = PLATFORM_SIZE
+	platform_mesh.mesh = platform_box
+	var platform_mat := StandardMaterial3D.new()
+	platform_mat.albedo_color = Color(0.3, 0.32, 0.35)
+	platform_mat.roughness = 0.85
+	platform_mesh.material_override = platform_mat
+	platform.add_child(platform_mesh)
+
+	add_child(platform)
+
+	# Seesaw geometry: board along X, fulcrum apex line along Z.
+	var base: Vector3 = Vector3(platform_center.x, platform_top_y, platform_center.z)
+
+	const FULCRUM_BASE_W := 0.8     # X (along board length)
+	const FULCRUM_HEIGHT := 0.8     # Y (apex above platform)
+	const FULCRUM_DEPTH := 1.5      # Z (along apex line — wider than board)
+	const BOARD_LENGTH := 8.0       # X
+	const BOARD_THICK := 0.15       # Y
+	const BOARD_WIDTH := 1.0        # Z (less than fulcrum depth so it sits cleanly)
+	const BOARD_MASS := 30.0
+
+	# --- Fulcrum (triangular prism, static) ---
+	var fulcrum := StaticBody3D.new()
+	fulcrum.name = "SeesawFulcrum"
+	fulcrum.collision_layer = 1
+	fulcrum.position = base + Vector3(0.0, FULCRUM_HEIGHT * 0.5, 0.0)
+
+	var fulcrum_shape := ConvexPolygonShape3D.new()
+	# PrismMesh-matching geometry centred on origin: triangle in XY (apex +Y,
+	# base −Y), extruded ±Z.
+	fulcrum_shape.points = PackedVector3Array([
+		Vector3(-FULCRUM_BASE_W * 0.5, -FULCRUM_HEIGHT * 0.5, -FULCRUM_DEPTH * 0.5),
+		Vector3( FULCRUM_BASE_W * 0.5, -FULCRUM_HEIGHT * 0.5, -FULCRUM_DEPTH * 0.5),
+		Vector3( 0.0,                   FULCRUM_HEIGHT * 0.5, -FULCRUM_DEPTH * 0.5),
+		Vector3(-FULCRUM_BASE_W * 0.5, -FULCRUM_HEIGHT * 0.5,  FULCRUM_DEPTH * 0.5),
+		Vector3( FULCRUM_BASE_W * 0.5, -FULCRUM_HEIGHT * 0.5,  FULCRUM_DEPTH * 0.5),
+		Vector3( 0.0,                   FULCRUM_HEIGHT * 0.5,  FULCRUM_DEPTH * 0.5),
+	])
+	var fulcrum_col := CollisionShape3D.new()
+	fulcrum_col.shape = fulcrum_shape
+	fulcrum.add_child(fulcrum_col)
+
+	var fulcrum_mesh := MeshInstance3D.new()
+	var prism := PrismMesh.new()
+	prism.size = Vector3(FULCRUM_BASE_W, FULCRUM_HEIGHT, FULCRUM_DEPTH)
+	fulcrum_mesh.mesh = prism
+	var fulcrum_mat := StandardMaterial3D.new()
+	fulcrum_mat.albedo_color = Color(0.45, 0.45, 0.5)
+	fulcrum_mat.roughness = 0.7
+	fulcrum_mesh.material_override = fulcrum_mat
+	fulcrum.add_child(fulcrum_mesh)
+
+	add_child(fulcrum)
+
+	# --- Board (long thin RigidBody3D) ---
+	var board := RigidBody3D.new()
+	board.name = "SeesawBoard"
+	board.collision_layer = 2
+	board.collision_mask = 2561
+	board.mass = BOARD_MASS
+	board.contact_monitor = true
+	board.max_contacts_reported = 4
+	# Centre the board's underside just above the fulcrum apex.
+	var apex_y: float = base.y + FULCRUM_HEIGHT
+	board.position = Vector3(base.x, apex_y + BOARD_THICK * 0.5 + 0.02, base.z)
+
+	var board_shape := BoxShape3D.new()
+	board_shape.size = Vector3(BOARD_LENGTH, BOARD_THICK, BOARD_WIDTH)
+	var board_col := CollisionShape3D.new()
+	board_col.shape = board_shape
+	board.add_child(board_col)
+
+	var board_mesh := MeshInstance3D.new()
+	var box_mesh := BoxMesh.new()
+	box_mesh.size = Vector3(BOARD_LENGTH, BOARD_THICK, BOARD_WIDTH)
+	board_mesh.mesh = box_mesh
+	var board_mat := StandardMaterial3D.new()
+	board_mat.albedo_color = Color(0.65, 0.42, 0.22)
+	board_mat.roughness = 0.8
+	board_mesh.material_override = board_mat
+	board.add_child(board_mesh)
+
+	add_child(board)
+
+	# Floating label so it's easy to find.
+	var label := Label3D.new()
+	label.text = "Seesaw"
+	label.font_size = 64
+	label.pixel_size = 0.01
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	label.position = base + Vector3(0.0, FULCRUM_HEIGHT + 1.8, 0.0)
+	add_child(label)
+
+	print("[BlockoutMap] Spawned seesaw at %s (board %.1fm × %.0fkg on %.1fm fulcrum)" % [
+		base, BOARD_LENGTH, BOARD_MASS, FULCRUM_HEIGHT])
+
+
+# ======================================================================
+#  Wavy Body — large 50×50m dynamic slab, flat bottom + wavy top, for
+#  testing player movement on a non-flat dynamic walkable surface.
+# ======================================================================
+
+func spawn_wavy_body() -> void:
+	## 50m × 50m × 2m RigidBody3D with a flat bottom and a sinusoidal
+	## wavy top. Compound collision: 10×10 ConvexPolygonShape3D tiles,
+	## each an 8-vertex convex hull (4 flat-bottom corners + 4 wave-
+	## deformed top corners). Locked rotation so it sits stably on the
+	## terrain instead of tipping; mass 5000 kg so the player can still
+	## perceptibly nudge it but it doesn't fly from incidental contacts.
+	var players_node := get_node_or_null("Players")
+	if players_node == null:
+		return
+	var host_player := players_node.get_node_or_null("1")
+	if host_player == null:
+		return
+
+	var host_pos: Vector3 = host_player.global_position
+
+	const SIZE := 50.0                  # X and Z extent
+	const THICKNESS := 3.0              # Total Y extent of the slab
+	const BODY_MASS := 5000.0
+
+	# Place 60m to the −X of the host, dropped from 30m up so it settles
+	# onto whatever terrain is below.
+	var center: Vector3 = Vector3(host_pos.x - 60.0, host_pos.y + 30.0, host_pos.z)
+
+	var body := RigidBody3D.new()
+	body.name = "WavyBody"
+	body.position = center
+	body.mass = BODY_MASS
+	body.collision_layer = 2          # ITEMS layer
+	body.collision_mask = 2561        # PHYSICS_PUSH (WORLD | PLAYERS_PUSH | WALL_SMOOTH)
+	body.contact_monitor = true
+	body.max_contacts_reported = 8
+	body.continuous_cd = true
+
+	# --- Single convex collision: flat slab.
+	# A single convex eliminates compound-tile boundary stutter and interacts
+	# cleanly with mesh terrain (convex-vs-mesh is supported in Jolt;
+	# mesh-vs-mesh isn't).
+	var bottom_local: float = -THICKNESS * 0.5
+	var slab_top_local: float = THICKNESS * 0.5
+	var slab_height: float = THICKNESS
+	var box_shape := BoxShape3D.new()
+	box_shape.size = Vector3(SIZE, slab_height, SIZE)
+	var col_node := CollisionShape3D.new()
+	col_node.shape = box_shape
+	body.add_child(col_node)
+
+	# --- Visual: single BoxMesh sized exactly like the BoxShape3D collision.
+	# Visual = collision so what you see is what you walk on.
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.42, 0.5, 0.6)
+	mat.roughness = 0.7
+
+	var box_mesh := BoxMesh.new()
+	box_mesh.size = Vector3(SIZE, slab_height, SIZE)
+	var mesh_inst := MeshInstance3D.new()
+	mesh_inst.mesh = box_mesh
+	mesh_inst.material_override = mat
+	body.add_child(mesh_inst)
+
+	add_child(body)
+
+	# Floating label so it's findable
+	var label := Label3D.new()
+	label.text = "Physics Slab (5000kg)"
+	label.font_size = 64
+	label.pixel_size = 0.01
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	label.position = center + Vector3(0.0, THICKNESS + 4.0, 0.0)
+	add_child(label)
+
+	print("[BlockoutMap] Spawned physics slab at %s (%.0fm × %.0fm × %.1fm thick, %.0fkg, single convex slab)" % [
+		center, SIZE, SIZE, slab_height, BODY_MASS])

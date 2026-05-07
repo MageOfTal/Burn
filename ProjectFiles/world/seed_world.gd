@@ -850,6 +850,10 @@ func _spawn_push_blocks() -> void:
 		body.collision_mask = CollisionLayers.DEFAULT_PHYSICS
 		body.contact_monitor = false
 		body.lock_rotation = false
+		# Continuous CD so high-speed player↔box contacts don't tunnel through.
+		# The phasing-into-box bug we diagnosed via [BOXLOG] traced to the
+		# constraint solver missing fast motion in a single tick.
+		body.continuous_cd = true
 
 		var shape := BoxShape3D.new()
 		shape.size = block_size

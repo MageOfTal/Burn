@@ -71,7 +71,7 @@ var _collision_body: StaticBody3D = null
 ## Smooth collision mesh shape RID (ConcavePolygonShape3D / trimesh).
 ## Jolt's MeshShape has internal edge smoothing — eliminates ghost collisions
 ## at block boundaries that compound box shapes suffer from.
-var _smooth_shape_rid: RID = RID()
+var _smooth_shape_rids: Array[RID] = []  ## One RID per cuboid in greedy box decomposition
 
 ## Cached debris config from subclass (populated in _ready)
 var _debris_size: float = 0.15
@@ -574,9 +574,10 @@ func _ready() -> void:
 
 
 func _exit_tree() -> void:
-	if _smooth_shape_rid.is_valid():
-		PhysicsServer3D.free_rid(_smooth_shape_rid)
-		_smooth_shape_rid = RID()
+	for rid in _smooth_shape_rids:
+		if rid.is_valid():
+			PhysicsServer3D.free_rid(rid)
+	_smooth_shape_rids.clear()
 
 
 func _process(_delta: float) -> void:
@@ -1941,46 +1942,118 @@ func _build_smooth_collision() -> void:
 	_rebuild_smooth_collision_mesh()
 	var t2 := Time.get_ticks_usec()
 	if t2 - t0 > 3000:
-		print("[SMOOTH_COL] %s body=%dus shape=%dus faces=%d" % [
-			name, t1 - t0, t2 - t1, _cached_faces.size() / 3])
+		print("[SMOOTH_COL] %s body=%dus shape=%dus boxes=%d" % [
+			name, t1 - t0, t2 - t1, _smooth_shape_rids.size()])
 
 
 func _rebuild_smooth_collision_mesh() -> void:
-	## Rebuild the trimesh collision shape from the greedy mesh faces.
+	## Rebuild smooth collision as a greedy axis-aligned box decomposition of
+	## the block grid. Each contiguous filled cuboid becomes one BoxShape3D.
+	##
+	## Replaces the prior trimesh (ConcavePolygonShape3D). The trimesh has
+	## intrinsic contact-stability problems against dynamic bodies pressed
+	## into it: even with Jolt's EnhancedInternalEdgeRemoval and manifold
+	## reduction enabled, multi-contact resolution against many adjacent
+	## triangles produces alternating per-frame impulses that translate to
+	## visible shake on dynamic bodies (e.g. PushBlocks against a wall).
+	## Confirmed by A/B test: trimesh + manifold reduction on still shakes;
+	## box decomposition does not.
+	##
+	## Algorithm: scan filled blocks in (x,y,z) order. For each unclaimed
+	## block, greedily extend +X then +Y then +Z to find the largest cuboid
+	## of solid unclaimed blocks. Mark them claimed, emit one BoxShape, repeat.
+	## Solid wall column = 1 box. Hollow tower = ~6-12 boxes. Decomposition
+	## is exact — every filled block is in exactly one box.
 	if _collision_body == null or not is_instance_valid(_collision_body):
 		return
 
-	var _t_smooth_total := Time.get_ticks_usec()
+	var _t_total := Time.get_ticks_usec()
 	var body_rid := _collision_body.get_rid()
-	var _t_clear := Time.get_ticks_usec()
+
+	# Free old shapes
 	PhysicsServer3D.body_clear_shapes(body_rid)
-	var _t_clear_us := Time.get_ticks_usec() - _t_clear
+	for rid in _smooth_shape_rids:
+		if rid.is_valid():
+			PhysicsServer3D.free_rid(rid)
+	_smooth_shape_rids.clear()
 
-	var _t_free := Time.get_ticks_usec()
-	if _smooth_shape_rid.is_valid():
-		PhysicsServer3D.free_rid(_smooth_shape_rid)
-		_smooth_shape_rid = RID()
-	var _t_free_us := Time.get_ticks_usec() - _t_free
+	# Greedy box decomposition over _block_grid
+	var _t_decomp := Time.get_ticks_usec()
+	var claimed: PackedByteArray = PackedByteArray()
+	claimed.resize(_block_grid.size())
 
-	# If cached faces are stale (destruction path), rebuild from grid
-	var _t_faces := Time.get_ticks_usec()
-	if _cached_faces.is_empty():
-		_cached_faces = BlockMeshBuilder.build_collision_faces(_block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE)
-	var _t_faces_us := Time.get_ticks_usec() - _t_faces
-	if _cached_faces.is_empty():
-		return
+	var box_count := 0
+	for bx0 in _num_x:
+		for by0 in _num_y:
+			for bz0 in _num_z:
+				var idx0 := _grid_idx(bx0, by0, bz0)
+				if _block_grid[idx0] == 0 or claimed[idx0] != 0:
+					continue
 
-	var _t_create := Time.get_ticks_usec()
-	_smooth_shape_rid = PhysicsServer3D.concave_polygon_shape_create()
-	PhysicsServer3D.shape_set_data(_smooth_shape_rid, {"faces": _cached_faces, "backface_collision": false})
-	PhysicsServer3D.body_add_shape(body_rid, _smooth_shape_rid)
-	var _t_create_us := Time.get_ticks_usec() - _t_create
+				# Greedy extend +X
+				var bx1 := bx0
+				while bx1 + 1 < _num_x:
+					var ni := _grid_idx(bx1 + 1, by0, bz0)
+					if _block_grid[ni] == 0 or claimed[ni] != 0:
+						break
+					bx1 += 1
 
-	var _t_smooth_us := Time.get_ticks_usec() - _t_smooth_total
-	if _t_smooth_us > 200:
-		print("[PERF] _rebuild_smooth_collision %s: clear=%dus free=%dus faces=%dus(%d tris) create=%dus total=%dus" % [
-			name, _t_clear_us, _t_free_us, _t_faces_us, _cached_faces.size() / 3, _t_create_us, _t_smooth_us])
-	GameManager.tick_add("smooth_collision", _t_smooth_us)
+				# Greedy extend +Y (entire X-row must remain solid & unclaimed)
+				var by1 := by0
+				while by1 + 1 < _num_y:
+					var ok := true
+					for bx in range(bx0, bx1 + 1):
+						var ni := _grid_idx(bx, by1 + 1, bz0)
+						if _block_grid[ni] == 0 or claimed[ni] != 0:
+							ok = false
+							break
+					if not ok:
+						break
+					by1 += 1
+
+				# Greedy extend +Z (entire XY-slab must remain solid & unclaimed)
+				var bz1 := bz0
+				while bz1 + 1 < _num_z:
+					var ok := true
+					for bx in range(bx0, bx1 + 1):
+						for by in range(by0, by1 + 1):
+							var ni := _grid_idx(bx, by, bz1 + 1)
+							if _block_grid[ni] == 0 or claimed[ni] != 0:
+								ok = false
+								break
+						if not ok:
+							break
+					if not ok:
+						break
+					bz1 += 1
+
+				# Mark cuboid claimed
+				for bx in range(bx0, bx1 + 1):
+					for by in range(by0, by1 + 1):
+						for bz in range(bz0, bz1 + 1):
+							claimed[_grid_idx(bx, by, bz)] = 1
+
+				# Emit BoxShape primitive at cuboid center
+				var size_x: float = (bx1 - bx0 + 1) * BLOCK_SIZE
+				var size_y: float = (by1 - by0 + 1) * BLOCK_SIZE
+				var size_z: float = (bz1 - bz0 + 1) * BLOCK_SIZE
+				var origin := Vector3(
+					(bx0 + (bx1 - bx0 + 1) * 0.5 - _num_x * 0.5) * BLOCK_SIZE,
+					(by0 + (by1 - by0 + 1) * 0.5 - _num_y * 0.5) * BLOCK_SIZE,
+					(bz0 + (bz1 - bz0 + 1) * 0.5 - _num_z * 0.5) * BLOCK_SIZE)
+
+				var rid := PhysicsServer3D.box_shape_create()
+				PhysicsServer3D.shape_set_data(rid, Vector3(size_x, size_y, size_z) * 0.5)
+				PhysicsServer3D.body_add_shape(body_rid, rid, Transform3D(Basis.IDENTITY, origin))
+				_smooth_shape_rids.append(rid)
+				box_count += 1
+	var _t_decomp_us := Time.get_ticks_usec() - _t_decomp
+
+	var _t_total_us := Time.get_ticks_usec() - _t_total
+	if _t_total_us > 200:
+		print("[PERF] _rebuild_smooth_collision %s: decomp=%dus boxes=%d total=%dus" % [
+			name, _t_decomp_us, box_count, _t_total_us])
+	GameManager.tick_add("smooth_collision", _t_total_us)
 
 
 # ======================================================================

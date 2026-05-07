@@ -957,6 +957,10 @@ func _start_match() -> void:
 			map.spawn_toad_bowl()
 		if map and map.has_method("spawn_test_ramps"):
 			map.spawn_test_ramps()
+		if map and map.has_method("spawn_seesaw"):
+			map.spawn_seesaw()
+		if map and map.has_method("spawn_wavy_body"):
+			map.spawn_wavy_body()
 
 		# Start burn clock
 		var burn_clock := get_node_or_null("/root/BurnClock")
