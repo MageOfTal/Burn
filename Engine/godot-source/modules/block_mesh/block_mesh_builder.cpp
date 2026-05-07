@@ -210,6 +210,7 @@ static void _compute_cluster_work(void *p_userdata, uint32_t p_index) {
 }
 
 BlockMeshBuilder *BlockMeshBuilder::singleton = nullptr;
+bool BlockMeshBuilder::s_stress_debug_print = false;
 
 BlockMeshBuilder::BlockMeshBuilder() {
 	singleton = this;
@@ -255,6 +256,12 @@ void BlockMeshBuilder::_bind_methods() {
 					"total_blocks", "max_load", "horizontal_transfer",
 					"dirty_seed_indices", "persistent_state"),
 			&BlockMeshBuilder::calc_stress_integrity_localized);
+	ClassDB::bind_method(
+			D_METHOD("set_stress_debug_print", "enabled"),
+			&BlockMeshBuilder::set_stress_debug_print);
+	ClassDB::bind_method(
+			D_METHOD("get_stress_debug_print"),
+			&BlockMeshBuilder::get_stress_debug_print);
 	ClassDB::bind_method(
 			D_METHOD("calc_streaming_update", "player_positions", "loaded_chunks",
 					"view_distance", "chunk_size", "min_by", "max_by"),
@@ -1609,9 +1616,11 @@ Array BlockMeshBuilder::calc_stress_integrity_components(
 		memfree(visited); memfree(bfs_queue); memfree(residual);
 		memfree(contact_compression); memfree(contact_shear);
 		memfree(failed); memfree(process_order); memfree(is_ground); memfree(active);
-		print_line(vformat("[StressIntegrity_C] blocks=%d  all_stable  iters=%d  bfs=%dus  solver=%dus",
-				p_total_blocks, solver_iters,
-				(int)(t_bfs - t_start), (int)(t_solver - t_bfs)));
+		if (s_stress_debug_print) {
+			print_line(vformat("[StressIntegrity_C] blocks=%d  all_stable  iters=%d  bfs=%dus  solver=%dus",
+					p_total_blocks, solver_iters,
+					(int)(t_bfs - t_start), (int)(t_solver - t_bfs)));
+		}
 		return Array();
 	}
 
@@ -1655,11 +1664,13 @@ Array BlockMeshBuilder::calc_stress_integrity_components(
 	memfree(failed); memfree(process_order); memfree(is_ground);
 
 	uint64_t t_end = OS::get_singleton()->get_ticks_usec();
-	print_line(vformat("[StressIntegrity_C] blocks=%d  stress_failed=%d  disconnected=%d  components=%d  iters=%d  bfs=%dus  solver=%dus  components=%dus  total=%dus",
-			p_total_blocks, stress_failed, total_unsupported - stress_failed,
-			components.size(), solver_iters,
-			(int)(t_bfs - t_start), (int)(t_solver - t_bfs),
-			(int)(t_end - t_solver), (int)(t_end - t_start)));
+	if (s_stress_debug_print) {
+		print_line(vformat("[StressIntegrity_C] blocks=%d  stress_failed=%d  disconnected=%d  components=%d  iters=%d  bfs=%dus  solver=%dus  components=%dus  total=%dus",
+				p_total_blocks, stress_failed, total_unsupported - stress_failed,
+				components.size(), solver_iters,
+				(int)(t_bfs - t_start), (int)(t_solver - t_bfs),
+				(int)(t_end - t_solver), (int)(t_end - t_start)));
+	}
 
 	return components;
 }
@@ -1754,8 +1765,10 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 		result["used_full_resolve"] = false;
 		result["active_set_size"] = 0;
 		uint64_t t_end_noop = OS::get_singleton()->get_ticks_usec();
-		print_line(vformat("[StressIntegrity_L] blocks=%d  no-op (no dirty seeds)  total=%dus",
-				p_total_blocks, (int)(t_end_noop - t_start)));
+		if (s_stress_debug_print) {
+			print_line(vformat("[StressIntegrity_L] blocks=%d  no-op (no dirty seeds)  total=%dus",
+					p_total_blocks, (int)(t_end_noop - t_start)));
+		}
 		return result;
 	}
 
@@ -2364,11 +2377,13 @@ Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
 	uint64_t t_end = OS::get_singleton()->get_ticks_usec();
 	const char *path_label = need_full ? "FULL" : "LOCAL";
 	const char *fb_str = fallback_reason ? fallback_reason : "-";
+	if (s_stress_debug_print) {
 	print_line(vformat("[StressIntegrity_L %s] blocks=%d  active=%d  failed=%d  components=%d  iters=%d  setup=%dus  solver=%dus  total=%dus  fb=%s",
 			path_label, p_total_blocks, peak_active, stress_failed,
 			components.size(), solver_iters,
 			(int)(t_setup - t_start), (int)(t_solver - t_setup),
 			(int)(t_end - t_start), fb_str));
+	}
 
 	Dictionary result;
 	result["components"] = components;

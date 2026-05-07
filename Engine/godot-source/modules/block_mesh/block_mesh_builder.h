@@ -11,11 +11,20 @@ class BlockMeshBuilder : public Object {
 
 	static BlockMeshBuilder *singleton;
 
+	// Diagnostic logging toggle. When false, the stress solver suppresses its
+	// per-call [StressIntegrity_*] prints. Off by default — enable from
+	// GDScript when debugging.
+	static bool s_stress_debug_print;
+
 protected:
 	static void _bind_methods();
 
 public:
 	static BlockMeshBuilder *get_singleton() { return singleton; }
+
+	/// Enable/disable the stress solver's per-call debug logging. Off by default.
+	void set_stress_debug_print(bool p_enabled) { s_stress_debug_print = p_enabled; }
+	bool get_stress_debug_print() const { return s_stress_debug_print; }
 
 	/// Build an ArrayMesh from a flat occupancy grid.
 	/// block_grid: PackedByteArray of size num_x * num_y * num_z (1 = occupied, 0 = empty).
