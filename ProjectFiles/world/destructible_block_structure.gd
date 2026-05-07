@@ -101,6 +101,22 @@ var _is_falling: bool = false
 var _fall_velocity: float = 0.0
 var _fall_ray_local: Vector3 = Vector3.ZERO  ## Bottom-center of blocks in local space
 
+## Persistent stress-solver state. Holds steady-state contact compression/shear
+## and ground-connectivity from the previous solve. Empty Dictionary triggers
+## a full solve on the next _check_structural_integrity() call.
+##
+## Keys (set by C++):
+##   "contact_compression": PackedFloat32Array(grid_size * 6)
+##   "contact_shear":       PackedFloat32Array(grid_size * 6)
+##   "visited":             PackedByteArray(grid_size)
+##   "last_block_count":    int — used for staleness detection
+var _stress_persistent_state: Dictionary = {}
+
+## Flat indices of blocks destroyed since the last stress solve. Seeds the
+## localized propagation in calc_stress_integrity_localized — the solver only
+## re-propagates from blocks adjacent to these. Cleared after each solve.
+var _stress_dirty_seeds: PackedInt32Array = PackedInt32Array()
+
 
 # ======================================================================
 #  Virtual methods — subclasses MUST override these
@@ -836,6 +852,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		_disable_hit_shape(key)
 		_block_hp_dict.erase(key)
 		_clear_block_grids(key.x, key.y, key.z)
+		_mark_dirty_stress_seed(key)
 		var t_disable_us := Time.get_ticks_usec() - t_disable
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
@@ -1035,6 +1052,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		_disable_hit_shape(key)
 		_block_hp_dict.erase(key)
 		_clear_block_grids(key.x, key.y, key.z)
+		_mark_dirty_stress_seed(key)
 	if destroyed_keys.size() > 0 and _compound_hit_body and is_instance_valid(_compound_hit_body):
 		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 	var t_erase_end := Time.get_ticks_usec()
@@ -1196,6 +1214,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	_disable_hit_shape(target_key)
 	_block_hp_dict.erase(target_key)
 	_clear_block_grids(target_key.x, target_key.y, target_key.z)
+	_mark_dirty_stress_seed(target_key)
 	var _t_erase_us := Time.get_ticks_usec() - _t_erase
 	_mesh_dirty = true
 	set_process(true)
@@ -1275,10 +1294,31 @@ func _deferred_integrity_check() -> void:
 var stress_max_load: float = 15.0
 var stress_horizontal_transfer: float = 0.6
 
+## When true, every Nth integrity check does a full solve and asserts the
+## persistent state matches what localized would have produced. Set to 0
+## to disable. Set to 1 to validate every call (very expensive).
+var stress_validate_every: int = 0
+var _stress_validate_counter: int = 0
+
+
+func _mark_dirty_stress_seed(key: Vector3i) -> void:
+	## Append a destroyed block's flat index to the dirty-seed list. The next
+	## _check_structural_integrity() call will use these as seeds for the
+	## localized solver. Safe to call before or after the block is erased
+	## from _block_grid; only the index is needed.
+	_stress_dirty_seeds.append(_grid_idx(key.x, key.y, key.z))
+
+
 func _check_structural_integrity() -> void:
 	## Server-only: force-equilibrium stress solver + connectivity check.
 	## Finds blocks that are either disconnected from ground OR cannot be
 	## held in static equilibrium within material strength limits.
+	##
+	## Uses the localized solver: persistent contact stress is reused across
+	## calls, and only blocks adjacent to recently-destroyed seeds (tracked
+	## via _stress_dirty_seeds) get re-propagated. Falls back to a full solve
+	## when persistent state is empty/stale, when the active set explodes,
+	## or when topology changes beyond destruction.
 	if not multiplayer.is_server():
 		return
 	if _block_hp_dict.is_empty():
@@ -1294,14 +1334,30 @@ func _check_structural_integrity() -> void:
 	Profiler.begin("struct_integrity")
 	var t_si_total := Time.get_ticks_usec()
 
-	# C++ force-equilibrium solver: ground-BFS + iterative stress solve + components.
-	# Pass ground_mask so the solver knows which blocks are terrain-anchored.
+	# C++ localized stress solver. Pass dirty seeds + persistent state.
 	var _t_solver := Time.get_ticks_usec()
-	var components: Array = BlockMeshBuilder.calc_stress_integrity_components(
+	var result: Dictionary = BlockMeshBuilder.calc_stress_integrity_localized(
 		_block_grid, _ground_mask, PackedFloat32Array(),
 		_num_x, _num_y, _num_z, _block_hp_dict.size(),
-		stress_max_load, stress_horizontal_transfer)
+		stress_max_load, stress_horizontal_transfer,
+		_stress_dirty_seeds, _stress_persistent_state)
 	var _t_solver_us := Time.get_ticks_usec() - _t_solver
+
+	# Update persistent state and clear dirty seeds for the next call.
+	_stress_persistent_state = result.get("persistent_state", {})
+	_stress_dirty_seeds = PackedInt32Array()
+
+	var components: Array = result.get("components", [])
+	var used_full: bool = result.get("used_full_resolve", false)
+	var active_set: int = result.get("active_set_size", 0)
+
+	# Optional drift validation: every Nth call, also run the full solver and
+	# assert the components match. Catches persistent-state bugs early.
+	if stress_validate_every > 0 and not used_full:
+		_stress_validate_counter += 1
+		if _stress_validate_counter >= stress_validate_every:
+			_stress_validate_counter = 0
+			_validate_stress_against_full(components)
 
 	if components.is_empty():
 		GameManager.tick_add("structural_integrity", Time.get_ticks_usec() - t_si_total)
@@ -1313,12 +1369,44 @@ func _check_structural_integrity() -> void:
 	var t_detach_end := Time.get_ticks_usec()
 
 	var si_us := Time.get_ticks_usec() - t_si_total
-	print("[StructuralIntegrity] %s  blocks=%d  components=%d  solver=%dus  detach=%dus  total=%dus" % [
-		name, _block_hp_dict.size(), components.size(),
+	print("[StructuralIntegrity] %s  blocks=%d  components=%d  active=%d  full_resolve=%s  solver=%dus  detach=%dus  total=%dus" % [
+		name, _block_hp_dict.size(), components.size(), active_set, str(used_full),
 		_t_solver_us, t_detach_end - t_detach, si_us,
 	])
 	GameManager.tick_add("structural_integrity", si_us)
 	Profiler.end("struct_integrity")
+
+
+func _validate_stress_against_full(localized_components: Array) -> void:
+	## Run the full solver and compare component sets. Triggers a push_error if
+	## they diverge — used during development to catch persistent-state bugs.
+	var full_components: Array = BlockMeshBuilder.calc_stress_integrity_components(
+		_block_grid, _ground_mask, PackedFloat32Array(),
+		_num_x, _num_y, _num_z, _block_hp_dict.size(),
+		stress_max_load, stress_horizontal_transfer)
+
+	# Compare by total block count and component sizes (sorted).
+	var local_blocks: int = 0
+	var local_sizes: Array[int] = []
+	for c: Array in localized_components:
+		local_sizes.append(c.size())
+		local_blocks += c.size()
+	var full_blocks: int = 0
+	var full_sizes: Array[int] = []
+	for c: Array in full_components:
+		full_sizes.append(c.size())
+		full_blocks += c.size()
+	local_sizes.sort()
+	full_sizes.sort()
+
+	if local_blocks != full_blocks or local_sizes != full_sizes:
+		push_error("[StressValidate] DIVERGENCE on %s: localized=%d blocks in %s components, full=%d blocks in %s components" % [
+			name, local_blocks, str(local_sizes), full_blocks, str(full_sizes)])
+		# Reset persistent state so next call re-establishes a clean baseline.
+		_stress_persistent_state = {}
+	else:
+		print("[StressValidate] OK on %s: %d components, %d blocks" % [
+			name, localized_components.size(), local_blocks])
 
 
 func _detach_clusters(components: Array) -> void:

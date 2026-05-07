@@ -132,6 +132,36 @@ public:
 			float p_max_load,
 			float p_horizontal_transfer);
 
+	/// Localized variant of the stress solver. Reuses persistent state from a prior
+	/// full solve and only re-propagates from blocks adjacent to recent destruction.
+	/// Falls back to a full solve when persistent state is empty/stale OR when the
+	/// active set exceeds half the grid (catastrophic event).
+	///
+	/// p_dirty_seed_indices: flat indices of blocks that were destroyed this tick
+	///   (gone from p_block_grid). Used to seed the localized propagation.
+	/// p_persistent_state: Dictionary containing
+	///     "contact_compression": PackedFloat32Array(grid_size * 6)
+	///     "contact_shear":       PackedFloat32Array(grid_size * 6)
+	///     "visited":             PackedByteArray(grid_size)
+	///     "last_block_count":    int — last total_blocks count, for staleness check
+	///   Empty Dictionary triggers a full solve.
+	///
+	/// Returns Dictionary:
+	///     "components":         Array of TypedArray<Vector3i> (same as full solver)
+	///     "persistent_state":   Dictionary with updated contact/visited arrays + count
+	///     "used_full_resolve":  bool — true if fell back to full solve
+	///     "active_set_size":    int — peak active block count during propagation
+	Dictionary calc_stress_integrity_localized(
+			const PackedByteArray &p_block_grid,
+			const PackedByteArray &p_ground_mask,
+			const PackedFloat32Array &p_external_load,
+			int p_num_x, int p_num_y, int p_num_z,
+			int p_total_blocks,
+			float p_max_load,
+			float p_horizontal_transfer,
+			const PackedInt32Array &p_dirty_seed_indices,
+			const Dictionary &p_persistent_state);
+
 	/// Terrain streaming: compute which chunks to load/unload.
 	/// All math done natively — no GDScript Dictionary overhead.
 	/// p_player_positions: world positions of all players.

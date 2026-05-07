@@ -250,6 +250,12 @@ void BlockMeshBuilder::_bind_methods() {
 					"total_blocks", "max_load", "horizontal_transfer"),
 			&BlockMeshBuilder::calc_stress_integrity_components);
 	ClassDB::bind_method(
+			D_METHOD("calc_stress_integrity_localized", "block_grid", "ground_mask",
+					"external_load", "num_x", "num_y", "num_z",
+					"total_blocks", "max_load", "horizontal_transfer",
+					"dirty_seed_indices", "persistent_state"),
+			&BlockMeshBuilder::calc_stress_integrity_localized);
+	ClassDB::bind_method(
 			D_METHOD("calc_streaming_update", "player_positions", "loaded_chunks",
 					"view_distance", "chunk_size", "min_by", "max_by"),
 			&BlockMeshBuilder::calc_streaming_update);
@@ -1656,6 +1662,720 @@ Array BlockMeshBuilder::calc_stress_integrity_components(
 			(int)(t_end - t_solver), (int)(t_end - t_start)));
 
 	return components;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Localized stress solver
+//
+// The full solver above does a Gauss-Seidel force-equilibrium pass over the
+// entire structure on every call, ignoring that most of the structure was
+// already in equilibrium before the latest damage event. The localized variant
+// keeps the steady-state contact stress field as persistent state and re-solves
+// only the perturbation that propagates outward from blocks adjacent to the
+// recently destroyed seeds.
+//
+// Far-from-damage blocks are already in equilibrium and stay in equilibrium
+// (their incoming forces don't change), so they're never touched. The active
+// set is bounded by the "shadow" cast by the destruction — typically much
+// smaller than the full structure.
+//
+// Falls back to a full solve when persistent state is missing or stale.
+// Always re-runs the Phase 3 cascade-up and Phase 4 component BFS, since
+// those phases must see the global topology.
+// ─────────────────────────────────────────────────────────────────────────────
+Dictionary BlockMeshBuilder::calc_stress_integrity_localized(
+		const PackedByteArray &p_block_grid,
+		const PackedByteArray &p_ground_mask,
+		const PackedFloat32Array &p_external_load,
+		int p_num_x, int p_num_y, int p_num_z,
+		int p_total_blocks,
+		float p_max_load,
+		float p_horizontal_transfer,
+		const PackedInt32Array &p_dirty_seed_indices,
+		const Dictionary &p_persistent_state) {
+	const int grid_size = p_num_x * p_num_y * p_num_z;
+	ERR_FAIL_COND_V_MSG(p_block_grid.size() != grid_size, Dictionary(),
+			"calc_stress_integrity_localized: grid size mismatch");
+	ERR_FAIL_COND_V(p_total_blocks <= 0, Dictionary());
+
+	uint64_t t_start = OS::get_singleton()->get_ticks_usec();
+
+	// ── Decide: localized path or full fallback ──
+	// We need: prior persistent state with matching grid size and a non-empty
+	// dirty seed set (otherwise nothing to do incrementally). Empty dirty set
+	// could mean "no destruction happened" (caller misuse) — fall back to full
+	// solve to be safe.
+	bool need_full = false;
+	const char *fallback_reason = nullptr;
+
+	if (p_persistent_state.is_empty()) {
+		need_full = true;
+		fallback_reason = "no_persistent_state";
+	} else {
+		Variant v_count = p_persistent_state.get("last_block_count", Variant());
+		if (v_count.get_type() != Variant::INT) {
+			need_full = true;
+			fallback_reason = "missing_last_block_count";
+		} else if ((int)v_count != p_total_blocks + (int)p_dirty_seed_indices.size()) {
+			// last_block_count should equal current_blocks + just_destroyed.
+			// If it doesn't, persistent state is stale.
+			need_full = true;
+			fallback_reason = "stale_block_count";
+		}
+	}
+
+	if (!need_full) {
+		Variant v_cc = p_persistent_state.get("contact_compression", Variant());
+		Variant v_cs = p_persistent_state.get("contact_shear", Variant());
+		Variant v_vis = p_persistent_state.get("visited", Variant());
+		if (v_cc.get_type() != Variant::PACKED_FLOAT32_ARRAY ||
+				v_cs.get_type() != Variant::PACKED_FLOAT32_ARRAY ||
+				v_vis.get_type() != Variant::PACKED_BYTE_ARRAY) {
+			need_full = true;
+			fallback_reason = "missing_state_arrays";
+		} else {
+			PackedFloat32Array cc = v_cc;
+			PackedFloat32Array cs = v_cs;
+			PackedByteArray vis = v_vis;
+			if (cc.size() != grid_size * 6 || cs.size() != grid_size * 6 ||
+					vis.size() != grid_size) {
+				need_full = true;
+				fallback_reason = "state_array_size_mismatch";
+			}
+		}
+	}
+
+	if (p_dirty_seed_indices.is_empty() && !need_full) {
+		// No new damage to propagate — nothing changed. Return empty components
+		// with the persistent state passed through.
+		Dictionary result;
+		result["components"] = Array();
+		result["persistent_state"] = p_persistent_state;
+		result["used_full_resolve"] = false;
+		result["active_set_size"] = 0;
+		uint64_t t_end_noop = OS::get_singleton()->get_ticks_usec();
+		print_line(vformat("[StressIntegrity_L] blocks=%d  no-op (no dirty seeds)  total=%dus",
+				p_total_blocks, (int)(t_end_noop - t_start)));
+		return result;
+	}
+
+	// ── Setup shared state arrays ──
+	const uint8_t *grid = p_block_grid.ptr();
+	const int nx = p_num_x;
+	const int ny = p_num_y;
+	const int nz = p_num_z;
+	const int ny_nz = ny * nz;
+
+	const bool has_ground_mask = p_ground_mask.size() == grid_size;
+	const uint8_t *ground_mask = has_ground_mask ? p_ground_mask.ptr() : nullptr;
+	const bool has_external_load = p_external_load.size() == grid_size;
+	const float *external_load = has_external_load ? p_external_load.ptr() : nullptr;
+
+	const float compressive_limit = p_max_load;
+	const float tensile_limit = p_max_load * 0.3f;
+	const float shear_limit = p_max_load * 0.4f;
+	const float h_transfer = CLAMP(p_horizontal_transfer, 0.0f, 1.0f);
+
+	const float dir_normals[6][3] = {
+		{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}
+	};
+	const int dir_offsets[6] = {ny_nz, -ny_nz, nz, -nz, 1, -1};
+	const int opposite_dir[6] = {1, 0, 3, 2, 5, 4};
+
+	// Allocate working arrays we always need.
+	uint8_t *visited = (uint8_t *)memalloc(grid_size);
+	uint8_t *is_ground = (uint8_t *)memalloc(grid_size);
+	uint8_t *failed = (uint8_t *)memalloc(grid_size);
+	uint8_t *active = (uint8_t *)memalloc(grid_size);
+	int *bfs_queue = (int *)memalloc(p_total_blocks * sizeof(int));
+	float *residual = (float *)memalloc(grid_size * 3 * sizeof(float));
+	float *contact_compression = (float *)memalloc(grid_size * 6 * sizeof(float));
+	float *contact_shear = (float *)memalloc(grid_size * 6 * sizeof(float));
+
+	memset(visited, 0, grid_size);
+	memset(is_ground, 0, grid_size);
+	memset(failed, 0, grid_size);
+	memset(active, 0, grid_size);
+	memset(residual, 0, grid_size * 3 * sizeof(float));
+	memset(contact_compression, 0, grid_size * 6 * sizeof(float));
+	memset(contact_shear, 0, grid_size * 6 * sizeof(float));
+
+	int peak_active = 0;
+
+	// ── Path A: full solve (fallback) ──
+	if (need_full) {
+		// Run the same algorithm as calc_stress_integrity_components, but write
+		// our state arrays so we can hand them back as persistent_state.
+		// Phase 1: Ground BFS.
+		int head = 0, tail = 0;
+		if (has_ground_mask) {
+			for (int idx = 0; idx < grid_size; idx++) {
+				if (grid[idx] == 1 && ground_mask[idx] == 1) {
+					visited[idx] = 1;
+					is_ground[idx] = 1;
+					bfs_queue[tail++] = idx;
+				}
+			}
+		} else {
+			for (int bx = 0; bx < nx; bx++) {
+				int base = bx * ny_nz;
+				for (int bz = 0; bz < nz; bz++) {
+					int idx = base + bz; // y=0
+					if (grid[idx] == 1) {
+						visited[idx] = 1;
+						is_ground[idx] = 1;
+						bfs_queue[tail++] = idx;
+					}
+				}
+			}
+		}
+		int visited_count = tail;
+		while (head < tail) {
+			if (visited_count == p_total_blocks) break;
+			const int ci = bfs_queue[head++];
+			const int bx = ci / ny_nz;
+			const int rem = ci % ny_nz;
+			const int by = rem / nz;
+			const int bz = rem % nz;
+			if (bx + 1 < nx) { int ni = ci + ny_nz;  if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+			if (bx > 0)      { int ni = ci - ny_nz;  if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+			if (by + 1 < ny) { int ni = ci + nz;     if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+			if (by > 0)      { int ni = ci - nz;     if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+			if (bz + 1 < nz) { int ni = ci + 1;      if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+			if (bz > 0)      { int ni = ci - 1;      if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count++; } }
+		}
+
+		// Phase 2: initialize residual = gravity + external load.
+		for (int idx = 0; idx < grid_size; idx++) {
+			if (grid[idx] != 1 || visited[idx] != 1) continue;
+			if (!is_ground[idx]) {
+				float load = -1.0f;
+				if (has_external_load) load -= external_load[idx];
+				residual[idx * 3 + 1] = load;
+				active[idx] = 1;
+			}
+		}
+		int active_count = 0;
+		for (int idx = 0; idx < grid_size; idx++) if (active[idx]) active_count++;
+		peak_active = active_count;
+	} else {
+		// ── Path B: localized re-solve ──
+		// Copy persistent state into our working arrays.
+		PackedFloat32Array cc_in = p_persistent_state.get("contact_compression", Variant());
+		PackedFloat32Array cs_in = p_persistent_state.get("contact_shear", Variant());
+		PackedByteArray vis_in = p_persistent_state.get("visited", Variant());
+		memcpy(contact_compression, cc_in.ptr(), grid_size * 6 * sizeof(float));
+		memcpy(contact_shear, cs_in.ptr(), grid_size * 6 * sizeof(float));
+		memcpy(visited, vis_in.ptr(), grid_size);
+
+		// Reconstruct is_ground from visited + ground_mask (or y=0 fallback).
+		if (has_ground_mask) {
+			for (int idx = 0; idx < grid_size; idx++) {
+				if (grid[idx] == 1 && ground_mask[idx] == 1) {
+					is_ground[idx] = 1;
+				}
+			}
+		} else {
+			for (int bx = 0; bx < nx; bx++) {
+				int base = bx * ny_nz;
+				for (int bz = 0; bz < nz; bz++) {
+					int idx = base + bz;
+					if (grid[idx] == 1) is_ground[idx] = 1;
+				}
+			}
+		}
+
+		// Re-run ground BFS over the (now reduced) grid. Some blocks marked
+		// visited=1 in the persistent state may have lost their connection to
+		// ground via the destruction. We need a fresh visited[] for correctness.
+		memset(visited, 0, grid_size);
+		int head = 0, tail = 0;
+		for (int idx = 0; idx < grid_size; idx++) {
+			if (is_ground[idx] && grid[idx] == 1) {
+				visited[idx] = 1;
+				bfs_queue[tail++] = idx;
+			}
+		}
+		while (head < tail) {
+			const int ci = bfs_queue[head++];
+			const int bx = ci / ny_nz;
+			const int rem = ci % ny_nz;
+			const int by = rem / nz;
+			const int bz = rem % nz;
+			if (bx + 1 < nx) { int ni = ci + ny_nz;  if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (bx > 0)      { int ni = ci - ny_nz;  if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (by + 1 < ny) { int ni = ci + nz;     if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (by > 0)      { int ni = ci - nz;     if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (bz + 1 < nz) { int ni = ci + 1;      if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (bz > 0)      { int ni = ci - 1;      if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+		}
+
+		// Seed the residual from the dirty seeds.
+		// For each destroyed block S, each surviving neighbor N had a contact
+		// (N, opposite_dir) carrying force from S. That force is now unsupported
+		// — apply it to N's residual so the solver redistributes.
+		const int *seeds = p_dirty_seed_indices.ptr();
+		for (int si = 0; si < p_dirty_seed_indices.size(); si++) {
+			int s_idx = seeds[si];
+			if (s_idx < 0 || s_idx >= grid_size) continue;
+
+			int sbx = s_idx / ny_nz;
+			int srem = s_idx % ny_nz;
+			int sby = srem / nz;
+			int sbz = srem % nz;
+
+			for (int d = 0; d < 6; d++) {
+				bool in_bounds = true;
+				if (d == 0 && sbx + 1 >= nx) in_bounds = false;
+				if (d == 1 && sbx <= 0)       in_bounds = false;
+				if (d == 2 && sby + 1 >= ny) in_bounds = false;
+				if (d == 3 && sby <= 0)       in_bounds = false;
+				if (d == 4 && sbz + 1 >= nz) in_bounds = false;
+				if (d == 5 && sbz <= 0)       in_bounds = false;
+				if (!in_bounds) continue;
+
+				int ni = s_idx + dir_offsets[d];
+				if (grid[ni] != 1 || visited[ni] != 1) continue;
+
+				int opp = opposite_dir[d];
+				int n_contact_idx = ni * 6 + opp;
+				float fn_at_n = contact_compression[n_contact_idx];
+				float shear_at_n = contact_shear[n_contact_idx];
+
+				// Reconstruct force vector on N from S. The compression sign
+				// convention is positive=compression. Tensile (fn<0) means
+				// the contact was pulling N toward S; releasing it means N's
+				// load that was counter-acting that pull is freed.
+				// Direction from N toward S is -dir_normals[opp] = dir_normals[d]
+				// (since opp is opposite of d, and dir_normals are unit vectors).
+				// Compression force pushed N AWAY from S, i.e., in -dir_normals[d].
+				// Removing it means N now has unbalanced force in +dir_normals[d].
+				const float *n_normal = dir_normals[opp]; // points from N toward S
+				float released_x = fn_at_n * n_normal[0];
+				float released_y = fn_at_n * n_normal[1];
+				float released_z = fn_at_n * n_normal[2];
+				// Shear we approximate by adding magnitude as residual along the
+				// vertical (dominant for gravity scenarios) — exact direction is
+				// not preserved in our scalar storage. Adding the magnitude up
+				// is a slight overestimate but converges quickly.
+				if (shear_at_n > 0.0f) {
+					released_y += shear_at_n;
+				}
+
+				residual[ni * 3 + 0] += released_x;
+				residual[ni * 3 + 1] += released_y;
+				residual[ni * 3 + 2] += released_z;
+				active[ni] = 1;
+
+				// Clear the contact accounting on N's side — that contact is gone.
+				contact_compression[n_contact_idx] = 0.0f;
+				contact_shear[n_contact_idx] = 0.0f;
+			}
+		}
+
+		// Count peak active.
+		for (int idx = 0; idx < grid_size; idx++) if (active[idx]) peak_active++;
+
+		// Catastrophic-event fallback: if active set is huge, just do full solve.
+		if (peak_active > grid_size / 2) {
+			// Reset to clean state and switch to full path.
+			memset(visited, 0, grid_size);
+			memset(is_ground, 0, grid_size);
+			memset(active, 0, grid_size);
+			memset(residual, 0, grid_size * 3 * sizeof(float));
+			memset(contact_compression, 0, grid_size * 6 * sizeof(float));
+			memset(contact_shear, 0, grid_size * 6 * sizeof(float));
+			need_full = true;
+			fallback_reason = "active_set_too_large";
+			peak_active = 0;
+
+			// Rerun Phase 1 (ground BFS).
+			head = 0; tail = 0;
+			if (has_ground_mask) {
+				for (int idx = 0; idx < grid_size; idx++) {
+					if (grid[idx] == 1 && ground_mask[idx] == 1) {
+						visited[idx] = 1;
+						is_ground[idx] = 1;
+						bfs_queue[tail++] = idx;
+					}
+				}
+			} else {
+				for (int bx = 0; bx < nx; bx++) {
+					int base = bx * ny_nz;
+					for (int bz = 0; bz < nz; bz++) {
+						int idx = base + bz;
+						if (grid[idx] == 1) {
+							visited[idx] = 1;
+							is_ground[idx] = 1;
+							bfs_queue[tail++] = idx;
+						}
+					}
+				}
+			}
+			int visited_count2 = tail;
+			while (head < tail) {
+				if (visited_count2 == p_total_blocks) break;
+				const int ci = bfs_queue[head++];
+				const int bx = ci / ny_nz;
+				const int rem = ci % ny_nz;
+				const int by = rem / nz;
+				const int bz = rem % nz;
+				if (bx + 1 < nx) { int ni = ci + ny_nz;  if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count2++; } }
+				if (bx > 0)      { int ni = ci - ny_nz;  if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count2++; } }
+				if (by + 1 < ny) { int ni = ci + nz;     if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count2++; } }
+				if (by > 0)      { int ni = ci - nz;     if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count2++; } }
+				if (bz + 1 < nz) { int ni = ci + 1;      if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count2++; } }
+				if (bz > 0)      { int ni = ci - 1;      if (grid[ni] == 1 && !visited[ni]) { visited[ni] = 1; bfs_queue[tail++] = ni; visited_count2++; } }
+			}
+			for (int idx = 0; idx < grid_size; idx++) {
+				if (grid[idx] != 1 || visited[idx] != 1) continue;
+				if (!is_ground[idx]) {
+					float load = -1.0f;
+					if (has_external_load) load -= external_load[idx];
+					residual[idx * 3 + 1] = load;
+					active[idx] = 1;
+					peak_active++;
+				}
+			}
+		}
+	}
+
+	uint64_t t_setup = OS::get_singleton()->get_ticks_usec();
+
+	// ── Phase 2: solver iterations (shared by full and localized paths) ──
+	// Build process order — bottom-to-top by Y for faster convergence.
+	int *process_order = (int *)memalloc(p_total_blocks * sizeof(int));
+	int process_count = 0;
+	for (int by = 0; by < ny; by++) {
+		for (int bx = 0; bx < nx; bx++) {
+			for (int bz = 0; bz < nz; bz++) {
+				int idx = bx * ny_nz + by * nz + bz;
+				if (grid[idx] == 1 && visited[idx] == 1 && !is_ground[idx]) {
+					process_order[process_count++] = idx;
+				}
+			}
+		}
+	}
+
+	const int MAX_ITERATIONS = 40;
+	const float RESIDUAL_EPSILON = 0.01f;
+	int solver_iters = 0;
+
+	for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+		solver_iters = iter + 1;
+		bool any_change = false;
+
+		for (int pi = 0; pi < process_count; pi++) {
+			const int idx = process_order[pi];
+			if (failed[idx] || !active[idx]) continue;
+
+			float rx = residual[idx * 3 + 0];
+			float ry = residual[idx * 3 + 1];
+			float rz = residual[idx * 3 + 2];
+			float rmag = sqrtf(rx * rx + ry * ry + rz * rz);
+			if (rmag < RESIDUAL_EPSILON) {
+				active[idx] = 0;
+				continue;
+			}
+
+			const int bx = idx / ny_nz;
+			const int rem = idx % ny_nz;
+			const int by = rem / nz;
+			const int bz = rem % nz;
+
+			float weights[6] = {};
+			int neighbor_idx[6] = {};
+			bool neighbor_valid[6] = {};
+			float total_weight = 0.0f;
+			int active_contacts = 0;
+
+			for (int d = 0; d < 6; d++) {
+				bool in_bounds = true;
+				if (d == 0 && bx + 1 >= nx) in_bounds = false;
+				if (d == 1 && bx <= 0)       in_bounds = false;
+				if (d == 2 && by + 1 >= ny) in_bounds = false;
+				if (d == 3 && by <= 0)       in_bounds = false;
+				if (d == 4 && bz + 1 >= nz) in_bounds = false;
+				if (d == 5 && bz <= 0)       in_bounds = false;
+				if (!in_bounds) { neighbor_valid[d] = false; continue; }
+
+				int ni = idx + dir_offsets[d];
+				if (grid[ni] != 1 || failed[ni]) { neighbor_valid[d] = false; continue; }
+				if (visited[ni] != 1) { neighbor_valid[d] = false; continue; }
+
+				neighbor_idx[d] = ni;
+				neighbor_valid[d] = true;
+				active_contacts++;
+
+				float dot = (rx * dir_normals[d][0] + ry * dir_normals[d][1] + rz * dir_normals[d][2]) / rmag;
+				bool is_vertical = (d == 2 || d == 3);
+				float dir_scale = is_vertical ? 1.0f : h_transfer;
+				weights[d] = MAX(dot, 0.05f) * dir_scale;
+				total_weight += weights[d];
+			}
+
+			if (active_contacts == 0) {
+				failed[idx] = 1;
+				residual[idx * 3 + 0] = 0.0f;
+				residual[idx * 3 + 1] = 0.0f;
+				residual[idx * 3 + 2] = 0.0f;
+				any_change = true;
+				continue;
+			}
+			if (total_weight < 1e-6f) total_weight = 1.0f;
+
+			float absorbed_x = 0.0f, absorbed_y = 0.0f, absorbed_z = 0.0f;
+			for (int d = 0; d < 6; d++) {
+				if (!neighbor_valid[d]) continue;
+				float frac = weights[d] / total_weight;
+				float fx = rx * frac;
+				float fy = ry * frac;
+				float fz = rz * frac;
+
+				float nx_d = dir_normals[d][0];
+				float ny_d = dir_normals[d][1];
+				float nz_d = dir_normals[d][2];
+				float fn = fx * nx_d + fy * ny_d + fz * nz_d;
+				float sx = fx - fn * nx_d;
+				float sy = fy - fn * ny_d;
+				float sz = fz - fn * nz_d;
+				float shear_mag = sqrtf(sx * sx + sy * sy + sz * sz);
+
+				float fn_clamped = fn;
+				int ci = idx * 6 + d;
+				if (fn > 0.0f) {
+					float remaining = compressive_limit - contact_compression[ci];
+					if (remaining < 0.0f) remaining = 0.0f;
+					fn_clamped = MIN(fn, remaining);
+				} else {
+					float remaining = tensile_limit + contact_compression[ci];
+					if (remaining < 0.0f) remaining = 0.0f;
+					fn_clamped = MAX(fn, -remaining);
+				}
+
+				float shear_clamped = shear_mag;
+				float shear_remaining = shear_limit - contact_shear[ci];
+				if (shear_remaining < 0.0f) shear_remaining = 0.0f;
+				shear_clamped = MIN(shear_mag, shear_remaining);
+
+				float tfx = fn_clamped * nx_d;
+				float tfy = fn_clamped * ny_d;
+				float tfz = fn_clamped * nz_d;
+				if (shear_mag > 1e-6f) {
+					float shear_scale = shear_clamped / shear_mag;
+					tfx += sx * shear_scale;
+					tfy += sy * shear_scale;
+					tfz += sz * shear_scale;
+				}
+
+				contact_compression[ci] += fn_clamped;
+				contact_shear[ci] += shear_clamped;
+
+				absorbed_x += tfx;
+				absorbed_y += tfy;
+				absorbed_z += tfz;
+
+				int ni = neighbor_idx[d];
+				if (!is_ground[ni]) {
+					residual[ni * 3 + 0] += tfx;
+					residual[ni * 3 + 1] += tfy;
+					residual[ni * 3 + 2] += tfz;
+					active[ni] = 1;
+					if (active[ni] && peak_active < grid_size) peak_active++;
+				}
+			}
+
+			residual[idx * 3 + 0] -= absorbed_x;
+			residual[idx * 3 + 1] -= absorbed_y;
+			residual[idx * 3 + 2] -= absorbed_z;
+
+			float new_rmag = sqrtf(
+					residual[idx * 3 + 0] * residual[idx * 3 + 0] +
+					residual[idx * 3 + 1] * residual[idx * 3 + 1] +
+					residual[idx * 3 + 2] * residual[idx * 3 + 2]);
+			if (new_rmag != rmag) any_change = true;
+		}
+
+		if (!any_change) break;
+	}
+
+	// ── Phase 3: stress-failed marking + cascade up ──
+	int stress_failed = 0;
+	for (int pi = 0; pi < process_count; pi++) {
+		int idx = process_order[pi];
+		if (failed[idx]) { stress_failed++; continue; }
+		float rx = residual[idx * 3 + 0];
+		float ry = residual[idx * 3 + 1];
+		float rz = residual[idx * 3 + 2];
+		float rmag = sqrtf(rx * rx + ry * ry + rz * rz);
+		if (rmag > 0.5f) {
+			failed[idx] = 1;
+			visited[idx] = 0;
+			stress_failed++;
+		}
+	}
+	bool cascade = true;
+	while (cascade) {
+		cascade = false;
+		for (int pi = process_count - 1; pi >= 0; pi--) {
+			int idx = process_order[pi];
+			if (failed[idx]) continue;
+			int bx = idx / ny_nz;
+			int rem = idx % ny_nz;
+			int by = rem / nz;
+			int bz = rem % nz;
+			bool has_support = false;
+			for (int d = 0; d < 6; d++) {
+				bool in_bounds = true;
+				if (d == 0 && bx + 1 >= nx) in_bounds = false;
+				if (d == 1 && bx <= 0)       in_bounds = false;
+				if (d == 2 && by + 1 >= ny) in_bounds = false;
+				if (d == 3 && by <= 0)       in_bounds = false;
+				if (d == 4 && bz + 1 >= nz) in_bounds = false;
+				if (d == 5 && bz <= 0)       in_bounds = false;
+				if (!in_bounds) continue;
+				int ni = idx + dir_offsets[d];
+				if (grid[ni] == 1 && visited[ni] == 1 && !failed[ni]) {
+					has_support = true;
+					break;
+				}
+			}
+			if (!has_support) {
+				failed[idx] = 1;
+				visited[idx] = 0;
+				stress_failed++;
+				cascade = true;
+			}
+		}
+	}
+
+	uint64_t t_solver = OS::get_singleton()->get_ticks_usec();
+
+	// ── Phase 4: component BFS over unsupported blocks ──
+	int total_unsupported = 0;
+	for (int idx = 0; idx < grid_size; idx++) {
+		if (grid[idx] == 1 && visited[idx] == 0) total_unsupported++;
+	}
+	for (int idx = 0; idx < grid_size; idx++) {
+		if (grid[idx] == 1 && failed[idx] && visited[idx] == 1) {
+			visited[idx] = 0;
+			total_unsupported++;
+		}
+	}
+
+	Array components;
+	if (total_unsupported > 0) {
+		int head = 0, tail = 0;
+		for (int idx = 0; idx < grid_size; idx++) {
+			if (grid[idx] != 1 || visited[idx] != 0) continue;
+			head = 0; tail = 0;
+			bfs_queue[tail++] = idx;
+			visited[idx] = 2;
+			while (head < tail) {
+				const int ci = bfs_queue[head++];
+				const int cbx = ci / ny_nz;
+				const int crem = ci % ny_nz;
+				const int cby = crem / nz;
+				const int cbz = crem % nz;
+				if (cbx + 1 < nx) { int ni = ci + ny_nz; if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+				if (cbx > 0)      { int ni = ci - ny_nz; if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+				if (cby + 1 < ny) { int ni = ci + nz;    if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+				if (cby > 0)      { int ni = ci - nz;    if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+				if (cbz + 1 < nz) { int ni = ci + 1;     if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+				if (cbz > 0)      { int ni = ci - 1;     if (grid[ni] == 1 && visited[ni] == 0) { visited[ni] = 2; bfs_queue[tail++] = ni; } }
+			}
+			TypedArray<Vector3i> component;
+			component.resize(tail);
+			for (int j = 0; j < tail; j++) {
+				const int cj = bfs_queue[j];
+				component[j] = Vector3i(cj / ny_nz, (cj % ny_nz) / nz, cj % nz);
+			}
+			components.push_back(component);
+		}
+	}
+
+	// ── Build the updated persistent state to return ──
+	// Restore visited[] to 1-or-0 (we set some to 2 during component BFS,
+	// and zeroed some during cascade — we want the steady-state ground mask).
+	// We need to re-derive what's still ground-connected AFTER components are
+	// extracted, since detached components are about to be removed by caller.
+	// Easiest: re-run a quick BFS over remaining (visited != 2 AND not failed).
+	// Actually for persistent state purposes, what matters is "which blocks
+	// are part of the still-attached structure." We rebuild visited[] from
+	// is_ground BFS, EXCLUDING failed blocks (caller will erase them).
+	memset(visited, 0, grid_size);
+	{
+		int head2 = 0, tail2 = 0;
+		for (int idx = 0; idx < grid_size; idx++) {
+			if (is_ground[idx] && grid[idx] == 1 && !failed[idx]) {
+				visited[idx] = 1;
+				bfs_queue[tail2++] = idx;
+			}
+		}
+		while (head2 < tail2) {
+			const int ci = bfs_queue[head2++];
+			const int bx = ci / ny_nz;
+			const int rem = ci % ny_nz;
+			const int by = rem / nz;
+			const int bz = rem % nz;
+			if (bx + 1 < nx) { int ni = ci + ny_nz; if (grid[ni] == 1 && !failed[ni] && !visited[ni]) { visited[ni] = 1; bfs_queue[tail2++] = ni; } }
+			if (bx > 0)      { int ni = ci - ny_nz; if (grid[ni] == 1 && !failed[ni] && !visited[ni]) { visited[ni] = 1; bfs_queue[tail2++] = ni; } }
+			if (by + 1 < ny) { int ni = ci + nz;    if (grid[ni] == 1 && !failed[ni] && !visited[ni]) { visited[ni] = 1; bfs_queue[tail2++] = ni; } }
+			if (by > 0)      { int ni = ci - nz;    if (grid[ni] == 1 && !failed[ni] && !visited[ni]) { visited[ni] = 1; bfs_queue[tail2++] = ni; } }
+			if (bz + 1 < nz) { int ni = ci + 1;     if (grid[ni] == 1 && !failed[ni] && !visited[ni]) { visited[ni] = 1; bfs_queue[tail2++] = ni; } }
+			if (bz > 0)      { int ni = ci - 1;     if (grid[ni] == 1 && !failed[ni] && !visited[ni]) { visited[ni] = 1; bfs_queue[tail2++] = ni; } }
+		}
+	}
+
+	// Pack persistent state into Dictionary.
+	PackedFloat32Array out_cc;
+	PackedFloat32Array out_cs;
+	PackedByteArray out_visited;
+	out_cc.resize(grid_size * 6);
+	out_cs.resize(grid_size * 6);
+	out_visited.resize(grid_size);
+	memcpy(out_cc.ptrw(), contact_compression, grid_size * 6 * sizeof(float));
+	memcpy(out_cs.ptrw(), contact_shear, grid_size * 6 * sizeof(float));
+	memcpy(out_visited.ptrw(), visited, grid_size);
+
+	// New last_block_count = total currently-existing blocks MINUS the dirty
+	// seeds that are about to be erased by the caller's component split.
+	// Actually: total_blocks param is the count BEFORE this stress check
+	// erases anything. After caller erases the components we returned, the
+	// new block count will be total_blocks - sum(component.size()).
+	int blocks_in_components = 0;
+	for (int i = 0; i < components.size(); i++) {
+		TypedArray<Vector3i> c = components[i];
+		blocks_in_components += c.size();
+	}
+	int next_block_count = p_total_blocks - blocks_in_components;
+
+	Dictionary new_state;
+	new_state["contact_compression"] = out_cc;
+	new_state["contact_shear"] = out_cs;
+	new_state["visited"] = out_visited;
+	new_state["last_block_count"] = next_block_count;
+
+	memfree(visited); memfree(is_ground); memfree(failed); memfree(active);
+	memfree(bfs_queue); memfree(residual);
+	memfree(contact_compression); memfree(contact_shear);
+	memfree(process_order);
+
+	uint64_t t_end = OS::get_singleton()->get_ticks_usec();
+	const char *path_label = need_full ? "FULL" : "LOCAL";
+	const char *fb_str = fallback_reason ? fallback_reason : "-";
+	print_line(vformat("[StressIntegrity_L %s] blocks=%d  active=%d  failed=%d  components=%d  iters=%d  setup=%dus  solver=%dus  total=%dus  fb=%s",
+			path_label, p_total_blocks, peak_active, stress_failed,
+			components.size(), solver_iters,
+			(int)(t_setup - t_start), (int)(t_solver - t_setup),
+			(int)(t_end - t_start), fb_str));
+
+	Dictionary result;
+	result["components"] = components;
+	result["persistent_state"] = new_state;
+	result["used_full_resolve"] = need_full;
+	result["active_set_size"] = peak_active;
+	return result;
 }
 
 Dictionary BlockMeshBuilder::build_cluster(
