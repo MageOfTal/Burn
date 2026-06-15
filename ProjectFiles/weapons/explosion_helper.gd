@@ -27,7 +27,7 @@ const DEBUG_RAY_LIFETIME := 4.0
 
 ## Maximum velocity change (m/s) from a single explosion impulse.
 ## Prevents absurdly fast launches on very light objects (e.g. 0.1 kg bubbles).
-const MAX_IMPULSE_VELOCITY := 50.0
+const MAX_IMPULSE_VELOCITY := 250.0
 
 ## Persistent sphere shape for physics queries. Pre-created in prewarm()
 ## (called from GameManager._ready) so the Jolt shape is registered before
@@ -58,7 +58,7 @@ static func do_explosion(
 	attacker_id: int,
 	exclude_body: Node = null,
 	impact_speed: float = INF,
-	impulse_strength: float = 400.0,
+	impulse_strength: float = 4000.0,
 ) -> void:
 	## Deal shielded explosion damage to all players and walls in radius.
 	## player_damage: base damage dealt to players (before falloff/shielding).
@@ -153,7 +153,21 @@ static func do_explosion(
 	var pass1_players := 0
 	var pass1_structures := 0
 	var pass1_objects := 0
+	# Bond-only clusters get batched: one C++ call, threaded across cores,
+	# instead of N individual GDScript→C++ calls. Massive saving when many
+	# clusters are in radius (e.g. 790 detached chunks from a toppled tower).
+	var bond_clusters: Array = []
+	var bond_inputs: Array = []
+	# Dedup by body RID. intersect_shape returns one result per overlapping
+	# SHAPE, so a cluster with 50 blocks (50 shapes on its compound_hit_body)
+	# appears 50× in results. Skip duplicates before walking _find_damageable.
+	var seen_rids: Dictionary = {}
 	for result in results:
+		var rid: RID = result.get("rid", RID())
+		if rid.is_valid():
+			if seen_rids.has(rid):
+				continue
+			seen_rids[rid] = true
 		var collider: Node = result["collider"]
 		if collider == exclude_body:
 			continue
@@ -161,14 +175,36 @@ static func do_explosion(
 		if target == null or target in already_damaged:
 			continue
 
-		if target.has_method("take_damage_at"):
-			# Wall: let take_damage_at handle per-block shielding internally
+		if target is FallingBlockCluster and target.bonds_only_destruction \
+				and target.grid != null and not target.grid.is_empty() \
+				and not target._bond_strength.is_empty():
+			# Defer to the batch path. Build per-cluster input dict once.
+			# Cluster's transform origin = component centroid (mesh-relative coords),
+			# but the C++ kernel addresses bonds in GRID-LOCAL coords. Add centroid
+			# back so voxel(0,0,0) → grid(0,0,0), not grid(centroid).
+			var hit_local: Vector3 = target.global_transform.affine_inverse() * explosion_pos + target.grid.centroid
+			bond_inputs.append({
+				"block_grid": target.grid.block_grid,
+				"bond_strength": target._bond_strength,
+				"bond_damage": target._bond_damage,
+				"bond_broken": target._bond_broken,
+				"num_x": target.grid.num_x,
+				"num_y": target.grid.num_y,
+				"num_z": target.grid.num_z,
+				"hit_local": hit_local,
+				"energy": structure_damage * target.bond_damage_explosion_factor,
+				"block_hp": target._block_hp_max,
+			})
+			bond_clusters.append(target)
+			already_damaged.append(target)
+			pass1_structures += 1
+		elif target.has_method("take_damage_at"):
+			# Structure (or non-bonds-only cluster): handle per-block shielding internally.
 			_dbg_pass1_structures.append(target.name)
 			target.take_damage_at(explosion_pos, structure_damage, radius, attacker_id, exclude_rids, impact_speed)
 			already_damaged.append(target)
 			pass1_structures += 1
 		elif target is Player and target.has_method("take_damage"):
-			# Player: multi-point raycast with flat shielding
 			var dmg := _calc_player_explosion_damage(
 				space_state, explosion_pos, player_damage, radius, target, exclude_rid
 			)
@@ -177,7 +213,6 @@ static func do_explosion(
 			already_damaged.append(target)
 			pass1_players += 1
 		elif target.has_method("take_damage"):
-			# Any damageable object (physics bodies, target dummies, etc.) — cubic falloff
 			var dist := explosion_pos.distance_to(target.global_position)
 			if dist <= radius:
 				var norm_dist := dist / radius
@@ -187,6 +222,32 @@ static func do_explosion(
 					target.take_damage(dmg, attacker_id)
 			already_damaged.append(target)
 			pass1_objects += 1
+
+	# Batch: all bond-only clusters get damaged in one threaded C++ call.
+	if not bond_inputs.is_empty():
+		var t_batch := Time.get_ticks_usec()
+		var batch_results: Array = BlockMeshBuilder.damage_bonds_radial_shielded_batch(
+			bond_inputs, BlockGridManager.BLOCK_SIZE,
+			structure_damage, radius, 35.0)
+		for i in bond_clusters.size():
+			var c: FallingBlockCluster = bond_clusters[i]
+			var r: Dictionary = batch_results[i]
+			c._bond_damage = r["bond_damage"]
+			c._bond_broken = r["bond_broken"]
+			var damaged: int = r["damaged"]
+			var broken: int = r["broken"]
+			if damaged > 0 or broken > 0:
+				print("[BondGraph] %s blast batch energy=%.1f r=%.1f → damaged=%d broken=%d" % [
+					c.name, structure_damage * c.bond_damage_explosion_factor,
+					radius, damaged, broken])
+			# Fragments come back from the same WorkerThreadPool job that did
+			# the bond damage — already largest-excluded, ready to spawn.
+			# Dispatch synchronously (call_local) so sub-clusters exist before
+			# the impulse re-query below; otherwise they'd spawn at rest.
+			var fragments: Array = r.get("fragments", [])
+			if not fragments.is_empty():
+				c._sync_fragment_split_batch.rpc(fragments)
+		GameManager.tick_add("bond_batch", Time.get_ticks_usec() - t_batch)
 	var t_pass1_process_end := Time.get_ticks_usec()
 
 	# --- Player scene scan (safety net — players move and may be missed by sphere) ---
@@ -222,12 +283,17 @@ static func do_explosion(
 	# ------------------------------------------------------------------
 	#  Impulse pass: push RigidBody3D objects away from the blast
 	# ------------------------------------------------------------------
+	# Re-query the sphere AFTER the damage pass — the damage pass spawns new
+	# clusters when structures fragment, and those clusters need the impulse
+	# too so they get blasted away from the explosion instead of just dropping
+	# straight down. Without this, a tower toppling looks limp.
 	var impulse_count := 0
 	if impulse_strength > 0.0:
 		var impulsed_rids: Dictionary = {}  # RID -> true (fast dedup)
+		var impulse_results: Array = space_state.intersect_shape(query, 2048)
 
 		# Bodies from the sphere query (players, items, clusters, projectiles)
-		for result in results:
+		for result in impulse_results:
 			var body: Node = result["collider"]
 			if not (body is RigidBody3D) or body == exclude_body:
 				continue
@@ -259,6 +325,39 @@ static func do_explosion(
 					_apply_explosion_impulse(p, explosion_pos, radius, impulse_strength)
 					impulsed_rids[p_rid] = true
 					impulse_count += 1
+
+		# Safety net: clusters spawned this tick by structure detach or fragment
+		# split. Jolt's broadphase doesn't see brand-new bodies until the next
+		# physics step, so the sphere re-query above misses them. Walk the tree
+		# directly. Without this, the first explosion silently breaks bonds and
+		# spawns clusters but never launches them — a second explosion finds
+		# them via sphere and they fly off "all at once".
+		if tree and tree.current_scene:
+			var structures_node: Node = tree.current_scene.get_node_or_null("SeedWorld/Structures")
+			if structures_node == null:
+				structures_node = tree.current_scene.get_node_or_null("BlockoutMap/SeedWorld/Structures")
+			if structures_node:
+				for child in structures_node.get_children():
+					if not (child is FallingBlockCluster) or child == exclude_body:
+						continue
+					var c_rb := child as RigidBody3D
+					if c_rb.freeze:
+						continue
+					var c_rid: RID = c_rb.get_rid()
+					if impulsed_rids.has(c_rid):
+						continue
+					var c_dist := explosion_pos.distance_to(c_rb.global_position)
+					if c_dist > radius:
+						continue
+					_apply_explosion_impulse(c_rb, explosion_pos, radius, impulse_strength)
+					impulsed_rids[c_rid] = true
+					impulse_count += 1
+
+		# Multimesh-backed fragments. They live in FragmentPool, not the scene
+		# tree, so neither sphere query nor tree walk finds them. The pool
+		# does its own radial impulse pass over its flat slot arrays.
+		impulse_count += FragmentPool.apply_radial_impulse(
+			explosion_pos, radius, impulse_strength)
 
 	var t_explosion_total_end := Time.get_ticks_usec()
 	var explosion_us := t_explosion_total_end - t_explosion_total
@@ -513,6 +612,16 @@ static func _apply_explosion_impulse(
 
 	# Cap impulse so very light objects don't reach absurd velocities
 	var impulse_mag := minf(impulse_strength * falloff, MAX_IMPULSE_VELOCITY * body.mass)
+	if body is Player:
+		# The player body is frozen-kinematic, so apply_central_impulse on it
+		# is a silent no-op — player explosion knockback has been dead since
+		# the CharacterVirtual migration. Convert the impulse to a velocity
+		# delta and feed the movement's knockback channel, which is frictioned
+		# independently of walk velocity (and survives the grounded grip).
+		var p := body as Player
+		if p.movement != null and p.movement.has_method("add_knockback"):
+			p.movement.add_knockback(dir * (impulse_mag / maxf(1.0, body.mass)))
+			return
 	body.apply_central_impulse(dir * impulse_mag)
 
 

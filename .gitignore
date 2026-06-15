@@ -43,6 +43,8 @@ Engine/godot-source/modules/jolt_physics/**
 !Engine/godot-source/modules/jolt_physics/objects/
 Engine/godot-source/modules/jolt_physics/objects/**
 !Engine/godot-source/modules/jolt_physics/objects/jolt_body_3d.h
+!Engine/godot-source/modules/jolt_physics/objects/jolt_character_virtual_3d.h
+!Engine/godot-source/modules/jolt_physics/objects/jolt_character_virtual_3d.cpp
 !Engine/godot-source/modules/jolt_physics/spaces/
 Engine/godot-source/modules/jolt_physics/spaces/**
 !Engine/godot-source/modules/jolt_physics/spaces/jolt_contact_listener_3d.h
@@ -62,6 +64,15 @@ Engine/godot-source/servers/physics_3d/**
 !Engine/godot-source/servers/physics_3d/physics_server_3d.cpp
 !Engine/godot-source/servers/physics_3d/physics_server_3d_extension.h
 !Engine/godot-source/servers/physics_3d/physics_server_3d_dummy.h
+
+# --- Patched vendored Jolt file (track only this one file in the huge tree) ---
+# Must un-ignore every parent directory level for the file negation to work.
+!Engine/godot-source/thirdparty/
+!Engine/godot-source/thirdparty/jolt_physics/
+!Engine/godot-source/thirdparty/jolt_physics/Jolt/
+!Engine/godot-source/thirdparty/jolt_physics/Jolt/Physics/
+!Engine/godot-source/thirdparty/jolt_physics/Jolt/Physics/Character/
+!Engine/godot-source/thirdparty/jolt_physics/Jolt/Physics/Character/CharacterVirtual.cpp
 
 # --- Custom engine modules (fully owned by this repo, track everything) ---
 !Engine/godot-source/modules/block_mesh/

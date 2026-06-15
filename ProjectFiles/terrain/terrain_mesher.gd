@@ -21,6 +21,14 @@ var buf_side: int
 
 func _init(material: Material) -> void:
 	_mesher = VoxelMesherTransvoxel.new()
+	# Transvoxel's default edge_clamp_margin (0.02) forcibly keeps mesh
+	# vertices 2% of a cell (20 mm) away from grid corners — a dead zone that
+	# kinked the mesh into steep sliver triangles along contour lines where
+	# the terrain surface crosses integer grid heights (measured 46–77° facets
+	# on 13–19° terrain; the "weird bump on smooth ground" spots). A hair
+	# above zero keeps its divide-by-zero/degenerate-triangle protection while
+	# making the displacement sub-0.1 mm.
+	_mesher.edge_clamp_margin = 0.0001
 	_min_pad = _mesher.get_minimum_padding()
 	_max_pad = _mesher.get_maximum_padding()
 	_material = material
@@ -62,7 +70,8 @@ func build_data(sdf_grid: TerrainSDFGrid, block_pos: Vector3i) -> Dictionary:
 	var buffer := VoxelBuffer.new()
 	buffer.create(bsize.x, bsize.y, bsize.z)
 	buffer.set_channel_depth(VoxelBuffer.CHANNEL_SDF, VoxelBuffer.DEPTH_16_BIT)
-	buffer.fill_f(1.0, VoxelBuffer.CHANNEL_SDF)
+	# Background fill = "1 m outside", in the same gained scale as fill_buffer.
+	buffer.fill_f(1.0 * TerrainSDFGrid.SDF_WRITE_GAIN, VoxelBuffer.CHANNEL_SDF)
 	sdf_grid.fill_buffer(buffer, region_min, bsize)
 
 	var mesh: Mesh = _mesher.build_mesh(buffer, [])

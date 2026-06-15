@@ -200,6 +200,13 @@ func _load_full_bake() -> bool:
 
 		var faces: PackedVector3Array = entry.get("faces", PackedVector3Array())
 
+		# Diagnostic for the "Mesh created without vertex array" load warnings:
+		# a chunk with collision faces but no render mesh would be an invisible
+		# floor patch — say exactly how big, instead of a vague engine warning.
+		if mesh == null and not faces.is_empty():
+			print("[TerrainSystem] bake chunk %s has %d collision faces but NO render mesh (invisible collision)" % [
+				str(bp), faces.size() / 3])
+
 		var chunk := TerrainChunk.new(bp)
 		add_child(chunk)
 		chunk.apply_data(mesh, faces, offset, _terrain_body)
@@ -360,7 +367,8 @@ func _submit_chunk(bp: Vector3i) -> void:
 	var buffer := VoxelBuffer.new()
 	buffer.create(bsize.x, bsize.y, bsize.z)
 	buffer.set_channel_depth(VoxelBuffer.CHANNEL_SDF, VoxelBuffer.DEPTH_16_BIT)
-	buffer.fill_f(1.0, VoxelBuffer.CHANNEL_SDF)
+	# Background fill = "1 m outside", in the same gained scale as fill_buffer.
+	buffer.fill_f(1.0 * TerrainSDFGrid.SDF_WRITE_GAIN, VoxelBuffer.CHANNEL_SDF)
 	sdf_grid.fill_buffer(buffer, region_min, bsize)
 
 	# Worker thread: C++ meshing + face extraction only
