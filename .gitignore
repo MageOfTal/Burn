@@ -27,8 +27,8 @@ ProjectFiles/terrain/*.bin
 # --- Engine: ignore everything, then whitelist patched files + binaries ---
 # Must un-ignore each directory level for negation to work.
 Engine/**
-!Engine/Godot_v4.6-stable_win64.exe
-!Engine/Godot_v4.6-stable_win64_console.exe
+# Engine binaries are NOT committed -- they are distributed via GitHub Releases
+# (see SETUP.md). Build them with Engine/build.bat or download a release.
 !Engine/godot-source/
 Engine/godot-source/**
 !Engine/godot-source/build.bat
@@ -62,6 +62,14 @@ Engine/godot-source/servers/physics_3d/**
 !Engine/godot-source/servers/physics_3d/physics_server_3d.cpp
 !Engine/godot-source/servers/physics_3d/physics_server_3d_extension.h
 !Engine/godot-source/servers/physics_3d/physics_server_3d_dummy.h
+
+# --- Custom engine modules (fully owned by this repo, track everything) ---
+!Engine/godot-source/modules/block_mesh/
+!Engine/godot-source/modules/block_mesh/**
+Engine/godot-source/modules/block_mesh/__pycache__/
+!Engine/godot-source/modules/terrain_fill/
+!Engine/godot-source/modules/terrain_fill/**
+Engine/godot-source/modules/terrain_fill/__pycache__/
 
 # --- OS junk ---
 .DS_Store
