@@ -40,6 +40,7 @@ Engine/godot-source/modules/jolt_physics/**
 !Engine/godot-source/modules/jolt_physics/jolt_physics_server_3d.cpp
 !Engine/godot-source/modules/jolt_physics/jolt_project_settings.h
 !Engine/godot-source/modules/jolt_physics/jolt_project_settings.cpp
+!Engine/godot-source/modules/jolt_physics/register_types.cpp
 !Engine/godot-source/modules/jolt_physics/objects/
 Engine/godot-source/modules/jolt_physics/objects/**
 !Engine/godot-source/modules/jolt_physics/objects/jolt_body_3d.h

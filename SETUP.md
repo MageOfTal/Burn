@@ -49,8 +49,10 @@ The repo stores **only our engine changes**, not the full Godot source tree:
 
 - Custom modules (fully ours): `Engine/godot-source/modules/block_mesh/`,
   `Engine/godot-source/modules/terrain_fill/`
-- Patched stock files: `modules/jolt_physics/`, `modules/godot_physics_3d/`,
-  `servers/physics_3d/`
+- Patched stock files: `modules/jolt_physics/` (incl. the custom
+  `JoltCharacterVirtual3D` node and its registration), `modules/godot_physics_3d/`,
+  `servers/physics_3d/`, and one patched vendored Jolt file
+  (`thirdparty/jolt_physics/Jolt/Physics/Character/CharacterVirtual.cpp`)
 
 So building means: lay our files on top of a clean Godot 4.6 checkout, then compile.
 
