@@ -246,6 +246,37 @@ void BlockMeshBuilder::_bind_methods() {
 			D_METHOD("calc_integrity_components", "block_grid", "num_x", "num_y", "num_z", "total_blocks"),
 			&BlockMeshBuilder::calc_integrity_components);
 	ClassDB::bind_method(
+			D_METHOD("calc_bond_connectivity_components", "block_grid", "ground_mask",
+					"bond_broken", "num_x", "num_y", "num_z", "total_blocks"),
+			&BlockMeshBuilder::calc_bond_connectivity_components);
+	ClassDB::bind_method(
+			D_METHOD("damage_bonds_radial_shielded", "block_grid", "bond_strength",
+					"bond_damage", "bond_broken", "num_x", "num_y", "num_z",
+					"block_size", "hit_local", "energy", "radius", "block_hp"),
+			&BlockMeshBuilder::damage_bonds_radial_shielded);
+	ClassDB::bind_method(
+			D_METHOD("damage_bonds_radial_shielded_batch", "clusters",
+					"block_size", "energy", "radius", "block_hp"),
+			&BlockMeshBuilder::damage_bonds_radial_shielded_batch);
+	ClassDB::bind_method(
+			D_METHOD("compute_bond_graph", "block_grid", "num_x", "num_y", "num_z", "strength"),
+			&BlockMeshBuilder::compute_bond_graph);
+	ClassDB::bind_method(
+			D_METHOD("solve_gravity_stress", "block_grid", "ground_mask",
+					"bond_strength", "bond_damage", "bond_broken",
+					"anchor_strength", "anchor_damage", "anchor_broken",
+					"num_x", "num_y", "num_z", "gravity_local", "params"),
+			&BlockMeshBuilder::solve_gravity_stress);
+	ClassDB::bind_method(
+			D_METHOD("rebuild_smooth_collision_box_shapes", "body", "block_grid",
+					"num_x", "num_y", "num_z", "block_size", "old_shape_rids"),
+			&BlockMeshBuilder::rebuild_smooth_collision_box_shapes);
+	ClassDB::bind_method(
+			D_METHOD("bulk_create_fragment_bodies", "count", "space", "shape",
+					"collision_layer", "collision_mask", "mass",
+					"gravity_scale", "kinematic"),
+			&BlockMeshBuilder::bulk_create_fragment_bodies);
+	ClassDB::bind_method(
 			D_METHOD("calc_stress_integrity_components", "block_grid", "ground_mask",
 					"external_load", "num_x", "num_y", "num_z",
 					"total_blocks", "max_load", "horizontal_transfer"),
@@ -271,9 +302,12 @@ void BlockMeshBuilder::_bind_methods() {
 			&BlockMeshBuilder::build_cluster,
 			DEFVAL(true), DEFVAL(true));
 	ClassDB::bind_method(
-			D_METHOD("build_clusters_batch", "block_hp_array", "num_x", "num_y", "num_z", "block_size", "cluster_bodies", "hit_bodies", "hit_shape", "include_uvs"),
+			D_METHOD("build_clusters_batch", "block_hp_array", "num_x", "num_y", "num_z", "block_size", "cluster_bodies", "hit_bodies", "hit_shape", "include_uvs", "cluster_dims"),
 			&BlockMeshBuilder::build_clusters_batch,
-			DEFVAL(true));
+			DEFVAL(true), DEFVAL(PackedInt32Array()));
+	ClassDB::bind_method(
+			D_METHOD("or_byte_arrays", "a", "b"),
+			&BlockMeshBuilder::or_byte_arrays);
 	ClassDB::bind_method(
 			D_METHOD("bulk_configure_debris", "nodes", "block_positions", "blast_centers", "counts", "speeds", "mass", "material"),
 			&BlockMeshBuilder::bulk_configure_debris);
@@ -1168,6 +1202,1770 @@ Dictionary BlockMeshBuilder::calc_streaming_update(
 	result["to_unload"] = to_unload;
 	return result;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bond-graph connectivity check.
+//
+// BFS from ground-anchored blocks, traversing only bonds that are not broken.
+// Bonds are stored canonically: bond between block idx and its +axis neighbor
+// is at p_bond_broken[idx * 3 + axis], where axis 0=X, 1=Y, 2=Z. The bond
+// from idx in the -axis direction is owned by the neighbor at idx + offset
+// (which is the lower-indexed block of that pair).
+// ─────────────────────────────────────────────────────────────────────────────
+Array BlockMeshBuilder::calc_bond_connectivity_components(
+		const PackedByteArray &p_block_grid,
+		const PackedByteArray &p_ground_mask,
+		const PackedByteArray &p_bond_broken,
+		int p_num_x, int p_num_y, int p_num_z,
+		int p_total_blocks) {
+	const int grid_size = p_num_x * p_num_y * p_num_z;
+	ERR_FAIL_COND_V_MSG(p_block_grid.size() != grid_size, Array(),
+			"calc_bond_connectivity_components: grid size mismatch");
+	ERR_FAIL_COND_V_MSG(p_bond_broken.size() != grid_size * 3, Array(),
+			"calc_bond_connectivity_components: bond_broken must be grid_size * 3");
+	ERR_FAIL_COND_V(p_total_blocks <= 0, Array());
+
+	uint64_t t_start = OS::get_singleton()->get_ticks_usec();
+
+	const uint8_t *grid = p_block_grid.ptr();
+	const uint8_t *bonds = p_bond_broken.ptr();
+	const int nx = p_num_x;
+	const int ny = p_num_y;
+	const int nz = p_num_z;
+	const int ny_nz = ny * nz;
+
+	const bool has_ground_mask = p_ground_mask.size() == grid_size;
+	const uint8_t *ground_mask = has_ground_mask ? p_ground_mask.ptr() : nullptr;
+
+	uint8_t *visited = (uint8_t *)memalloc(grid_size);
+	memset(visited, 0, grid_size);
+	int *bfs_queue = (int *)memalloc(p_total_blocks * sizeof(int));
+	int head = 0, tail = 0;
+
+	// Seed BFS from ground-anchored blocks.
+	if (has_ground_mask) {
+		for (int idx = 0; idx < grid_size; idx++) {
+			if (grid[idx] == 1 && ground_mask[idx] == 1) {
+				visited[idx] = 1;
+				bfs_queue[tail++] = idx;
+			}
+		}
+	} else {
+		for (int bx = 0; bx < nx; bx++) {
+			int base = bx * ny_nz;
+			for (int bz = 0; bz < nz; bz++) {
+				int idx = base + bz; // y=0
+				if (grid[idx] == 1) {
+					visited[idx] = 1;
+					bfs_queue[tail++] = idx;
+				}
+			}
+		}
+	}
+
+	// BFS, traversing only intact bonds.
+	while (head < tail) {
+		const int ci = bfs_queue[head++];
+		const int bx = ci / ny_nz;
+		const int rem = ci % ny_nz;
+		const int by = rem / nz;
+		const int bz = rem % nz;
+
+		// +X: bond owned by ci, axis 0
+		if (bx + 1 < nx) {
+			int ni = ci + ny_nz;
+			if (grid[ni] == 1 && !visited[ni] && !bonds[ci * 3 + 0]) {
+				visited[ni] = 1;
+				bfs_queue[tail++] = ni;
+			}
+		}
+		// -X: bond owned by ni (lower-indexed), axis 0
+		if (bx > 0) {
+			int ni = ci - ny_nz;
+			if (grid[ni] == 1 && !visited[ni] && !bonds[ni * 3 + 0]) {
+				visited[ni] = 1;
+				bfs_queue[tail++] = ni;
+			}
+		}
+		// +Y: bond owned by ci, axis 1
+		if (by + 1 < ny) {
+			int ni = ci + nz;
+			if (grid[ni] == 1 && !visited[ni] && !bonds[ci * 3 + 1]) {
+				visited[ni] = 1;
+				bfs_queue[tail++] = ni;
+			}
+		}
+		// -Y: bond owned by ni, axis 1
+		if (by > 0) {
+			int ni = ci - nz;
+			if (grid[ni] == 1 && !visited[ni] && !bonds[ni * 3 + 1]) {
+				visited[ni] = 1;
+				bfs_queue[tail++] = ni;
+			}
+		}
+		// +Z: bond owned by ci, axis 2
+		if (bz + 1 < nz) {
+			int ni = ci + 1;
+			if (grid[ni] == 1 && !visited[ni] && !bonds[ci * 3 + 2]) {
+				visited[ni] = 1;
+				bfs_queue[tail++] = ni;
+			}
+		}
+		// -Z: bond owned by ni, axis 2
+		if (bz > 0) {
+			int ni = ci - 1;
+			if (grid[ni] == 1 && !visited[ni] && !bonds[ni * 3 + 2]) {
+				visited[ni] = 1;
+				bfs_queue[tail++] = ni;
+			}
+		}
+	}
+
+	uint64_t t_bfs = OS::get_singleton()->get_ticks_usec();
+
+	// Count unreachable blocks; bail early if everything is connected.
+	int unsupported = 0;
+	for (int idx = 0; idx < grid_size; idx++) {
+		if (grid[idx] == 1 && visited[idx] == 0) unsupported++;
+	}
+	if (unsupported == 0) {
+		memfree(visited);
+		memfree(bfs_queue);
+		return Array();
+	}
+
+	// Component BFS over unreachable blocks, traversing only INTACT bonds.
+	// Two blocks are in the same component iff there's a path of unbroken
+	// bonds between them. This is the right answer for both structures (a
+	// detached chunk that's bond-cut in half → two chunks fall) and clusters
+	// (no ground anchor; pieces separated by broken bonds become separate
+	// sub-clusters when re-checked).
+	Array components;
+	for (int idx = 0; idx < grid_size; idx++) {
+		if (grid[idx] != 1 || visited[idx] != 0) continue;
+
+		head = 0; tail = 0;
+		bfs_queue[tail++] = idx;
+		visited[idx] = 2;
+
+		while (head < tail) {
+			const int ci = bfs_queue[head++];
+			const int cbx = ci / ny_nz;
+			const int crem = ci % ny_nz;
+			const int cby = crem / nz;
+			const int cbz = crem % nz;
+			// +X: bond owned by ci, axis 0
+			if (cbx + 1 < nx) {
+				int ni = ci + ny_nz;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ci * 3 + 0]) { visited[ni] = 2; bfs_queue[tail++] = ni; }
+			}
+			// -X: bond owned by ni
+			if (cbx > 0) {
+				int ni = ci - ny_nz;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ni * 3 + 0]) { visited[ni] = 2; bfs_queue[tail++] = ni; }
+			}
+			// +Y: bond owned by ci, axis 1
+			if (cby + 1 < ny) {
+				int ni = ci + nz;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ci * 3 + 1]) { visited[ni] = 2; bfs_queue[tail++] = ni; }
+			}
+			// -Y: bond owned by ni
+			if (cby > 0) {
+				int ni = ci - nz;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ni * 3 + 1]) { visited[ni] = 2; bfs_queue[tail++] = ni; }
+			}
+			// +Z: bond owned by ci, axis 2
+			if (cbz + 1 < nz) {
+				int ni = ci + 1;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ci * 3 + 2]) { visited[ni] = 2; bfs_queue[tail++] = ni; }
+			}
+			// -Z: bond owned by ni
+			if (cbz > 0) {
+				int ni = ci - 1;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ni * 3 + 2]) { visited[ni] = 2; bfs_queue[tail++] = ni; }
+			}
+		}
+
+		TypedArray<Vector3i> component;
+		component.resize(tail);
+		for (int j = 0; j < tail; j++) {
+			const int cj = bfs_queue[j];
+			component[j] = Vector3i(cj / ny_nz, (cj % ny_nz) / nz, cj % nz);
+		}
+		components.push_back(component);
+	}
+
+	memfree(visited);
+	memfree(bfs_queue);
+
+	if (s_stress_debug_print) {
+		uint64_t t_end = OS::get_singleton()->get_ticks_usec();
+		print_line(vformat("[BondConnectivity] blocks=%d  detached=%d  components=%d  bfs=%dus  total=%dus",
+				p_total_blocks, unsupported, components.size(),
+				(int)(t_bfs - t_start), (int)(t_end - t_start)));
+	}
+
+	return components;
+}
+
+
+// ── Radial bond damage with DDA voxel-walk shielding ──
+//
+// For each bond inside the blast radius, casts a ray from the blast position
+// to the bond midpoint and walks the voxel grid. Each occupied voxel along
+// the path contributes (path_length_in_voxel * block_hp) to the total HP
+// absorbed by the ray. The bond receives the remaining energy after subtracting
+// absorption from the cubic-falloff raw energy.
+//
+// Falloff matches calc_structure_explosion's block-damage curve and the rigid-
+// body impulse curve in explosion_helper, so all three blast effects share one
+// decay shape: 1 / (1 + (3 d/r)^3).
+//
+// DDA reference: Amanatides & Woo (1987). The bond midpoint sits exactly on
+// a voxel face, so the ray ends on a boundary; the loop terminates at t=1.
+// One of the bond's two endpoint blocks (the one on the blast side) IS counted
+// in the absorption — that is correct: a block between blast and bond shields
+// the bond regardless of whether it owns the bond.
+
+// Inner kernel: operates on raw pointers, modifies damage_w / broken_w in place.
+// Single-call and batch paths both call this. Thread-safe (no shared state —
+// each call has its own buffers).
+static void _damage_bonds_radial_shielded_inner(
+		const uint8_t *grid,
+		const float *strength,
+		float *damage_w,
+		uint8_t *broken_w,
+		int nx, int ny, int nz,
+		float block_size,
+		const Vector3 &hit_local,
+		float energy,
+		float radius,
+		float block_hp,
+		int &out_damaged_count,
+		int &out_broken_count) {
+
+	const int ny_nz = ny * nz;
+	const float inv_block_size = 1.0f / block_size;
+	const float radius_sq = radius * radius;
+	const float inv_radius = 1.0f / radius;
+
+	const float half_nx = nx * 0.5f;
+	const float half_ny = ny * 0.5f;
+	const float half_nz = nz * 0.5f;
+	const float blast_gx = hit_local.x * inv_block_size + half_nx;
+	const float blast_gy = hit_local.y * inv_block_size + half_ny;
+	const float blast_gz = hit_local.z * inv_block_size + half_nz;
+
+	int damaged_count = 0;
+	int broken_count = 0;
+
+	const float r_voxels = radius * inv_block_size + 1.0f;
+	const int min_bx = MAX(0, (int)floorf(blast_gx - r_voxels));
+	const int max_bx = MIN(nx, (int)ceilf(blast_gx + r_voxels));
+	const int min_by = MAX(0, (int)floorf(blast_gy - r_voxels));
+	const int max_by = MIN(ny, (int)ceilf(blast_gy + r_voxels));
+	const int min_bz = MAX(0, (int)floorf(blast_gz - r_voxels));
+	const int max_bz = MIN(nz, (int)ceilf(blast_gz + r_voxels));
+
+	for (int bx = min_bx; bx < max_bx; bx++) {
+		for (int by = min_by; by < max_by; by++) {
+			for (int bz = min_bz; bz < max_bz; bz++) {
+				const int here = bx * ny_nz + by * nz + bz;
+				if (grid[here] == 0) continue;
+
+				for (int axis = 0; axis < 3; axis++) {
+					const int bi = here * 3 + axis;
+					if (broken_w[bi] != 0) continue;
+
+					float mid_lx = (bx + 0.5f - half_nx) * block_size;
+					float mid_ly = (by + 0.5f - half_ny) * block_size;
+					float mid_lz = (bz + 0.5f - half_nz) * block_size;
+					if (axis == 0) mid_lx += 0.5f * block_size;
+					else if (axis == 1) mid_ly += 0.5f * block_size;
+					else mid_lz += 0.5f * block_size;
+
+					const float dlx = mid_lx - hit_local.x;
+					const float dly = mid_ly - hit_local.y;
+					const float dlz = mid_lz - hit_local.z;
+					const float dist_sq = dlx * dlx + dly * dly + dlz * dlz;
+					if (dist_sq >= radius_sq) continue;
+
+					const float dist = sqrtf(dist_sq);
+					const float norm_dist = dist * inv_radius;
+					const float scaled = norm_dist * 3.0f;
+					const float falloff = 1.0f / (1.0f + scaled * scaled * scaled);
+					const float raw_energy = energy * falloff;
+
+					const float bond_gx = mid_lx * inv_block_size + half_nx;
+					const float bond_gy = mid_ly * inv_block_size + half_ny;
+					const float bond_gz = mid_lz * inv_block_size + half_nz;
+
+					const float ray_dx = bond_gx - blast_gx;
+					const float ray_dy = bond_gy - blast_gy;
+					const float ray_dz = bond_gz - blast_gz;
+					const float ray_len_sq = ray_dx * ray_dx + ray_dy * ray_dy + ray_dz * ray_dz;
+
+					float absorbed = 0.0f;
+					if (ray_len_sq > 1e-12f) {
+						const float ray_len = sqrtf(ray_len_sq);
+						const float abs_dx = fabsf(ray_dx);
+						const float abs_dy = fabsf(ray_dy);
+						const float abs_dz = fabsf(ray_dz);
+
+						int vx = (int)floorf(blast_gx);
+						int vy = (int)floorf(blast_gy);
+						int vz = (int)floorf(blast_gz);
+
+						const int step_x = (ray_dx > 0.0f) ? 1 : (ray_dx < 0.0f ? -1 : 0);
+						const int step_y = (ray_dy > 0.0f) ? 1 : (ray_dy < 0.0f ? -1 : 0);
+						const int step_z = (ray_dz > 0.0f) ? 1 : (ray_dz < 0.0f ? -1 : 0);
+
+						const float BIG = 1e30f;
+						const float t_delta_x = (abs_dx > 1e-9f) ? (1.0f / abs_dx) : BIG;
+						const float t_delta_y = (abs_dy > 1e-9f) ? (1.0f / abs_dy) : BIG;
+						const float t_delta_z = (abs_dz > 1e-9f) ? (1.0f / abs_dz) : BIG;
+
+						float t_max_x = BIG;
+						if (abs_dx > 1e-9f) {
+							t_max_x = (step_x > 0) ? ((vx + 1.0f - blast_gx) / abs_dx)
+													: ((blast_gx - vx) / abs_dx);
+						}
+						float t_max_y = BIG;
+						if (abs_dy > 1e-9f) {
+							t_max_y = (step_y > 0) ? ((vy + 1.0f - blast_gy) / abs_dy)
+													: ((blast_gy - vy) / abs_dy);
+						}
+						float t_max_z = BIG;
+						if (abs_dz > 1e-9f) {
+							t_max_z = (step_z > 0) ? ((vz + 1.0f - blast_gz) / abs_dz)
+													: ((blast_gz - vz) / abs_dz);
+						}
+
+						float t_prev = 0.0f;
+						const int max_iter = (int)(abs_dx + abs_dy + abs_dz) + 4;
+						for (int iter = 0; iter < max_iter; iter++) {
+							float t_next = t_max_x;
+							if (t_max_y < t_next) t_next = t_max_y;
+							if (t_max_z < t_next) t_next = t_max_z;
+							if (t_next > 1.0f) t_next = 1.0f;
+
+							const float seg_len = (t_next - t_prev) * ray_len;
+
+							if (vx >= 0 && vx < nx && vy >= 0 && vy < ny && vz >= 0 && vz < nz) {
+								const int idx = vx * ny_nz + vy * nz + vz;
+								if (grid[idx] == 1) {
+									absorbed += seg_len * block_hp;
+									if (absorbed >= raw_energy) {
+										absorbed = raw_energy;
+										break;
+									}
+								}
+							}
+
+							if (t_next >= 1.0f) break;
+
+							if (t_max_x <= t_max_y && t_max_x <= t_max_z) {
+								vx += step_x;
+								t_max_x += t_delta_x;
+							} else if (t_max_y <= t_max_z) {
+								vy += step_y;
+								t_max_y += t_delta_y;
+							} else {
+								vz += step_z;
+								t_max_z += t_delta_z;
+							}
+							t_prev = t_next;
+						}
+					}
+
+					float shielded_energy = raw_energy - absorbed;
+					if (shielded_energy <= 0.0f) continue;
+
+					damage_w[bi] += shielded_energy;
+					damaged_count++;
+					if (damage_w[bi] >= strength[bi]) {
+						broken_w[bi] = 1;
+						broken_count++;
+					}
+				}
+			}
+		}
+	}
+
+	out_damaged_count = damaged_count;
+	out_broken_count = broken_count;
+}
+
+Dictionary BlockMeshBuilder::damage_bonds_radial_shielded(
+		const PackedByteArray &p_block_grid,
+		const PackedFloat32Array &p_bond_strength,
+		const PackedFloat32Array &p_bond_damage_in,
+		const PackedByteArray &p_bond_broken_in,
+		int p_num_x, int p_num_y, int p_num_z,
+		float p_block_size,
+		const Vector3 &p_hit_local,
+		float p_energy,
+		float p_radius,
+		float p_block_hp) {
+
+	const int grid_size = p_num_x * p_num_y * p_num_z;
+	const int bond_count = grid_size * 3;
+
+	ERR_FAIL_COND_V_MSG(p_block_grid.size() != grid_size, Dictionary(),
+			"damage_bonds_radial_shielded: block_grid size mismatch");
+	ERR_FAIL_COND_V_MSG(p_bond_strength.size() != bond_count, Dictionary(),
+			"damage_bonds_radial_shielded: bond_strength must be grid_size*3");
+	ERR_FAIL_COND_V_MSG(p_bond_damage_in.size() != bond_count, Dictionary(),
+			"damage_bonds_radial_shielded: bond_damage must be grid_size*3");
+	ERR_FAIL_COND_V_MSG(p_bond_broken_in.size() != bond_count, Dictionary(),
+			"damage_bonds_radial_shielded: bond_broken must be grid_size*3");
+
+	Dictionary result;
+	if (p_radius <= 0.0f || p_energy <= 0.0f || p_block_size <= 0.0f) {
+		result["bond_damage"] = p_bond_damage_in;
+		result["bond_broken"] = p_bond_broken_in;
+		result["broken"] = 0;
+		result["damaged"] = 0;
+		return result;
+	}
+
+	uint64_t t_start = OS::get_singleton()->get_ticks_usec();
+
+	// Working copies (Godot CoW makes these cheap until first write).
+	PackedFloat32Array bond_damage = p_bond_damage_in;
+	PackedByteArray bond_broken = p_bond_broken_in;
+
+	int damaged_count = 0;
+	int broken_count = 0;
+
+	_damage_bonds_radial_shielded_inner(
+			p_block_grid.ptr(), p_bond_strength.ptr(),
+			bond_damage.ptrw(), bond_broken.ptrw(),
+			p_num_x, p_num_y, p_num_z,
+			p_block_size, p_hit_local,
+			p_energy, p_radius, p_block_hp,
+			damaged_count, broken_count);
+
+	if (s_stress_debug_print) {
+		uint64_t t_end = OS::get_singleton()->get_ticks_usec();
+		print_line(vformat("[BondShielded] energy=%.1f r=%.1f  damaged=%d broken=%d  total=%dus",
+				p_energy, p_radius, damaged_count, broken_count,
+				(int)(t_end - t_start)));
+	}
+
+	result["bond_damage"] = bond_damage;
+	result["bond_broken"] = bond_broken;
+	result["broken"] = broken_count;
+	result["damaged"] = damaged_count;
+	return result;
+}
+
+
+// ── Multithreaded batch version ──
+//
+// Per-cluster job state. One per cluster, lifetime-managed by the batch
+// caller. Worker threads write directly into damage_buf / broken_buf which
+// are pre-allocated heap arrays — Godot's PackedXxxArray COW writes aren't
+// thread-safe outside the main thread, so we use raw pointers.
+struct BondDamageJob {
+	const uint8_t *grid;
+	const float *strength;
+	float *damage_buf;
+	uint8_t *broken_buf;
+	int num_x, num_y, num_z;
+	Vector3 hit_local;
+	float energy;     // per-cluster: lets each cluster have its own factor
+	float block_hp;   // per-cluster: shielding contribution per voxel
+	int damaged_count = 0;
+	int broken_count = 0;
+	// Cluster-side connectivity output. After bond damage, if any bonds broke
+	// AND the cluster has >=2 blocks, the worker runs component BFS over the
+	// updated bond_broken buffer and stores fragments here (largest excluded).
+	// Indices are flat grid indices; main thread converts them to Vector3i.
+	LocalVector<LocalVector<int>> fragments;
+};
+
+struct BondDamageBatch {
+	BondDamageJob *jobs;
+	int count;
+	float block_size;
+	float radius;
+};
+
+// Cluster-side connectivity BFS. No ground anchor — clusters float free, so the
+// "supported" set is empty and every block lands in some component. We then
+// drop the LARGEST component (which stays in the source cluster) and return the
+// rest as fragments for the caller to spawn as child clusters. Identical
+// traversal rules to calc_bond_connectivity_components but specialized for the
+// cluster path so we can drive it from a worker thread.
+static void _bond_components_cluster(
+		const uint8_t *grid,
+		const uint8_t *bonds,
+		int nx, int ny, int nz,
+		LocalVector<LocalVector<int>> &out_fragments) {
+
+	const int grid_size = nx * ny * nz;
+	const int ny_nz = ny * nz;
+
+	uint8_t *visited = (uint8_t *)memalloc(grid_size);
+	memset(visited, 0, grid_size);
+	int *bfs_queue = (int *)memalloc(grid_size * sizeof(int));
+
+	LocalVector<LocalVector<int>> components;
+	int largest_idx = -1;
+	int largest_size = -1;
+
+	for (int idx = 0; idx < grid_size; idx++) {
+		if (grid[idx] != 1 || visited[idx] != 0) continue;
+
+		int head = 0, tail = 0;
+		bfs_queue[tail++] = idx;
+		visited[idx] = 1;
+
+		while (head < tail) {
+			const int ci = bfs_queue[head++];
+			const int cbx = ci / ny_nz;
+			const int crem = ci % ny_nz;
+			const int cby = crem / nz;
+			const int cbz = crem % nz;
+			if (cbx + 1 < nx) {
+				int ni = ci + ny_nz;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ci * 3 + 0]) { visited[ni] = 1; bfs_queue[tail++] = ni; }
+			}
+			if (cbx > 0) {
+				int ni = ci - ny_nz;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ni * 3 + 0]) { visited[ni] = 1; bfs_queue[tail++] = ni; }
+			}
+			if (cby + 1 < ny) {
+				int ni = ci + nz;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ci * 3 + 1]) { visited[ni] = 1; bfs_queue[tail++] = ni; }
+			}
+			if (cby > 0) {
+				int ni = ci - nz;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ni * 3 + 1]) { visited[ni] = 1; bfs_queue[tail++] = ni; }
+			}
+			if (cbz + 1 < nz) {
+				int ni = ci + 1;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ci * 3 + 2]) { visited[ni] = 1; bfs_queue[tail++] = ni; }
+			}
+			if (cbz > 0) {
+				int ni = ci - 1;
+				if (grid[ni] == 1 && visited[ni] == 0 && !bonds[ni * 3 + 2]) { visited[ni] = 1; bfs_queue[tail++] = ni; }
+			}
+		}
+
+		LocalVector<int> comp;
+		comp.resize(tail);
+		for (int j = 0; j < tail; j++) comp[j] = bfs_queue[j];
+		if ((int)comp.size() > largest_size) {
+			largest_size = comp.size();
+			largest_idx = components.size();
+		}
+		components.push_back(comp);
+	}
+
+	memfree(visited);
+	memfree(bfs_queue);
+
+	if (components.size() <= 1) return;
+	for (uint32_t i = 0; i < components.size(); i++) {
+		if ((int)i == largest_idx) continue;
+		out_fragments.push_back(components[i]);
+	}
+}
+
+static void _bond_damage_worker(void *p_userdata, uint32_t p_idx) {
+	BondDamageBatch *batch = (BondDamageBatch *)p_userdata;
+	BondDamageJob &job = batch->jobs[p_idx];
+	_damage_bonds_radial_shielded_inner(
+			job.grid, job.strength,
+			job.damage_buf, job.broken_buf,
+			job.num_x, job.num_y, job.num_z,
+			batch->block_size, job.hit_local,
+			job.energy, batch->radius, job.block_hp,
+			job.damaged_count, job.broken_count);
+
+	// If any bonds broke, run component BFS in this same worker so the BFS
+	// parallelizes across clusters too. Caller no longer dispatches a serial
+	// GDScript pass to figure out fragments.
+	if (job.broken_count > 0) {
+		_bond_components_cluster(job.grid, job.broken_buf,
+				job.num_x, job.num_y, job.num_z,
+				job.fragments);
+	}
+}
+
+Array BlockMeshBuilder::damage_bonds_radial_shielded_batch(
+		const Array &p_clusters,
+		float p_block_size,
+		float p_energy,
+		float p_radius,
+		float p_block_hp) {
+
+	const int n_clusters = p_clusters.size();
+	Array results;
+	if (n_clusters == 0) return results;
+	if (p_radius <= 0.0f || p_block_size <= 0.0f) {
+		for (int c = 0; c < n_clusters; c++) {
+			Dictionary src = p_clusters[c];
+			Dictionary out;
+			out["bond_damage"] = src["bond_damage"];
+			out["bond_broken"] = src["bond_broken"];
+			out["broken"] = 0;
+			out["damaged"] = 0;
+			results.push_back(out);
+		}
+		return results;
+	}
+
+	uint64_t t_start = OS::get_singleton()->get_ticks_usec();
+
+	// Phase 1: pull arrays out of each Dict, build per-cluster job descriptors.
+	// We hold COW copies of bond_damage / bond_broken in vectors so the worker
+	// threads can write into their .ptrw() buffers safely (each cluster has
+	// its own buffer; no cross-job sharing).
+	LocalVector<PackedByteArray> grids;
+	LocalVector<PackedFloat32Array> strengths;
+	LocalVector<PackedFloat32Array> damages;
+	LocalVector<PackedByteArray> brokens;
+	LocalVector<BondDamageJob> jobs;
+	grids.resize(n_clusters);
+	strengths.resize(n_clusters);
+	damages.resize(n_clusters);
+	brokens.resize(n_clusters);
+	jobs.resize(n_clusters);
+
+	for (int c = 0; c < n_clusters; c++) {
+		Dictionary cd = p_clusters[c];
+		grids[c] = cd["block_grid"];
+		strengths[c] = cd["bond_strength"];
+		damages[c] = cd["bond_damage"];   // CoW copy — cheap until ptrw() forces a unique buffer
+		brokens[c] = cd["bond_broken"];
+
+		const int nx = (int)cd["num_x"];
+		const int ny = (int)cd["num_y"];
+		const int nz = (int)cd["num_z"];
+		const int gsz = nx * ny * nz;
+		ERR_FAIL_COND_V_MSG(grids[c].size() != gsz, Array(),
+				vformat("damage_bonds_radial_shielded_batch: cluster %d block_grid size mismatch", c));
+		ERR_FAIL_COND_V_MSG(strengths[c].size() != gsz * 3, Array(),
+				vformat("damage_bonds_radial_shielded_batch: cluster %d bond_strength size mismatch", c));
+		ERR_FAIL_COND_V_MSG(damages[c].size() != gsz * 3, Array(),
+				vformat("damage_bonds_radial_shielded_batch: cluster %d bond_damage size mismatch", c));
+		ERR_FAIL_COND_V_MSG(brokens[c].size() != gsz * 3, Array(),
+				vformat("damage_bonds_radial_shielded_batch: cluster %d bond_broken size mismatch", c));
+
+		BondDamageJob &job = jobs[c];
+		job.grid = grids[c].ptr();
+		job.strength = strengths[c].ptr();
+		// Force unique buffers BEFORE handing pointers to worker threads.
+		// ptrw() may trigger a COW copy; do it on the main thread so the
+		// writes inside the worker are into thread-local memory.
+		job.damage_buf = damages[c].ptrw();
+		job.broken_buf = brokens[c].ptrw();
+		job.num_x = nx;
+		job.num_y = ny;
+		job.num_z = nz;
+		job.hit_local = cd["hit_local"];
+		// Per-cluster energy / block_hp (fall back to batch-level defaults).
+		job.energy = cd.has("energy") ? (float)cd["energy"] : p_energy;
+		job.block_hp = cd.has("block_hp") ? (float)cd["block_hp"] : p_block_hp;
+		if (job.energy <= 0.0f) {
+			// Skip clusters with zero energy: write through unchanged later.
+			job.damaged_count = 0;
+			job.broken_count = 0;
+		}
+	}
+
+	// Phase 2: dispatch via WorkerThreadPool. Each cluster is one task — the
+	// pool batches small tasks across cores automatically.
+	BondDamageBatch batch;
+	batch.jobs = jobs.ptr();
+	batch.count = n_clusters;
+	batch.block_size = p_block_size;
+	batch.radius = p_radius;
+
+	// For very small batches (1-2 clusters), the pool's overhead exceeds the
+	// per-cluster cost — run inline instead.
+	if (n_clusters <= 2) {
+		for (int c = 0; c < n_clusters; c++) {
+			_bond_damage_worker(&batch, c);
+		}
+	} else {
+		WorkerThreadPool::GroupID group = WorkerThreadPool::get_singleton()->add_native_group_task(
+				_bond_damage_worker, &batch, n_clusters, -1, false,
+				String("bond_damage_batch"));
+		WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group);
+	}
+
+	// Phase 3: pack results. Fragments come back as flat grid indices; convert
+	// them to Vector3i keys here on the main thread (Variant containers aren't
+	// safe to construct from worker threads).
+	int total_damaged = 0;
+	int total_broken = 0;
+	int total_fragments = 0;
+	for (int c = 0; c < n_clusters; c++) {
+		Dictionary out;
+		out["bond_damage"] = damages[c];
+		out["bond_broken"] = brokens[c];
+		out["broken"] = jobs[c].broken_count;
+		out["damaged"] = jobs[c].damaged_count;
+
+		Array fragments_out;
+		const BondDamageJob &job = jobs[c];
+		if (!job.fragments.is_empty()) {
+			const int ny_nz = job.num_y * job.num_z;
+			const int nz = job.num_z;
+			for (uint32_t f = 0; f < job.fragments.size(); f++) {
+				const LocalVector<int> &frag = job.fragments[f];
+				TypedArray<Vector3i> keys;
+				keys.resize(frag.size());
+				for (uint32_t k = 0; k < frag.size(); k++) {
+					const int gi = frag[k];
+					keys[k] = Vector3i(gi / ny_nz, (gi % ny_nz) / nz, gi % nz);
+				}
+				fragments_out.push_back(keys);
+			}
+			total_fragments += job.fragments.size();
+		}
+		out["fragments"] = fragments_out;
+
+		results.push_back(out);
+		total_damaged += jobs[c].damaged_count;
+		total_broken += jobs[c].broken_count;
+	}
+
+	if (s_stress_debug_print) {
+		uint64_t t_end = OS::get_singleton()->get_ticks_usec();
+		print_line(vformat("[BondShieldedBatch] clusters=%d  energy=%.1f r=%.1f  damaged=%d broken=%d  fragments=%d  total=%dus",
+				n_clusters, p_energy, p_radius, total_damaged, total_broken, total_fragments,
+				(int)(t_end - t_start)));
+	}
+
+	return results;
+}
+
+
+// ── Build initial bond graph from a populated block grid ──
+//
+// Replaces a triple-nested GDScript loop. Walks the grid once, sets bond
+// strength on every adjacent-occupied pair (axis ∈ {0=+X, 1=+Y, 2=+Z}) and
+// marks everything else broken. Tens of thousands of clusters can spawn in
+// a single tick after a big detach, so this hot path lives in C++ now.
+Dictionary BlockMeshBuilder::compute_bond_graph(
+		const PackedByteArray &p_block_grid,
+		int p_num_x, int p_num_y, int p_num_z,
+		float p_strength) {
+
+	const int grid_size = p_num_x * p_num_y * p_num_z;
+	const int bond_count = grid_size * 3;
+
+	ERR_FAIL_COND_V_MSG(p_block_grid.size() != grid_size, Dictionary(),
+			"compute_bond_graph: block_grid size mismatch");
+
+	PackedFloat32Array strength;
+	strength.resize(bond_count);
+	PackedFloat32Array damage;
+	damage.resize(bond_count);
+	PackedByteArray broken;
+	broken.resize(bond_count);
+
+	float *strength_w = strength.ptrw();
+	float *damage_w = damage.ptrw();
+	uint8_t *broken_w = broken.ptrw();
+	const uint8_t *grid = p_block_grid.ptr();
+
+	// Default: every bond slot broken, zero strength, zero damage.
+	// IMPORTANT: C++ Vector::resize() leaves trivially-constructible element
+	// types UNINITIALIZED (only GDScript's resize zero-fills) — both float
+	// arrays MUST be zeroed explicitly. Heap garbage in bond_damage reads as
+	// pre-damaged bonds: random spurious breaks, and instant false collapse
+	// under the gravity stress solver's κ = 1 − damage/strength coupling.
+	memset(strength_w, 0, bond_count * sizeof(float));
+	memset(damage_w, 0, bond_count * sizeof(float));
+	memset(broken_w, 1, bond_count);
+
+	const int nx = p_num_x;
+	const int ny = p_num_y;
+	const int nz = p_num_z;
+	const int ny_nz = ny * nz;
+	int live = 0;
+
+	for (int bx = 0; bx < nx; bx++) {
+		for (int by = 0; by < ny; by++) {
+			for (int bz = 0; bz < nz; bz++) {
+				const int here = bx * ny_nz + by * nz + bz;
+				if (grid[here] == 0) continue;
+				// +X
+				if (bx + 1 < nx && grid[here + ny_nz] == 1) {
+					const int bi = here * 3 + 0;
+					strength_w[bi] = p_strength;
+					broken_w[bi] = 0;
+					live++;
+				}
+				// +Y
+				if (by + 1 < ny && grid[here + nz] == 1) {
+					const int bi = here * 3 + 1;
+					strength_w[bi] = p_strength;
+					broken_w[bi] = 0;
+					live++;
+				}
+				// +Z
+				if (bz + 1 < nz && grid[here + 1] == 1) {
+					const int bi = here * 3 + 2;
+					strength_w[bi] = p_strength;
+					broken_w[bi] = 0;
+					live++;
+				}
+			}
+		}
+	}
+
+	Dictionary result;
+	result["bond_strength"] = strength;
+	result["bond_damage"] = damage;
+	result["bond_broken"] = broken;
+	result["live_count"] = live;
+	return result;
+}
+
+
+// ── Gravity stress solver — quasi-static elastic-brittle interface analysis ──
+//
+// Physics: see GRAVITY_STRESS_PLAN.md. Each block has 6 DOF (small
+// displacement u + small rotation θ). Each intact bond / terrain anchor is a
+// glued-face interface transmitting force AND moment. Rotational DOF are
+// mandatory: a 1-thick cantilever attached by a single face is a mechanism
+// under force-only models (gravity at the block center and a point force at
+// the face center form a couple only a face moment can close), and bending —
+// which grows with overhang length SQUARED — is the dominant failure mode of
+// overhangs. The old residual-flow solver had no moments, which is why it
+// could never do cantilevers.
+//
+// Element (bond a→b along unit axis ê, direction d̂ = s·ê, face at midpoint):
+//   δ = u_b − u_a + ½s·(ê × (θ_a + θ_b))       relative face translation
+//   φ = θ_b − θ_a                               relative face rotation
+//   F = κ[k_n δ_ax ê + k_s δ_perp]              normal + shear force
+//   M = κ[k_t φ_ax ê + k_b φ_perp]              torsion + bending moment
+// Gradient of interface energy (what the matvec accumulates, y = Kx):
+//   y_a.u −= F                y_b.u += F
+//   y_a.θ −= ½s(ê×F) + M      y_b.θ −= ½s(ê×F) − M
+// Anchors are the same element with the far side fixed (u=θ=0), ê=ŷ, s=−1
+// (bottom face) — so anchors carry real load and can be ripped out, which
+// makes top-heavy structures tear free and topple as rigid bodies.
+//
+// Units: lengths in blocks (h=1), forces in block-weights (W=1 per block),
+// moments in W·h. Stiffness ratios from an isotropic glue layer (ν≈0.25):
+// k_n = E, k_s = 0.4E, k_b = E/12 (I=h⁴/12), k_t = 0.0562E (J≈0.1406h⁴).
+// Only the RATIOS affect the force distribution; E is scale-free.
+//
+// Failure: combined edge stress on the square face (Z = h³/6 → factor 6;
+// torsion c/J = 0.5/0.1406 → factor 3.556), capacity scaled by the bond's
+// remaining fraction κ = 1 − damage/strength (bond graph feeds the physics —
+// blast-weakened joints are softer and weaker, so explosions lower what an
+// overhang can carry and gravity finishes the job).
+
+struct GravityStressElem {
+	int a_slot;          // block-side slot into the DOF vector
+	int b_slot;          // neighbor slot, or -1 for terrain-anchor elements
+	int grid_ref;        // bond: index into bond arrays; anchor: grid idx
+	uint8_t axis;        // 0=X 1=Y 2=Z
+	int8_t sign;         // +1 for bonds (d̂ = +ê), -1 for anchors (d̂ = −ŷ)
+	float k_st;          // stiffness scale κ (floored for conditioning)
+	float k_cap;         // capacity scale κ (unfloored)
+};
+
+// (ê_ax × v) for a coordinate axis ê_ax.
+static inline void _gs_axis_cross(int ax, const double *v, double *out) {
+	const int i1 = (ax + 1) % 3;
+	const int i2 = (ax + 2) % 3;
+	out[ax] = 0.0;
+	out[i1] = -v[i2];
+	out[i2] = v[i1];
+}
+
+// Interface force/moment from endpoint states. xa/xb are 6-double DOF blocks
+// (u then θ); xb == nullptr means fixed ground side (anchor).
+static inline void _gs_elem_wrench(const GravityStressElem &e,
+		const double *xa, const double *xb,
+		double k_n, double k_s, double k_b, double k_t,
+		double *F, double *M, double *delta_ax_out) {
+	const int ax = e.axis;
+	double thsum[3], delta[3], phi[3];
+	for (int i = 0; i < 3; i++) {
+		const double ub = xb ? xb[i] : 0.0;
+		const double tb = xb ? xb[3 + i] : 0.0;
+		thsum[i] = xa[3 + i] + tb;
+		delta[i] = ub - xa[i];
+		phi[i] = tb - xa[3 + i];
+	}
+	double cr[3];
+	_gs_axis_cross(ax, thsum, cr);
+	for (int i = 0; i < 3; i++) {
+		delta[i] += 0.5 * (double)e.sign * cr[i];
+	}
+	const int i1 = (ax + 1) % 3;
+	const int i2 = (ax + 2) % 3;
+	F[ax] = e.k_st * k_n * delta[ax];
+	F[i1] = e.k_st * k_s * delta[i1];
+	F[i2] = e.k_st * k_s * delta[i2];
+	M[ax] = e.k_st * k_t * phi[ax];
+	M[i1] = e.k_st * k_b * phi[i1];
+	M[i2] = e.k_st * k_b * phi[i2];
+	*delta_ax_out = delta[ax];
+}
+
+// y += K x, matrix-free over the element list.
+static void _gs_matvec(const LocalVector<GravityStressElem> &elems,
+		const double *x, double *y, int n_dof,
+		double k_n, double k_s, double k_b, double k_t) {
+	memset(y, 0, n_dof * sizeof(double));
+	double F[3], M[3], crF[3], d_ax;
+	for (uint32_t j = 0; j < elems.size(); j++) {
+		const GravityStressElem &e = elems[j];
+		const double *xa = x + e.a_slot * 6;
+		const double *xb = (e.b_slot >= 0) ? x + e.b_slot * 6 : nullptr;
+		_gs_elem_wrench(e, xa, xb, k_n, k_s, k_b, k_t, F, M, &d_ax);
+		_gs_axis_cross(e.axis, F, crF);
+		const double half_s = 0.5 * (double)e.sign;
+		double *ya = y + e.a_slot * 6;
+		for (int i = 0; i < 3; i++) {
+			ya[i] -= F[i];
+			ya[3 + i] -= half_s * crF[i] + M[i];
+		}
+		if (xb) {
+			double *yb = y + e.b_slot * 6;
+			for (int i = 0; i < 3; i++) {
+				yb[i] += F[i];
+				yb[3 + i] -= half_s * crF[i] - M[i];
+			}
+		}
+	}
+}
+
+// ── Threaded matvec: slot-partitioned via a CSR incident-element table ──
+//
+// Each worker owns a contiguous slot range and writes ONLY its own y slots —
+// no partial buffers, no reduction pass, zero contention. Elements are
+// visited once per endpoint (2× wrench math total), which threads far better
+// than the 1×-work-plus-reduction alternative at 100k+ DOF.
+
+struct GsMatvecCtx {
+	const GravityStressElem *elems;
+	const int *inc_offsets;   // n_slots + 1
+	const uint32_t *inc_entries; // elem_idx | (side << 31)
+	const double *x;
+	double *y;
+	int n_slots;
+	int slots_per_chunk;
+	double k_n, k_s, k_b, k_t;
+};
+
+static void _gs_matvec_worker(void *p_userdata, uint32_t p_chunk) {
+	GsMatvecCtx *ctx = (GsMatvecCtx *)p_userdata;
+	const int begin = (int)p_chunk * ctx->slots_per_chunk;
+	const int end = MIN(begin + ctx->slots_per_chunk, ctx->n_slots);
+	double F[3], M[3], crF[3], d_ax;
+	for (int s = begin; s < end; s++) {
+		double *ys = ctx->y + s * 6;
+		for (int i = 0; i < 6; i++) {
+			ys[i] = 0.0;
+		}
+		for (int k = ctx->inc_offsets[s]; k < ctx->inc_offsets[s + 1]; k++) {
+			const uint32_t entry = ctx->inc_entries[k];
+			const GravityStressElem &e = ctx->elems[entry & 0x7FFFFFFFu];
+			const bool is_b = (entry >> 31) != 0;
+			const double *xa = ctx->x + e.a_slot * 6;
+			const double *xb = (e.b_slot >= 0) ? ctx->x + e.b_slot * 6 : nullptr;
+			_gs_elem_wrench(e, xa, xb, ctx->k_n, ctx->k_s, ctx->k_b, ctx->k_t, F, M, &d_ax);
+			_gs_axis_cross(e.axis, F, crF);
+			const double half_s = 0.5 * (double)e.sign;
+			if (!is_b) {
+				for (int i = 0; i < 3; i++) {
+					ys[i] -= F[i];
+					ys[3 + i] -= half_s * crF[i] + M[i];
+				}
+			} else {
+				for (int i = 0; i < 3; i++) {
+					ys[i] += F[i];
+					ys[3 + i] -= half_s * crF[i] - M[i];
+				}
+			}
+		}
+	}
+}
+
+// Invert a 6x6 SPD matrix in place via Gauss-Jordan with partial pivoting.
+// Returns false if singular (caller falls back to scalar jacobi for it).
+static bool _gs_invert6(double *m /* 36, row-major */) {
+	double inv[36];
+	memset(inv, 0, sizeof(inv));
+	for (int i = 0; i < 6; i++) {
+		inv[i * 6 + i] = 1.0;
+	}
+	for (int col = 0; col < 6; col++) {
+		int piv = col;
+		double best = Math::abs(m[col * 6 + col]);
+		for (int r = col + 1; r < 6; r++) {
+			const double v = Math::abs(m[r * 6 + col]);
+			if (v > best) {
+				best = v;
+				piv = r;
+			}
+		}
+		if (best < 1e-30) {
+			return false;
+		}
+		if (piv != col) {
+			for (int c = 0; c < 6; c++) {
+				SWAP(m[piv * 6 + c], m[col * 6 + c]);
+				SWAP(inv[piv * 6 + c], inv[col * 6 + c]);
+			}
+		}
+		const double d = 1.0 / m[col * 6 + col];
+		for (int c = 0; c < 6; c++) {
+			m[col * 6 + c] *= d;
+			inv[col * 6 + c] *= d;
+		}
+		for (int r = 0; r < 6; r++) {
+			if (r == col) {
+				continue;
+			}
+			const double f = m[r * 6 + col];
+			if (f == 0.0) {
+				continue;
+			}
+			for (int c = 0; c < 6; c++) {
+				m[r * 6 + c] -= f * m[col * 6 + c];
+				inv[r * 6 + c] -= f * inv[col * 6 + c];
+			}
+		}
+	}
+	memcpy(m, inv, sizeof(inv));
+	return true;
+}
+
+Dictionary BlockMeshBuilder::solve_gravity_stress(
+		const PackedByteArray &p_block_grid,
+		const PackedByteArray &p_ground_mask,
+		const PackedFloat32Array &p_bond_strength,
+		const PackedFloat32Array &p_bond_damage,
+		const PackedByteArray &p_bond_broken_in,
+		const PackedFloat32Array &p_anchor_strength,
+		const PackedFloat32Array &p_anchor_damage,
+		const PackedByteArray &p_anchor_broken_in,
+		int p_num_x, int p_num_y, int p_num_z,
+		const Vector3 &p_gravity_local,
+		const Dictionary &p_params) {
+	const int grid_size = p_num_x * p_num_y * p_num_z;
+	Dictionary out;
+	out["bond_broken"] = p_bond_broken_in;
+	out["anchor_broken"] = p_anchor_broken_in;
+	out["broke_bonds"] = 0;
+	out["broke_anchors"] = 0;
+	out["max_utilization"] = 0.0f;
+	out["passes"] = 0;
+	out["cg_iters"] = 0;
+	out["converged"] = true;
+
+	ERR_FAIL_COND_V_MSG(p_block_grid.size() != grid_size, out,
+			"solve_gravity_stress: block_grid size mismatch");
+	ERR_FAIL_COND_V_MSG(p_ground_mask.size() != grid_size, out,
+			"solve_gravity_stress: ground_mask size mismatch");
+	ERR_FAIL_COND_V_MSG(p_bond_strength.size() != grid_size * 3, out,
+			"solve_gravity_stress: bond_strength must be grid_size*3");
+	ERR_FAIL_COND_V_MSG(p_bond_damage.size() != grid_size * 3, out,
+			"solve_gravity_stress: bond_damage must be grid_size*3");
+	ERR_FAIL_COND_V_MSG(p_bond_broken_in.size() != grid_size * 3, out,
+			"solve_gravity_stress: bond_broken must be grid_size*3");
+
+	Vector3 g = p_gravity_local;
+	if (g.length_squared() < 1e-12f) {
+		return out;
+	}
+	g = g.normalized();
+
+	// Tunables (block-weight units).
+	const double T0 = p_params.has("tension") ? (double)p_params["tension"] : 50.0;
+	const double C0 = p_params.has("compression") ? (double)p_params["compression"] : 500.0;
+	const double S0 = p_params.has("shear") ? (double)p_params["shear"] : 37.5;
+	const double anchor_factor = p_params.has("anchor_factor") ? (double)p_params["anchor_factor"] : 1.0;
+	const int max_cg_iters = p_params.has("max_cg_iters") ? (int)p_params["max_cg_iters"] : 2000;
+	const double tol = p_params.has("tolerance") ? (double)p_params["tolerance"] : 1e-6;
+	const int max_passes = p_params.has("max_break_passes") ? (int)p_params["max_break_passes"] : 6;
+	const bool check_symmetry = p_params.has("check_symmetry") && (bool)p_params["check_symmetry"];
+	const bool debug_pass_stats = p_params.has("debug_pass_stats") && (bool)p_params["debug_pass_stats"];
+	Array pass_stats;
+
+	// Stiffness (scale-free; ratios from isotropic glue layer, ν ≈ 0.25).
+	const double K_N = 100.0;
+	const double K_S = 0.4 * K_N;
+	const double K_B = K_N / 12.0;
+	const double K_T = 0.0562 * K_N;
+	const double KAPPA_FLOOR = 0.02;
+	const double BEND_EDGE = 6.0;      // m_b → edge normal stress (Z = h³/6)
+	const double TORS_EDGE = 3.556;    // m_t → edge shear stress (c/J)
+
+	uint64_t t_start = OS::get_singleton()->get_ticks_usec();
+
+	const uint8_t *grid = p_block_grid.ptr();
+	const uint8_t *mask = p_ground_mask.ptr();
+	const float *b_str = p_bond_strength.ptr();
+	const float *b_dmg = p_bond_damage.ptr();
+
+	// Working copies (returned).
+	PackedByteArray bond_broken = p_bond_broken_in;
+	PackedByteArray anchor_broken;
+	if (p_anchor_broken_in.size() == grid_size) {
+		anchor_broken = p_anchor_broken_in;
+	} else {
+		// No anchor state provided: every ground_mask block is a pristine anchor.
+		anchor_broken.resize(grid_size);
+		uint8_t *aw = anchor_broken.ptrw();
+		for (int i = 0; i < grid_size; i++) {
+			aw[i] = (grid[i] == 1 && mask[i] == 1) ? 0 : 1;
+		}
+	}
+	uint8_t *bond_broken_w = bond_broken.ptrw();
+	uint8_t *anchor_broken_w = anchor_broken.ptrw();
+	const bool has_anchor_kappa = p_anchor_strength.size() == grid_size &&
+			p_anchor_damage.size() == grid_size;
+	const float *a_str = has_anchor_kappa ? p_anchor_strength.ptr() : nullptr;
+	const float *a_dmg = has_anchor_kappa ? p_anchor_damage.ptr() : nullptr;
+
+	const int nx = p_num_x, ny = p_num_y, nz = p_num_z;
+	const int ny_nz = ny * nz;
+	const double g_arr[3] = { (double)g.x, (double)g.y, (double)g.z };
+
+	int *slot_of = (int *)memalloc(grid_size * sizeof(int));
+	int *active = (int *)memalloc(grid_size * sizeof(int));
+	uint8_t *visited = (uint8_t *)memalloc(grid_size);
+	int *bfs_queue = (int *)memalloc(grid_size * sizeof(int));
+
+	LocalVector<GravityStressElem> elems;
+	LocalVector<double> x_v, r_v, z_v, p_v, ap_v, jinv_v;
+
+	int broke_bonds = 0;
+	int broke_anchors = 0;
+	double max_util = 0.0;
+	int total_cg_iters = 0;
+	int passes = 0;
+	bool all_converged = true;
+	double sym_err = 0.0;
+
+	for (int pass = 0; pass < max_passes; pass++) {
+		// ── Anchored-reachable BFS over intact bonds ──
+		// Blocks outside this set have no load path; the connectivity check
+		// detaches them, and including them would make K singular.
+		memset(visited, 0, grid_size);
+		int head = 0, tail = 0;
+		for (int i = 0; i < grid_size; i++) {
+			if (grid[i] == 1 && mask[i] == 1 && anchor_broken_w[i] == 0) {
+				visited[i] = 1;
+				bfs_queue[tail++] = i;
+			}
+		}
+		if (tail == 0) {
+			break; // nothing anchored — connectivity check owns the outcome
+		}
+		while (head < tail) {
+			const int ci = bfs_queue[head++];
+			const int bx = ci / ny_nz;
+			const int rem = ci % ny_nz;
+			const int by = rem / nz;
+			const int bz = rem % nz;
+			if (bx + 1 < nx) { int ni = ci + ny_nz; if (grid[ni] == 1 && !visited[ni] && !bond_broken_w[ci * 3 + 0]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (bx > 0)      { int ni = ci - ny_nz; if (grid[ni] == 1 && !visited[ni] && !bond_broken_w[ni * 3 + 0]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (by + 1 < ny) { int ni = ci + nz;    if (grid[ni] == 1 && !visited[ni] && !bond_broken_w[ci * 3 + 1]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (by > 0)      { int ni = ci - nz;    if (grid[ni] == 1 && !visited[ni] && !bond_broken_w[ni * 3 + 1]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (bz + 1 < nz) { int ni = ci + 1;     if (grid[ni] == 1 && !visited[ni] && !bond_broken_w[ci * 3 + 2]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+			if (bz > 0)      { int ni = ci - 1;     if (grid[ni] == 1 && !visited[ni] && !bond_broken_w[ni * 3 + 2]) { visited[ni] = 1; bfs_queue[tail++] = ni; } }
+		}
+
+		// ── Active set + slots ──
+		int n_active = 0;
+		for (int i = 0; i < grid_size; i++) {
+			slot_of[i] = -1;
+			if (visited[i]) {
+				slot_of[i] = n_active;
+				active[n_active++] = i;
+			}
+		}
+		if (n_active == 0) {
+			break;
+		}
+		const int n_dof = n_active * 6;
+
+		// ── Element lists (bonds between active blocks + intact anchors) ──
+		elems.clear();
+		for (int s = 0; s < n_active; s++) {
+			const int idx = active[s];
+			const int bx = idx / ny_nz;
+			const int rem = idx % ny_nz;
+			const int by = rem / nz;
+			const int bz = rem % nz;
+			for (int ax = 0; ax < 3; ax++) {
+				const int bi = idx * 3 + ax;
+				if (bond_broken_w[bi]) {
+					continue;
+				}
+				int nidx = -1;
+				if (ax == 0 && bx + 1 < nx) nidx = idx + ny_nz;
+				else if (ax == 1 && by + 1 < ny) nidx = idx + nz;
+				else if (ax == 2 && bz + 1 < nz) nidx = idx + 1;
+				if (nidx < 0 || grid[nidx] != 1 || slot_of[nidx] < 0) {
+					continue;
+				}
+				const double s_str = b_str[bi];
+				double kappa = 0.0;
+				if (s_str > 0.0) {
+					kappa = CLAMP(1.0 - (double)b_dmg[bi] / s_str, 0.0, 1.0);
+				}
+				GravityStressElem e;
+				e.a_slot = s;
+				e.b_slot = slot_of[nidx];
+				e.grid_ref = bi;
+				e.axis = (uint8_t)ax;
+				e.sign = 1;
+				e.k_st = (float)MAX(kappa, KAPPA_FLOOR);
+				e.k_cap = (float)kappa;
+				elems.push_back(e);
+			}
+			if (mask[idx] == 1 && anchor_broken_w[idx] == 0) {
+				double kappa = 1.0;
+				if (has_anchor_kappa && a_str[idx] > 0.0f) {
+					kappa = CLAMP(1.0 - (double)a_dmg[idx] / (double)a_str[idx], 0.0, 1.0);
+				}
+				GravityStressElem e;
+				e.a_slot = s;
+				e.b_slot = -1;
+				e.grid_ref = idx;
+				e.axis = 1;   // bottom face: d̂ = −ŷ
+				e.sign = -1;
+				e.k_st = (float)MAX(kappa, KAPPA_FLOOR);
+				e.k_cap = (float)kappa;
+				elems.push_back(e);
+			}
+		}
+
+		// ── Block-Jacobi preconditioner: exact 6×6 diagonal blocks of K ──
+		// Per endpoint of an element along axis ax with uθ-coupling sign
+		// c_e = (endpoint == a ? −1 : +1)·½s:
+		//   uu:  K_f = diag(k_n at ax, k_s perp)
+		//   uθ:  c_e·K_f·C   (C = cross(ê_ax); couples u_i1↔θ_i2, u_i2↔θ_i1)
+		//   θθ:  diag(k_t at ax, k_b + ¼k_s perp)
+		// The scalar-diagonal version ignored the uθ coupling, which is what
+		// made CG crawl (1400+ iters) on house-scale structures.
+		jinv_v.resize(n_active * 36);
+		double *binv = jinv_v.ptr();
+		memset(binv, 0, n_active * 36 * sizeof(double));
+		for (uint32_t j = 0; j < elems.size(); j++) {
+			const GravityStressElem &e = elems[j];
+			const int ax = e.axis;
+			const int i1 = (ax + 1) % 3, i2 = (ax + 2) % 3;
+			const double ks = e.k_st;
+			const double f_n = ks * K_N;
+			const double f_s = ks * K_S;
+			const double t_ax = ks * K_T;
+			const double t_perp = ks * (K_B + 0.25 * K_S);
+			const int sides[2] = { e.a_slot, e.b_slot };
+			for (int sd = 0; sd < 2; sd++) {
+				if (sides[sd] < 0) {
+					continue;
+				}
+				double *B = binv + sides[sd] * 36;
+				B[ax * 6 + ax] += f_n;
+				B[i1 * 6 + i1] += f_s;
+				B[i2 * 6 + i2] += f_s;
+				B[(3 + ax) * 6 + (3 + ax)] += t_ax;
+				B[(3 + i1) * 6 + (3 + i1)] += t_perp;
+				B[(3 + i2) * 6 + (3 + i2)] += t_perp;
+				// uθ coupling: c_e·K_f·C has [i1][i2] = −c_e·k_s, [i2][i1] = +c_e·k_s.
+				const double c_e = (sd == 0 ? -0.5 : 0.5) * (double)e.sign;
+				const double v = c_e * f_s;
+				B[i1 * 6 + (3 + i2)] += -v;
+				B[i2 * 6 + (3 + i1)] += v;
+				B[(3 + i2) * 6 + i1] += -v;
+				B[(3 + i1) * 6 + i2] += v;
+			}
+		}
+		for (int s = 0; s < n_active; s++) {
+			double *B = binv + s * 36;
+			if (!_gs_invert6(B)) {
+				// Degenerate block (shouldn't happen — every active block has
+				// ≥1 element): fall back to identity-scaled diagonal.
+				memset(B, 0, 36 * sizeof(double));
+				for (int i = 0; i < 6; i++) {
+					B[i * 6 + i] = 1.0;
+				}
+			}
+		}
+
+		// ── CSR incident-element table for the threaded matvec ──
+		// OPT-IN ONLY ("threaded_matvec" param): group-task dispatch per CG
+		// iteration measured as a wash at 17k blocks, and the game runs
+		// solves on a dedicated thread — spraying nested group tasks into the
+		// shared WorkerThreadPool from there starves Jolt physics jobs and
+		// terrain chunk meshing (micro-stutter + map holes).
+		const bool allow_threaded = p_params.has("threaded_matvec") && (bool)p_params["threaded_matvec"];
+		const bool use_threaded_matvec = allow_threaded && n_dof >= 24000;
+		LocalVector<int> inc_offsets;
+		LocalVector<uint32_t> inc_entries;
+		if (use_threaded_matvec) {
+			inc_offsets.resize(n_active + 1);
+			for (int i = 0; i <= n_active; i++) {
+				inc_offsets[i] = 0;
+			}
+			for (uint32_t j = 0; j < elems.size(); j++) {
+				inc_offsets[elems[j].a_slot + 1]++;
+				if (elems[j].b_slot >= 0) {
+					inc_offsets[elems[j].b_slot + 1]++;
+				}
+			}
+			for (int i = 0; i < n_active; i++) {
+				inc_offsets[i + 1] += inc_offsets[i];
+			}
+			inc_entries.resize(inc_offsets[n_active]);
+			LocalVector<int> cursor;
+			cursor.resize(n_active);
+			for (int i = 0; i < n_active; i++) {
+				cursor[i] = inc_offsets[i];
+			}
+			for (uint32_t j = 0; j < elems.size(); j++) {
+				inc_entries[cursor[elems[j].a_slot]++] = j;
+				if (elems[j].b_slot >= 0) {
+					inc_entries[cursor[elems[j].b_slot]++] = j | 0x80000000u;
+				}
+			}
+		}
+
+		// Optional K-symmetry self check (deterministic LCG vectors). A sign
+		// error in the matvec breaks symmetry, which silently wrecks CG — this
+		// is the canary for exactly that class of bug.
+		if (check_symmetry && pass == 0) {
+			LocalVector<double> u_v, v_v, ku_v, kv_v;
+			u_v.resize(n_dof); v_v.resize(n_dof);
+			ku_v.resize(n_dof); kv_v.resize(n_dof);
+			uint64_t lcg = 0x9E3779B97F4A7C15ULL;
+			for (int i = 0; i < n_dof; i++) {
+				lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+				u_v[i] = (double)((lcg >> 33) & 0xFFFF) / 65536.0 - 0.5;
+				lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+				v_v[i] = (double)((lcg >> 33) & 0xFFFF) / 65536.0 - 0.5;
+			}
+			_gs_matvec(elems, u_v.ptr(), ku_v.ptr(), n_dof, K_N, K_S, K_B, K_T);
+			_gs_matvec(elems, v_v.ptr(), kv_v.ptr(), n_dof, K_N, K_S, K_B, K_T);
+			double uKv = 0.0, vKu = 0.0;
+			for (int i = 0; i < n_dof; i++) {
+				uKv += u_v[i] * kv_v[i];
+				vKu += v_v[i] * ku_v[i];
+			}
+			sym_err = Math::abs(uKv - vKu) / MAX(Math::abs(uKv), 1e-12);
+		}
+
+		// ── Preconditioned conjugate gradient on K x = f_gravity ──
+		x_v.resize(n_dof); r_v.resize(n_dof); z_v.resize(n_dof);
+		p_v.resize(n_dof); ap_v.resize(n_dof);
+		double *x = x_v.ptr(), *r = r_v.ptr(), *z = z_v.ptr();
+		double *pv = p_v.ptr(), *ap = ap_v.ptr();
+		double fnorm2 = 0.0;
+		for (int s = 0; s < n_active; s++) {
+			double *xr = x + s * 6;
+			double *rr = r + s * 6;
+			for (int i = 0; i < 3; i++) {
+				xr[i] = 0.0; xr[3 + i] = 0.0;
+				rr[i] = g_arr[i];        // unit weight per block
+				rr[3 + i] = 0.0;         // gravity acts at the center: no torque
+				fnorm2 += rr[i] * rr[i];
+			}
+		}
+		// Block-precondition apply: z_s = B_s⁻¹ r_s.
+		auto apply_precond = [&](const double *rin, double *zout) {
+			for (int s = 0; s < n_active; s++) {
+				const double *B = binv + s * 36;
+				const double *rs = rin + s * 6;
+				double *zs = zout + s * 6;
+				for (int row = 0; row < 6; row++) {
+					const double *Br = B + row * 6;
+					zs[row] = Br[0] * rs[0] + Br[1] * rs[1] + Br[2] * rs[2] +
+							Br[3] * rs[3] + Br[4] * rs[4] + Br[5] * rs[5];
+				}
+			}
+		};
+
+		GsMatvecCtx mv_ctx;
+		mv_ctx.elems = elems.ptr();
+		mv_ctx.inc_offsets = use_threaded_matvec ? inc_offsets.ptr() : nullptr;
+		mv_ctx.inc_entries = use_threaded_matvec ? inc_entries.ptr() : nullptr;
+		mv_ctx.n_slots = n_active;
+		mv_ctx.k_n = K_N;
+		mv_ctx.k_s = K_S;
+		mv_ctx.k_b = K_B;
+		mv_ctx.k_t = K_T;
+		int mv_chunks = 1;
+		if (use_threaded_matvec) {
+			const int threads = MAX(1, (int)WorkerThreadPool::get_singleton()->get_thread_count());
+			mv_chunks = MIN(threads * 4, MAX(1, n_active / 512));
+			mv_ctx.slots_per_chunk = (n_active + mv_chunks - 1) / mv_chunks;
+		}
+		auto run_matvec = [&](const double *xin, double *yout) {
+			if (use_threaded_matvec && mv_chunks > 1) {
+				mv_ctx.x = xin;
+				mv_ctx.y = yout;
+				WorkerThreadPool::GroupID g = WorkerThreadPool::get_singleton()->add_native_group_task(
+						_gs_matvec_worker, &mv_ctx, mv_chunks, -1, false,
+						String("gravity_matvec"));
+				WorkerThreadPool::get_singleton()->wait_for_group_task_completion(g);
+			} else {
+				_gs_matvec(elems, xin, yout, n_dof, K_N, K_S, K_B, K_T);
+			}
+		};
+
+		double rz = 0.0;
+		apply_precond(r, z);
+		for (int i = 0; i < n_dof; i++) {
+			pv[i] = z[i];
+			rz += r[i] * z[i];
+		}
+		const double tol2 = tol * tol * fnorm2;
+		bool converged = false;
+		int iter = 0;
+		for (; iter < max_cg_iters; iter++) {
+			run_matvec(pv, ap);
+			double pap = 0.0;
+			for (int i = 0; i < n_dof; i++) {
+				pap += pv[i] * ap[i];
+			}
+			if (pap <= 0.0) {
+				break; // SPD violated — bail with current iterate
+			}
+			const double alpha = rz / pap;
+			double rr2 = 0.0;
+			for (int i = 0; i < n_dof; i++) {
+				x[i] += alpha * pv[i];
+				r[i] -= alpha * ap[i];
+				rr2 += r[i] * r[i];
+			}
+			if (rr2 <= tol2) {
+				converged = true;
+				iter++;
+				break;
+			}
+			apply_precond(r, z);
+			double rz_new = 0.0;
+			for (int i = 0; i < n_dof; i++) {
+				rz_new += r[i] * z[i];
+			}
+			const double beta = rz_new / rz;
+			rz = rz_new;
+			for (int i = 0; i < n_dof; i++) {
+				pv[i] = z[i] + beta * pv[i];
+			}
+		}
+		total_cg_iters += iter;
+		if (!converged) {
+			all_converged = false;
+		}
+		passes = pass + 1;
+
+		// ── Recover interface loads, evaluate failure criteria, break ──
+		int broke_this_pass = 0;
+		double F[3], M[3], d_ax;
+		max_util = 0.0;
+		int worst_ref = -1;
+		bool worst_is_anchor = false;
+		double worst_fn = 0.0, worst_fs = 0.0, worst_mb = 0.0, worst_mt = 0.0;
+		double worst_kcap = 0.0, worst_kst = 0.0;
+		for (uint32_t j = 0; j < elems.size(); j++) {
+			const GravityStressElem &e = elems[j];
+			const double *xa = x + e.a_slot * 6;
+			const double *xb = (e.b_slot >= 0) ? x + e.b_slot * 6 : nullptr;
+			_gs_elem_wrench(e, xa, xb, K_N, K_S, K_B, K_T, F, M, &d_ax);
+			const int ax = e.axis;
+			const int i1 = (ax + 1) % 3, i2 = (ax + 2) % 3;
+			const double f_n = (double)e.sign * F[ax]; // tension positive
+			const double f_s = Math::sqrt(F[i1] * F[i1] + F[i2] * F[i2]);
+			const double m_b = Math::sqrt(M[i1] * M[i1] + M[i2] * M[i2]);
+			const double m_t = Math::abs(M[ax]);
+			const double cap_scale = (double)e.k_cap * (e.b_slot < 0 ? anchor_factor : 1.0);
+			double U;
+			if (cap_scale < 1e-6) {
+				const double load = Math::abs(f_n) + f_s + m_b + m_t;
+				U = (load > 1e-9) ? 1e9 : 0.0;
+			} else {
+				const double u_t = (MAX(f_n, 0.0) + BEND_EDGE * m_b) / (cap_scale * T0);
+				const double u_c = (MAX(-f_n, 0.0) + BEND_EDGE * m_b) / (cap_scale * C0);
+				const double u_s = (f_s + TORS_EDGE * m_t) / (cap_scale * S0);
+				U = MAX(u_t, MAX(u_c, u_s));
+			}
+			if (U > max_util) {
+				max_util = U;
+				worst_ref = e.grid_ref;
+				worst_is_anchor = e.b_slot < 0;
+				worst_fn = f_n;
+				worst_fs = f_s;
+				worst_mb = m_b;
+				worst_mt = m_t;
+				worst_kcap = e.k_cap;
+				worst_kst = e.k_st;
+			}
+			if (U > 1.0) {
+				if (e.b_slot < 0) {
+					anchor_broken_w[e.grid_ref] = 1;
+					broke_anchors++;
+				} else {
+					bond_broken_w[e.grid_ref] = 1;
+					broke_bonds++;
+				}
+				broke_this_pass++;
+			}
+		}
+		if (debug_pass_stats) {
+			Dictionary ps;
+			ps["pass"] = pass;
+			ps["n_active"] = n_active;
+			ps["n_elems"] = (int)elems.size();
+			ps["cg_iters"] = iter;
+			ps["converged"] = converged;
+			ps["max_u"] = max_util;
+			ps["broke"] = broke_this_pass;
+			ps["worst_ref"] = worst_ref;
+			ps["worst_is_anchor"] = worst_is_anchor;
+			ps["worst_fn"] = worst_fn;
+			ps["worst_fs"] = worst_fs;
+			ps["worst_mb"] = worst_mb;
+			ps["worst_mt"] = worst_mt;
+			ps["worst_kcap"] = worst_kcap;
+			ps["worst_kst"] = worst_kst;
+			pass_stats.push_back(ps);
+		}
+		if (broke_this_pass == 0) {
+			break; // stable — crack propagation finished
+		}
+	}
+
+	memfree(slot_of);
+	memfree(active);
+	memfree(visited);
+	memfree(bfs_queue);
+
+	uint64_t t_end = OS::get_singleton()->get_ticks_usec();
+	if (s_stress_debug_print) {
+		print_line(vformat("[GravityStress] passes=%d cg_iters=%d broke_bonds=%d broke_anchors=%d maxU=%.3f converged=%s total=%dus",
+				passes, total_cg_iters, broke_bonds, broke_anchors, max_util,
+				all_converged ? "yes" : "no", (int)(t_end - t_start)));
+	}
+
+	out["bond_broken"] = bond_broken;
+	out["anchor_broken"] = anchor_broken;
+	out["broke_bonds"] = broke_bonds;
+	out["broke_anchors"] = broke_anchors;
+	out["max_utilization"] = (float)max_util;
+	out["passes"] = passes;
+	out["cg_iters"] = total_cg_iters;
+	out["converged"] = all_converged;
+	out["solve_us"] = (int)(t_end - t_start);
+	if (check_symmetry) {
+		out["symmetry_error"] = (float)sym_err;
+	}
+	if (debug_pass_stats) {
+		out["pass_stats"] = pass_stats;
+	}
+	return out;
+}
+
+
+// ── Smooth collision rebuild via greedy box decomposition ──
+//
+// For each contiguous filled cuboid in the block grid, emit one BoxShape.
+// Solid wall column = 1 box. Hollow tower = ~6-12 boxes. Replaces the GDScript
+// triple-nested loop that was running 8-11ms per call on 4000-block structures.
+//
+// PhysicsServer3D body_add_shape / shape_set_data calls dominated the GDScript
+// version (one binding per shape). The C++ port batches them through the
+// server pointer directly with no Variant marshaling.
+Array BlockMeshBuilder::rebuild_smooth_collision_box_shapes(
+		const RID &p_body,
+		const PackedByteArray &p_block_grid,
+		int p_num_x, int p_num_y, int p_num_z,
+		float p_block_size,
+		const Array &p_old_shape_rids) {
+
+	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
+	ERR_FAIL_NULL_V(ps, Array());
+
+	const int grid_size = p_num_x * p_num_y * p_num_z;
+	ERR_FAIL_COND_V_MSG(p_block_grid.size() != grid_size, Array(),
+			"rebuild_smooth_collision_box_shapes: block_grid size mismatch");
+
+	// Wrap shape changes in bulk mode so the broadphase doesn't update once
+	// per shape — single rebroadphase at the end of the function.
+	ps->body_set_shapes_bulk_mode(p_body, true);
+
+	// Free old shapes and clear the body's shape list before rebuilding.
+	ps->body_clear_shapes(p_body);
+	for (int i = 0; i < p_old_shape_rids.size(); i++) {
+		RID old_rid = p_old_shape_rids[i];
+		if (old_rid.is_valid()) {
+			ps->free_rid(old_rid);
+		}
+	}
+
+	const int ny_nz = p_num_y * p_num_z;
+	const float bs = p_block_size;
+	const float half_x = p_num_x * 0.5f;
+	const float half_y = p_num_y * 0.5f;
+	const float half_z = p_num_z * 0.5f;
+
+	uint8_t *claimed = (uint8_t *)memalloc(grid_size);
+	memset(claimed, 0, grid_size);
+	const uint8_t *grid = p_block_grid.ptr();
+
+	Array new_rids;
+
+	for (int bx0 = 0; bx0 < p_num_x; bx0++) {
+		for (int by0 = 0; by0 < p_num_y; by0++) {
+			for (int bz0 = 0; bz0 < p_num_z; bz0++) {
+				const int idx0 = bx0 * ny_nz + by0 * p_num_z + bz0;
+				if (grid[idx0] == 0 || claimed[idx0] != 0) {
+					continue;
+				}
+
+				// Greedy extend +X.
+				int bx1 = bx0;
+				while (bx1 + 1 < p_num_x) {
+					int ni = (bx1 + 1) * ny_nz + by0 * p_num_z + bz0;
+					if (grid[ni] == 0 || claimed[ni] != 0) break;
+					bx1++;
+				}
+
+				// Greedy extend +Y (entire X-row must remain solid & unclaimed).
+				int by1 = by0;
+				while (by1 + 1 < p_num_y) {
+					bool ok = true;
+					for (int bx = bx0; bx <= bx1; bx++) {
+						int ni = bx * ny_nz + (by1 + 1) * p_num_z + bz0;
+						if (grid[ni] == 0 || claimed[ni] != 0) { ok = false; break; }
+					}
+					if (!ok) break;
+					by1++;
+				}
+
+				// Greedy extend +Z (entire XY-slab must remain solid & unclaimed).
+				int bz1 = bz0;
+				while (bz1 + 1 < p_num_z) {
+					bool ok = true;
+					for (int bx = bx0; bx <= bx1 && ok; bx++) {
+						for (int by = by0; by <= by1; by++) {
+							int ni = bx * ny_nz + by * p_num_z + (bz1 + 1);
+							if (grid[ni] == 0 || claimed[ni] != 0) { ok = false; break; }
+						}
+					}
+					if (!ok) break;
+					bz1++;
+				}
+
+				// Mark the cuboid claimed.
+				for (int bx = bx0; bx <= bx1; bx++) {
+					for (int by = by0; by <= by1; by++) {
+						for (int bz = bz0; bz <= bz1; bz++) {
+							claimed[bx * ny_nz + by * p_num_z + bz] = 1;
+						}
+					}
+				}
+
+				// Emit one BoxShape primitive at the cuboid center.
+				const float size_x = (bx1 - bx0 + 1) * bs;
+				const float size_y = (by1 - by0 + 1) * bs;
+				const float size_z = (bz1 - bz0 + 1) * bs;
+				const Vector3 origin(
+						(bx0 + (bx1 - bx0 + 1) * 0.5f - half_x) * bs,
+						(by0 + (by1 - by0 + 1) * 0.5f - half_y) * bs,
+						(bz0 + (bz1 - bz0 + 1) * 0.5f - half_z) * bs);
+
+				RID shape_rid = ps->box_shape_create();
+				ps->shape_set_data(shape_rid, Vector3(size_x, size_y, size_z) * 0.5f);
+				ps->body_add_shape(p_body, shape_rid, Transform3D(Basis(), origin));
+				new_rids.push_back(shape_rid);
+			}
+		}
+	}
+
+	// Commit the new shape list in one broadphase update.
+	ps->body_set_shapes_bulk_mode(p_body, false);
+
+	memfree(claimed);
+	return new_rids;
+}
+
+
+// ── Bulk fragment body creation ──
+//
+// Single C++ call creates N fragment bodies, sized + configured + parked
+// off-world. Replaces a GDScript loop that paid GDScript→C++ marshaling
+// overhead on ~10 PhysicsServer3D calls per body. For pool growth (where N
+// can be hundreds), that loop was the dominant frame-time cost.
+Array BlockMeshBuilder::bulk_create_fragment_bodies(
+		int p_count,
+		const RID &p_space,
+		const RID &p_shape,
+		int p_collision_layer,
+		int p_collision_mask,
+		float p_mass,
+		float p_gravity_scale,
+		bool p_kinematic) {
+
+	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
+	ERR_FAIL_NULL_V(ps, Array());
+	ERR_FAIL_COND_V(p_count <= 0, Array());
+	ERR_FAIL_COND_V_MSG(!p_space.is_valid(), Array(),
+			"bulk_create_fragment_bodies: space RID invalid (no World3D yet?)");
+
+	const PhysicsServer3D::BodyMode mode = p_kinematic
+			? PhysicsServer3D::BODY_MODE_KINEMATIC
+			: PhysicsServer3D::BODY_MODE_RIGID;
+
+	uint64_t t_start = OS::get_singleton()->get_ticks_usec();
+
+	// Park bodies WITHOUT collision layer/mask so they don't generate
+	// broadphase pairs while idle. With 5000 fragments stacked at one
+	// parking spot, Jolt's body-pair cache (default 65k) overflows
+	// instantly and the game crashes. Setting layer/mask to 0 makes the
+	// body "exist but ignore everything"; on acquire(), the GDScript side
+	// sets the real layer/mask back.
+	const Transform3D hidden_xform(Basis(), Vector3(0.0f, -100000.0f, 0.0f));
+
+	Array rids;
+	rids.resize(p_count);
+	for (int i = 0; i < p_count; i++) {
+		RID body = ps->body_create();
+		ps->body_set_mode(body, mode);
+		ps->body_set_space(body, p_space);
+		ps->body_add_shape(body, p_shape, Transform3D());
+		// Layer/mask = 0: parked body has no broadphase membership.
+		// acquire() promotes them to the real layer/mask.
+		ps->body_set_collision_layer(body, 0);
+		ps->body_set_collision_mask(body, 0);
+		ps->body_set_param(body, PhysicsServer3D::BODY_PARAM_MASS, p_mass);
+		ps->body_set_param(body, PhysicsServer3D::BODY_PARAM_GRAVITY_SCALE, p_gravity_scale);
+		// Server (RIGID) bodies sleep so the broadphase doesn't track them
+		// while parked. Client (KINEMATIC) bodies don't auto-sleep.
+		ps->body_set_state(body, PhysicsServer3D::BODY_STATE_CAN_SLEEP, !p_kinematic);
+		ps->body_set_state(body, PhysicsServer3D::BODY_STATE_SLEEPING, true);
+		ps->body_set_state(body, PhysicsServer3D::BODY_STATE_TRANSFORM, hidden_xform);
+		rids[i] = body;
+	}
+	// Suppress unused-arg warnings for the layer/mask we deliberately ignore at
+	// creation (set later by acquire()).
+	(void)p_collision_layer;
+	(void)p_collision_mask;
+	uint64_t t_end = OS::get_singleton()->get_ticks_usec();
+	print_line(vformat("[FragmentBulkCreate] count=%d  total=%dus  per_body=%.1fus",
+			p_count, (int)(t_end - t_start),
+			float(t_end - t_start) / float(p_count)));
+	return rids;
+}
+
 
 // ── Force-equilibrium structural stress solver ──
 //
@@ -2652,6 +4450,21 @@ Dictionary BlockMeshBuilder::build_cluster(
 	return result;
 }
 
+PackedByteArray BlockMeshBuilder::or_byte_arrays(
+		const PackedByteArray &p_a,
+		const PackedByteArray &p_b) {
+	ERR_FAIL_COND_V_MSG(p_a.size() != p_b.size(), p_a,
+			"or_byte_arrays: size mismatch");
+	PackedByteArray out = p_a;
+	uint8_t *w = out.ptrw();
+	const uint8_t *b = p_b.ptr();
+	const int n = out.size();
+	for (int i = 0; i < n; i++) {
+		w[i] |= b[i];
+	}
+	return out;
+}
+
 Array BlockMeshBuilder::build_clusters_batch(
 		const Array &p_block_hp_array,
 		int p_num_x, int p_num_y, int p_num_z,
@@ -2659,7 +4472,8 @@ Array BlockMeshBuilder::build_clusters_batch(
 		const Array &p_cluster_bodies,
 		const Array &p_hit_bodies,
 		const RID &p_hit_shape,
-		bool p_include_uvs) {
+		bool p_include_uvs,
+		const PackedInt32Array &p_cluster_dims) {
 	const int n_clusters = p_block_hp_array.size();
 	ERR_FAIL_COND_V_MSG(p_cluster_bodies.size() != n_clusters, Array(),
 			vformat("cluster_bodies size %d != block_hp_array size %d", p_cluster_bodies.size(), n_clusters));
@@ -2673,13 +4487,19 @@ Array BlockMeshBuilder::build_clusters_batch(
 		return Array();
 	}
 
+	const bool has_dims = p_cluster_dims.size() == n_clusters * 3;
+	ERR_FAIL_COND_V_MSG(!has_dims && p_cluster_dims.size() != 0, Array(),
+			"build_clusters_batch: cluster_dims must be empty or 3 per cluster");
+
 	// For a single cluster, skip threading overhead and use the direct path.
 	if (n_clusters == 1) {
 		Array results;
 		results.resize(1);
 		results[0] = build_cluster(
 				(Dictionary)p_block_hp_array[0],
-				p_num_x, p_num_y, p_num_z,
+				has_dims ? p_cluster_dims[0] : p_num_x,
+				has_dims ? p_cluster_dims[1] : p_num_y,
+				has_dims ? p_cluster_dims[2] : p_num_z,
 				p_block_size,
 				(RID)p_cluster_bodies[0],
 				(RID)p_hit_bodies[0],
@@ -2702,9 +4522,9 @@ Array BlockMeshBuilder::build_clusters_batch(
 	items.resize(n_clusters);
 	for (int c = 0; c < n_clusters; c++) {
 		items[c].block_hp = &dict_refs[c];
-		items[c].num_x = p_num_x;
-		items[c].num_y = p_num_y;
-		items[c].num_z = p_num_z;
+		items[c].num_x = has_dims ? p_cluster_dims[c * 3 + 0] : p_num_x;
+		items[c].num_y = has_dims ? p_cluster_dims[c * 3 + 1] : p_num_y;
+		items[c].num_z = has_dims ? p_cluster_dims[c * 3 + 2] : p_num_z;
 		items[c].block_size = p_block_size;
 		items[c].include_uvs = p_include_uvs;
 	}
