@@ -36,6 +36,7 @@ func _do_fire(shooter: Player, aim_origin: Vector3, aim_direction: Vector3) -> D
 				"hit_normal": result.normal,
 				"hit_collider": result.collider,
 				"hit_shape": result.shape,
+				"hit_rid": result.rid,  # for FragmentPool routing (raw bodies have no Node)
 				"shot_end": result.position,
 			})
 

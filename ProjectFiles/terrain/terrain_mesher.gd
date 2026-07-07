@@ -83,8 +83,43 @@ func build_data(sdf_grid: TerrainSDFGrid, block_pos: Vector3i) -> Dictionary:
 		for i in array_mesh.get_surface_count():
 			array_mesh.surface_set_material(i, _material)
 
-	var faces := mesh.get_faces()
+	var faces := filter_degenerate_faces(mesh.get_faces())
 	return { "mesh": mesh, "faces": faces }
+
+
+static func filter_degenerate_faces(faces: PackedVector3Array) -> PackedVector3Array:
+	## Drop zero-area triangles.  The mesher's edge clamping can collapse a
+	## triangle's vertices together; Jolt culls such triangles, and a chunk
+	## whose ONLY triangles are degenerate then fails its whole shape build
+	## ("Need triangles to create a mesh shape!" — was ~1257 errors/session).
+	## Consumers already treat empty faces as "no collision".
+	const MIN_CROSS_SQ := 1e-12  # (2×area)² — drops only true degenerates
+	var count := faces.size()
+
+	# Fast path: most chunks have no degenerate faces.
+	var has_bad := false
+	for i in range(0, count, 3):
+		var cross := (faces[i + 1] - faces[i]).cross(faces[i + 2] - faces[i])
+		if cross.length_squared() <= MIN_CROSS_SQ:
+			has_bad = true
+			break
+	if not has_bad:
+		return faces
+
+	var out := PackedVector3Array()
+	out.resize(count)
+	var kept := 0
+	for i in range(0, count, 3):
+		var a := faces[i]
+		var b := faces[i + 1]
+		var c := faces[i + 2]
+		if (b - a).cross(c - a).length_squared() > MIN_CROSS_SQ:
+			out[kept] = a
+			out[kept + 1] = b
+			out[kept + 2] = c
+			kept += 3
+	out.resize(kept)
+	return out
 
 
 func build(sdf_grid: TerrainSDFGrid, block_pos: Vector3i) -> Array:

@@ -48,6 +48,11 @@ var _air_frames := 0
 var _k_cross_frame := -1
 var _k_pre_vy := 0.0
 var _k_descended := false
+var _toad: RigidBody3D = null
+var _toad2: RigidBody3D = null
+var _m_pop_frames := 0
+var _m_max_pop := 0.0
+var _n_max_pop := 0.0
 
 
 func _ready() -> void:
@@ -57,6 +62,7 @@ func _ready() -> void:
 	_make_corner()
 	_make_ramp()
 	_make_side_hill()
+	_make_toad()
 
 	_cv = JoltCharacterVirtual3D.new()
 	_cv.name = "Character"
@@ -70,6 +76,8 @@ func _ready() -> void:
 	_cv.max_slope_angle_deg = 50.0
 	_cv.predictive_contact_distance = 0.2
 	_cv.enhanced_internal_edge_removal = true
+	_cv.penetration_recovery_speed = 0.15  # matches the game (see player_movement.gd)
+	_cv.max_strength = 1000.0  # matches the game — default 100 N is the old "brick wall"
 	_cv.position = Vector3(-6.0, 1.0, 0.0)
 	add_child(_cv)
 
@@ -131,6 +139,39 @@ func _make_ramp() -> void:
 	# crest — together they form a "curved ramp" that steepens past the
 	# walkable limit mid-climb.
 	_make_static_box("SteepCap", Vector3(10, 1, 6), Vector3(55.3, 9.3, -8.0), Vector3(0, 0, 56))
+
+
+func _make_toad() -> void:
+	# Phase M: a light dynamic sphere (toad stand-in) resting on the flat
+	# floor in a clear lane. Landing on it exercises the dynamic-support
+	# re-seat: impact impulses spin light bodies hard, and riding the spinning
+	# contact-point velocity launched the player (the 2026-07-02 toad-landing
+	# glitch). The fix tracks the body's LINEAR velocity only.
+	_toad = RigidBody3D.new()
+	_toad.name = "TestToad"
+	_toad.mass = 4.0
+	_toad.collision_layer = 1
+	_toad.collision_mask = 1
+	var col := CollisionShape3D.new()
+	var sph := SphereShape3D.new()
+	sph.radius = 0.3
+	col.shape = sph
+	_toad.add_child(col)
+	_toad.position = Vector3(0.0, 0.35, 10.0)
+	add_child(_toad)
+	# Phase N: a second resting sphere in its own lane, sprinted THROUGH.
+	_toad2 = RigidBody3D.new()
+	_toad2.name = "TestToad2"
+	_toad2.mass = 4.0
+	_toad2.collision_layer = 1
+	_toad2.collision_mask = 1
+	var col2 := CollisionShape3D.new()
+	var sph2 := SphereShape3D.new()
+	sph2.radius = 0.3
+	col2.shape = sph2
+	_toad2.add_child(col2)
+	_toad2.position = Vector3(0.0, 0.35, 14.0)
+	add_child(_toad2)
 
 
 func _make_side_hill() -> void:
@@ -454,6 +495,59 @@ func _physics_process(delta: float) -> void:
 				else:
 					print("[TEST] curved ramp: crossed at f%d, slid up on momentum and started descending by f%d" % [
 						_k_cross_frame, _phase_frames])
+				print("[TEST] === Phase M: land on a light dynamic sphere (toad-landing family) ===")
+				_cv.teleport(Vector3(0.0, 2.2, 10.0))
+				_vel = Vector3.ZERO
+				_next_phase()
+		13:
+			# Phase M: drop onto the 4 kg sphere and stand there. Impact spin
+			# on the sphere must NOT translate into upward pops of the player
+			# (the re-seat tracks linear support velocity only). The sphere
+			# squishing out from under the player and the player settling onto
+			# the floor is fine — the failure signature is repeated unexplained
+			# upward frames.
+			var moved := _drive(Vector3.ZERO, delta)
+			if _phase_frames > 15:
+				# Falling and settling are downward; flag meaningful up-motion.
+				if moved.y > 0.02:
+					_m_pop_frames += 1
+					_m_max_pop = maxf(_m_max_pop, moved.y)
+					print("[TEST] POP f%d moved=(%.4f,%.4f,%.4f) vel_in=(%.2f,%.2f,%.2f) toad=(%.2f,%.2f,%.2f) toad_v=(%.2f,%.2f,%.2f)" % [
+						_phase_frames, moved.x, moved.y, moved.z, _vel.x, _vel.y, _vel.z,
+						_toad.global_position.x, _toad.global_position.y, _toad.global_position.z,
+						_toad.linear_velocity.x, _toad.linear_velocity.y, _toad.linear_velocity.z])
+			if _phase_frames >= 100:
+				print("[TEST] toad landing: pop_frames=%d max_pop=%.3f end_vel=(%.2f,%.2f,%.2f)" % [
+					_m_pop_frames, _m_max_pop, _vel.x, _vel.y, _vel.z])
+				if _m_pop_frames > 3:
+					_failures.append("toad-landing: %d upward-pop frames (max %.3f m) — spin feedback" % [
+						_m_pop_frames, _m_max_pop])
+				if _vel.length() > 2.0:
+					_failures.append("toad-landing: still moving %.2f m/s at rest — no settle" % _vel.length())
+				print("[TEST] === Phase N: sprint through a light sphere (flank-vault family) ===")
+				_cv.teleport(Vector3(-6.0, 1.0, 14.0))
+				_vel = Vector3.ZERO
+				_next_phase()
+		14:
+			# Phase N: sprint straight through the resting 4 kg sphere. The
+			# walkable-angle flank contact (~48°) must NOT vault the player on
+			# top of it terrain-style — the vertical re-seat couples by
+			# m/(m+char) so the player plows through and the sphere is shoved.
+			var settle := _phase_frames <= 10
+			var moved := _drive(Vector3(WALK_SPEED, 0, 0) if not settle else Vector3.ZERO, delta)
+			if not settle:
+				_n_max_pop = maxf(_n_max_pop, moved.y)
+			if _phase_frames >= 95:
+				var px := _cv.get_character_position().x
+				var toad_moved := (_toad2.global_position - Vector3(0.0, 0.35, 14.0)).length()
+				print("[TEST] sprint-through: max_up=%.3f m/frame, player x=%.2f, sphere displaced %.2f m" % [
+					_n_max_pop, px, toad_moved])
+				if _n_max_pop > 0.05:
+					_failures.append("sprint-through: vaulted upward %.3f m in one frame off the sphere flank" % _n_max_pop)
+				if px < 1.5:
+					_failures.append("sprint-through: stopped at the sphere (x=%.2f) — not plowing through" % px)
+				if toad_moved < 1.5:
+					_failures.append("sprint-through: sphere barely moved (%.2f m) — not being shoved" % toad_moved)
 				_finish()
 
 

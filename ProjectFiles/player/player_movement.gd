@@ -273,6 +273,14 @@ func _create_wall_oracle() -> void:
 	# walk speed in ~3 frames (essentially instant), while a 100 kg crate still
 	# accelerates slowly, so heavier-is-harder remains a natural gradient.
 	_wall_oracle.max_strength = 1000.0
+	# Penetration recovery: fraction of overlap depth ejected per frame. 0.15
+	# keeps the deep-overlap launch ramp from igniting (toad-landing fix,
+	# 2026-07-02: full-rate recovery of a 0.6 m overlap leaked upward velocity
+	# past gravity through the mass-ratio clip). Known trade-off: sustained
+	# pushing lets bodies sit visibly inside the capsule (~16 cm measured) —
+	# kept at the user's request until the block-vs-wall phasing they observed
+	# is captured with the [BLOCKPEN] logging under THESE exact conditions.
+	_wall_oracle.penetration_recovery_speed = 0.15
 	# Route the CV's collision detection through Jolt's internal-edge removal:
 	# contacts at mesh triangle seams / voxel block boundaries whose normal
 	# disagrees with the real face get voided, instead of entering the solver
@@ -1108,19 +1116,23 @@ func process_normal_movement(delta: float) -> void:
 	# onto their crease (vertical for walls → dime stop). Derived from speed
 	# and dt — not a tuned constant.
 	var _wp_reach: float = maxf(_ORACLE_TOUCH_EPS, Vector2(player.velocity.x, player.velocity.z).length() * delta)
-	# Each plane carries a resistance fraction f: 1.0 for static geometry, and
-	# mass/(mass + character_mass) for dynamic bodies — the same law the
-	# solver's velocity clip uses. The input target is projected off each
-	# plane by f, so an infinite-mass dynamic wall shapes input exactly like
-	# a static wall and a light crate barely shapes it at all (you push it
-	# instead). This replaces the old binary `_dynamic_wall_fraction < 0.5`
-	# skip — a step function where the doctrine wants continuity.
-	var _wp_char_mass: float = _wall_oracle.character_mass if _wall_oracle != null else 70.0
+	# Input-target shaping applies to STATIC geometry only (f = 1 planes).
+	# Dynamic bodies are deliberately excluded: the engine's contact clip
+	# already cancels velocity into them by the mass-ratio law, so shaping the
+	# input by a mass fraction TOO counted their resistance twice — a 40 kg
+	# block lost 36% of the player's drive before the clip took its own share,
+	# reading as "harder to push" (2026-07-03 log). One owner per channel:
+	# the engine clip owns ALL dynamic proportionality (its clip_frac → 1
+	# walls you off an infinite-mass dynamic body exactly like this static
+	# projection would), the input shaping owns the trig speed cap on
+	# unmovable geometry.
 	var wall_planes: Array = []
 	for c in _oracle_contacts:
 		if bool(c.get("is_sensor", false)):
 			continue
 		if c.get("collider") == player:
+			continue
+		if c["collider"] is RigidBody3D and not GameManager.debug_wall_proj_dynamic:
 			continue
 		if float(c.get("distance", 1.0)) > _wp_reach:
 			continue
@@ -1129,11 +1141,7 @@ func process_normal_movement(delta: float) -> void:
 			continue
 		if cn.angle_to(Vector3.UP) <= FLOOR_MAX_ANGLE:
 			continue
-		var f := 1.0
-		if c["collider"] is RigidBody3D and not GameManager.debug_wall_proj_dynamic:
-			var rb_mass: float = (c["collider"] as RigidBody3D).mass
-			f = rb_mass / (rb_mass + _wp_char_mass)
-		wall_planes.append({"n": cn, "f": f})
+		wall_planes.append({"n": cn, "f": 1.0})
 
 	# ── Walk-accel target ────────────────────────────────────────────────────
 	# Walk-accel is a ground push — it only ever produces *horizontal* velocity,
@@ -1219,7 +1227,12 @@ func process_normal_movement(delta: float) -> void:
 	var ground_carry := Vector3.ZERO
 	if _is_grounded and _wall_oracle != null and _wall_oracle.has_method("get_ground_velocity"):
 		var gv: Vector3 = _wall_oracle.get_ground_velocity()
-		ground_carry = Vector3(gv.x, 0.0, gv.z)
+		# Carry couples by the support's resistance fraction: a platform
+		# (static/kinematic/heavy) is a full reference frame; a light toad
+		# (f = m/(m+char_mass) ≈ 0.05) slips out from under the player instead
+		# of carrying them — the "surfing a toad" fix.
+		var coupling: float = _wall_oracle.get_ground_coupling() if _wall_oracle.has_method("get_ground_coupling") else 1.0
+		ground_carry = Vector3(gv.x, 0.0, gv.z) * coupling
 		hvel -= ground_carry
 		hspeed = hvel.length()
 

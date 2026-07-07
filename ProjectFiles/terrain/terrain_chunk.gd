@@ -145,6 +145,11 @@ func apply_data(mesh: Mesh, faces: PackedVector3Array, mesh_offset: Vector3, ter
 	_mesh_instance.mesh = mesh
 	_mesh_instance.position = mesh_offset
 
+	# Choke point for ALL face sources (background mesher, crater rebuilds,
+	# AND baked caches — old bake .bin files carry degenerate triangles that
+	# fail Jolt's shape build with "Need triangles to create a mesh shape!").
+	faces = TerrainMesher.filter_degenerate_faces(faces)
+
 	if not faces.is_empty():
 		if _collision_shape == null:
 			_collision_shape = CollisionShape3D.new()

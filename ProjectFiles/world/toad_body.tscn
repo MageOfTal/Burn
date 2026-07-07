@@ -14,7 +14,7 @@ albedo_color = Color(0.15, 0.55, 0.1, 1)
 roughness = 0.7
 
 [sub_resource type="PhysicsMaterial" id="ToadPhysMat"]
-bounce = 0.3
+bounce = 0.0
 friction = 0.5
 
 [node name="ToadBody" type="RigidBody3D"]

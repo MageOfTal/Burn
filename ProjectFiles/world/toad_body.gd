@@ -220,7 +220,7 @@ func _ready() -> void:
 	lock_rotation = false
 	can_sleep = false
 	continuous_cd = true  ## Prevent tunneling through ground at high speeds
-	# PhysicsMaterial (bounce=0.3, friction=0.5) is set in toad_body.tscn
+	# PhysicsMaterial (bounce=0.0, friction=0.5) is set in toad_body.tscn
 
 	# Wire collision signal for bounce detection (server only)
 	if multiplayer.is_server() and not _physics_disabled:

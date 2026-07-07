@@ -524,6 +524,9 @@ func apply_lowered_pose(capsule_height: float, camera_offset: float) -> void:
 	if col_shape.shape is CapsuleShape3D:
 		col_shape.shape.height = capsule_height
 		col_shape.position.y = capsule_height * 0.5
+	# Keep the movement CharacterVirtual's capsule in sync with the body.
+	if player.movement != null and player.movement.has_method("set_capsule_height"):
+		player.movement.set_capsule_height(capsule_height)
 
 	var height_ratio := capsule_height / _original_capsule_height
 	player.body_mesh.scale.y = _original_mesh_scale_y * height_ratio
@@ -538,6 +541,8 @@ func apply_standing_pose() -> void:
 	if col_shape.shape is CapsuleShape3D:
 		col_shape.shape.height = _original_capsule_height
 		col_shape.position.y = _original_capsule_height * 0.5
+	if player.movement != null and player.movement.has_method("set_capsule_height"):
+		player.movement.set_capsule_height(_original_capsule_height)
 
 	player.body_mesh.scale.y = _original_mesh_scale_y
 	player.body_mesh.position.y = _original_mesh_y

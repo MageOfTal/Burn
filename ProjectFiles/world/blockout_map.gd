@@ -75,9 +75,27 @@ func _ready() -> void:
 	_spawn_loot_chests()
 	_spawn_kill_stores()
 
+	# DEBUG: diorama near spawn visualizing the grapple leaf go-around shell
+	_spawn_leaf_shape_display()
+
 	# NOTE: BurnClock.start(), _start_zone(), and _spawn_demo_items() are now
 	# called from NetworkManager._start_match() when the host starts the game
 	# from the lobby. They are no longer auto-started in _ready().
+
+
+func _spawn_leaf_shape_display() -> void:
+	## DEBUG: place the grapple leaf-shell diorama next to the first player
+	## spawn point.  Cosmetic — created on all peers (spawn points come from
+	## a fixed-seed RNG, so the position is deterministic everywhere).
+	var container := get_node_or_null("PlayerSpawnPoints")
+	if container == null or container.get_child_count() == 0:
+		return
+	var spawn_marker := container.get_child(0) as Node3D
+	if spawn_marker == null:
+		return
+	var display: Node3D = preload("res://world/leaf_shape_display.gd").new()
+	add_child(display)
+	display.global_position = spawn_marker.global_position + Vector3(10.0, 0.0, 0.0)
 
 
 # ======================================================================
@@ -788,14 +806,18 @@ func spawn_toad_bowl() -> void:
 		return
 
 	var host_pos: Vector3 = host_player.global_position
-	# Place the bowl 15m in front of the host player (+Z) and 8m up
-	var bowl_center: Vector3 = host_pos + Vector3(0, 8.0, 15.0)
+	# Place the bowl 18 m in front of the host player (+Z), seated ON the
+	# terrain (the bowl samples heights itself and never buries a piece).
+	var seed_world := get_node_or_null("SeedWorld")
+	var bowl_center := Vector3(host_pos.x, host_pos.y, host_pos.z + 18.0)
+	if seed_world and seed_world.has_method("get_height_from_noise"):
+		bowl_center.y = seed_world.get_height_from_noise(bowl_center.x, bowl_center.z)
 
 	var bowl := Node3D.new()
 	bowl.name = "ToadBowl"
 	bowl.set_script(load("res://world/toad_bowl.gd"))
 	add_child(bowl)
-	bowl.build(bowl_center)
+	bowl.build(bowl_center, seed_world)
 
 
 func spawn_toad_rail_cannon() -> void:

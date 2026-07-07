@@ -466,6 +466,24 @@ func _build_main_panel() -> void:
 		.toggled.connect(func(p): GameManager.debug_wedge_fraction_decay = p)
 	_add_check("Fix 6: Hold fraction while contact exists", GameManager.debug_wedge_fraction_hold, vbox) \
 		.toggled.connect(func(p): GameManager.debug_wedge_fraction_hold = p)
+	_add_check("Fix 7: Stick to walls when pressing in (zero outward drift)", GameManager.debug_wedge_stick_to_walls, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_stick_to_walls = p)
+	_add_check("Fix 8: Wall-proj full 3D normal (compound contact constraint)", GameManager.debug_wall_proj_full_normal, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wall_proj_full_normal = p)
+	_add_check("Fix 9: Joint wedge-axis projection (geometric correct)", GameManager.debug_wedge_joint_proj, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_joint_proj = p)
+	# Wedge-cause isolation tests (turn ONE on, leave Fix 9 OFF, reproduce wedge,
+	# see if the stutter still happens — proves which subsystem is responsible).
+	_add_check("[Test] Disable Snap entirely", GameManager.debug_no_snap, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_snap = p)
+	_add_check("[Test] Disable Slope-proj", GameManager.debug_no_slope_projection, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_slope_projection = p)
+	_add_check("[Test] Disable Wall-proj", GameManager.debug_no_wall_proj, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_wall_proj = p)
+	_add_check("[Test] Disable Walk-accel", GameManager.debug_no_walk_accel, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_walk_accel = p)
+	_add_check("[Test] Apply gravity always (every frame, world-Y)", GameManager.debug_gravity_always, vbox) \
+		.toggled.connect(func(p): GameManager.debug_gravity_always = p)
 	_add_check("Restore Even With Walls", GameManager.debug_restore_with_walls, vbox) \
 		.toggled.connect(func(p): GameManager.debug_restore_with_walls = p)
 	_add_check("Instant Acceleration", GameManager.debug_instant_accel, vbox) \
