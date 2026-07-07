@@ -143,6 +143,8 @@ void JoltCharacterVirtual3D::_create_character() {
 
 	listener.up = to_jolt(up_direction);
 	listener.cos_max_slope = Math::cos(Math::deg_to_rad(max_slope_angle_deg));
+	listener.system = &space->get_physics_system();
+	listener.char_mass = character_mass;
 	jolt_character->SetListener(&listener);
 
 	// Build stamp: stale engine copies (locked exe variants skipped by
@@ -198,9 +200,42 @@ void JoltCharacterVirtual3D::ContactListener::OnContactSolve(const JPH::Characte
 		return;
 	}
 
+	// For a DYNAMIC support, track its center-of-mass LINEAR velocity, not the
+	// contact-point velocity: the ω×r of a spinning body is slip under the
+	// feet, not carry — real feet don't counter-rotate with a ball, they
+	// slide on it. Landing impulses hit off-center and spin light bodies hard
+	// (measured 2026-07-02: a 4 kg toad at ~20 rad/s put +4.2 m/s of pure
+	// spin into the contact point, and the re-seat riding that surface
+	// launched the player — 143 tripwire events in one capture). Kinematic
+	// platforms keep the full contact-point velocity: a carousel's spin IS
+	// the ride, and scripted motion carries no impact noise.
+	// support_coupling: how strongly this support can act on the player —
+	// 1.0 for static/kinematic (terrain, platforms), m/(m + char_mass) for
+	// dynamic bodies. It scales the VERTICAL half of the re-seat (a surface
+	// redirects you upward only in proportion to its resistance — a 48°-flank
+	// contact on a 4 kg toad must NOT vault the player on top of it the way a
+	// 48° hillside would) and is exported to the walk pipeline for the
+	// ground-carry (a platform carries you; a light toad slips out from under
+	// you). Horizontal preservation stays FULL authority regardless: a light
+	// body can't slow the player, so full h-restore is what mass-proportional
+	// physics says anyway.
+	JPH::Vec3 support_vel = p_contact_velocity;
+	float support_coupling = 1.0f;
+	if (system != nullptr) {
+		JPH::BodyLockRead lock(system->GetBodyLockInterface(), p_body_id2);
+		if (lock.SucceededAndIsInBroadPhase() && lock.GetBody().GetMotionType() == JPH::EMotionType::Dynamic) {
+			support_vel = lock.GetBody().GetLinearVelocity();
+			const float inv_m = lock.GetBody().GetMotionProperties()->GetInverseMass();
+			if (inv_m > 0.0f) {
+				const float m = 1.0f / inv_m;
+				support_coupling = m / (m + char_mass);
+			}
+		}
+	}
+
 	// Moving away from this walkable contact (a jump, or a launch off the crest):
 	// leave it — JPH won't usually even call us for that, but guard.
-	const JPH::Vec3 rel = p_character_velocity - p_contact_velocity;
+	const JPH::Vec3 rel = p_character_velocity - support_vel;
 	if (rel.Dot(p_contact_normal) >= 0.0f) {
 		if (log_this) {
 			print_line(vformat("[CV-CAP-SOLVE] kind=separating in_vel=(%.3f,%.3f,%.3f) cn=(%.3f,%.3f,%.3f) rel_dot_n=%.4f",
@@ -260,8 +295,25 @@ void JoltCharacterVirtual3D::ContactListener::OnContactSolve(const JPH::Characte
 	const float nz = (float)p_contact_normal.GetZ();
 	const float vx = (float)p_character_velocity.GetX();
 	const float vz = (float)p_character_velocity.GetZ();
-	const float vy_tangent = ((float)p_contact_velocity.Dot(p_contact_normal) - nx * vx - nz * vz) / ny;
-	const JPH::Vec3 target(vx, vy_tangent, vz);
+	// The support's motion enters the re-seat only in the non-lifting sense:
+	// a dropping/receding support is followed (the doctrine's "pushed out
+	// from under you" channel), but upward support motion must NOT be
+	// converted into player lift here — a light body squeezed between the
+	// player and the ground oscillates (weight impulses vs floor counter-
+	// impulses, ±3 m/s per frame on a 4 kg toad), and riding the positive
+	// half of that oscillation is the landing-launch feedback. Genuinely
+	// rising supports lift the player through the contact constraint and
+	// push the player through the body-shove knockback channel — both
+	// mass-proportional and free of solver ring.
+	const float support_dot = MIN(0.0f, (float)support_vel.Dot(p_contact_normal));
+	const float vy_tangent = (support_dot - nx * vx - nz * vz) / ny;
+	// Horizontal: full authority. Vertical: the tangent conversion is applied
+	// in proportion to the support's coupling — terrain vaults you up its
+	// slope in full; a light body's flank mostly just gets shoved (the clip
+	// already barely deflected you, and HandleContact accelerates the body).
+	const float vy_target = (float)p_new_character_velocity.GetY() +
+			support_coupling * (vy_tangent - (float)p_new_character_velocity.GetY());
+	const JPH::Vec3 target(vx, vy_target, vz);
 	// Design note: horizontal speed is preserved VERBATIM on walkable slopes —
 	// |target| = h/cosθ grows with the slope angle by design ("don't slow me
 	// down walking up hills"). A 3D speed budget (|target| ≤ in_h, i.e.
@@ -674,7 +726,42 @@ Vector3 JoltCharacterVirtual3D::get_ground_velocity() const {
 	if (jolt_character == nullptr) {
 		return Vector3();
 	}
+	// For DYNAMIC ground, report the body's center-of-mass linear velocity
+	// rather than the contact-point velocity: spin is slip under the feet,
+	// not carry, and impact-induced spin on light bodies otherwise leaks
+	// launch noise into the walk pipeline's support-relative frame (see the
+	// matching note in OnContactSolve). Kinematic platforms keep the full
+	// contact-point velocity — a carousel's spin is the ride.
+	const JPH::BodyID ground_id = jolt_character->GetGroundBodyID();
+	if (!ground_id.IsInvalid() && space != nullptr) {
+		JPH::BodyLockRead lock(space->get_physics_system().GetBodyLockInterface(), ground_id);
+		if (lock.SucceededAndIsInBroadPhase() && lock.GetBody().GetMotionType() == JPH::EMotionType::Dynamic) {
+			return to_godot(lock.GetBody().GetLinearVelocity());
+		}
+	}
 	return to_godot(jolt_character->GetGroundVelocity());
+}
+
+float JoltCharacterVirtual3D::get_ground_coupling() const {
+	// How strongly the current support can act on the player: 1.0 for
+	// static/kinematic ground (terrain, platforms — full carry), and
+	// m/(m + character_mass) for dynamic bodies — a light toad slips out
+	// from under the player instead of carrying them ("surfing" fix).
+	if (jolt_character == nullptr) {
+		return 1.0f;
+	}
+	const JPH::BodyID ground_id = jolt_character->GetGroundBodyID();
+	if (!ground_id.IsInvalid() && space != nullptr) {
+		JPH::BodyLockRead lock(space->get_physics_system().GetBodyLockInterface(), ground_id);
+		if (lock.SucceededAndIsInBroadPhase() && lock.GetBody().GetMotionType() == JPH::EMotionType::Dynamic) {
+			const float inv_m = lock.GetBody().GetMotionProperties()->GetInverseMass();
+			if (inv_m > 0.0f) {
+				const float m = 1.0f / inv_m;
+				return m / (m + character_mass);
+			}
+		}
+	}
+	return 1.0f;
 }
 
 Vector3 JoltCharacterVirtual3D::get_character_position() const {
@@ -713,6 +800,9 @@ void JoltCharacterVirtual3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_character_padding", "pad"), &JoltCharacterVirtual3D::set_character_padding);
 	ClassDB::bind_method(D_METHOD("get_character_padding"), &JoltCharacterVirtual3D::get_character_padding);
 
+	ClassDB::bind_method(D_METHOD("set_penetration_recovery_speed", "speed"), &JoltCharacterVirtual3D::set_penetration_recovery_speed);
+	ClassDB::bind_method(D_METHOD("get_penetration_recovery_speed"), &JoltCharacterVirtual3D::get_penetration_recovery_speed);
+
 	ClassDB::bind_method(D_METHOD("set_max_slope_angle_deg", "deg"), &JoltCharacterVirtual3D::set_max_slope_angle_deg);
 	ClassDB::bind_method(D_METHOD("get_max_slope_angle_deg"), &JoltCharacterVirtual3D::get_max_slope_angle_deg);
 
@@ -744,6 +834,7 @@ void JoltCharacterVirtual3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_ground_normal"), &JoltCharacterVirtual3D::get_ground_normal);
 	ClassDB::bind_method(D_METHOD("get_ground_state"), &JoltCharacterVirtual3D::get_ground_state);
 	ClassDB::bind_method(D_METHOD("get_ground_velocity"), &JoltCharacterVirtual3D::get_ground_velocity);
+	ClassDB::bind_method(D_METHOD("get_ground_coupling"), &JoltCharacterVirtual3D::get_ground_coupling);
 	ClassDB::bind_method(D_METHOD("get_character_position"), &JoltCharacterVirtual3D::get_character_position);
 	ClassDB::bind_method(D_METHOD("get_character_velocity"), &JoltCharacterVirtual3D::get_character_velocity);
 
@@ -753,6 +844,7 @@ void JoltCharacterVirtual3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "max_strength", PROPERTY_HINT_RANGE, "0.0,10000.0,1.0"), "set_max_strength", "get_max_strength");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "predictive_contact_distance", PROPERTY_HINT_RANGE, "0.001,1.0,0.001"), "set_predictive_contact_distance", "get_predictive_contact_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "character_padding", PROPERTY_HINT_RANGE, "0.001,0.5,0.001"), "set_character_padding", "get_character_padding");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "penetration_recovery_speed", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_penetration_recovery_speed", "get_penetration_recovery_speed");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "max_slope_angle_deg", PROPERTY_HINT_RANGE, "0.0,90.0,0.5"), "set_max_slope_angle_deg", "get_max_slope_angle_deg");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "up_direction"), "set_up_direction", "get_up_direction");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "collision_layer", PROPERTY_HINT_LAYERS_3D_PHYSICS), "set_collision_layer", "get_collision_layer");

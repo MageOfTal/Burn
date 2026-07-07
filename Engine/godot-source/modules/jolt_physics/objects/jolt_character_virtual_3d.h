@@ -56,6 +56,8 @@ private:
 	struct ContactListener : public JPH::CharacterContactListener {
 		JPH::Vec3 up = JPH::Vec3(0.0f, 1.0f, 0.0f);
 		float cos_max_slope = 0.6427876f; // cos(50°); set from max_slope_angle_deg at creation
+		JPH::PhysicsSystem *system = nullptr; // body lookups (dynamic support velocity/coupling); set at creation
+		float char_mass = 70.0f; // mirrors character_mass; set at creation
 		bool had_walkable_reseat = false; // set when a walkable contact re-seated us this step; tells a later wall contact to forfeit the orphaned climb-vertical
 		int solve_calls = 0;       // DEBUG: how many times OnContactSolve fired in the current ExtendedUpdate
 		int solve_reseats = 0;     // DEBUG: how many of those actually re-seated the velocity
@@ -164,6 +166,9 @@ public:
 	void set_character_padding(float p_pad) { character_padding = p_pad; }
 	float get_character_padding() const { return character_padding; }
 
+	void set_penetration_recovery_speed(float p_speed) { penetration_recovery_speed = p_speed; }
+	float get_penetration_recovery_speed() const { return penetration_recovery_speed; }
+
 	void set_max_slope_angle_deg(float p_deg) { max_slope_angle_deg = p_deg; }
 	float get_max_slope_angle_deg() const { return max_slope_angle_deg; }
 
@@ -257,6 +262,9 @@ public:
 	// Velocity of the surface the character is standing on (moving platforms);
 	// zero on static ground or in air.
 	Vector3 get_ground_velocity() const;
+	// Coupling fraction of the current support (1.0 static/kinematic,
+	// m/(m + character_mass) for dynamic bodies) — scales the ground-carry.
+	float get_ground_coupling() const;
 	Vector3 get_character_position() const;
 	Vector3 get_character_velocity() const;
 };

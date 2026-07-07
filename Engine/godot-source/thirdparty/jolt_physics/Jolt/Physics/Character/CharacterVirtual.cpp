@@ -659,6 +659,9 @@ void CharacterVirtual::DetermineConstraints(TempContactList &inContacts, float i
 		Vec3 contact_velocity = c.mLinearVelocity;
 
 		// Penetrating contact: Add a contact velocity that pushes the character out at the desired speed
+		// (2026-07-04: a 4 m/s recovery-velocity cap briefly lived here; reverted at the user's request
+		// pending an in-game capture of the block-vs-wall phasing it was reasoned from — the ramp-safety
+		// role is covered by the reduced penetration_recovery_speed on the player's character instead.)
 		if (c.mDistance < 0.0f)
 			contact_velocity -= c.mContactNormal * c.mDistance * mPenetrationRecoverySpeed / inDeltaTime;
 
