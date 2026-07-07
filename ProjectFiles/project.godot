@@ -30,6 +30,10 @@ ZoneManager="*res://autoloads/zone_manager.gd"
 DebugFreecam="*res://autoloads/debug_freecam.gd"
 DebrisManager="*res://autoloads/debris_manager.gd"
 Profiler="*res://autoloads/profiler.gd"
+ClusterPool="*res://autoloads/cluster_pool.gd"
+FragmentPool="*res://autoloads/fragment_pool.gd"
+ClusterSync="*res://autoloads/cluster_sync.gd"
+StressSolver="*res://autoloads/stress_solver.gd"
 
 [display]
 
@@ -152,10 +156,10 @@ forfeit={
 
 [physics]
 
-3d/run_on_separate_thread=true
 common/max_physics_steps_per_frame=256
 3d/physics_engine="Jolt Physics"
 jolt_physics_3d/simulation/velocity_steps=30
 jolt_physics_3d/simulation/position_steps=6
+jolt_physics_3d/simulation/body_pair_contact_cache_distance_threshold=0.05
 jolt_physics_3d/limits/max_bodies=300000
 common/physics_interpolation=true

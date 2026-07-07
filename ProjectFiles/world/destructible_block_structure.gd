@@ -71,7 +71,8 @@ var _collision_body: StaticBody3D = null
 ## Smooth collision mesh shape RID (ConcavePolygonShape3D / trimesh).
 ## Jolt's MeshShape has internal edge smoothing — eliminates ghost collisions
 ## at block boundaries that compound box shapes suffer from.
-var _smooth_shape_rids: Array[RID] = []  ## One RID per cuboid in greedy box decomposition
+var _smooth_shape_rids: Array = []  ## One RID per cuboid in greedy box decomposition
+									## (untyped because C++ kernel returns plain Array)
 
 ## Cached debris config from subclass (populated in _ready)
 var _debris_size: float = 0.15
@@ -101,21 +102,122 @@ var _is_falling: bool = false
 var _fall_velocity: float = 0.0
 var _fall_ray_local: Vector3 = Vector3.ZERO  ## Bottom-center of blocks in local space
 
-## Persistent stress-solver state. Holds steady-state contact compression/shear
-## and ground-connectivity from the previous solve. Empty Dictionary triggers
-## a full solve on the next _check_structural_integrity() call.
-##
-## Keys (set by C++):
-##   "contact_compression": PackedFloat32Array(grid_size * 6)
-##   "contact_shear":       PackedFloat32Array(grid_size * 6)
-##   "visited":             PackedByteArray(grid_size)
-##   "last_block_count":    int — used for staleness detection
+## Persistent stress-solver state. Currently unused — kept for the future
+## localized-solver path. See BOND_GRAPH_PLAN.md.
 var _stress_persistent_state: Dictionary = {}
 
-## Flat indices of blocks destroyed since the last stress solve. Seeds the
-## localized propagation in calc_stress_integrity_localized — the solver only
-## re-propagates from blocks adjacent to these. Cleared after each solve.
+## Flat indices of blocks destroyed since the last stress solve. Currently unused.
 var _stress_dirty_seeds: PackedInt32Array = PackedInt32Array()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bond graph state (see BOND_GRAPH_PLAN.md)
+#
+# Each bond connects two adjacent occupied blocks. Storage is canonical: a
+# bond is owned by the lower-indexed of the two blocks. Per-block, we store
+# 3 bonds — the +X, +Y, +Z neighbors. Bonds in the -X/-Y/-Z direction are
+# owned by the *neighbor* in that direction.
+#
+# Indexing: bond_idx = block_grid_idx * 3 + axis, where axis ∈ {0=X, 1=Y, 2=Z}.
+#
+# A bond is INTACT when _bond_strength[i] > 0 and _bond_broken[i] == 0.
+# A bond is BROKEN when _bond_broken[i] != 0 OR when either of its endpoint
+# blocks is gone from _block_hp_dict.
+#
+# Bonds at the structure boundary (no neighbor) have strength 0 and are
+# pre-marked broken — ignored.
+# ─────────────────────────────────────────────────────────────────────────────
+
+## Maximum damage each bond can absorb before breaking. Sized grid_size * 3.
+var _bond_strength: PackedFloat32Array = PackedFloat32Array()
+
+## Accumulated damage on each bond. Sized grid_size * 3. Compared against
+## _bond_strength to determine if a bond should break.
+var _bond_damage: PackedFloat32Array = PackedFloat32Array()
+
+## 1 if bond is broken, 0 if intact. Sized grid_size * 3.
+var _bond_broken: PackedByteArray = PackedByteArray()
+
+# ─── Terrain anchor bonds (one per block) ────────────────────────────────
+# Each block in `_ground_mask` has an additional "bond to terrain" that holds
+# it in place against gravity. These bonds break the same way inter-block
+# bonds do — accumulate damage from blasts/bullets/impacts, snap when damage
+# exceeds strength. Once a block's anchor breaks, it stops being a BFS seed
+# and can be detached as a free cluster like any unsupported block.
+#
+# Sized grid_size (one entry per block, vs grid_size*3 for inter-block bonds).
+# Index is the same flat grid index as _block_grid.
+var _anchor_bond_strength: PackedFloat32Array = PackedFloat32Array()
+var _anchor_bond_damage: PackedFloat32Array = PackedFloat32Array()
+var _anchor_bond_broken: PackedByteArray = PackedByteArray()
+
+## Multiplier from block HP to bond strength. Tunable. Higher = bonds are
+## tougher than the blocks they connect; structures hold together longer
+## under marginal damage.
+var bond_strength_factor: float = 1.0
+
+## How much damage to apply per unit of explosion energy. Tunable. The
+## explosion path passes its `structure_damage` × this factor as the energy
+## value to damage_bonds_in_radius.
+var bond_damage_explosion_factor: float = 0.5
+
+
+## How much bond damage a bullet inflicts on the bonds touching the hit block,
+## as a fraction of the block damage applied. 0.5 = each bond touching the hit
+## block takes 50% of the block damage value.
+var bond_damage_bullet_factor: float = 0.5
+
+## How much bond damage a momentum impact inflicts in a small radius around
+## the impact point. Multiplies the impact damage value passed to
+## take_momentum_damage_at.
+var bond_damage_momentum_factor: float = 0.75
+
+## Radius (in world units) around a momentum impact within which bonds take
+## damage. Kept small so heavy collisions weaken local supports without
+## propagating through the whole structure.
+var bond_damage_momentum_radius: float = 1.5
+
+## Bonds-only destruction mode. When true, blocks never lose HP from damage —
+## only bonds accumulate damage. Blocks "die" only when the connectivity check
+## detaches them as part of a falling cluster. Faithful to The Finals model.
+var bonds_only_destruction: bool = true
+
+# ─── Gravity stress solver (see GRAVITY_STRESS_PLAN.md) ─────────────────────
+# Quasi-static elastic-brittle analysis: 6-DOF blocks joined by glued-face
+# interfaces that carry force AND moment. Runs inside the integrity check when
+# the bond graph changed; breaks interfaces whose combined edge stress exceeds
+# capacity, then the ordinary connectivity check detaches whatever came loose.
+# Capacities couple to bond damage (κ = 1 − damage/strength): blast-weakened
+# joints hold less, so explosions weaken and gravity finishes the job.
+# Limits are in block-weight units. Tension governs overhangs via bending:
+# a 1-thick cantilever survives n ≤ √(tension/3) blocks; a 1-thick roof span
+# supported at both ends survives ~√(8·tension/6) blocks. Default 90 →
+# cantilever ≈5 blocks (2.7m), roof span ≈11 blocks (5.5m) — strict enough
+# that bad builds collapse, forgiving enough that typical map geometry
+# survives the spawn check. Drop toward 50 for harsher realism.
+
+## Tensile capacity of a pristine bond, in block-weights.
+var stress_tension_blocks: float = 90.0
+
+## Compressive capacity, in block-weights (~10× tension, masonry-like).
+var stress_compression_blocks: float = 900.0
+
+## Shear capacity, in block-weights (0.75× tension, brittle materials).
+var stress_shear_blocks: float = 67.5
+
+## True when bond/anchor damage or topology changed since the last gravity
+## solve. Cleared when the solver runs; keeps the (ms-scale) solve off the
+## per-bullet hot path when nothing structural actually changed.
+var _gravity_stress_dirty: bool = false
+
+## Async gravity solve. On big structures a solve is tens-to-hundreds of ms
+## of CPU — far too much to block the main thread (the original synchronous
+## call was THE rocket-lag spike: ~476ms on the 17k-block house). Solves run
+## on StressSolver's dedicated thread against COW snapshots of the bond
+## arrays; the result merges back in _physics_process 1-N frames later. The
+## merge is safe because the solver only SETS broken flags — OR-ing with live
+## state can't resurrect a bond, and damage accumulated during the solve is
+## preserved.
+var _gravity_task_id: int = -1
 
 
 # ======================================================================
@@ -156,7 +258,7 @@ func _build_foundation() -> void:
 	## then extend the grid downward so foundation blocks reach into terrain.
 	var space_state := get_world_3d().direct_space_state
 	if space_state == null:
-		print("[Foundation] %s  SKIP: no space_state" % name)
+		GameManager.plog("[Foundation] %s  SKIP: no space_state" % name)
 		return
 
 	# For each (bx, bz) column, find the lowest occupied block and raycast down.
@@ -203,7 +305,7 @@ func _build_foundation() -> void:
 					column_depths[bx * _num_z + bz] = rows
 					max_extra_rows = maxi(max_extra_rows, rows)
 
-	print("[Foundation] %s  rays=%d  hits=%d  max_extra=%d  pos=%s" % [
+	GameManager.plog("[Foundation] %s  rays=%d  hits=%d  max_extra=%d  pos=%s" % [
 		name, ray_count, hit_count, max_extra_rows, str(global_position)])
 
 	if max_extra_rows == 0:
@@ -254,9 +356,18 @@ func _build_foundation() -> void:
 	_block_hp_dict = new_hp_dict
 	_block_grid = new_grid
 
-	# Build ground mask: lowest occupied block per column is the terrain anchor.
+	# Build ground mask: every foundation block is a terrain anchor (not just
+	# the lowest one). If we only anchored the bottom row, a bond breaking
+	# between foundation rows would let the upper foundation rows "detach"
+	# into a falling cluster, which renders with the structure's wall material
+	# and looks like the foundation just changed color.
 	_ground_mask.resize(new_grid_size)
 	_ground_mask.fill(0)
+	for i in _foundation_grid.size():
+		if _foundation_grid[i] == 1:
+			_ground_mask[i] = 1
+	# Also anchor the lowest occupied block per column for any column whose
+	# foundation didn't reach the rest of the structure (defensive).
 	for bx in _num_x:
 		for bz in _num_z:
 			for by in _num_y:
@@ -264,10 +375,15 @@ func _build_foundation() -> void:
 					_ground_mask[_grid_idx_raw(bx, by, bz, _num_y, _num_z)] = 1
 					break
 
+	# Grid grew in Y (foundation rows added), so the bond arrays we sized at
+	# initial setup are now too small. Re-init from the expanded grid before
+	# any damage event tries to index past the old end.
+	_init_bond_graph()
+
 	# Shift structure down to keep original blocks at the same world position.
 	global_position.y -= max_extra_rows * BLOCK_SIZE * 0.5
 
-	print("[Foundation] %s  extra_rows=%d  new_num_y=%d  foundation_blocks=%d  total_blocks=%d  shift=%.2f" % [
+	GameManager.plog("[Foundation] %s  extra_rows=%d  new_num_y=%d  foundation_blocks=%d  total_blocks=%d  shift=%.2f" % [
 		name, max_extra_rows, _num_y, foundation_count, _block_hp_dict.size(),
 		max_extra_rows * BLOCK_SIZE * 0.5])
 
@@ -310,7 +426,7 @@ func _build_ground_mask() -> void:
 				break  # only check lowest block per column
 
 	if grounded > 0:
-		print("[GroundMask] %s  grounded=%d/%d columns" % [name, grounded, _num_x * _num_z])
+		GameManager.plog("[GroundMask] %s  grounded=%d/%d columns" % [name, grounded, _num_x * _num_z])
 
 
 static var _foundation_material: StandardMaterial3D
@@ -328,10 +444,16 @@ func _deferred_build_foundation() -> void:
 	if _num_y == old_num_y:
 		var _t_gm := Time.get_ticks_usec()
 		_build_ground_mask()
+		# The anchor bonds were initialized in _ready() against an all-zero
+		# ground mask (all pre-broken). Re-init from the real mask, otherwise
+		# the structure has no effective anchors and detaches wholesale on the
+		# first integrity check.
+		_init_anchor_bonds()
 		var _t_gm_us := Time.get_ticks_usec() - _t_gm
 		var _t_foundation_us := Time.get_ticks_usec() - _t_foundation_total
-		print("[PERF] _deferred_build_foundation %s (no expand): build=%dus ground_mask=%dus total=%dus" % [
+		GameManager.plog("[PERF] _deferred_build_foundation %s (no expand): build=%dus ground_mask=%dus total=%dus" % [
 			name, _t_build_us, _t_gm_us, _t_foundation_us])
+		_queue_creation_integrity_check()
 		return
 
 	# Grid expanded — rebuild everything.
@@ -400,8 +522,303 @@ func _deferred_build_foundation() -> void:
 	var _t_hitbody_us := Time.get_ticks_usec() - _t_hitbody
 
 	var _t_foundation_us := Time.get_ticks_usec() - _t_foundation_total
-	print("[PERF] _deferred_build_foundation %s (expanded): build=%dus mesh=%dus foundation_mesh=%dus collision=%dus hitbody=%dus total=%dus blocks=%d" % [
+	GameManager.plog("[PERF] _deferred_build_foundation %s (expanded): build=%dus mesh=%dus foundation_mesh=%dus collision=%dus hitbody=%dus total=%dus blocks=%d" % [
 		name, _t_build_us, _t_mesh_rebuild_us, _t_foundation_mesh_us, _t_col_rebuild_us, _t_hitbody_us, _t_foundation_us, _block_hp_dict.size()])
+	_queue_creation_integrity_check()
+
+
+func _queue_creation_integrity_check() -> void:
+	## Called once the foundation pass has produced real terrain anchors.
+	## Runs the first integrity check (gravity stress + connectivity) so a
+	## structure built with inadequate support collapses at spawn — no damage
+	## required. Server-only; clients receive the result via detach RPCs.
+	if not multiplayer.is_server():
+		return
+	if not GameManager.gravity_stress_enabled:
+		return
+	_gravity_stress_dirty = true
+	if not _integrity_check_pending:
+		_integrity_check_pending = true
+		call_deferred("_deferred_integrity_check")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bond graph (see BOND_GRAPH_PLAN.md)
+# ─────────────────────────────────────────────────────────────────────────────
+
+const _BOND_AXIS_X: int = 0
+const _BOND_AXIS_Y: int = 1
+const _BOND_AXIS_Z: int = 2
+
+
+func _bond_idx(block_grid_idx: int, axis: int) -> int:
+	## Canonical bond index. The bond is owned by the lower-indexed block
+	## (this one) and connects to its neighbor in +axis direction.
+	return block_grid_idx * 3 + axis
+
+
+func _bond_idx_at(bx: int, by: int, bz: int, axis: int) -> int:
+	return (bx * _num_y * _num_z + by * _num_z + bz) * 3 + axis
+
+
+func _has_neighbor(bx: int, by: int, bz: int, axis: int) -> bool:
+	## True if (bx, by, bz) has a +axis neighbor inside the grid AND that
+	## neighbor is currently occupied (block exists in _block_grid).
+	if axis == _BOND_AXIS_X:
+		if bx + 1 >= _num_x:
+			return false
+		return _block_grid[_grid_idx(bx + 1, by, bz)] == 1
+	elif axis == _BOND_AXIS_Y:
+		if by + 1 >= _num_y:
+			return false
+		return _block_grid[_grid_idx(bx, by + 1, bz)] == 1
+	else:
+		if bz + 1 >= _num_z:
+			return false
+		return _block_grid[_grid_idx(bx, by, bz + 1)] == 1
+
+
+func _init_bond_graph() -> void:
+	## C++ kernel populates strengths for every adjacent pair in _block_grid.
+	## Single-block structures skip — nothing to bond to, naturally inert.
+	if _block_hp_dict.size() < 2:
+		_bond_strength = PackedFloat32Array()
+		_bond_damage = PackedFloat32Array()
+		_bond_broken = PackedByteArray()
+		_anchor_bond_strength = PackedFloat32Array()
+		_anchor_bond_damage = PackedFloat32Array()
+		_anchor_bond_broken = PackedByteArray()
+		return
+	var strength := _block_hp * bond_strength_factor
+	var result: Dictionary = BlockMeshBuilder.compute_bond_graph(
+		_block_grid, _num_x, _num_y, _num_z, strength)
+	_bond_strength = result["bond_strength"]
+	_bond_damage = result["bond_damage"]
+	_bond_broken = result["bond_broken"]
+	_init_anchor_bonds()
+
+
+func _init_anchor_bonds() -> void:
+	## Set up the per-block terrain anchor bond from the current ground mask.
+	## Each block that touches terrain gets an anchor bond with the same
+	## strength as a regular inter-block bond. Other blocks are pre-broken
+	## (treated as having no anchor) so they can never seed the BFS.
+	## Reads _ground_mask, so call AFTER the foundation pass populates it.
+	var grid_size := _block_grid.size()
+	_anchor_bond_strength.resize(grid_size)
+	_anchor_bond_damage.resize(grid_size)
+	_anchor_bond_broken.resize(grid_size)
+	_anchor_bond_strength.fill(0.0)
+	_anchor_bond_damage.fill(0.0)
+	_anchor_bond_broken.fill(1)
+	if _ground_mask.size() != grid_size:
+		return
+	var anchor_strength: float = _block_hp * bond_strength_factor
+	for i in grid_size:
+		if _ground_mask[i] == 1 and _block_grid[i] == 1:
+			_anchor_bond_strength[i] = anchor_strength
+			_anchor_bond_broken[i] = 0
+
+
+func _damage_anchors_in_radius(world_pos: Vector3, energy: float, radius: float) -> int:
+	## Damage terrain anchor bonds within `radius` of world_pos. Same cubic
+	## falloff as the inter-block bond kernel (no DDA shielding here — anchors
+	## are local to each block; their "strength" already factors in bedrock).
+	## Returns number of anchors that broke.
+	if radius <= 0.0 or energy <= 0.0:
+		return 0
+	if _anchor_bond_strength.is_empty():
+		return 0
+	var inv_radius := 1.0 / radius
+	var ny_nz := _num_y * _num_z
+	var grid_size := _block_grid.size()
+	var local_hit: Vector3 = global_transform.affine_inverse() * world_pos
+	var broken := 0
+	# Spatial pre-filter — skip blocks well outside radius.
+	var r_blocks := radius / BLOCK_SIZE + 1.0
+	var min_bx: int = maxi(0, int(local_hit.x / BLOCK_SIZE + _num_x * 0.5 - r_blocks))
+	var max_bx: int = mini(_num_x, int(local_hit.x / BLOCK_SIZE + _num_x * 0.5 + r_blocks) + 1)
+	var min_by: int = maxi(0, int(local_hit.y / BLOCK_SIZE + _num_y * 0.5 - r_blocks))
+	var max_by: int = mini(_num_y, int(local_hit.y / BLOCK_SIZE + _num_y * 0.5 + r_blocks) + 1)
+	var min_bz: int = maxi(0, int(local_hit.z / BLOCK_SIZE + _num_z * 0.5 - r_blocks))
+	var max_bz: int = mini(_num_z, int(local_hit.z / BLOCK_SIZE + _num_z * 0.5 + r_blocks) + 1)
+	for bx in range(min_bx, max_bx):
+		for by in range(min_by, max_by):
+			for bz in range(min_bz, max_bz):
+				var idx := bx * ny_nz + by * _num_z + bz
+				if idx >= grid_size:
+					continue
+				if _anchor_bond_broken[idx] != 0:
+					continue
+				if _ground_mask[idx] != 1 or _block_grid[idx] != 1:
+					continue
+				var bp := Vector3(
+					(bx + 0.5 - _num_x * 0.5) * BLOCK_SIZE,
+					(by + 0.5 - _num_y * 0.5) * BLOCK_SIZE,
+					(bz + 0.5 - _num_z * 0.5) * BLOCK_SIZE)
+				var d := local_hit.distance_to(bp)
+				if d > radius:
+					continue
+				var norm_d := d * inv_radius
+				var falloff: float = 1.0 / (1.0 + (norm_d * 3.0) ** 3)
+				_anchor_bond_damage[idx] += energy * falloff
+				if _anchor_bond_damage[idx] >= _anchor_bond_strength[idx]:
+					_anchor_bond_broken[idx] = 1
+					broken += 1
+	return broken
+
+
+func _bond_world_midpoint(block_grid_idx: int, axis: int) -> Vector3:
+	## World-space midpoint of a bond, useful for distance checks during
+	## radial damage application.
+	var rem := block_grid_idx % (_num_y * _num_z)
+	var bx := block_grid_idx / (_num_y * _num_z)
+	var by := rem / _num_z
+	var bz := rem % _num_z
+	var local := _block_local_pos(Vector3i(bx, by, bz))
+	# Offset toward +axis neighbor by half a block.
+	var off := 0.5 * BLOCK_SIZE
+	if axis == _BOND_AXIS_X:
+		local.x += off
+	elif axis == _BOND_AXIS_Y:
+		local.y += off
+	else:
+		local.z += off
+	return global_transform * local
+
+
+func damage_bonds_in_radius(world_pos: Vector3, energy: float, radius: float) -> int:
+	## Apply radial bond damage with DDA voxel-walk shielding. Each bond inside
+	## the blast radius gets `energy × cubic_falloff(d) − absorbed_along_ray`
+	## damage; absorption is the sum of block HPs the ray crosses on its way
+	## from blast → bond. Offloaded to C++ (BlockMeshBuilder.damage_bonds_radial_shielded).
+	## Returns the number of bonds that broke this call (for diagnostics).
+	if radius <= 0.0 or energy <= 0.0:
+		return 0
+	if _bond_strength.is_empty():
+		return 0
+
+	# C++ kernel works in the structure's LOCAL coordinates.
+	var hit_local: Vector3 = global_transform.affine_inverse() * world_pos
+	var result: Dictionary = BlockMeshBuilder.damage_bonds_radial_shielded(
+		_block_grid, _bond_strength, _bond_damage, _bond_broken,
+		_num_x, _num_y, _num_z, BLOCK_SIZE,
+		hit_local, energy, radius, _block_hp)
+
+	_bond_damage = result["bond_damage"]
+	_bond_broken = result["bond_broken"]
+	var broken: int = result["broken"]
+	var damaged: int = result["damaged"]
+
+	# Same blast also damages terrain anchors. Without this, the foundation
+	# can't fragment — every foundation block is its own BFS seed and BFS
+	# never sees an "unsupported" component. Anchors break with the same
+	# falloff curve, so a direct hit reliably tears the foundation.
+	var anchor_broken := _damage_anchors_in_radius(world_pos, energy, radius)
+
+	if damaged > 0 or broken > 0 or anchor_broken > 0:
+		# Bond capacities changed (κ = 1 − damage/strength) — the next
+		# integrity check must re-run the gravity stress solve.
+		_gravity_stress_dirty = true
+		GameManager.plog("[BondGraph] %s blast pos=%s energy=%.1f r=%.1f → damaged=%d broken=%d anchor_broken=%d" % [
+			name, str(world_pos).substr(0, 30), energy, radius, damaged, broken, anchor_broken])
+
+	return broken
+
+
+func _damage_bonds_at_block(key: Vector3i, energy: float) -> int:
+	## Apply `energy` damage to every intact bond touching the block at `key`.
+	## Used by the bullet path: a hitscan hit damages local bonds in addition
+	## to dealing block HP damage. Returns the number of bonds that broke.
+	if energy <= 0.0 or _bond_strength.is_empty():
+		return 0
+	_gravity_stress_dirty = true  # capacities shrink even when nothing breaks
+	var here_idx := _grid_idx(key.x, key.y, key.z)
+	var broken := 0
+
+	# This block's own +X/+Y/+Z bonds.
+	for axis in 3:
+		var bi := here_idx * 3 + axis
+		if _bond_broken[bi] != 0:
+			continue
+		_bond_damage[bi] += energy
+		if _bond_damage[bi] >= _bond_strength[bi]:
+			_bond_broken[bi] = 1
+			broken += 1
+
+	# Neighbor-owned bonds (-X/-Y/-Z).
+	if key.x > 0:
+		var bi := _grid_idx(key.x - 1, key.y, key.z) * 3 + _BOND_AXIS_X
+		if _bond_broken[bi] == 0:
+			_bond_damage[bi] += energy
+			if _bond_damage[bi] >= _bond_strength[bi]:
+				_bond_broken[bi] = 1
+				broken += 1
+	if key.y > 0:
+		var bi := _grid_idx(key.x, key.y - 1, key.z) * 3 + _BOND_AXIS_Y
+		if _bond_broken[bi] == 0:
+			_bond_damage[bi] += energy
+			if _bond_damage[bi] >= _bond_strength[bi]:
+				_bond_broken[bi] = 1
+				broken += 1
+	if key.z > 0:
+		var bi := _grid_idx(key.x, key.y, key.z - 1) * 3 + _BOND_AXIS_Z
+		if _bond_broken[bi] == 0:
+			_bond_damage[bi] += energy
+			if _bond_damage[bi] >= _bond_strength[bi]:
+				_bond_broken[bi] = 1
+				broken += 1
+
+	# Also damage the block's terrain anchor (if it has one). A bullet hitting
+	# a foundation block weakens its anchor, same way it weakens its bonds to
+	# neighbors.
+	var here_grid_idx := here_idx
+	if here_grid_idx < _anchor_bond_strength.size() and _anchor_bond_broken[here_grid_idx] == 0:
+		_anchor_bond_damage[here_grid_idx] += energy
+		if _anchor_bond_damage[here_grid_idx] >= _anchor_bond_strength[here_grid_idx]:
+			_anchor_bond_broken[here_grid_idx] = 1
+
+	return broken
+
+
+func _break_block_bonds(key: Vector3i) -> int:
+	## When a block is destroyed (HP→0), all 6 bonds touching it must break.
+	## 3 are owned by this block (+X, +Y, +Z); 3 are owned by lower-indexed
+	## neighbors (-X, -Y, -Z). Returns the number of bonds newly broken.
+	if _bond_strength.is_empty():
+		return 0
+	_gravity_stress_dirty = true  # topology changed — loads redistribute
+	var here_idx := _grid_idx(key.x, key.y, key.z)
+	var broken := 0
+
+	# This block's own bonds.
+	for axis in 3:
+		var bi := here_idx * 3 + axis
+		if _bond_broken[bi] == 0:
+			_bond_broken[bi] = 1
+			broken += 1
+
+	# Neighbor-owned bonds (the -X, -Y, -Z directions).
+	if key.x > 0:
+		var nidx := _grid_idx(key.x - 1, key.y, key.z)
+		var bi := nidx * 3 + _BOND_AXIS_X
+		if _bond_broken[bi] == 0:
+			_bond_broken[bi] = 1
+			broken += 1
+	if key.y > 0:
+		var nidx := _grid_idx(key.x, key.y - 1, key.z)
+		var bi := nidx * 3 + _BOND_AXIS_Y
+		if _bond_broken[bi] == 0:
+			_bond_broken[bi] = 1
+			broken += 1
+	if key.z > 0:
+		var nidx := _grid_idx(key.x, key.y, key.z - 1)
+		var bi := nidx * 3 + _BOND_AXIS_Z
+		if _bond_broken[bi] == 0:
+			_bond_broken[bi] = 1
+			broken += 1
+
+	return broken
 
 
 func _create_structure_material(tier_info: Dictionary) -> StandardMaterial3D:
@@ -512,6 +929,10 @@ func _ready() -> void:
 		if not is_detach:
 			_foundation_pending = true
 
+	# Initialize bond graph from the populated block grid. Each pair of
+	# adjacent occupied blocks gets a bond at the canonical lower-block side.
+	_init_bond_graph()
+
 	# Build compound hit body (one StaticBody3D with N shapes, layer 11).
 	_compound_hit_body = StaticBody3D.new()
 	_compound_hit_body.set_script(_compound_body_script)
@@ -558,7 +979,7 @@ func _ready() -> void:
 
 	var ready_total := Time.get_ticks_usec() - t_blocks
 	if ready_total > 5000:
-		print("[StructureReady] %s  blocks=%d  spawn_blocks=%dus  greedy_mesh=%dus  smooth_col=%dus  total=%dus%s" % [
+		GameManager.plog("[StructureReady] %s  blocks=%d  spawn_blocks=%dus  greedy_mesh=%dus  smooth_col=%dus  total=%dus%s" % [
 			name, _block_hp_dict.size(),
 			t_blocks_end - t_blocks,
 			t_mesh_end - t_mesh,
@@ -590,6 +1011,12 @@ func _ready() -> void:
 
 
 func _exit_tree() -> void:
+	# A gravity solve may still be queued/running on the StressSolver thread;
+	# it holds COW snapshots, not references to this node. Cancel so the
+	# result is discarded instead of accumulating in the solver's table.
+	if _gravity_task_id >= 0:
+		StressSolver.cancel(_gravity_task_id)
+		_gravity_task_id = -1
 	for rid in _smooth_shape_rids:
 		if rid.is_valid():
 			PhysicsServer3D.free_rid(rid)
@@ -605,7 +1032,7 @@ func _process(_delta: float) -> void:
 		_rebuild_greedy_mesh()
 		var t_mesh_end := Time.get_ticks_usec()
 		var _mesh_us := t_mesh_end - t_mesh
-		print("[GreedyMesh] %s  blocks=%d  time=%dus" % [name, _block_hp_dict.size(), _mesh_us])
+		GameManager.plog("[GreedyMesh] %s  blocks=%d  time=%dus" % [name, _block_hp_dict.size(), _mesh_us])
 		GameManager.frame_add("greedy_mesh", _mesh_us)
 		set_process(false)
 	Profiler.end("destructible_mesh")
@@ -618,12 +1045,15 @@ func _physics_process(delta: float) -> void:
 	if _foundation_pending:
 		_foundation_pending = false
 		_deferred_build_foundation()
-		if not _is_falling:
+		if not _is_falling and _gravity_task_id < 0:
 			set_physics_process(false)
 			Profiler.end("destructible_physics")
 			return
+	if _gravity_task_id >= 0:
+		_poll_gravity_solve()
 	if not _is_falling:
-		set_physics_process(false)
+		if _gravity_task_id < 0:
+			set_physics_process(false)
 		Profiler.end("destructible_physics")
 		return
 
@@ -831,8 +1261,30 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 	Profiler.begin("struct_damage_block")
 	var t_dmg_total := Time.get_ticks_usec()
 	_last_attacker_id = _attacker_id
-	_block_hp_dict[key] -= amount
-	_update_compound_shielding_hp()
+	if not bonds_only_destruction:
+		_block_hp_dict[key] -= amount
+		_update_compound_shielding_hp()
+
+	# Bullet bond damage: every shot that lands on a block also damages the
+	# bonds touching it. Small per-hit damage, so a wall takes several rounds
+	# to weaken. Independent of block HP — bonds may break before the block
+	# itself dies, producing the "loosened wall" effect.
+	if amount > 0.0 and bond_damage_bullet_factor > 0.0 and not _bond_strength.is_empty():
+		var bullet_energy: float = amount * bond_damage_bullet_factor
+		var _broken := _damage_bonds_at_block(key, bullet_energy)
+		if _broken > 0:
+			GameManager.plog("[BondGraph] %s bullet key=%s energy=%.1f broke=%d" % [
+				name, str(key), bullet_energy, _broken])
+
+	# Bonds-only mode: never let HP drive destruction; queue a connectivity
+	# check so any newly-disconnected chunks fall.
+	if bonds_only_destruction:
+		if not _integrity_check_pending:
+			_integrity_check_pending = true
+			call_deferred("_deferred_integrity_check")
+		Profiler.end("struct_damage_block")
+		return
+
 	if _block_hp_dict[key] <= 0.0:
 		var block_pos: Vector3 = global_transform * _block_local_pos(key)
 		var debris_count := randi_range(1, 2)
@@ -853,6 +1305,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		_block_hp_dict.erase(key)
 		_clear_block_grids(key.x, key.y, key.z)
 		_mark_dirty_stress_seed(key)
+		_break_block_bonds(key)
 		var t_disable_us := Time.get_ticks_usec() - t_disable
 		_mesh_dirty = true
 		set_process(true)  # Wake up _process to rebuild mesh next frame
@@ -871,7 +1324,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		var t_debris_us := Time.get_ticks_usec() - t_debris
 
 		var dmg_us := Time.get_ticks_usec() - t_dmg_total
-		print("[PERF] _damage_block %s key=%s: disable=%dus smooth_col=%dus rpc=%dus debris=%dus total=%dus blocks=%d" % [
+		GameManager.plog("[PERF] _damage_block %s key=%s: disable=%dus smooth_col=%dus rpc=%dus debris=%dus total=%dus blocks=%d" % [
 			name, str(key), t_disable_us, t_col_us, t_rpc_us, t_debris_us, dmg_us, _block_hp_dict.size()])
 		GameManager.tick_add("damage_block", dmg_us)
 
@@ -909,7 +1362,7 @@ func _sync_block_destroyed(key: Vector3i, block_pos: Vector3 = Vector3.ZERO,
 	var _t_debris_us := Time.get_ticks_usec() - _t_debris
 	var _t_sync_us := Time.get_ticks_usec() - _t_sync
 	if _t_sync_us > 200:
-		print("[PERF] _sync_block_destroyed(client) %s key=%s: total=%dus blocks=%d" % [
+		GameManager.plog("[PERF] _sync_block_destroyed(client) %s key=%s: total=%dus blocks=%d" % [
 			name, str(key), _t_sync_us, _block_hp_dict.size()])
 
 
@@ -919,7 +1372,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	## explosion and a target block absorbs damage equal to its current HP.
 	## exclude_rids: physics bodies to ignore in shielding raycasts (e.g. the rocket).
 	Profiler.begin("struct_take_damage_at")
-	print("[TakeDamageAt-ENTRY] %s  blocks=%d  is_server=%s  hit_pos=%s  global_pos=%s" % [
+	GameManager.plog("[TakeDamageAt-ENTRY] %s  blocks=%d  is_server=%s  hit_pos=%s  global_pos=%s" % [
 		name, _block_hp_dict.size(), str(multiplayer.is_server()), str(hit_pos), str(global_position)])
 	if not multiplayer.is_server():
 		Profiler.end("struct_take_damage_at")
@@ -944,11 +1397,11 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 	var t_pass1 := Time.get_ticks_usec()
 	var t_query_setup := Time.get_ticks_usec()
 	var query: PhysicsRayQueryParameters3D = null
-	if space_state:
+	if space_state and not bonds_only_destruction:
 		query = ExplosionHelper._make_shielding_query(hit_pos, exclude_rids)
 	var t_query_setup_end := Time.get_ticks_usec()
 	var t_calc_explosion := Time.get_ticks_usec()
-	if space_state:
+	if space_state and not bonds_only_destruction:
 		var compound_rid := _compound_hit_body.get_rid() if (_compound_hit_body and is_instance_valid(_compound_hit_body)) else RID()
 		var repeat_count := 2000 if GameManager.debug_explosion_repeat else 1
 		for _i in repeat_count:
@@ -1053,9 +1506,19 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		_block_hp_dict.erase(key)
 		_clear_block_grids(key.x, key.y, key.z)
 		_mark_dirty_stress_seed(key)
+		# Block destruction cascades to bond breaks: all 6 bonds touching
+		# this block are now broken.
+		_break_block_bonds(key)
 	if destroyed_keys.size() > 0 and _compound_hit_body and is_instance_valid(_compound_hit_body):
 		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 	var t_erase_end := Time.get_ticks_usec()
+
+	# Damage bonds in the blast radius. Bonds may break on intact blocks too,
+	# producing the "weakened wall" effect — connectivity check after this
+	# call will detect any chunks now disconnected from ground.
+	if amount > 0.0 and blast_radius > 0.0:
+		var bond_energy: float = amount * bond_damage_explosion_factor
+		damage_bonds_in_radius(hit_pos, bond_energy, blast_radius)
 
 	# Draw debug rays if toggled on
 	var t_debug := Time.get_ticks_usec()
@@ -1117,15 +1580,17 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float, _attac
 		_rebuild_smooth_collision_mesh()
 	var t_columns_end := Time.get_ticks_usec()
 
-	# Batch structural integrity check after all blocks destroyed this frame
+	# Batch structural integrity check after all blocks destroyed this frame.
+	# In bonds-only mode, always run it — bonds may have broken even though
+	# no blocks died directly.
 	var t_integrity := Time.get_ticks_usec()
-	if destroyed_keys.size() > 0:
+	if destroyed_keys.size() > 0 or bonds_only_destruction:
 		_check_structural_integrity()
 	var t_integrity_end := Time.get_ticks_usec()
 
 	var t_total_end := Time.get_ticks_usec()
 	var _total_us := t_total_end - t_total
-	print("[TakeDamageAt] %s  blocks=%d  pass1=%dus(query=%d calc=%d)  erase=%dus  debris=%dus(rpcs=%d spawned=%d rpc_time=%d spawn_time=%d)  collision=%dus  integrity=%dus  destroyed=%d  total=%dus" % [
+	GameManager.plog("[TakeDamageAt] %s  blocks=%d  pass1=%dus(query=%d calc=%d)  erase=%dus  debris=%dus(rpcs=%d spawned=%d rpc_time=%d spawn_time=%d)  collision=%dus  integrity=%dus  destroyed=%d  total=%dus" % [
 		name, _block_hp_dict.size(),
 		t_pass1_end - t_pass1, t_query_setup_end - t_query_setup, t_calc_explosion_end - t_calc_explosion,
 		t_erase_end - t_erase,
@@ -1198,8 +1663,28 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	var hp_before: float = _block_hp_dict[target_key]
 	var absorbed: float = minf(damage, hp_before)
 
-	# Apply damage
-	_block_hp_dict[target_key] -= damage
+	# Apply damage (HP path skipped in bonds-only mode)
+	if not bonds_only_destruction:
+		_block_hp_dict[target_key] -= damage
+
+	# Bond damage: localized to the impact point. Heavy/fast collisions
+	# weaken nearby supports regardless of whether this single block dies.
+	if damage > 0.0 and bond_damage_momentum_factor > 0.0 and not _bond_strength.is_empty():
+		var momentum_energy: float = damage * bond_damage_momentum_factor
+		damage_bonds_in_radius(hit_world_pos, momentum_energy, bond_damage_momentum_radius)
+
+	# Bonds-only: never destroy blocks here. Queue a connectivity check so any
+	# newly-detached chunks fall this frame. Block returns "not destroyed" — the
+	# caller treats the impact as fully absorbed by the structure.
+	if bonds_only_destruction:
+		if not _integrity_check_pending:
+			_integrity_check_pending = true
+			call_deferred("_deferred_integrity_check")
+		var block_pos_local := _block_local_pos(target_key)
+		Profiler.end("struct_momentum_dmg")
+		return { "absorbed": absorbed, "block_destroyed": false,
+			"block_key": target_key, "block_pos": global_transform * block_pos_local }
+
 	if _block_hp_dict[target_key] > 0.0:
 		_update_compound_shielding_hp()
 		var block_pos_local := _block_local_pos(target_key)
@@ -1212,6 +1697,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	var ok_frac := clampf(-_block_hp_dict[target_key] / _block_hp, 0.0, 1.0)
 	var _t_erase := Time.get_ticks_usec()
 	_disable_hit_shape(target_key)
+	_break_block_bonds(target_key)
 	_block_hp_dict.erase(target_key)
 	_clear_block_grids(target_key.x, target_key.y, target_key.z)
 	_mark_dirty_stress_seed(target_key)
@@ -1239,7 +1725,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 		call_deferred("_deferred_integrity_check")
 
 	var _t_momentum_us := Time.get_ticks_usec() - _t_momentum_total
-	print("[PERF] take_momentum_damage_at %s key=%s: search=%dus erase=%dus smooth_col=%dus rpc=%dus debris=%dus total=%dus blocks=%d" % [
+	GameManager.plog("[PERF] take_momentum_damage_at %s key=%s: search=%dus erase=%dus smooth_col=%dus rpc=%dus debris=%dus total=%dus blocks=%d" % [
 		name, str(target_key), _t_search_us, _t_erase_us, _t_col_us, _t_rpc_us, _t_debris_us, _t_momentum_us, _block_hp_dict.size()])
 	GameManager.tick_add("momentum_damage", _t_momentum_us)
 	Profiler.end("struct_momentum_dmg")
@@ -1278,7 +1764,7 @@ func _deferred_integrity_check() -> void:
 	var t0 := Time.get_ticks_usec()
 	_check_structural_integrity()
 	var us := Time.get_ticks_usec() - t0
-	print("[PERF] _deferred_integrity_check %s: %dus  blocks=%d" % [name, us, _block_hp_dict.size()])
+	GameManager.plog("[PERF] _deferred_integrity_check %s: %dus  blocks=%d" % [name, us, _block_hp_dict.size()])
 	GameManager.tick_add("deferred_integrity", us)
 	if _block_hp_dict.is_empty():
 		_clear_physics_before_free()
@@ -1309,6 +1795,71 @@ func _mark_dirty_stress_seed(key: Vector3i) -> void:
 	_stress_dirty_seeds.append(_grid_idx(key.x, key.y, key.z))
 
 
+func _start_gravity_solve() -> void:
+	## Queue the gravity solve on StressSolver's dedicated thread. NOT on
+	## WorkerThreadPool: long solves there starved Jolt physics jobs and
+	## terrain chunk meshing (micro-stutter + map holes). The job dict holds
+	## COW snapshots — main-thread writes during the solve fork the buffers,
+	## the worker keeps reading its consistent snapshot — and carries no
+	## reference to this node, so freeing mid-solve is safe (see cancel()).
+	_gravity_task_id = StressSolver.submit_solve({
+		"grid": _block_grid,
+		"mask": _ground_mask,
+		"bond_strength": _bond_strength,
+		"bond_damage": _bond_damage,
+		"bond_broken": _bond_broken,
+		"anchor_strength": _anchor_bond_strength,
+		"anchor_damage": _anchor_bond_damage,
+		"anchor_broken": _anchor_bond_broken,
+		"nx": _num_x, "ny": _num_y, "nz": _num_z,
+		"gravity": (global_transform.basis.inverse() * Vector3.DOWN).normalized(),
+		"params": {
+			"tension": stress_tension_blocks,
+			"compression": stress_compression_blocks,
+			"shear": stress_shear_blocks,
+			# Failure decisions need ~1% accuracy on utilization. Measured on
+			# the 17k-block house: maxU differs by 1e-4 between tol=1e-6 and
+			# 1e-3, while the solve drops 179ms → 105ms. The kernel's 1e-6
+			# default stays for the validation suite.
+			"tolerance": 1.0e-3,
+		},
+	})
+	set_physics_process(true)
+
+
+func _poll_gravity_solve() -> void:
+	## Called from _physics_process while a solve job is in flight.
+	var gs: Dictionary = StressSolver.take_result(_gravity_task_id)
+	if gs.is_empty():
+		return
+	_gravity_task_id = -1
+	if not gs["converged"]:
+		push_warning("[GravityStress] %s CG did not converge (blocks=%d) — using best iterate" % [
+			name, _block_hp_dict.size()])
+	GameManager.tick_add("gravity_stress", int(gs.get("solve_us", 0)))
+	var gs_bonds: int = gs["broke_bonds"]
+	var gs_anchors: int = gs["broke_anchors"]
+	if gs_bonds > 0 or gs_anchors > 0:
+		GameManager.plog("[GravityStress] %s broke bonds=%d anchors=%d maxU=%.2f cg=%d passes=%d %dus (async)" % [
+			name, gs_bonds, gs_anchors, float(gs["max_utilization"]),
+			int(gs["cg_iters"]), int(gs["passes"]), int(gs.get("solve_us", 0))])
+		# OR-merge: the solver only sets broken flags, and damage that arrived
+		# during the solve only ADDS broken flags — union is always correct.
+		var nb: PackedByteArray = gs["bond_broken"]
+		if nb.size() == _bond_broken.size():
+			_bond_broken = BlockMeshBuilder.or_byte_arrays(_bond_broken, nb)
+		var na: PackedByteArray = gs["anchor_broken"]
+		if na.size() == _anchor_bond_broken.size():
+			_anchor_bond_broken = BlockMeshBuilder.or_byte_arrays(_anchor_bond_broken, na)
+		# Breaks change the load paths — follow-on failures possible. Re-dirty
+		# and re-check: the connectivity pass detaches what came loose and the
+		# next solve continues the cascade.
+		_gravity_stress_dirty = true
+	if _gravity_stress_dirty and not _integrity_check_pending:
+		_integrity_check_pending = true
+		call_deferred("_deferred_integrity_check")
+
+
 func _check_structural_integrity() -> void:
 	## Server-only: force-equilibrium stress solver + connectivity check.
 	## Finds blocks that are either disconnected from ground OR cannot be
@@ -1334,18 +1885,37 @@ func _check_structural_integrity() -> void:
 	Profiler.begin("struct_integrity")
 	var t_si_total := Time.get_ticks_usec()
 
-	# Currently calls the existing C++ force-equilibrium full solver. This is
-	# being replaced by an explicit bond-graph connectivity check (see
-	# BOND_GRAPH_PLAN.md). The bond-based system breaks bonds when accumulated
-	# damage exceeds their strength, then runs connectivity BFS to find
-	# detached components. Force-equilibrium stress detection (e.g. tower too
-	# top-heavy for its supports) will be deferred — destruction in v1
-	# requires explicit damage events.
+	# ── Gravity stress solve (see GRAVITY_STRESS_PLAN.md) ──
+	# Elastic-brittle interface analysis: breaks bonds/anchors whose static
+	# load under gravity exceeds remaining capacity. Detects instability in
+	# UNDAMAGED structures too (bad overhangs, top-heavy builds). Runs ASYNC
+	# on a worker thread; the result merges in _physics_process a frame or
+	# two later and re-queues this check, so collapse cascades over frames
+	# with near-zero main-thread cost instead of a single giant spike.
+	if GameManager.gravity_stress_enabled and _gravity_stress_dirty \
+			and not _bond_strength.is_empty() and _gravity_task_id < 0:
+		_gravity_stress_dirty = false
+		_start_gravity_solve()
+
+	# Bond-graph connectivity check: BFS from ground anchors, traversing only
+	# intact bonds. Disconnected blocks become components and detach. Damage
+	# breaks bonds via the explosion / bullet / momentum paths; the gravity
+	# solve above breaks them from static overload. See BOND_GRAPH_PLAN.md.
+	#
+	# Effective ground mask: a block is anchored only if its terrain bond is
+	# still intact. Once an anchor breaks (tracked in _anchor_bond_broken),
+	# the block is no longer a BFS seed and can be torn loose like any block.
+	var effective_ground_mask: PackedByteArray = _ground_mask
+	if not _anchor_bond_broken.is_empty():
+		effective_ground_mask = _ground_mask.duplicate()
+		var n := effective_ground_mask.size()
+		for i in n:
+			if _anchor_bond_broken[i] != 0:
+				effective_ground_mask[i] = 0
 	var _t_solver := Time.get_ticks_usec()
-	var components: Array = BlockMeshBuilder.calc_stress_integrity_components(
-		_block_grid, _ground_mask, PackedFloat32Array(),
-		_num_x, _num_y, _num_z, _block_hp_dict.size(),
-		stress_max_load, stress_horizontal_transfer)
+	var components: Array = BlockMeshBuilder.calc_bond_connectivity_components(
+		_block_grid, effective_ground_mask, _bond_broken,
+		_num_x, _num_y, _num_z, _block_hp_dict.size())
 	var _t_solver_us := Time.get_ticks_usec() - _t_solver
 
 	if components.is_empty():
@@ -1358,7 +1928,7 @@ func _check_structural_integrity() -> void:
 	var t_detach_end := Time.get_ticks_usec()
 
 	var si_us := Time.get_ticks_usec() - t_si_total
-	print("[StructuralIntegrity] %s  blocks=%d  components=%d  solver=%dus  detach=%dus  total=%dus" % [
+	GameManager.plog("[StructuralIntegrity] %s  blocks=%d  components=%d  solver=%dus  detach=%dus  total=%dus" % [
 		name, _block_hp_dict.size(), components.size(),
 		_t_solver_us, t_detach_end - t_detach, si_us,
 	])
@@ -1394,8 +1964,60 @@ func _validate_stress_against_full(localized_components: Array) -> void:
 		# Reset persistent state so next call re-establishes a clean baseline.
 		_stress_persistent_state = {}
 	else:
-		print("[StressValidate] OK on %s: %d components, %d blocks" % [
+		GameManager.plog("[StressValidate] OK on %s: %d components, %d blocks" % [
 			name, localized_components.size(), local_blocks])
+
+
+func _split_component_by_material(keys: Array[Vector3i]) -> Array:
+	## Partition a detached component into connected single-material pieces.
+	## Foundation (stone) and wall blocks never share a falling cluster — each
+	## piece keeps its true material instead of the majority-vote repaint.
+	## Returns Array of { "keys": Array[Vector3i], "is_foundation": bool }.
+	if _foundation_grid.size() != _block_grid.size():
+		return [{ "keys": keys, "is_foundation": false }]
+	var fkeys: Array[Vector3i] = []
+	var wkeys: Array[Vector3i] = []
+	for key in keys:
+		if _foundation_grid[_grid_idx(key.x, key.y, key.z)] == 1:
+			fkeys.append(key)
+		else:
+			wkeys.append(key)
+	if fkeys.is_empty():
+		return [{ "keys": wkeys, "is_foundation": false }]
+	if wkeys.is_empty():
+		return [{ "keys": fkeys, "is_foundation": true }]
+	# Mixed: removing the other material can disconnect a part (e.g. two
+	# stone feet joined only through the wall above), so each side splits
+	# into its own connected subsets.
+	var parts: Array = []
+	for sub: Array in _connected_subsets(fkeys):
+		parts.append({ "keys": sub, "is_foundation": true })
+	for sub: Array in _connected_subsets(wkeys):
+		parts.append({ "keys": sub, "is_foundation": false })
+	return parts
+
+
+func _connected_subsets(keys: Array[Vector3i]) -> Array:
+	## 6-adjacency connected components restricted to `keys`.
+	var remaining: Dictionary = {}
+	for key in keys:
+		remaining[key] = true
+	var out: Array = []
+	while not remaining.is_empty():
+		var seed_key: Vector3i = remaining.keys()[0]
+		remaining.erase(seed_key)
+		var comp: Array[Vector3i] = [seed_key]
+		var qi := 0
+		while qi < comp.size():
+			var cur := comp[qi]
+			qi += 1
+			for off in NEIGHBOR_OFFSETS:
+				var nb := cur + off
+				if remaining.has(nb):
+					remaining.erase(nb)
+					comp.append(nb)
+		out.append(comp)
+	return out
 
 
 func _detach_clusters(components: Array) -> void:
@@ -1409,37 +2031,60 @@ func _detach_clusters(components: Array) -> void:
 	var cluster_data: Array = []  # Array of {keys, hps, centroid_world, mass}
 	var all_valid_keys: Array[Vector3i] = []
 
+	# Single-block components are dispatched to FragmentPool (multimesh-backed
+	# indestructible debris). They make up most of a typical detach event but
+	# don't need a full FallingBlockCluster's compound hit body, bond graph,
+	# or settle logic.
+	var fragment_positions := PackedVector3Array()
+	var fragment_colors := PackedColorArray()
+
+	var wall_color: Color = _structure_material.albedo_color if _structure_material else Color(0.7, 0.55, 0.35)
+	var stone_color: Color = Color(0.55, 0.55, 0.50)
 	for component in components:
-		var centroid_local := Vector3.ZERO
-		var valid_count := 0
 		var valid_keys: Array[Vector3i] = []
-		var block_hps: Array[float] = []
-
 		for key in component:
-			if not _block_hp_dict.has(key):
-				continue
-			centroid_local += _block_local_pos(key)
-			valid_count += 1
-			valid_keys.append(key)
-			block_hps.append(_block_hp_dict[key])
-
-		if valid_count == 0:
+			if _block_hp_dict.has(key):
+				valid_keys.append(key)
+		if valid_keys.is_empty():
 			continue
-
-		centroid_local /= float(valid_count)
-		var centroid_world: Vector3 = global_transform * centroid_local
-		var cluster_mass: float = valid_count * _get_block_mass()
-
-		cluster_data.append({
-			"keys": valid_keys,
-			"hps": block_hps,
-			"centroid": centroid_world,
-			"mass": cluster_mass,
-		})
 		all_valid_keys.append_array(valid_keys)
+
+		# A cluster renders with exactly ONE material, so a mixed
+		# foundation+wall chunk would repaint its minority blocks on detach
+		# (the color-transmute bug — resurfaced when the gravity stress solver
+		# started breaking structures at their supports, where stone meets
+		# wall). Cleave mixed components along the material interface into
+		# connected single-material pieces instead. Pure components (the
+		# common case) come back as a single part, no extra work.
+		for part: Dictionary in _split_component_by_material(valid_keys):
+			var pkeys: Array[Vector3i] = part["keys"]
+			var is_foundation: bool = part["is_foundation"]
+			var centroid_local := Vector3.ZERO
+			var block_hps: Array[float] = []
+			for key in pkeys:
+				centroid_local += _block_local_pos(key)
+				block_hps.append(_block_hp_dict[key])
+			centroid_local /= float(pkeys.size())
+			var centroid_world: Vector3 = global_transform * centroid_local
+
+			# Fast path: single block becomes a multimesh fragment instead of a
+			# full RigidBody3D + StaticBody3D + MeshInstance3D cluster. Saves
+			# 30-70us of GDScript node-creation + add_child time per fragment.
+			if pkeys.size() == 1:
+				fragment_positions.append(centroid_world)
+				fragment_colors.append(stone_color if is_foundation else wall_color)
+				continue
+
+			cluster_data.append({
+				"keys": pkeys,
+				"hps": block_hps,
+				"centroid": centroid_world,
+				"mass": pkeys.size() * _get_block_mass(),
+				"is_foundation": is_foundation,
+			})
 	var t_collect_end := Time.get_ticks_usec()
 
-	if cluster_data.is_empty():
+	if cluster_data.is_empty() and fragment_positions.is_empty():
 		return
 
 	# ── Erase blocks: single bulk-mode session for compound hit body ──
@@ -1467,29 +2112,52 @@ func _detach_clusters(components: Array) -> void:
 
 	# ── Single batched RPC for all clusters ──
 	var t_rpc := Time.get_ticks_usec()
-	var all_keys: Array = []
-	var all_hps: Array = []
-	var all_centroids := PackedVector3Array()
-	var all_masses := PackedFloat32Array()
-	all_centroids.resize(cluster_data.size())
-	all_masses.resize(cluster_data.size())
-	for i in cluster_data.size():
-		all_keys.append(cluster_data[i]["keys"])
-		all_hps.append(cluster_data[i]["hps"])
-		all_centroids[i] = cluster_data[i]["centroid"]
-		all_masses[i] = cluster_data[i]["mass"]
-	_sync_cluster_detach_batch.rpc(all_keys, all_hps, all_centroids, all_masses,
-		_last_attacker_id, _num_x, _num_y, _num_z, _get_block_mass())
+	if not cluster_data.is_empty():
+		var all_keys: Array = []
+		var all_hps: Array = []
+		var all_centroids := PackedVector3Array()
+		var all_masses := PackedFloat32Array()
+		var all_is_foundation := PackedByteArray()
+		all_centroids.resize(cluster_data.size())
+		all_masses.resize(cluster_data.size())
+		all_is_foundation.resize(cluster_data.size())
+		for i in cluster_data.size():
+			all_keys.append(cluster_data[i]["keys"])
+			all_hps.append(cluster_data[i]["hps"])
+			all_centroids[i] = cluster_data[i]["centroid"]
+			all_masses[i] = cluster_data[i]["mass"]
+			all_is_foundation[i] = 1 if cluster_data[i]["is_foundation"] else 0
+		_sync_cluster_detach_batch.rpc(all_keys, all_hps, all_centroids, all_masses,
+			_last_attacker_id, _num_x, _num_y, _num_z, _get_block_mass(),
+			all_is_foundation, ClusterSync.allocate_ids(cluster_data.size()))
+
+	# Fragments (single-block components) go to the multimesh pool. Same RPC
+	# pattern (call_local) so server and clients each spawn into their own pool.
+	# attacker_id and per-block HP are tracked server-side for damage routing.
+	if not fragment_positions.is_empty():
+		_sync_fragment_spawn_batch.rpc(fragment_positions, fragment_colors,
+			_block_hp, _last_attacker_id)
 	var t_rpc_end := Time.get_ticks_usec()
 
-	print("[DetachClusters] %s  components=%d  blocks=%d  collect=%dus  erase=%dus  collision=%dus  rpc=%dus  total=%dus" % [
+	var t_total_us := Time.get_ticks_usec() - t_total
+	GameManager.tick_add("detach_clusters", t_total_us)
+	GameManager.plog("[DetachClusters] %s  components=%d  blocks=%d  collect=%dus  erase=%dus  collision=%dus  rpc=%dus  total=%dus" % [
 		name, cluster_data.size(), all_valid_keys.size(),
 		t_collect_end - t_collect,
 		t_erase_end - t_erase,
 		t_col_end - t_col,
 		t_rpc_end - t_rpc,
-		Time.get_ticks_usec() - t_total,
+		t_total_us,
 	])
+
+	# Detaching removed weight and load paths — what remains may now be
+	# overloaded (or relieved). Queue one more integrity check so the gravity
+	# solve re-runs next frame; collapse propagates frame by frame and
+	# terminates because the block count strictly decreases.
+	_gravity_stress_dirty = true
+	if not _integrity_check_pending:
+		_integrity_check_pending = true
+		call_deferred("_deferred_integrity_check")
 
 
 @rpc("authority", "call_local", "reliable")
@@ -1536,7 +2204,7 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 	var t_spawn_end := Time.get_ticks_usec()
 
 	var sync_total := Time.get_ticks_usec() - t_sync_total
-	print("[SyncClusterDetach] %s  keys=%d  client_cleanup=%dus  type_convert=%dus  spawn_structure=%dus  total=%dus" % [
+	GameManager.plog("[SyncClusterDetach] %s  keys=%d  client_cleanup=%dus  type_convert=%dus  spawn_structure=%dus  total=%dus" % [
 		name, block_keys.size(),
 		t_client_cleanup_end - t_client_cleanup,
 		t_type_convert_end - t_type_convert,
@@ -1546,12 +2214,38 @@ func _sync_cluster_detach(block_keys: Array, block_hps: Array, spawn_pos: Vector
 
 
 @rpc("authority", "call_local", "reliable")
+func _sync_fragment_spawn_batch(positions: PackedVector3Array,
+		colors: PackedColorArray, hp: float, attacker_id: int) -> void:
+	## All peers: spawn N single-block fragments via FragmentPool.
+	## No bond graph, no compound hit body, no per-fragment node — each is just
+	## a slot in the shared MultiMesh + a PhysicsServer3D body, but they're
+	## still real game entities (server-auth physics, bullet hits, HP, free
+	## on death). Used for single-block components from detach events.
+	var t0 := Time.get_ticks_usec()
+	var n: int = positions.size()
+	# Pre-grow the pool ONCE for the full count; otherwise the per-spawn loop
+	# triggers a mid-loop grow when the free list runs out, which is a
+	# noticeable spike on large detach events.
+	FragmentPool.ensure_capacity(n)
+	for i in n:
+		FragmentPool.acquire(positions[i], Vector3.ZERO, colors[i], hp, attacker_id)
+	var us := Time.get_ticks_usec() - t0
+	if us > 200:
+		GameManager.plog("[SyncFragmentSpawn] %s  count=%d  total=%dus" % [name, n, us])
+
+
+@rpc("authority", "call_local", "reliable")
 func _sync_cluster_detach_batch(all_keys: Array, all_hps: Array,
 		all_centroids: PackedVector3Array, all_masses: PackedFloat32Array,
 		attacker_id: int, grid_num_x: int, grid_num_y: int,
-		grid_num_z: int, mass_per_block: float) -> void:
+		grid_num_z: int, mass_per_block: float,
+		all_is_foundation: PackedByteArray = PackedByteArray(),
+		all_sync_ids: PackedInt32Array = PackedInt32Array()) -> void:
 	## All peers: remove ALL detached blocks once, rebuild collision once,
 	## then spawn all falling clusters. Replaces N individual _sync_cluster_detach RPCs.
+	## all_sync_ids: server-allocated ClusterSync ids, parallel to all_keys.
+	## Clusters are named from these ids so node paths match across peers and
+	## client transforms follow the server via ClusterSync.
 	var t_batch_total := Time.get_ticks_usec()
 	var n_clusters := all_keys.size()
 
@@ -1579,7 +2273,7 @@ func _sync_cluster_detach_batch(all_keys: Array, all_hps: Array,
 	var t_spawn := Time.get_ticks_usec()
 	if GameManager.debug_disable_detached_structures or n_clusters == 0:
 		var t_batch_us := Time.get_ticks_usec() - t_batch_total
-		print("[SyncClusterDetachBatch] %s  clusters=%d  SKIPPED  total=%dus" % [
+		GameManager.plog("[SyncClusterDetachBatch] %s  clusters=%d  SKIPPED  total=%dus" % [
 			name, n_clusters, t_batch_us])
 		return
 
@@ -1594,50 +2288,67 @@ func _sync_cluster_detach_batch(all_keys: Array, all_hps: Array,
 	var cluster_body_rids: Array = []
 	var hit_body_rids: Array = []
 
+	# Per-cluster tight grid dims (3 ints each) for the batched C++ build.
+	var cluster_dims := PackedInt32Array()
+	cluster_dims.resize(n_clusters * 3)
+
 	for i in n_clusters:
 		var cluster_keys: Array = all_keys[i]
 		var cluster_hps: Array = all_hps[i]
+		# Rebase keys to a tight AABB. Wire keys stay in STRUCTURE grid coords
+		# (the client-erase step above needs them); the rebase here runs the
+		# same arithmetic on every peer, so all peers build identical cluster
+		# grids. Without this, every cluster carries the FULL structure grid
+		# (e.g. 21,780 cells for a 20-block chunk of the big house) through
+		# its bond arrays and every downstream kernel — ~0.6MB of dead weight
+		# per chunk and full-grid loop costs on every damage event.
+		var kmin: Vector3i = cluster_keys[0]
+		var kmax: Vector3i = cluster_keys[0]
+		for key_variant in cluster_keys:
+			var key: Vector3i = key_variant
+			kmin = kmin.min(key)
+			kmax = kmax.max(key)
 		var hp_dict: Dictionary = {}
 		for j in cluster_keys.size():
-			hp_dict[cluster_keys[j] as Vector3i] = float(cluster_hps[j])
+			hp_dict[(cluster_keys[j] as Vector3i) - kmin] = float(cluster_hps[j])
 		hp_dicts.append(hp_dict)
+		var tight: Vector3i = kmax - kmin + Vector3i.ONE
+		cluster_dims[i * 3 + 0] = tight.x
+		cluster_dims[i * 3 + 1] = tight.y
+		cluster_dims[i * 3 + 2] = tight.z
 
-		var cluster := RigidBody3D.new()
-		cluster.set_script(FallingBlockClusterScript)
-		cluster.name = "FallingCluster_%s_%d" % [name, randi() % 10000]
+		var shell: Dictionary = ClusterPool.acquire()
+		var cluster: RigidBody3D = shell["rb"]
+		# Deterministic name from the sync id — node paths must match across
+		# peers for the cluster's own RPCs (splits, block destruction) to
+		# resolve on clients. randi() fallback only for id 0 (no sync).
+		var sid: int = all_sync_ids[i] if i < all_sync_ids.size() else 0
+		cluster.sync_id = sid
+		cluster.name = ("FallingCluster_%d" % sid) if sid != 0 \
+			else ("FallingCluster_%s_%d" % [name, randi() % 10000])
 		cluster.mass = all_masses[i]
 		cluster.cluster_mass = all_masses[i]
 		cluster.attacker_id = attacker_id
-		cluster.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_SMOOTH
-		cluster.collision_mask = CollisionLayers.DEFAULT_PHYSICS | CollisionLayers.DEBRIS
-		cluster.contact_monitor = true
-		cluster.max_contacts_reported = 4
-		cluster.gravity_scale = 1.0
-		cluster.continuous_cd = true
+		# Constant collision/physics properties are pre-configured in
+		# ClusterPool._create_shell(); skip them here.
 
-		# Grid manager
+		# Grid manager — tight rebased dims, not the parent structure's.
 		cluster.grid = BlockGridManager.new()
-		cluster.grid.num_x = grid_num_x
-		cluster.grid.num_y = grid_num_y
-		cluster.grid.num_z = grid_num_z
+		cluster.grid.num_x = cluster_dims[i * 3 + 0]
+		cluster.grid.num_y = cluster_dims[i * 3 + 1]
+		cluster.grid.num_z = cluster_dims[i * 3 + 2]
 		cluster.grid.block_hp = hp_dict
 		cluster._mass_per_block = mass_per_block
 
-		# Mesh instance
-		var mesh_inst := MeshInstance3D.new()
-		mesh_inst.name = "ClusterMesh"
-		mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		# Mesh instance (from pool shell — already has script none + correct settings)
+		var mesh_inst: MeshInstance3D = shell["mesh_inst"]
 		cluster.add_child(mesh_inst)
 		cluster._mesh_instance = mesh_inst
 
-		# Compound hit body
+		# Compound hit body (from pool — script + collision layer preset)
 		cluster._shared_hit_shape = shared_hit_shape
-		var hit_body := StaticBody3D.new()
-		hit_body.set_script(compound_body_script)
+		var hit_body: StaticBody3D = shell["hit_body"]
 		hit_body.parent_wall = cluster
-		hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
-		hit_body.collision_mask = 0
-		hit_body.name = "CompoundHitBody"
 		cluster._compound_hit_body = hit_body
 
 		clusters.append(cluster)
@@ -1649,7 +2360,8 @@ func _sync_cluster_detach_batch(all_keys: Array, all_hps: Array,
 	var t_build := Time.get_ticks_usec()
 	var results: Array = BlockMeshBuilder.build_clusters_batch(
 		hp_dicts, grid_num_x, grid_num_y, grid_num_z, BLOCK_SIZE,
-		cluster_body_rids, hit_body_rids, shared_hit_shape.get_rid())
+		cluster_body_rids, hit_body_rids, shared_hit_shape.get_rid(),
+		true, cluster_dims)
 	var t_build_us := Time.get_ticks_usec() - t_build
 
 	# Phase 3: Unpack results, assemble subtrees outside the scene tree.
@@ -1680,10 +2392,31 @@ func _sync_cluster_detach_batch(all_keys: Array, all_hps: Array,
 		# Add hit body as child while cluster is still outside the tree (cheap).
 		cluster.add_child(cluster._compound_hit_body)
 
-		if _structure_material:
-			cluster.set_material(_structure_material)
+		# Clusters are single-material by construction (_detach_clusters cleaves
+		# mixed components along the stone/wall interface), so this material is
+		# exact — no majority-vote repaint.
+		var is_foundation: bool = i < all_is_foundation.size() and all_is_foundation[i] == 1
+		var cluster_material: Material = _foundation_material if is_foundation else _structure_material
+		if cluster_material:
+			cluster.set_material(cluster_material)
+		# Pool shells default to shadows OFF (fragment-scale tuning); chunks
+		# torn off a shadowed structure must keep casting shadows or they
+		# visibly brighten the moment they detach.
+		cluster._mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 		cluster.set_debris_config(_debris_size, _debris_lifetime, _debris_mass,
 			_debris_name, _block_hp)
+
+		# Propagate bond config + initialize the cluster's bond graph. Without
+		# this the cluster has empty bond arrays, every damage_bonds_in_radius
+		# call early-returns, and the cluster is indestructible.
+		cluster._block_hp_max = _block_hp
+		cluster.bonds_only_destruction = bonds_only_destruction
+		cluster.bond_strength_factor = bond_strength_factor
+		cluster.bond_damage_explosion_factor = bond_damage_explosion_factor
+		cluster.bond_damage_bullet_factor = bond_damage_bullet_factor
+		cluster.bond_damage_momentum_factor = bond_damage_momentum_factor
+		cluster.bond_damage_momentum_radius = bond_damage_momentum_radius
+		cluster._init_bond_graph()
 
 	# Batch add: add all clusters to the scene tree.
 	# Each add_child triggers enter_tree cascade for cluster + children.
@@ -1701,7 +2434,7 @@ func _sync_cluster_detach_batch(all_keys: Array, all_hps: Array,
 	var t_spawn_us := Time.get_ticks_usec() - t_spawn
 
 	var t_batch_us := Time.get_ticks_usec() - t_batch_total
-	print("[SyncClusterDetachBatch] %s  clusters=%d  client_cleanup=%dus  create=%dus  build=%dus  finish=%dus(tree=%d)  spawn=%dus  total=%dus" % [
+	GameManager.plog("[SyncClusterDetachBatch] %s  clusters=%d  client_cleanup=%dus  create=%dus  build=%dus  finish=%dus(tree=%d)  spawn=%dus  total=%dus" % [
 		name, n_clusters, t_client_cleanup_us, t_create_us, t_build_us, t_finish_us, t_tree_us, t_spawn_us, t_batch_us])
 
 
@@ -1751,7 +2484,7 @@ func _spawn_detached_structure(block_keys: Array[Vector3i],
 	if not new_structure._block_hp_dict.is_empty():
 		var first_key: Vector3i = new_structure._block_hp_dict.keys()[0]
 		sample_block_pos = str(new_structure.global_transform * new_structure._block_local_pos(first_key))
-	print("[SpawnDetachedStructure] name=%s  blocks=%d  parent=%s  struct_pos=%s  sample_block_pos=%s  script=%s" % [
+	GameManager.plog("[SpawnDetachedStructure] name=%s  blocks=%d  parent=%s  struct_pos=%s  sample_block_pos=%s  script=%s" % [
 		new_structure.name, new_structure._block_hp_dict.size(),
 		new_structure.get_parent().name if new_structure.get_parent() else "null",
 		str(new_structure.global_position), sample_block_pos,
@@ -1775,24 +2508,33 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 		block_hp_dict[block_keys[i]] = block_hps[i]
 	var t_prep_end := Time.get_ticks_usec()
 
-	# Build the RigidBody3D
+	# Build the RigidBody3D from a pre-allocated shell when available.
 	var t_body := Time.get_ticks_usec()
-	var cluster := RigidBody3D.new()
-	cluster.set_script(FallingBlockClusterScript)
+	var shell: Dictionary = ClusterPool.acquire()
+	var cluster: RigidBody3D = shell["rb"]
 	cluster.name = "FallingCluster_%s_%d" % [name, randi() % 10000]
+	# Hand the pool's shell parts to the cluster so init_cluster_blocks doesn't
+	# have to .new() them. add_child still happens inside init.
+	cluster._mesh_instance = shell["mesh_inst"]
+	cluster._compound_hit_body = shell["hit_body"]
 	cluster.mass = cluster_mass
 	cluster.cluster_mass = cluster_mass
 	cluster.attacker_id = attacker_id
-	cluster.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_SMOOTH
-	cluster.collision_mask = CollisionLayers.DEFAULT_PHYSICS | CollisionLayers.DEBRIS
-	cluster.contact_monitor = true
-	cluster.max_contacts_reported = 4
-	cluster.gravity_scale = 1.0
-	cluster.continuous_cd = true
+	# Constant collision/physics properties pre-configured in
+	# ClusterPool._create_shell(); skip them here.
 	var t_body_end := Time.get_ticks_usec()
 
 	# init_cluster_blocks handles mesh, collision shapes, AND compound hit body.
+	# Propagate bond config + per-block HP BEFORE init_cluster_blocks so the
+	# cluster's _init_bond_graph() reads the right strength factor.
 	var t_init := Time.get_ticks_usec()
+	cluster._block_hp_max = _block_hp
+	cluster.bonds_only_destruction = bonds_only_destruction
+	cluster.bond_strength_factor = bond_strength_factor
+	cluster.bond_damage_explosion_factor = bond_damage_explosion_factor
+	cluster.bond_damage_bullet_factor = bond_damage_bullet_factor
+	cluster.bond_damage_momentum_factor = bond_damage_momentum_factor
+	cluster.bond_damage_momentum_radius = bond_damage_momentum_radius
 	cluster.init_cluster_blocks(block_hp_dict, grid_num_x, grid_num_y, grid_num_z,
 		mass_per_block)
 	if _structure_material:
@@ -1820,7 +2562,7 @@ func _spawn_falling_cluster(block_keys: Array[Vector3i], block_hps: Array[float]
 	PhysicsServer3D.body_set_shielding_hp(cluster_rid, total_hp)
 	var t_addchild_end := Time.get_ticks_usec()
 
-	print("[SpawnCluster] %s  blocks=%d  prep=%dus  body=%dus  init=%dus  add_child=%dus  total=%dus" % [
+	GameManager.plog("[SpawnCluster] %s  blocks=%d  prep=%dus  body=%dus  init=%dus  add_child=%dus  total=%dus" % [
 		name, block_keys.size(),
 		t_prep_end - t_prep,
 		t_body_end - t_body,
@@ -2019,7 +2761,7 @@ func _build_smooth_collision() -> void:
 	_rebuild_smooth_collision_mesh()
 	var t2 := Time.get_ticks_usec()
 	if t2 - t0 > 3000:
-		print("[SMOOTH_COL] %s body=%dus shape=%dus boxes=%d" % [
+		GameManager.plog("[SMOOTH_COL] %s body=%dus shape=%dus boxes=%d" % [
 			name, t1 - t0, t2 - t1, _smooth_shape_rids.size()])
 
 
@@ -2047,88 +2789,18 @@ func _rebuild_smooth_collision_mesh() -> void:
 	var _t_total := Time.get_ticks_usec()
 	var body_rid := _collision_body.get_rid()
 
-	# Free old shapes
-	PhysicsServer3D.body_clear_shapes(body_rid)
-	for rid in _smooth_shape_rids:
-		if rid.is_valid():
-			PhysicsServer3D.free_rid(rid)
-	_smooth_shape_rids.clear()
-
-	# Greedy box decomposition over _block_grid
-	var _t_decomp := Time.get_ticks_usec()
-	var claimed: PackedByteArray = PackedByteArray()
-	claimed.resize(_block_grid.size())
-
-	var box_count := 0
-	for bx0 in _num_x:
-		for by0 in _num_y:
-			for bz0 in _num_z:
-				var idx0 := _grid_idx(bx0, by0, bz0)
-				if _block_grid[idx0] == 0 or claimed[idx0] != 0:
-					continue
-
-				# Greedy extend +X
-				var bx1 := bx0
-				while bx1 + 1 < _num_x:
-					var ni := _grid_idx(bx1 + 1, by0, bz0)
-					if _block_grid[ni] == 0 or claimed[ni] != 0:
-						break
-					bx1 += 1
-
-				# Greedy extend +Y (entire X-row must remain solid & unclaimed)
-				var by1 := by0
-				while by1 + 1 < _num_y:
-					var ok := true
-					for bx in range(bx0, bx1 + 1):
-						var ni := _grid_idx(bx, by1 + 1, bz0)
-						if _block_grid[ni] == 0 or claimed[ni] != 0:
-							ok = false
-							break
-					if not ok:
-						break
-					by1 += 1
-
-				# Greedy extend +Z (entire XY-slab must remain solid & unclaimed)
-				var bz1 := bz0
-				while bz1 + 1 < _num_z:
-					var ok := true
-					for bx in range(bx0, bx1 + 1):
-						for by in range(by0, by1 + 1):
-							var ni := _grid_idx(bx, by, bz1 + 1)
-							if _block_grid[ni] == 0 or claimed[ni] != 0:
-								ok = false
-								break
-						if not ok:
-							break
-					if not ok:
-						break
-					bz1 += 1
-
-				# Mark cuboid claimed
-				for bx in range(bx0, bx1 + 1):
-					for by in range(by0, by1 + 1):
-						for bz in range(bz0, bz1 + 1):
-							claimed[_grid_idx(bx, by, bz)] = 1
-
-				# Emit BoxShape primitive at cuboid center
-				var size_x: float = (bx1 - bx0 + 1) * BLOCK_SIZE
-				var size_y: float = (by1 - by0 + 1) * BLOCK_SIZE
-				var size_z: float = (bz1 - bz0 + 1) * BLOCK_SIZE
-				var origin := Vector3(
-					(bx0 + (bx1 - bx0 + 1) * 0.5 - _num_x * 0.5) * BLOCK_SIZE,
-					(by0 + (by1 - by0 + 1) * 0.5 - _num_y * 0.5) * BLOCK_SIZE,
-					(bz0 + (bz1 - bz0 + 1) * 0.5 - _num_z * 0.5) * BLOCK_SIZE)
-
-				var rid := PhysicsServer3D.box_shape_create()
-				PhysicsServer3D.shape_set_data(rid, Vector3(size_x, size_y, size_z) * 0.5)
-				PhysicsServer3D.body_add_shape(body_rid, rid, Transform3D(Basis.IDENTITY, origin))
-				_smooth_shape_rids.append(rid)
-				box_count += 1
-	var _t_decomp_us := Time.get_ticks_usec() - _t_decomp
+	# Hand off the entire greedy decomp + body shape rebuild to C++ — saves
+	# ~10x over the GDScript version. The kernel frees the previous shape RIDs
+	# and returns the new ones.
+	_smooth_shape_rids = BlockMeshBuilder.rebuild_smooth_collision_box_shapes(
+		body_rid, _block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE,
+		_smooth_shape_rids)
+	var box_count: int = _smooth_shape_rids.size()
+	var _t_decomp_us := Time.get_ticks_usec() - _t_total
 
 	var _t_total_us := Time.get_ticks_usec() - _t_total
 	if _t_total_us > 200:
-		print("[PERF] _rebuild_smooth_collision %s: decomp=%dus boxes=%d total=%dus" % [
+		GameManager.plog("[PERF] _rebuild_smooth_collision %s: decomp=%dus boxes=%d total=%dus" % [
 			name, _t_decomp_us, box_count, _t_total_us])
 	GameManager.tick_add("smooth_collision", _t_total_us)
 
@@ -2175,7 +2847,7 @@ func _rebuild_greedy_mesh() -> void:
 			_t_foundation_mesh_us = Time.get_ticks_usec() - _t_fm
 		var _t_greedy_us := Time.get_ticks_usec() - _t_greedy_total
 		if _t_greedy_us > 200:
-			print("[PERF] _rebuild_greedy_mesh %s (split): grid_split=%dus struct_mesh=%dus foundation_mesh=%dus total=%dus blocks=%d" % [
+			GameManager.plog("[PERF] _rebuild_greedy_mesh %s (split): grid_split=%dus struct_mesh=%dus foundation_mesh=%dus total=%dus blocks=%d" % [
 				name, _t_split_us, _t_struct_mesh_us, _t_foundation_mesh_us, _t_greedy_us, _block_hp_dict.size()])
 	else:
 		var _t_mesh := Time.get_ticks_usec()
@@ -2183,7 +2855,7 @@ func _rebuild_greedy_mesh() -> void:
 			_block_grid, _num_x, _num_y, _num_z, BLOCK_SIZE, Vector3.ZERO, true)
 		var _t_mesh_us := Time.get_ticks_usec() - _t_mesh
 		if _t_mesh_us > 200:
-			print("[PERF] _rebuild_greedy_mesh %s: mesh=%dus blocks=%d" % [name, _t_mesh_us, _block_hp_dict.size()])
+			GameManager.plog("[PERF] _rebuild_greedy_mesh %s: mesh=%dus blocks=%d" % [name, _t_mesh_us, _block_hp_dict.size()])
 
 	# Build collision faces from the full block grid (both structure + foundation).
 	var _t_faces := Time.get_ticks_usec()

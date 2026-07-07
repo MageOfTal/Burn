@@ -58,6 +58,24 @@ func _server_process(delta: float) -> void:
 		_do_explode()
 		return
 
+	# Contact-driven detonation via direct body state. FragmentPool debris are
+	# raw PhysicsServer3D bodies with no Node, and Godot only emits
+	# body_entered for node-backed colliders — so the rocket would physically
+	# bounce off debris without ever detonating. The direct state reports ALL
+	# contacts (rocket layer is 0, so every pair comes from our own mask).
+	# We're already in _physics_process context, so exploding here is safe.
+	if not _has_exploded:
+		var state := PhysicsServer3D.body_get_direct_state(get_rid())
+		if state:
+			for i in state.get_contact_count():
+				var obj: Object = state.get_contact_collider_object(i)
+				if obj is Node and _is_shooter_immune(obj):
+					continue
+				_has_exploded = true
+				_is_terminated = true
+				_do_explode()
+				return
+
 	# Raycast forward to catch tunneling at high speed.
 	# The rocket moves ~0.83m per frame at 60fps — if terrain is thin or at
 	# a glancing angle, the physics engine can miss the collision.

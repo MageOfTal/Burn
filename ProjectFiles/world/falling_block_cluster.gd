@@ -39,6 +39,13 @@ const BREAKTHROUGH_BASE_RADIUS := 1.0   ## Minimum explosion radius (2 blocks)
 var cluster_mass: float = 25.0         ## Total mass in kg
 var attacker_id: int = -1              ## Player who caused the structural failure
 
+## Server-allocated id for ClusterSync transform replication. Set by the
+## spawner BEFORE add_child (travels inside the spawn RPCs so every peer uses
+## the same id). Also determines the node name ("FallingCluster_<id>") so
+## node paths — and therefore per-cluster RPCs — match across peers.
+## 0 = unregistered (debug/legacy spawn paths); such clusters don't sync.
+var sync_id: int = 0
+
 # ======================================================================
 #  Block grid — shared data manager (position math, mesh, shapes, BFS)
 # ======================================================================
@@ -101,6 +108,28 @@ var _debris_mass: float = 0.5
 var _debris_name: String = "Debris"
 var _block_hp_max: float = 35.0  ## Original full HP per block, for overkill fraction
 
+# ======================================================================
+#  Bond graph (mirrors DestructibleBlockStructure — bonds carry damage,
+#  blocks never lose HP, connectivity decides what splits off)
+# ======================================================================
+
+const _BOND_AXIS_X: int = 0
+const _BOND_AXIS_Y: int = 1
+const _BOND_AXIS_Z: int = 2
+
+var _bond_strength: PackedFloat32Array = PackedFloat32Array()
+var _bond_damage: PackedFloat32Array = PackedFloat32Array()
+var _bond_broken: PackedByteArray = PackedByteArray()
+
+var bonds_only_destruction: bool = true
+var bond_strength_factor: float = 4.0
+var bond_damage_explosion_factor: float = 0.5
+var bond_damage_bullet_factor: float = 0.5
+var bond_damage_momentum_factor: float = 0.75
+var bond_damage_momentum_radius: float = 1.5
+
+var _integrity_check_pending: bool = false
+
 
 # ======================================================================
 #  Initialization
@@ -121,12 +150,16 @@ func init_cluster_blocks(block_hp_dict: Dictionary, num_x: int, num_y: int,
 	grid.num_z = num_z
 	grid.block_hp = block_hp_dict
 
-	# Create mesh instance
-	_mesh_instance = get_node_or_null("ClusterMesh")
+	# Create or reuse mesh instance. Caller may have pre-attached one from
+	# ClusterPool — in which case we skip the .new() + add_child cost.
+	if _mesh_instance == null:
+		_mesh_instance = get_node_or_null("ClusterMesh")
 	if _mesh_instance == null:
 		_mesh_instance = MeshInstance3D.new()
 		_mesh_instance.name = "ClusterMesh"
 		_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		add_child(_mesh_instance)
+	elif _mesh_instance.get_parent() == null:
 		add_child(_mesh_instance)
 
 	# Create shared hit shape and compound hit body (need RIDs for build_cluster)
@@ -134,13 +167,16 @@ func init_cluster_blocks(block_hp_dict: Dictionary, num_x: int, num_y: int,
 		_shared_hit_shape = BoxShape3D.new()
 		_shared_hit_shape.size = Vector3.ONE * BlockGridManager.BLOCK_SIZE
 
-	_clear_compound_hit_body()
-	_compound_hit_body = StaticBody3D.new()
-	_compound_hit_body.set_script(_compound_body_script)
+	# Pool shell may have already provided _compound_hit_body. Only build a
+	# fresh one when the slot is empty (and only then set layer/mask — the
+	# pool pre-configures those for shells it owns).
+	if _compound_hit_body == null or not is_instance_valid(_compound_hit_body):
+		_compound_hit_body = StaticBody3D.new()
+		_compound_hit_body.set_script(_compound_body_script)
+		_compound_hit_body.name = "CompoundHitBody"
+		_compound_hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
+		_compound_hit_body.collision_mask = 0
 	_compound_hit_body.parent_wall = self
-	_compound_hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
-	_compound_hit_body.collision_mask = 0
-	_compound_hit_body.name = "CompoundHitBody"
 
 	# All-in-one C++ call: grid + mesh + collision shapes + hit body shapes
 	var result: Dictionary = BlockMeshBuilder.build_cluster(
@@ -176,8 +212,12 @@ func init_cluster_blocks(block_hp_dict: Dictionary, num_x: int, num_y: int,
 	PhysicsServer3D.body_set_shielding_tag(_compound_hit_body.get_rid(), 1)
 	_update_compound_shielding_hp()
 
+	# Initialize bond graph — full strength on every adjacent-block pair.
+	# Bonds carry damage independently of block HP and drive split-off.
+	_init_bond_graph()
+
 	var _t_init_us := Time.get_ticks_usec() - _t_init_total
-	print("[ClusterPerf] init_cluster_blocks %s: %d blocks, total=%dus (single C++ call)" % [
+	GameManager.plog("[ClusterPerf] init_cluster_blocks %s: %d blocks, total=%dus (single C++ call)" % [
 		name, block_hp_dict.size(), _t_init_us])
 
 
@@ -228,16 +268,27 @@ func set_debris_config(size: float, lifetime: float, dmass: float,
 
 
 func _ready() -> void:
+	# Override the default 0.1 air-damping so launched chunks fly through the
+	# air without "drifting down" — gravity does the slowing, not air resistance.
+	linear_damp_mode = RigidBody3D.DAMP_MODE_REPLACE
+	angular_damp_mode = RigidBody3D.DAMP_MODE_REPLACE
+	linear_damp = 0.0
+	angular_damp = 0.0
+
 	if multiplayer.is_server():
 		body_entered.connect(_on_body_entered)
 		body_exited.connect(_on_body_exited)
 	else:
 		freeze = true
 		freeze_mode = RigidBody3D.FREEZE_MODE_KINEMATIC
+	if sync_id != 0:
+		ClusterSync.register(sync_id, self)
 	set_process(false)
 
 
 func _exit_tree() -> void:
+	if sync_id != 0:
+		ClusterSync.unregister(sync_id)
 	_col_shapes.clear()
 	_col_shape_count = 0
 
@@ -259,23 +310,31 @@ func _process(_delta: float) -> void:
 	Profiler.end("cluster_mesh_rebuild")
 
 
+## Sentinel origin guarantees the first _physics_process always syncs.
+var _last_synced_xform: Transform3D = Transform3D(Basis(), Vector3(INF, INF, INF))
+
 func _physics_process(delta: float) -> void:
 	Profiler.begin("falling_cluster")
 	var _t0 := Time.get_ticks_usec()
 	super._physics_process(delta)
 
-	# Sync compound hit body transform so hitscan raycasts hit the correct
-	# position.  Jolt threaded physics can desync child StaticBody3D from
-	# parent RigidBody3D by at least one frame.
-	if _compound_hit_body and is_instance_valid(_compound_hit_body):
-		PhysicsServer3D.body_set_state(
-			_compound_hit_body.get_rid(),
-			PhysicsServer3D.BODY_STATE_TRANSFORM,
-			global_transform)
-
-	# Sync visual RID transform (fast path — no MeshInstance3D node)
-	if _visual_rid.is_valid():
-		RenderingServer.instance_set_transform(_visual_rid, global_transform)
+	# Sync compound hit body + visual transforms — but only when the body
+	# actually moved. Settled/sleeping clusters (and client clusters between
+	# ClusterSync updates) otherwise pay two PhysicsServer/RenderingServer
+	# calls per tick each; with hundreds of chunks on the ground that's
+	# thousands of per-frame binding calls doing nothing.
+	var xf := global_transform
+	if xf != _last_synced_xform:
+		_last_synced_xform = xf
+		# Jolt threaded physics can desync child StaticBody3D from parent
+		# RigidBody3D by at least one frame — push the hit body along.
+		if _compound_hit_body and is_instance_valid(_compound_hit_body):
+			PhysicsServer3D.body_set_state(
+				_compound_hit_body.get_rid(),
+				PhysicsServer3D.BODY_STATE_TRANSFORM,
+				xf)
+		if _visual_rid.is_valid():
+			RenderingServer.instance_set_transform(_visual_rid, xf)
 
 	if not multiplayer.is_server():
 		GameManager.tick_add("cluster_tick", Time.get_ticks_usec() - _t0)
@@ -293,8 +352,10 @@ func _physics_process(delta: float) -> void:
 	else:
 		_settle_timer = 0.0
 
-	# Periodic stress check while contacts exist
-	if not _active_body_contacts.is_empty() or _has_ground_contact:
+	# Periodic force-equilibrium stress check while contacts exist. This is
+	# the OLD destruction model — disabled in bonds-only mode where it would
+	# silently erase blocks based on stress (the "beam disintegration" bug).
+	if not bonds_only_destruction and (not _active_body_contacts.is_empty() or _has_ground_contact):
 		_stress_check_timer += delta
 		if _stress_check_timer >= STRESS_CHECK_INTERVAL:
 			_stress_check_timer = 0.0
@@ -302,6 +363,178 @@ func _physics_process(delta: float) -> void:
 
 	GameManager.tick_add("cluster_tick", Time.get_ticks_usec() - _t0)
 	Profiler.end("falling_cluster")
+
+
+# ======================================================================
+#  Bond graph helpers (mirror DestructibleBlockStructure)
+# ======================================================================
+
+func _bond_idx(block_grid_idx: int, axis: int) -> int:
+	return block_grid_idx * 3 + axis
+
+
+func _has_neighbor_in_grid(bx: int, by: int, bz: int, axis: int) -> bool:
+	if axis == _BOND_AXIS_X:
+		if bx + 1 >= grid.num_x: return false
+		return grid.block_grid[grid.grid_idx(bx + 1, by, bz)] == 1
+	elif axis == _BOND_AXIS_Y:
+		if by + 1 >= grid.num_y: return false
+		return grid.block_grid[grid.grid_idx(bx, by + 1, bz)] == 1
+	else:
+		if bz + 1 >= grid.num_z: return false
+		return grid.block_grid[grid.grid_idx(bx, by, bz + 1)] == 1
+
+
+func _init_bond_graph() -> void:
+	## C++ kernel populates strengths for every adjacent pair in grid.block_grid
+	## and pre-marks everything else broken. Single-block clusters skip entirely
+	## — there's nothing to bond to, so the cluster is naturally inert.
+	if grid == null or grid.block_count() < 2:
+		_bond_strength = PackedFloat32Array()
+		_bond_damage = PackedFloat32Array()
+		_bond_broken = PackedByteArray()
+		return
+	var s := _block_hp_max * bond_strength_factor
+	var result: Dictionary = BlockMeshBuilder.compute_bond_graph(
+		grid.block_grid, grid.num_x, grid.num_y, grid.num_z, s)
+	_bond_strength = result["bond_strength"]
+	_bond_damage = result["bond_damage"]
+	_bond_broken = result["bond_broken"]
+
+
+func _bond_world_midpoint(block_grid_idx: int, axis: int) -> Vector3:
+	var ny_nz := grid.num_y * grid.num_z
+	var rem := block_grid_idx % ny_nz
+	var bx := block_grid_idx / ny_nz
+	var by := rem / grid.num_z
+	var bz := rem % grid.num_z
+	var local := grid.block_local_pos(Vector3i(bx, by, bz))
+	var off := 0.5 * BlockGridManager.BLOCK_SIZE
+	if axis == _BOND_AXIS_X: local.x += off
+	elif axis == _BOND_AXIS_Y: local.y += off
+	else: local.z += off
+	return global_transform * local
+
+
+func damage_bonds_in_radius(world_pos: Vector3, energy: float, radius: float) -> int:
+	## DDA voxel-walk shielded bond damage (C++). See structure's variant for details.
+	if radius <= 0.0 or energy <= 0.0: return 0
+	if _bond_strength.is_empty(): return 0
+	# Cluster's transform origin is the component centroid; the kernel addresses
+	# bonds in grid-local coords. Add centroid to convert.
+	var hit_local: Vector3 = global_transform.affine_inverse() * world_pos + grid.centroid
+	var result: Dictionary = BlockMeshBuilder.damage_bonds_radial_shielded(
+		grid.block_grid, _bond_strength, _bond_damage, _bond_broken,
+		grid.num_x, grid.num_y, grid.num_z, BlockGridManager.BLOCK_SIZE,
+		hit_local, energy, radius, _block_hp_max)
+	_bond_damage = result["bond_damage"]
+	_bond_broken = result["bond_broken"]
+	var broken: int = result["broken"]
+	var damaged: int = result["damaged"]
+	if damaged > 0 or broken > 0:
+		GameManager.plog("[BondGraph] %s blast pos=%s energy=%.1f r=%.1f → damaged=%d broken=%d" % [
+			name, str(world_pos).substr(0, 30), energy, radius, damaged, broken])
+	return broken
+
+
+func _damage_bonds_at_block(key: Vector3i, energy: float) -> int:
+	if energy <= 0.0 or _bond_strength.is_empty(): return 0
+	var here_idx := grid.grid_idx(key.x, key.y, key.z)
+	var broken := 0
+	for axis in 3:
+		var bi := here_idx * 3 + axis
+		if _bond_broken[bi] != 0: continue
+		_bond_damage[bi] += energy
+		if _bond_damage[bi] >= _bond_strength[bi]:
+			_bond_broken[bi] = 1
+			broken += 1
+	if key.x > 0:
+		var bi := grid.grid_idx(key.x - 1, key.y, key.z) * 3 + _BOND_AXIS_X
+		if _bond_broken[bi] == 0:
+			_bond_damage[bi] += energy
+			if _bond_damage[bi] >= _bond_strength[bi]:
+				_bond_broken[bi] = 1; broken += 1
+	if key.y > 0:
+		var bi := grid.grid_idx(key.x, key.y - 1, key.z) * 3 + _BOND_AXIS_Y
+		if _bond_broken[bi] == 0:
+			_bond_damage[bi] += energy
+			if _bond_damage[bi] >= _bond_strength[bi]:
+				_bond_broken[bi] = 1; broken += 1
+	if key.z > 0:
+		var bi := grid.grid_idx(key.x, key.y, key.z - 1) * 3 + _BOND_AXIS_Z
+		if _bond_broken[bi] == 0:
+			_bond_damage[bi] += energy
+			if _bond_damage[bi] >= _bond_strength[bi]:
+				_bond_broken[bi] = 1; broken += 1
+	return broken
+
+
+func _break_block_bonds(key: Vector3i) -> int:
+	if _bond_strength.is_empty(): return 0
+	var here_idx := grid.grid_idx(key.x, key.y, key.z)
+	var broken := 0
+	for axis in 3:
+		var bi := here_idx * 3 + axis
+		if _bond_broken[bi] == 0:
+			_bond_broken[bi] = 1; broken += 1
+	if key.x > 0:
+		var bi := grid.grid_idx(key.x - 1, key.y, key.z) * 3 + _BOND_AXIS_X
+		if _bond_broken[bi] == 0:
+			_bond_broken[bi] = 1; broken += 1
+	if key.y > 0:
+		var bi := grid.grid_idx(key.x, key.y - 1, key.z) * 3 + _BOND_AXIS_Y
+		if _bond_broken[bi] == 0:
+			_bond_broken[bi] = 1; broken += 1
+	if key.z > 0:
+		var bi := grid.grid_idx(key.x, key.y, key.z - 1) * 3 + _BOND_AXIS_Z
+		if _bond_broken[bi] == 0:
+			_bond_broken[bi] = 1; broken += 1
+	return broken
+
+
+func _queue_cluster_integrity_check() -> void:
+	if _integrity_check_pending: return
+	_integrity_check_pending = true
+	call_deferred("_deferred_cluster_integrity_check")
+
+
+func _deferred_cluster_integrity_check() -> void:
+	_integrity_check_pending = false
+	if not multiplayer.is_server(): return
+	if grid == null or grid.block_count() < 2: return
+	var _t_total := Time.get_ticks_usec()
+	# Bond-aware connectivity. Cluster has no ground anchor — pass an all-zero
+	# ground mask so every block is "unsupported" and the C++ kernel returns
+	# every connected component. Then we keep the largest in self and split
+	# the rest off as child clusters.
+	var grid_size: int = grid.num_x * grid.num_y * grid.num_z
+	var empty_ground := PackedByteArray(); empty_ground.resize(grid_size)
+	var components: Array = BlockMeshBuilder.calc_bond_connectivity_components(
+		grid.block_grid, empty_ground, _bond_broken,
+		grid.num_x, grid.num_y, grid.num_z, grid.block_count())
+	if components.size() <= 1:
+		GameManager.tick_add("cluster_bond_integrity", Time.get_ticks_usec() - _t_total)
+		return
+
+	# Largest stays in self; everything else splits off as child clusters.
+	var largest_idx := 0
+	for i in components.size():
+		if components[i].size() > components[largest_idx].size():
+			largest_idx = i
+	var fragment_keys: Array = []
+	for i in components.size():
+		if i == largest_idx: continue
+		var keys_variant: Array = []
+		for key in components[i]:
+			keys_variant.append(key)
+		fragment_keys.append(keys_variant)
+	if fragment_keys.is_empty():
+		GameManager.tick_add("cluster_bond_integrity", Time.get_ticks_usec() - _t_total)
+		return
+	GameManager.plog("[ClusterBondIntegrity] %s splits=%d (largest=%d)" % [
+		name, fragment_keys.size(), components[largest_idx].size()])
+	_sync_fragment_split_batch.rpc(fragment_keys, ClusterSync.allocate_ids(fragment_keys.size()))
+	GameManager.tick_add("cluster_bond_integrity", Time.get_ticks_usec() - _t_total)
 
 
 # ======================================================================
@@ -318,8 +551,21 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 
 	Profiler.begin("cluster_damage_block")
 	var _t_dmg_total := Time.get_ticks_usec()
-	grid.block_hp[key] -= amount
-	_update_compound_shielding_hp()
+	if not bonds_only_destruction:
+		grid.block_hp[key] -= amount
+		_update_compound_shielding_hp()
+
+	if amount > 0.0 and bond_damage_bullet_factor > 0.0 and not _bond_strength.is_empty():
+		var bullet_energy: float = amount * bond_damage_bullet_factor
+		var _broken := _damage_bonds_at_block(key, bullet_energy)
+		if _broken > 0:
+			GameManager.plog("[BondGraph] %s bullet key=%s energy=%.1f broke=%d" % [
+				name, str(key), bullet_energy, _broken])
+
+	if bonds_only_destruction:
+		_queue_cluster_integrity_check()
+		Profiler.end("cluster_damage_block")
+		return
 
 	if grid.block_hp[key] <= 0.0:
 		var ok_frac := clampf(-grid.block_hp[key] / _block_hp_max, 0.0, 1.0)
@@ -339,7 +585,7 @@ func _damage_block(key: Vector3i, amount: float, _attacker_id: int) -> void:
 		_after_blocks_destroyed([key], blast_pos, [spd])
 		var _t_abd_us := Time.get_ticks_usec() - _t_abd
 		var _t_dmg_us := Time.get_ticks_usec() - _t_dmg_total
-		print("[PERF] cluster._damage_block %s key=%s: erase=%dus after_destroyed=%dus total=%dus blocks=%d" % [
+		GameManager.plog("[PERF] cluster._damage_block %s key=%s: erase=%dus after_destroyed=%dus total=%dus blocks=%d" % [
 			name, str(key), _t_erase_us, _t_abd_us, _t_dmg_us, grid.block_count()])
 		GameManager.tick_add("cluster_damage_block", _t_dmg_us)
 	Profiler.end("cluster_damage_block")
@@ -351,6 +597,11 @@ func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
 	if not multiplayer.is_server():
 		return
 	if grid == null or grid.is_empty():
+		return
+	if bonds_only_destruction:
+		# No positional info, so no bonds to damage in any meaningful way.
+		# Drop the hit silently — bonds-only relies on take_damage_at /
+		# take_momentum_damage_at / _damage_block for spatial signals.
 		return
 
 	Profiler.begin("cluster_take_damage")
@@ -378,7 +629,7 @@ func take_damage(amount: float, _from_attacker_id: int = -1) -> void:
 		_after_blocks_destroyed(destroyed_keys)
 		var _t_abd_us := Time.get_ticks_usec() - _t_abd
 		var _t_td_us := Time.get_ticks_usec() - _t_td_total
-		print("[PERF] cluster.take_damage %s: %d destroyed, erase=%dus after_destroyed=%dus total=%dus" % [
+		GameManager.plog("[PERF] cluster.take_damage %s: %d destroyed, erase=%dus after_destroyed=%dus total=%dus" % [
 			name, destroyed_keys.size(), _t_erase_us, _t_abd_us, _t_td_us])
 	Profiler.end("cluster_take_damage")
 
@@ -396,6 +647,18 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 
 	Profiler.begin("cluster_take_damage_at")
 	var _t_take_damage_at := Time.get_ticks_usec()
+
+	# Bonds-only: just damage bonds in radius, queue integrity. Skip the
+	# expensive per-block shielding raycasts since no block HP changes anyway.
+	if bonds_only_destruction:
+		if amount > 0.0 and blast_radius > 0.0:
+			var bond_energy: float = amount * bond_damage_explosion_factor
+			damage_bonds_in_radius(hit_pos, bond_energy, blast_radius)
+		_queue_cluster_integrity_check()
+		var _t_total_us := Time.get_ticks_usec() - _t_take_damage_at
+		GameManager.tick_add("cluster_take_damage_at", _t_total_us)
+		Profiler.end("cluster_take_damage_at")
+		return
 
 	var space_state: PhysicsDirectSpaceState3D = null
 	var w3d := get_world_3d()
@@ -459,7 +722,7 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 			destroyed_keys.append(key)
 
 	if dbg_blocks_hit > 0:
-		print("[FallingCluster] take_damage_at %s: %d blocks hit, raw=%.1f, absorbed=%.1f, applied=%.1f" % [
+		GameManager.plog("[FallingCluster] take_damage_at %s: %d blocks hit, raw=%.1f, absorbed=%.1f, applied=%.1f" % [
 			name, dbg_blocks_hit, dbg_total_raw, dbg_total_absorbed,
 			dbg_total_raw - dbg_total_absorbed])
 
@@ -494,13 +757,13 @@ func take_damage_at(hit_pos: Vector3, amount: float, blast_radius: float,
 		_after_blocks_destroyed(destroyed_keys, hit_pos, per_block_speeds, true)
 		var _t_abd_us := Time.get_ticks_usec() - _t_abd
 		var total_us := Time.get_ticks_usec() - _t_take_damage_at
-		print("[ClusterPerf] take_damage_at %s: %d blocks hit, %d destroyed, raycasts=%dus after_destroyed=%dus total=%dus" % [
+		GameManager.plog("[ClusterPerf] take_damage_at %s: %d blocks hit, %d destroyed, raycasts=%dus after_destroyed=%dus total=%dus" % [
 			name, dbg_blocks_hit, destroyed_keys.size(), _t_raycast_total, _t_abd_us, total_us])
 		GameManager.tick_add("cluster_take_damage_at", total_us)
 	else:
 		var total_us := Time.get_ticks_usec() - _t_take_damage_at
 		if total_us > 200:
-			print("[ClusterPerf] take_damage_at %s (no destroys): %d blocks hit, raycasts=%dus total=%dus" % [
+			GameManager.plog("[ClusterPerf] take_damage_at %s (no destroys): %d blocks hit, raycasts=%dus total=%dus" % [
 				name, dbg_blocks_hit, _t_raycast_total, total_us])
 		GameManager.tick_add("cluster_take_damage_at", total_us)
 	Profiler.end("cluster_take_damage_at")
@@ -544,7 +807,21 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	var hp_before: float = grid.block_hp[best_key]
 	var absorbed: float = minf(damage, hp_before)
 
-	grid.block_hp[best_key] -= damage
+	if not bonds_only_destruction:
+		grid.block_hp[best_key] -= damage
+
+	# Bond damage: localized radial impulse. Heavy collisions weaken nearby
+	# bonds even though no block HP changes in bonds-only mode.
+	if damage > 0.0 and bond_damage_momentum_factor > 0.0 and not _bond_strength.is_empty():
+		var momentum_energy: float = damage * bond_damage_momentum_factor
+		damage_bonds_in_radius(hit_world_pos, momentum_energy, bond_damage_momentum_radius)
+
+	if bonds_only_destruction:
+		_queue_cluster_integrity_check()
+		Profiler.end("cluster_momentum_dmg")
+		return { "absorbed": absorbed, "block_destroyed": false,
+			"block_key": best_key, "block_pos": block_world }
+
 	if grid.block_hp[best_key] > 0.0:
 		_update_compound_shielding_hp()
 		Profiler.end("cluster_momentum_dmg")
@@ -562,7 +839,7 @@ func take_momentum_damage_at(hit_world_pos: Vector3, damage: float,
 	var _t_abd_us := Time.get_ticks_usec() - _t_abd
 
 	var _t_momentum_us := Time.get_ticks_usec() - _t_momentum_total
-	print("[PERF] cluster.take_momentum_damage_at %s: search=%dus erase=%dus after_destroyed=%dus total=%dus blocks=%d" % [
+	GameManager.plog("[PERF] cluster.take_momentum_damage_at %s: search=%dus erase=%dus after_destroyed=%dus total=%dus blocks=%d" % [
 		name, _t_search_us, _t_erase_us, _t_abd_us, _t_momentum_us, grid.block_count()])
 	GameManager.tick_add("cluster_momentum_damage", _t_momentum_us)
 	Profiler.end("cluster_momentum_dmg")
@@ -633,7 +910,7 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i],
 
 	if grid.is_empty():
 		var total_us := Time.get_ticks_usec() - _t_abd_start
-		print("[ClusterPerf] _after_blocks_destroyed %s (empty): mass=%dus prep=%dus rpc=%dus debris=%dus total=%dus" % [
+		GameManager.plog("[ClusterPerf] _after_blocks_destroyed %s (empty): mass=%dus prep=%dus rpc=%dus debris=%dus total=%dus" % [
 			name, _t_mass_us, _t_prep_us, _t_rpc_us, _t_debris_us, total_us])
 		Profiler.end("cluster_after_destroyed")
 		_clear_physics_before_free()
@@ -645,7 +922,7 @@ func _after_blocks_destroyed(destroyed_keys: Array[Vector3i],
 	_check_cluster_integrity()
 	var _t_integrity_us := Time.get_ticks_usec() - _t_integrity
 	var total_us := Time.get_ticks_usec() - _t_abd_start
-	print("[ClusterPerf] _after_blocks_destroyed %s: %d destroyed, %d remaining, mass=%dus prep=%dus rpc=%dus debris=%dus integrity=%dus total=%dus" % [
+	GameManager.plog("[ClusterPerf] _after_blocks_destroyed %s: %d destroyed, %d remaining, mass=%dus prep=%dus rpc=%dus debris=%dus integrity=%dus total=%dus" % [
 		name, destroyed_keys.size(), grid.block_count(), _t_mass_us, _t_prep_us, _t_rpc_us, _t_debris_us, _t_integrity_us, total_us])
 	GameManager.tick_add("cluster_after_destroyed", total_us)
 	Profiler.end("cluster_after_destroyed")
@@ -730,7 +1007,7 @@ func _spawn_debris_for_blocks(block_positions: Array[Vector3],
 	var _t_batch_us := Time.get_ticks_usec() - _t_batch
 	var _t_spawn_us := Time.get_ticks_usec() - _t_spawn_debris
 	if _t_spawn_us > 100:
-		print("[PERF] cluster._spawn_debris_for_blocks %s: %d blocks, %d debris, batch=%dus total=%dus" % [
+		GameManager.plog("[PERF] cluster._spawn_debris_for_blocks %s: %d blocks, %d debris, batch=%dus total=%dus" % [
 			name, n_blocks, total_debris, _t_batch_us, _t_spawn_us])
 
 
@@ -823,7 +1100,7 @@ func _check_cluster_stress() -> void:
 
 	var us := Time.get_ticks_usec() - t0
 	if not components.is_empty():
-		print("[ClusterStress] %s  %d components failed  %dus" % [name, components.size(), us])
+		GameManager.plog("[ClusterStress] %s  %d components failed  %dus" % [name, components.size(), us])
 		# Convert stress-failed blocks to destroyed blocks
 		if _compound_hit_body and is_instance_valid(_compound_hit_body):
 			PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
@@ -881,25 +1158,31 @@ func _check_cluster_integrity() -> void:
 		_sync_fragment_split_batch.rpc(all_fragment_keys)
 	var _t_splits_us := Time.get_ticks_usec() - _t_splits
 	var _t_integrity_us := Time.get_ticks_usec() - _t_integrity_start
-	print("[ClusterPerf] _check_cluster_integrity %s: %d blocks, %d components, %d splits, bfs=%dus splits=%dus total=%dus" % [
+	GameManager.plog("[ClusterPerf] _check_cluster_integrity %s: %d blocks, %d components, %d splits, bfs=%dus splits=%dus total=%dus" % [
 		name, grid.block_count(), components.size(), all_fragment_keys.size(), _t_bfs_us, _t_splits_us, _t_integrity_us])
 	GameManager.tick_add("cluster_integrity", _t_integrity_us)
 	Profiler.end("cluster_integrity")
 
 
 @rpc("authority", "call_local", "reliable")
-func _sync_fragment_split_batch(all_fragment_keys: Array) -> void:
+func _sync_fragment_split_batch(all_fragment_keys: Array,
+		fragment_ids: PackedInt32Array = PackedInt32Array()) -> void:
 	## All peers: split ALL specified fragment groups off into child clusters
 	## in one batched C++ call. Bulk mode wraps ALL bodies at once.
+	## fragment_ids: server-allocated ClusterSync ids, parallel to
+	## all_fragment_keys. Children are named from these ids so node paths match
+	## across peers and client transforms follow the server via ClusterSync.
 	var _t_total := Time.get_ticks_usec()
 
 	# Phase 1: Extract block HPs and erase from grid for all fragments.
 	var _t_extract := Time.get_ticks_usec()
 	var fragment_dicts: Array = []
+	var fragment_sync_ids := PackedInt32Array()  # parallel to fragment_dicts
 	# Bulk mode: disable all fragment shapes in one commit instead of N rebuilds.
 	if _compound_hit_body and is_instance_valid(_compound_hit_body):
 		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), true)
-	for keys_variant: Array in all_fragment_keys:
+	for fi in all_fragment_keys.size():
+		var keys_variant: Array = all_fragment_keys[fi]
 		var block_hp_dict: Dictionary = {}
 		for key_variant in keys_variant:
 			var key: Vector3i = key_variant
@@ -909,6 +1192,7 @@ func _sync_fragment_split_batch(all_fragment_keys: Array) -> void:
 				grid.erase_block(key)
 		if not block_hp_dict.is_empty():
 			fragment_dicts.append(block_hp_dict)
+			fragment_sync_ids.append(fragment_ids[fi] if fi < fragment_ids.size() else 0)
 	if _compound_hit_body and is_instance_valid(_compound_hit_body):
 		PhysicsServer3D.body_set_shapes_bulk_mode(_compound_hit_body.get_rid(), false)
 	var _t_extract_us := Time.get_ticks_usec() - _t_extract
@@ -942,56 +1226,80 @@ func _sync_fragment_split_batch(all_fragment_keys: Array) -> void:
 		_shared_hit_shape = BoxShape3D.new()
 		_shared_hit_shape.size = Vector3.ONE * BlockGridManager.BLOCK_SIZE
 
-	for block_hp_dict: Dictionary in fragment_dicts:
+	# Per-child tight grid dims (3 ints each) for the batched C++ build.
+	var fragment_tight_dims := PackedInt32Array()
+	fragment_tight_dims.resize(fragment_dicts.size() * 3)
+
+	for fi in fragment_dicts.size():
+		var block_hp_dict: Dictionary = fragment_dicts[fi]
 		var block_keys: Array[Vector3i] = []
 		for key: Vector3i in block_hp_dict:
 			block_keys.append(key)
 
 		var child_mass := float(block_keys.size()) * _mass_per_block
 
-		# Compute child centroid in grid space for spawn position
+		# Compute child centroid in PARENT grid space for the spawn position
+		# (keys are still parent-grid coords at this point).
 		var child_centroid_grid := Vector3.ZERO
 		for key: Vector3i in block_keys:
 			child_centroid_grid += grid.block_local_pos_raw(key)
 		child_centroid_grid /= float(block_keys.size())
 		var spawn_pos := global_position + global_transform.basis * (child_centroid_grid - grid.centroid)
 
-		# Build child RigidBody3D
-		var child := RigidBody3D.new()
-		child.set_script(get_script())
-		child.name = "FallingCluster_frag_%d" % (randi() % 10000)
+		# Rebase the child to a tight AABB grid — same deterministic
+		# arithmetic on every peer (this runs inside the call_local RPC).
+		# Children otherwise inherit the parent's grid dims, which for chunks
+		# of a big structure means full-structure-sized bond/grid arrays.
+		var kmin: Vector3i = block_keys[0]
+		var kmax: Vector3i = block_keys[0]
+		for key: Vector3i in block_keys:
+			kmin = kmin.min(key)
+			kmax = kmax.max(key)
+		var rebased_dict: Dictionary = {}
+		for key: Vector3i in block_keys:
+			rebased_dict[key - kmin] = block_hp_dict[key]
+		fragment_dicts[fi] = rebased_dict
+		block_hp_dict = rebased_dict
+		var tight: Vector3i = kmax - kmin + Vector3i.ONE
+		fragment_tight_dims[fi * 3 + 0] = tight.x
+		fragment_tight_dims[fi * 3 + 1] = tight.y
+		fragment_tight_dims[fi * 3 + 2] = tight.z
+
+		# Build child RigidBody3D from a pool shell (or fresh allocation).
+		var shell: Dictionary = ClusterPool.acquire()
+		var child: RigidBody3D = shell["rb"]
+		# Deterministic name from the sync id — node paths must match across
+		# peers for the child's own RPCs to resolve. randi() fallback only for
+		# id 0 (legacy/debug paths that never sync anyway).
+		var sid: int = fragment_sync_ids[fi]
+		child.sync_id = sid
+		child.name = ("FallingCluster_%d" % sid) if sid != 0 \
+			else ("FallingCluster_frag_%d" % (randi() % 10000))
 		child.mass = child_mass
 		child.cluster_mass = child_mass
 		child.attacker_id = attacker_id
-		child.collision_layer = collision_layer
-		child.collision_mask = collision_mask
-		child.contact_monitor = true
-		child.max_contacts_reported = 4
-		child.gravity_scale = 1.0
-		child.continuous_cd = true
+		# Constant collision/physics properties pre-configured in
+		# ClusterPool._create_shell(). Parent and child of a fragment split
+		# share collision layer/mask, so the pool defaults are correct.
 
-		# Create grid manager (needed for ongoing damage tracking)
+		# Create grid manager (needed for ongoing damage tracking) with the
+		# child's tight rebased dims, not the parent's.
 		child.grid = BlockGridManager.new()
-		child.grid.num_x = grid.num_x
-		child.grid.num_y = grid.num_y
-		child.grid.num_z = grid.num_z
+		child.grid.num_x = fragment_tight_dims[fi * 3 + 0]
+		child.grid.num_y = fragment_tight_dims[fi * 3 + 1]
+		child.grid.num_z = fragment_tight_dims[fi * 3 + 2]
 		child.grid.block_hp = block_hp_dict
 
-		# Create mesh instance
-		var mesh_inst := MeshInstance3D.new()
-		mesh_inst.name = "ClusterMesh"
+		# Mesh instance from the pool shell.
+		var mesh_inst: MeshInstance3D = shell["mesh_inst"]
 		mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 		child.add_child(mesh_inst)
 		child._mesh_instance = mesh_inst
 
-		# Create compound hit body (need RID for batch call)
+		# Compound hit body from shell (collision layer pre-configured).
 		child._shared_hit_shape = _shared_hit_shape
-		var hit_body := StaticBody3D.new()
-		hit_body.set_script(_compound_body_script)
+		var hit_body: StaticBody3D = shell["hit_body"]
 		hit_body.parent_wall = child
-		hit_body.collision_layer = CollisionLayers.WALL_BLOCKS
-		hit_body.collision_mask = 0
-		hit_body.name = "CompoundHitBody"
 		child._compound_hit_body = hit_body
 
 		children.append(child)
@@ -1005,7 +1313,7 @@ func _sync_fragment_split_batch(all_fragment_keys: Array) -> void:
 	var results: Array = BlockMeshBuilder.build_clusters_batch(
 		fragment_dicts, grid.num_x, grid.num_y, grid.num_z,
 		BlockGridManager.BLOCK_SIZE, cluster_body_rids, hit_body_rids,
-		_shared_hit_shape.get_rid())
+		_shared_hit_shape.get_rid(), true, fragment_tight_dims)
 	var _t_build_us := Time.get_ticks_usec() - _t_build
 
 	# Phase 4: Unpack results and add children to scene tree.
@@ -1018,6 +1326,18 @@ func _sync_fragment_split_batch(all_fragment_keys: Array) -> void:
 		# Unpack grid data
 		child.grid.block_grid = result["block_grid"]
 		child.grid.centroid = result["centroid"]
+
+		# Initialize child's bond graph from its (now populated) block grid.
+		# Without this, bond arrays stay zero-sized and any damage event on
+		# the child would early-return as "no bonds" — making it indestructible.
+		child._block_hp_max = _block_hp_max
+		child.bonds_only_destruction = bonds_only_destruction
+		child.bond_strength_factor = bond_strength_factor
+		child.bond_damage_explosion_factor = bond_damage_explosion_factor
+		child.bond_damage_bullet_factor = bond_damage_bullet_factor
+		child.bond_damage_momentum_factor = bond_damage_momentum_factor
+		child.bond_damage_momentum_radius = bond_damage_momentum_radius
+		child._init_bond_graph()
 
 		# Set mesh
 		child._mesh_instance.mesh = result["mesh"]
@@ -1067,7 +1387,7 @@ func _sync_fragment_split_batch(all_fragment_keys: Array) -> void:
 	var _t_finish_us := Time.get_ticks_usec() - _t_finish
 
 	var total_us := Time.get_ticks_usec() - _t_total
-	print("[ClusterPerf] _sync_fragment_split_batch %s: %d fragments, extract=%dus create=%dus build=%dus finish=%dus total=%dus" % [
+	GameManager.plog("[ClusterPerf] _sync_fragment_split_batch %s: %d fragments, extract=%dus create=%dus build=%dus finish=%dus total=%dus" % [
 		name, fragment_dicts.size(), _t_extract_us, _t_create_us, _t_build_us, _t_finish_us, total_us])
 
 
@@ -1093,19 +1413,19 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 	# World position: parent origin + basis * (child centroid offset from parent centroid)
 	var spawn_pos := global_position + global_transform.basis * (child_centroid_grid - grid.centroid)
 
-	# Build child RigidBody3D
-	var child := RigidBody3D.new()
-	child.set_script(get_script())
+	# Build child RigidBody3D from a pool shell.
+	var shell: Dictionary = ClusterPool.acquire()
+	var child: RigidBody3D = shell["rb"]
 	child.name = "FallingCluster_frag_%d" % (randi() % 10000)
 	child.mass = child_mass
 	child.cluster_mass = child_mass
 	child.attacker_id = attacker_id
-	child.collision_layer = collision_layer
-	child.collision_mask = collision_mask
-	child.contact_monitor = true
-	child.max_contacts_reported = 4
-	child.gravity_scale = 1.0
-	child.continuous_cd = true
+	# Constant collision/physics properties pre-configured in
+	# ClusterPool._create_shell().
+
+	# Hand pool shell parts to the cluster so init_cluster_blocks reuses them.
+	child._mesh_instance = shell["mesh_inst"]
+	child._compound_hit_body = shell["hit_body"]
 
 	# Initialize block tracking — builds compound hit body
 	var _t_init := Time.get_ticks_usec()
@@ -1139,7 +1459,7 @@ func _spawn_child_cluster(block_hp_dict: Dictionary) -> void:
 		PhysicsServer3D.body_set_shielding_hp(child_rid, child.grid.get_total_hp())
 
 	var total_us := Time.get_ticks_usec() - _t_spawn
-	print("[ClusterPerf] _spawn_child_cluster %s->%s: %d blocks, children=%d, init=%dus add_child=%dus total=%dus" % [
+	GameManager.plog("[ClusterPerf] _spawn_child_cluster %s->%s: %d blocks, children=%d, init=%dus add_child=%dus total=%dus" % [
 		name, child.name, block_keys.size(), child.get_child_count(), _t_init_us, _t_addchild_us, total_us])
 
 
@@ -1214,7 +1534,7 @@ func _handle_generic_hit(body: Node) -> void:
 	var contact_point: Vector3 = impact["contact_point"]
 	take_momentum_damage_at(contact_point, impact["base_damage"], -1, impact["impact_speed"])
 
-	print("[FallingCluster] Hit %s for %.1f structure damage (speed=%.1f mass=%.1f)" % [
+	GameManager.plog("[FallingCluster] Hit %s for %.1f structure damage (speed=%.1f mass=%.1f)" % [
 		body.name, impact["base_damage"], impact["impact_speed"], cluster_mass])
 
 
@@ -1275,11 +1595,11 @@ func _handle_structure_hit(body: Node, target_structure: DestructibleBlockStruct
 			take_damage_at(block_pos, expl_damage, expl_radius, attacker_id, [], remaining_speed)
 			_t_self_expl = Time.get_ticks_usec() - _t0
 
-	print("[FallingCluster] Carve into %s: dmg=%.1f absorbed=%.1f remaining_speed=%.1f" % [
+	GameManager.plog("[FallingCluster] Carve into %s: dmg=%.1f absorbed=%.1f remaining_speed=%.1f" % [
 		target_structure.name, base_damage, target_absorbed, remaining_speed])
 	var total_us := _t_target_dmg + _t_target_expl + _t_self_dmg + _t_self_expl
 	if total_us > 100:
-		print("[ClusterPerf] _handle_structure_hit %s->%s: target_dmg=%dus target_expl=%dus self_dmg=%dus self_expl=%dus total=%dus" % [
+		GameManager.plog("[ClusterPerf] _handle_structure_hit %s->%s: target_dmg=%dus target_expl=%dus self_dmg=%dus self_expl=%dus total=%dus" % [
 			name, target_structure.name, _t_target_dmg, _t_target_expl, _t_self_dmg, _t_self_expl, total_us])
 
 
@@ -1347,10 +1667,10 @@ func _handle_cluster_vs_cluster(other: FallingBlockCluster) -> void:
 			_t_self_expl = Time.get_ticks_usec() - _t0
 
 	var total_us := Time.get_ticks_usec() - _t_cvc
-	print("[FallingCluster] Cluster vs cluster: %s(%.1fkg) vs %s(%.1fkg) speed=%.1f" % [
+	GameManager.plog("[FallingCluster] Cluster vs cluster: %s(%.1fkg) vs %s(%.1fkg) speed=%.1f" % [
 		name, cluster_mass, other.name, other.cluster_mass, impact_speed])
 	if total_us > 100:
-		print("[ClusterPerf] _handle_cluster_vs_cluster %s vs %s: other_dmg=%dus self_dmg=%dus other_expl=%dus self_expl=%dus total=%dus" % [
+		GameManager.plog("[ClusterPerf] _handle_cluster_vs_cluster %s vs %s: other_dmg=%dus self_dmg=%dus other_expl=%dus self_expl=%dus total=%dus" % [
 			name, other.name, _t_other_dmg, _t_self_dmg, _t_other_expl, _t_self_expl, total_us])
 
 
@@ -1383,7 +1703,7 @@ func _rebuild_visuals() -> void:
 	_update_compound_shielding_hp()
 
 	var total_us := _t_mesh_us + _t_col_us
-	print("[ClusterPerf] _rebuild_visuals %s: %d blocks, mesh=%dus collision=%dus total=%dus" % [
+	GameManager.plog("[ClusterPerf] _rebuild_visuals %s: %d blocks, mesh=%dus collision=%dus total=%dus" % [
 		name, grid.block_count(), _t_mesh_us, _t_col_us, total_us])
 
 
@@ -1422,7 +1742,7 @@ func _rebuild_collision_shapes() -> void:
 
 	var total_us := _t_free_us + _t_compute_us + _t_add_us
 	if total_us > 200:
-		print("[ClusterPerf] _rebuild_collision_shapes %s: compute=%dus add=%d(%dus) total=%dus" % [
+		GameManager.plog("[ClusterPerf] _rebuild_collision_shapes %s: compute=%dus add=%d(%dus) total=%dus" % [
 			name, _t_compute_us, shapes.size(), _t_add_us, total_us])
 
 

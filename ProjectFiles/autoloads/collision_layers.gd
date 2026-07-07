@@ -68,8 +68,10 @@ const TOAD_PLAYER_MASK := WORLD | TOAD_WALLS | TOAD_RAIN | TOAD_PLAYERS  # 337
 const DEFAULT_PHYSICS := WORLD | ITEMS | BUBBLES | RUBBER_BALLS | PLAYERS_PUSH | WALL_SMOOTH  # 2575
 
 ## Mask for projectiles and projectile-like objects (rockets, bubbles, toads).
-## Deliberately excludes items and rubber balls.
-const PROJECTILE_PHYSICS := WORLD | BUBBLES | PLAYERS_PUSH | WALL_SMOOTH  # 2565
+## Deliberately excludes items and rubber balls. Includes WALL_BLOCKS so a
+## rocket's forward raycast finds raw-body fragments (no Node, no body_entered
+## signal) before the physics step has a chance to bounce the rocket off them.
+const PROJECTILE_PHYSICS := WORLD | BUBBLES | PLAYERS_PUSH | WALL_SMOOTH | WALL_BLOCKS  # 3589
 
 # ======================================================================
 #  Helpers

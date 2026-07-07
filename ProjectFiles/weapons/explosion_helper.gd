@@ -237,7 +237,7 @@ static func do_explosion(
 			var damaged: int = r["damaged"]
 			var broken: int = r["broken"]
 			if damaged > 0 or broken > 0:
-				print("[BondGraph] %s blast batch energy=%.1f r=%.1f → damaged=%d broken=%d" % [
+				GameManager.plog("[BondGraph] %s blast batch energy=%.1f r=%.1f → damaged=%d broken=%d" % [
 					c.name, structure_damage * c.bond_damage_explosion_factor,
 					radius, damaged, broken])
 			# Fragments come back from the same WorkerThreadPool job that did
@@ -246,7 +246,8 @@ static func do_explosion(
 			# the impulse re-query below; otherwise they'd spawn at rest.
 			var fragments: Array = r.get("fragments", [])
 			if not fragments.is_empty():
-				c._sync_fragment_split_batch.rpc(fragments)
+				c._sync_fragment_split_batch.rpc(fragments,
+					ClusterSync.allocate_ids(fragments.size()))
 		GameManager.tick_add("bond_batch", Time.get_ticks_usec() - t_batch)
 	var t_pass1_process_end := Time.get_ticks_usec()
 
@@ -362,7 +363,7 @@ static func do_explosion(
 	var t_explosion_total_end := Time.get_ticks_usec()
 	var explosion_us := t_explosion_total_end - t_explosion_total
 	if GameManager.debug_explosion_diagnostics:
-		print("[DoExplosion] sphere=%dus(%d results)  damage=%dus(players=%d structs=%d objs=%d)  player_scan=%dus(%d)  impulse=%d  total=%dus" % [
+		GameManager.plog("[DoExplosion] sphere=%dus(%d results)  damage=%dus(players=%d structs=%d objs=%d)  player_scan=%dus(%d)  impulse=%d  total=%dus" % [
 			t_sphere_end - t_sphere, results.size(),
 			t_pass1_process_end - t_pass1_process, pass1_players, pass1_structures, pass1_objects,
 			t_pass2_players_end - t_pass2_players, pass2_players,
@@ -647,14 +648,14 @@ static func _dump_explosion_diagnostics(
 	## Comprehensive diagnostic: compares what the explosion found against every
 	## block structure in the scene. Flags structures within blast radius that
 	## were NOT damaged and suggests likely causes.
-	print("[ExplosionDiag] ══════════════════════════════════════════════════════")
-	print("[ExplosionDiag] EXPLOSION pos=%s  radius=%.1f  struct_dmg=%.0f" % [
+	GameManager.plog("[ExplosionDiag] ══════════════════════════════════════════════════════")
+	GameManager.plog("[ExplosionDiag] EXPLOSION pos=%s  radius=%.1f  struct_dmg=%.0f" % [
 		str(explosion_pos).substr(0, 40), radius, structure_damage])
-	print("[ExplosionDiag] Sphere query: %d results  |  query mask=%d (WALL_BLOCKS=%d)" % [
+	GameManager.plog("[ExplosionDiag] Sphere query: %d results  |  query mask=%d (WALL_BLOCKS=%d)" % [
 		sphere_results.size(), CollisionLayers.WORLD | CollisionLayers.ITEMS | CollisionLayers.BUBBLES | CollisionLayers.ALL_PLAYERS | CollisionLayers.WALL_BLOCKS,
 		CollisionLayers.WALL_BLOCKS])
-	print("[ExplosionDiag] NOTE: Jolt deferred shapes — first-frame sphere query may use default radius (0.5m)")
-	print("[ExplosionDiag] Already damaged (%d): %s" % [already_damaged.size(),
+	GameManager.plog("[ExplosionDiag] NOTE: Jolt deferred shapes — first-frame sphere query may use default radius (0.5m)")
+	GameManager.plog("[ExplosionDiag] Already damaged (%d): %s" % [already_damaged.size(),
 		str(already_damaged.map(func(n: Node): return n.name if n else "null"))])
 
 	# Identify which structures the sphere query actually returned colliders for
@@ -672,12 +673,12 @@ static func _dump_explosion_diagnostics(
 				break
 			cur = cur.get_parent()
 
-	print("[ExplosionDiag] Sphere query resolved to %d unique structures" % sphere_structure_ids.size())
+	GameManager.plog("[ExplosionDiag] Sphere query resolved to %d unique structures" % sphere_structure_ids.size())
 
 	# Find ALL structures in scene
 	var tree := Engine.get_main_loop() as SceneTree
 	if not tree or not tree.current_scene:
-		print("[ExplosionDiag] No scene tree!")
+		GameManager.plog("[ExplosionDiag] No scene tree!")
 		return
 
 	var structures_node: Node = null
@@ -688,10 +689,10 @@ static func _dump_explosion_diagnostics(
 		structures_node = seed_world.get_node_or_null("Structures")
 
 	if not structures_node:
-		print("[ExplosionDiag] Structures node NOT FOUND in scene tree!")
+		GameManager.plog("[ExplosionDiag] Structures node NOT FOUND in scene tree!")
 		return
 
-	print("[ExplosionDiag] Structures node: %d children total" % structures_node.get_child_count())
+	GameManager.plog("[ExplosionDiag] Structures node: %d children total" % structures_node.get_child_count())
 
 	var missed_count := 0
 	for child in structures_node.get_children():
@@ -710,15 +711,15 @@ static func _dump_explosion_diagnostics(
 		var in_radius := dist <= radius
 
 		var status := "DAMAGED" if was_damaged else ("IN_SPHERE" if in_sphere else "MISSED")
-		print("[ExplosionDiag] ── %s '%s'  dist=%.1f  %s ──" % [type_str, child.name, dist, status])
-		print("[ExplosionDiag]   pos=%s" % str(child.global_position).substr(0, 40))
+		GameManager.plog("[ExplosionDiag] ── %s '%s'  dist=%.1f  %s ──" % [type_str, child.name, dist, status])
+		GameManager.plog("[ExplosionDiag]   pos=%s" % str(child.global_position).substr(0, 40))
 
 		# Compound hit body diagnostics
 		var hit_body: Node = child.get("_compound_hit_body")
 		if hit_body == null:
-			print("[ExplosionDiag]   hit_body: NULL — no shapes for sphere query to find!")
+			GameManager.plog("[ExplosionDiag]   hit_body: NULL — no shapes for sphere query to find!")
 		elif not is_instance_valid(hit_body):
-			print("[ExplosionDiag]   hit_body: FREED/INVALID")
+			GameManager.plog("[ExplosionDiag]   hit_body: FREED/INVALID")
 		else:
 			var layer: int = hit_body.collision_layer
 			var has_wb := bool(layer & CollisionLayers.WALL_BLOCKS)
@@ -726,39 +727,39 @@ static func _dump_explosion_diagnostics(
 			var shape_arr: Array = child.get("_shape_to_key")
 			var n_active: int = key_map.size() if key_map else 0
 			var n_total: int = shape_arr.size() if shape_arr else 0
-			print("[ExplosionDiag]   hit_body: layer=%d WALL_BLOCKS=%s  active_shapes=%d/%d  rid=%s" % [
+			GameManager.plog("[ExplosionDiag]   hit_body: layer=%d WALL_BLOCKS=%s  active_shapes=%d/%d  rid=%s" % [
 				layer, str(has_wb), n_active, n_total, str(hit_body.get_rid())])
 			if not has_wb:
-				print("[ExplosionDiag]   >>> MISSING WALL_BLOCKS LAYER — explosion query CANNOT find this!")
+				GameManager.plog("[ExplosionDiag]   >>> MISSING WALL_BLOCKS LAYER — explosion query CANNOT find this!")
 			if n_active == 0 and n_total > 0:
-				print("[ExplosionDiag]   >>> ALL SHAPES DISABLED — nothing to collide with!")
+				GameManager.plog("[ExplosionDiag]   >>> ALL SHAPES DISABLED — nothing to collide with!")
 
 		if is_wall:
 			var smooth: Node = child.get("_collision_body")
 			if smooth and is_instance_valid(smooth):
-				print("[ExplosionDiag]   smooth_body: layer=%d" % smooth.collision_layer)
+				GameManager.plog("[ExplosionDiag]   smooth_body: layer=%d" % smooth.collision_layer)
 			else:
-				print("[ExplosionDiag]   smooth_body: %s" % ("NULL" if smooth == null else "FREED"))
+				GameManager.plog("[ExplosionDiag]   smooth_body: %s" % ("NULL" if smooth == null else "FREED"))
 			var hp_dict: Dictionary = child.get("_block_hp_dict")
-			print("[ExplosionDiag]   blocks=%d" % (hp_dict.size() if hp_dict else 0))
+			GameManager.plog("[ExplosionDiag]   blocks=%d" % (hp_dict.size() if hp_dict else 0))
 
 		if is_cluster:
-			print("[ExplosionDiag]   body_layer=%d  frozen=%s  mass=%.1f" % [
+			GameManager.plog("[ExplosionDiag]   body_layer=%d  frozen=%s  mass=%.1f" % [
 				child.collision_layer, str(child.freeze), child.cluster_mass])
 			var grid = child.get("grid")
-			print("[ExplosionDiag]   blocks=%d" % (grid.block_hp.size() if grid else 0))
+			GameManager.plog("[ExplosionDiag]   blocks=%d" % (grid.block_hp.size() if grid else 0))
 
 		# ── Critical diagnostic: in radius but not damaged ──
 		if in_radius and not was_damaged and child != exclude_body:
 			missed_count += 1
-			print("[ExplosionDiag]   >>>>>> WITHIN RADIUS (%.1f <= %.1f) BUT NOT DAMAGED! <<<<<<" % [dist, radius])
+			GameManager.plog("[ExplosionDiag]   >>>>>> WITHIN RADIUS (%.1f <= %.1f) BUT NOT DAMAGED! <<<<<<" % [dist, radius])
 
 			if hit_body == null or (hit_body != null and not is_instance_valid(hit_body)):
-				print("[ExplosionDiag]   Likely cause: no valid compound_hit_body")
+				GameManager.plog("[ExplosionDiag]   Likely cause: no valid compound_hit_body")
 			elif not bool(hit_body.collision_layer & CollisionLayers.WALL_BLOCKS):
-				print("[ExplosionDiag]   Likely cause: missing WALL_BLOCKS layer (layer=%d)" % hit_body.collision_layer)
+				GameManager.plog("[ExplosionDiag]   Likely cause: missing WALL_BLOCKS layer (layer=%d)" % hit_body.collision_layer)
 			elif not in_sphere:
-				print("[ExplosionDiag]   Likely cause: sphere query missed this (deferred shape? shape positions?)")
+				GameManager.plog("[ExplosionDiag]   Likely cause: sphere query missed this (deferred shape? shape positions?)")
 				# Test raycast from explosion to structure center
 				if space_state:
 					var test_q := PhysicsRayQueryParameters3D.new()
@@ -769,12 +770,12 @@ static func _dump_explosion_diagnostics(
 					var test_hit := space_state.intersect_ray(test_q)
 					if test_hit:
 						var hitter: Node = test_hit.get("collider")
-						print("[ExplosionDiag]   Test ray hit: %s (%s) at %s" % [
+						GameManager.plog("[ExplosionDiag]   Test ray hit: %s (%s) at %s" % [
 							hitter.name if hitter else "null",
 							hitter.get_class() if hitter else "null",
 							str(test_hit.get("position", Vector3.ZERO)).substr(0, 30)])
 					else:
-						print("[ExplosionDiag]   Test ray from explosion to structure center: NO HIT")
+						GameManager.plog("[ExplosionDiag]   Test ray from explosion to structure center: NO HIT")
 				# Check if any individual blocks are actually within radius
 				if is_wall:
 					var any_in := false
@@ -786,7 +787,7 @@ static func _dump_explosion_diagnostics(
 								any_in = true
 								break
 					if not any_in:
-						print("[ExplosionDiag]   Note: center in range but NO individual blocks within blast radius")
+						GameManager.plog("[ExplosionDiag]   Note: center in range but NO individual blocks within blast radius")
 				if is_cluster:
 					var grid = child.get("grid")
 					if grid:
@@ -797,21 +798,21 @@ static func _dump_explosion_diagnostics(
 								any_in = true
 								break
 						if not any_in:
-							print("[ExplosionDiag]   Note: center in range but NO individual blocks within blast radius")
+							GameManager.plog("[ExplosionDiag]   Note: center in range but NO individual blocks within blast radius")
 			else:
-				print("[ExplosionDiag]   Likely cause: sphere found it, but _find_damageable or take_damage_at skipped it")
+				GameManager.plog("[ExplosionDiag]   Likely cause: sphere found it, but _find_damageable or take_damage_at skipped it")
 				# Check if _find_damageable would resolve this
 				if hit_body and is_instance_valid(hit_body):
 					var parent_wall = hit_body.get("parent_wall")
 					if parent_wall == null:
-						print("[ExplosionDiag]   hit_body.parent_wall is NULL — _find_damageable cannot walk to structure")
+						GameManager.plog("[ExplosionDiag]   hit_body.parent_wall is NULL — _find_damageable cannot walk to structure")
 					elif not is_instance_valid(parent_wall):
-						print("[ExplosionDiag]   hit_body.parent_wall is INVALID/FREED")
+						GameManager.plog("[ExplosionDiag]   hit_body.parent_wall is INVALID/FREED")
 					elif not parent_wall.has_method("take_damage_at"):
-						print("[ExplosionDiag]   parent_wall has NO take_damage_at method!")
+						GameManager.plog("[ExplosionDiag]   parent_wall has NO take_damage_at method!")
 
 	if missed_count == 0:
-		print("[ExplosionDiag] All nearby structures accounted for")
+		GameManager.plog("[ExplosionDiag] All nearby structures accounted for")
 	else:
-		print("[ExplosionDiag] >>> %d STRUCTURE(S) IN RADIUS BUT NOT DAMAGED <<<" % missed_count)
-	print("[ExplosionDiag] ══════════════════════════════════════════════════════")
+		GameManager.plog("[ExplosionDiag] >>> %d STRUCTURE(S) IN RADIUS BUT NOT DAMAGED <<<" % missed_count)
+	GameManager.plog("[ExplosionDiag] ══════════════════════════════════════════════════════")

@@ -18,6 +18,24 @@ var debug_disable_demon: bool = true
 var debug_disable_zone_damage: bool = true
 var debug_skip_structures: bool = false
 var debug_disable_detached_structures: bool = false
+## Gravity stress solver: structures fail under their own weight when support
+## is inadequate (undamaged overhangs shear off, top-heavy builds rip their
+## anchors). See GRAVITY_STRESS_PLAN.md. Toggle off to fall back to pure
+## bond-connectivity destruction.
+var gravity_stress_enabled: bool = true
+
+## Perf/diagnostic logging for the destruction pipeline ([PERF], [ClusterPerf],
+## [BondGraph], ...). A console print costs ~10ms on Windows; a big collapse
+## emits 300+ lines, so leaving this on costs SECONDS of frame time per event.
+var debug_perf_logging: bool = false
+
+
+func plog(msg: String) -> void:
+	## Gated print for hot-path perf/diagnostic logging. The string is still
+	## formatted at the call site (µs), but the ~10ms console write is skipped
+	## unless debug_perf_logging is on.
+	if debug_perf_logging:
+		print(msg)
 var debug_disable_bots: bool = true          # Don't spawn bots on host
 var debug_free_firing: bool = false          # No burn fuel cost when firing weapons
 var debug_shotgun_boost: bool = false        # Double barrel: halved fire rate, doubled pellets
@@ -78,6 +96,9 @@ var debug_grounding_extend_snap: bool = false        # Extend snap range to 0.5m
 var debug_dynamic_snap: bool = false                  # Scale snap budget by vel.y × delta to recover from steep-slope launches
 var debug_snap_budget: float = 0.05                   # Static snap budget (m) extended when grounded last frame
 var debug_grounding_no_snap_ground: bool = false     # Disable snap setting _is_grounded
+var debug_no_snap: bool = false                       # Disable snap ENTIRELY (no pos/vel modification, no _is_grounded). For wedge-cause isolation tests.
+var debug_no_walk_accel: bool = false                  # Disable walk-acceleration (skip _process_ground_movement / _process_air_movement). hvel passes through unchanged.
+var debug_gravity_always: bool = false                 # Apply world-Y gravity unconditionally every frame (skip the grounded conditional that normally skips gravity on static contacts).
 var debug_grounding_surface_press: bool = false      # Add downward vel.y after slope projection
 var debug_grounding_press_strength: float = 1.0      # Surface press strength (m/s)
 var debug_player_zero_friction: bool = false          # Set player friction to 0 (no solver friction drag)
@@ -126,6 +147,11 @@ var debug_instant_accel: bool = false                   # Set walk acceleration 
 var debug_floor_diag: bool = false                       # F9: dump full floor/dynamic-contact diagnostic per frame
 var debug_floor_flicker: bool = false                    # F7: compact log of grounding transitions and floor-normal jumps
 var debug_snap_log: bool = false                         # F5: log every potential-flicker frame's snap inputs/outputs
+var debug_wedge_stutter: bool = false                    # F8: per-frame multi-contact wedge diagnostic — pos/vel deltas, contacts, pipeline trace
+var debug_combined_capture_active: bool = false          # Press F8 or F9 to toggle. While true, debug_floor_diag and debug_wedge_stutter are forced on AND the C++ [CV-CAP] stream is requested every physics tick — press the same key again to stop. All three diagnostic streams are time-aligned. (F3 dropped because debug_freecam.gd already binds it to toggle the freecam.)
+var debug_wedge_stick_to_walls: bool = false             # In compound contact (walkable below + non-walkable above), cancel only the OUTWARD velocity delta that the pipeline (walk_accel + slope_proj) added this frame. Drift is killed; pre-existing impulses are preserved.
+var debug_wall_proj_full_normal: bool = false            # After slope-proj, project velocity against the FULL 3D normal of every active non-walkable contact (compound-contact constraint). Catches sloped-ceiling drift that horizontal-only wall-proj misses.
+var debug_wedge_joint_proj: bool = false                 # JOINT compound-contact constraint: project velocity onto wedge axis (n_floor × n_other) so vel·n_floor = 0 AND vel·n_other = 0 hold simultaneously. Replaces sequential single-plane projections that fight each other. Restricts motion to wedge axis when geometrically wedged (correct physics).
 
 # Structure collision tuning (set from pause menu, all default to 1.0 base ratio)
 var structure_momentum_damage_scale: float = 1.0    # Multiplier on momentum → structure damage
@@ -145,7 +171,9 @@ signal god_mode_changed(enabled: bool)
 # to last_tick_gdscript_us (read by HUDPerfGraph for the pink line).
 #
 # Per-subsystem Dictionary breakdown only records when _tick_profile_remaining > 0
-# (triggered by start_tick_profile). This keeps always-on overhead minimal.
+# (triggered by start_tick_profile) OR when auto_profile_slow_ticks is on AND the
+# previous tick exceeded slow_tick_threshold_us — that auto path catches lag
+# spikes without manual triggering.
 var _tick_profile_remaining: int = 0
 var _tick_timing_us: Dictionary = {}     # subsystem -> total us this tick
 var _tick_timing_count: Dictionary = {}  # subsystem -> call count this tick
@@ -157,6 +185,30 @@ var _tick_number: int = 0
 var _tick_total_us: int = 0              # Running total for current tick
 var last_tick_gdscript_us: int = 0       # Total from previous tick (read by HUD)
 
+# Auto-profile slow ticks: when on, every tick populates _tick_timing_us and
+# any tick whose gdscript total exceeds slow_tick_threshold_us prints a one-line
+# breakdown labelled [SlowTick]. Cheap (one Dictionary insert per tick_add call)
+# and catches frame spikes without user action.
+var auto_profile_slow_ticks: bool = true
+var slow_tick_threshold_us: int = 8000   # 8ms — catches anything over half a 60fps budget
+var _tick_breakdown_us: Dictionary = {}    # subsystem -> us, current tick
+var _tick_breakdown_count: Dictionary = {} # subsystem -> call count, current tick
+
+# ── Continuous frame-time logger ────────────────────────────────────────────
+# Periodic wall-clock measurement of physics ticks AND render frames. Lets us
+# see if slideshow is physics-bound (ticks slipping behind 60Hz target) or
+# render-bound (process_frames per second much lower than physics).
+var debug_continuous_frame_log: bool = true
+const FRAME_LOG_INTERVAL_S: float = 1.0    # window size in seconds
+var _frame_log_window_start_us: int = 0
+var _frame_log_tick_count: int = 0
+var _frame_log_process_count: int = 0       # incremented from _process (render frames)
+var _frame_log_tick_gdscript_us: int = 0    # GDScript-tracked tick time over window
+var _frame_log_max_tick_gap_us: int = 0     # worst single-tick gap (real wall clock)
+var _frame_log_last_tick_us: int = 0
+var _frame_log_max_proc_gap_us: int = 0
+var _frame_log_last_proc_us: int = 0
+
 
 func _ready() -> void:
 	process_physics_priority = -100  # Run before all game nodes
@@ -165,15 +217,21 @@ func _ready() -> void:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
-		if event.keycode == KEY_F9:
-			debug_floor_diag = not debug_floor_diag
-			print("[FloorDiag] %s" % ("ON" if debug_floor_diag else "OFF"))
-		elif event.keycode == KEY_F7:
+		if event.keycode == KEY_F7:
 			debug_floor_flicker = not debug_floor_flicker
 			print("[FloorFlicker] %s" % ("ON" if debug_floor_flicker else "OFF"))
 		elif event.keycode == KEY_F5:
 			debug_snap_log = not debug_snap_log
 			print("[SnapLog] %s" % ("ON" if debug_snap_log else "OFF"))
+		elif event.keycode == KEY_F8 or event.keycode == KEY_F9:
+			# Unified capture toggle: press once to start, press again (F8 or F9) to stop.
+			# Turns on debug_floor_diag, debug_wedge_stutter, and the C++ [CV-CAP] stream
+			# so all three diagnostic streams are time-aligned. F3 is reserved by
+			# debug_freecam.gd so we can't include it.
+			debug_combined_capture_active = not debug_combined_capture_active
+			debug_floor_diag = debug_combined_capture_active
+			debug_wedge_stutter = debug_combined_capture_active
+			print("[CV-CAP] Combined capture %s" % ("STARTED — press F8 or F9 again to stop" if debug_combined_capture_active else "STOPPED"))
 
 
 func start_tick_profile(num_ticks: int) -> void:
@@ -193,6 +251,9 @@ func tick_add(subsystem: String, us: int) -> void:
 	if _tick_profile_remaining > 0:
 		_tick_timing_us[subsystem] = _tick_timing_us.get(subsystem, 0) + us
 		_tick_timing_count[subsystem] = _tick_timing_count.get(subsystem, 0) + 1
+	if auto_profile_slow_ticks:
+		_tick_breakdown_us[subsystem] = _tick_breakdown_us.get(subsystem, 0) + us
+		_tick_breakdown_count[subsystem] = _tick_breakdown_count.get(subsystem, 0) + 1
 
 
 func frame_add(subsystem: String, us: int) -> void:
@@ -239,10 +300,139 @@ func clear_usernames() -> void:
 	player_usernames_changed.emit()
 
 
+func _blockpen_monitor() -> void:
+	## Measure PushBlock penetration into static geometry (see call site).
+	## For each PushBlock within 15 m of the host player: an intersect_shape
+	## names the overlapping static bodies, a collide_shape gives contact-pair
+	## depths. Prints one [BLOCKPEN] line per penetrating block per tick.
+	var cs := get_tree().current_scene
+	if cs == null:
+		return
+	var blocks: Node = cs.get_node_or_null("SeedWorld/PushBlocks")
+	if blocks == null:
+		blocks = cs.find_child("PushBlocks", true, false)
+	if blocks == null:
+		return
+	var players := cs.get_node_or_null("Players")
+	var pl: Node3D = players.get_node_or_null("1") as Node3D if players else null
+	var world: World3D = (blocks as Node3D).get_world_3d() if blocks is Node3D else null
+	if world == null:
+		return
+	var dss := world.direct_space_state
+
+	for b in blocks.get_children():
+		var rb := b as RigidBody3D
+		if rb == null:
+			continue
+		if pl != null and rb.global_position.distance_to(pl.global_position) > 15.0:
+			continue
+		var col: CollisionShape3D = null
+		for child in rb.get_children():
+			if child is CollisionShape3D:
+				col = child
+				break
+		if col == null or col.shape == null:
+			continue
+		var params := PhysicsShapeQueryParameters3D.new()
+		params.shape = col.shape
+		params.transform = col.global_transform
+		# Static world geometry only: terrain/statics + wall hulls + per-block
+		# wall bodies. Excludes the block itself (and other dynamics aren't in
+		# the mask except fellow WALL_SMOOTH bodies — names disambiguate).
+		params.collision_mask = CollisionLayers.WORLD | CollisionLayers.WALL_SMOOTH | CollisionLayers.WALL_BLOCKS
+		params.exclude = [rb.get_rid()]
+		var hits := dss.intersect_shape(params, 6)
+		if hits.is_empty():
+			continue
+		var pairs := dss.collide_shape(params, 6)
+		var max_depth := 0.0
+		var j := 0
+		while j + 1 < pairs.size():
+			max_depth = maxf(max_depth, pairs[j].distance_to(pairs[j + 1]))
+			j += 2
+		if max_depth < 0.005:
+			continue  # sub-slop contact, not worth a line
+		var names := ""
+		for h in hits:
+			var hc: Object = h.get("collider")
+			names += ("%s " % (hc.name if hc is Node else "?"))
+		print("[BLOCKPEN] %s overlap=%.3f m into: %s@ pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f,%.2f)" % [
+			rb.name, max_depth, names,
+			rb.global_position.x, rb.global_position.y, rb.global_position.z,
+			rb.linear_velocity.x, rb.linear_velocity.y, rb.linear_velocity.z])
+
+
 func _physics_process(_delta: float) -> void:
 	# Always publish previous tick's total for the HUD graph (pink line)
 	last_tick_gdscript_us = _tick_total_us
 	_tick_total_us = 0
+
+	# [BLOCKPEN] — while the F8/F9 capture is on, directly measure how deep
+	# nearby PushBlocks sit inside STATIC geometry each physics tick (shape
+	# overlap pair depths + collider names). Body-vs-wall penetration is
+	# invisible to every other diagnostic stream (the CV capture only sees the
+	# player's own contacts), so "the block is phasing into the wall" reports
+	# get hard numbers: which wall body, how deep, where.
+	if debug_combined_capture_active:
+		_blockpen_monitor()
+
+
+	# (see _blockpen_monitor below for the [BLOCKPEN] stream)
+
+	# Continuous frame-time logger using wall-clock time. Tracks how many
+	# physics ticks AND render frames actually happened in the window. If
+	# tick_rate < 60 → physics is slipping. If proc_rate < tick_rate → render
+	# is the bottleneck.
+	if debug_continuous_frame_log:
+		var now := Time.get_ticks_usec()
+		_frame_log_tick_count += 1
+		_frame_log_tick_gdscript_us += last_tick_gdscript_us
+		if _frame_log_last_tick_us > 0:
+			var gap := now - _frame_log_last_tick_us
+			if gap > _frame_log_max_tick_gap_us:
+				_frame_log_max_tick_gap_us = gap
+		_frame_log_last_tick_us = now
+
+		if _frame_log_window_start_us == 0:
+			_frame_log_window_start_us = now
+		var window_us := now - _frame_log_window_start_us
+		if window_us >= int(FRAME_LOG_INTERVAL_S * 1_000_000.0):
+			var tick_rate := float(_frame_log_tick_count) * 1_000_000.0 / float(window_us)
+			var proc_rate := float(_frame_log_process_count) * 1_000_000.0 / float(window_us)
+			var avg_gdscript_per_tick: int = 0
+			if _frame_log_tick_count > 0:
+				avg_gdscript_per_tick = _frame_log_tick_gdscript_us / _frame_log_tick_count
+			print("[FrameLog] %.1f tick/s  %.1f proc/s (render)  avg_gdscript_per_tick=%dus  max_tick_gap=%dus  max_proc_gap=%dus" % [
+				tick_rate, proc_rate,
+				avg_gdscript_per_tick,
+				_frame_log_max_tick_gap_us,
+				_frame_log_max_proc_gap_us])
+			_frame_log_window_start_us = now
+			_frame_log_tick_count = 0
+			_frame_log_process_count = 0
+			_frame_log_tick_gdscript_us = 0
+			_frame_log_max_tick_gap_us = 0
+			_frame_log_max_proc_gap_us = 0
+
+
+
+	# Auto-print slow-tick breakdown. Runs PREVIOUS tick's accumulated breakdown
+	# if its total exceeded the threshold. Then clears for next tick.
+	if auto_profile_slow_ticks:
+		if last_tick_gdscript_us >= slow_tick_threshold_us and not _tick_breakdown_us.is_empty():
+			var sorted_bk := _tick_breakdown_us.keys()
+			sorted_bk.sort_custom(func(a, b): return _tick_breakdown_us[a] > _tick_breakdown_us[b])
+			var bk_parts: PackedStringArray = []
+			for key in sorted_bk:
+				var bus: int = _tick_breakdown_us[key]
+				var bcount: int = _tick_breakdown_count.get(key, 1)
+				if bcount > 1:
+					bk_parts.append("%s=%dus(x%d)" % [key, bus, bcount])
+				else:
+					bk_parts.append("%s=%dus" % [key, bus])
+			print("[SlowTick] total=%dus  %s" % [last_tick_gdscript_us, "  ".join(bk_parts)])
+		_tick_breakdown_us.clear()
+		_tick_breakdown_count.clear()
 
 	# Per-subsystem console profiling (only when explicitly triggered)
 	if _tick_profile_remaining <= 0:
@@ -287,3 +477,13 @@ func _physics_process(_delta: float) -> void:
 func _process(delta: float) -> void:
 	if current_state == GameState.PLAYING:
 		match_time_elapsed += delta
+
+	# Render-frame counter for the FrameLog logger in _physics_process.
+	if debug_continuous_frame_log:
+		_frame_log_process_count += 1
+		var now := Time.get_ticks_usec()
+		if _frame_log_last_proc_us > 0:
+			var gap := now - _frame_log_last_proc_us
+			if gap > _frame_log_max_proc_gap_us:
+				_frame_log_max_proc_gap_us = gap
+		_frame_log_last_proc_us = now
