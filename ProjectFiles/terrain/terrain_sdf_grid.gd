@@ -9,6 +9,21 @@ const CHUNK_SIZE := 16
 const CS := CHUNK_SIZE  # shorthand for index math
 const CHUNK_VOLUME := CS * CS * CS  # 4096
 
+## Gain applied to SDF values when writing into a VoxelBuffer for meshing.
+## The buffer's 16-bit SDF channel spans ±500 m, so its quantum is ~15.3 mm —
+## raw values within ±15 mm of the surface all snap to EXACTLY 0. Along
+## contour lines where the terrain height crosses an integer grid plane,
+## whole runs of corners landed in that dead zone and Transvoxel emitted
+## degenerate sliver triangles (measured 46–77° facets on 13–19° terrain,
+## always at y mod 1 < 0.015 — the "weird bump on smooth ground" spots).
+## Zero-crossings are scale-invariant (vertex position depends only on the
+## RATIO of corner values), so a gain shrinks the effective quantum without
+## moving the surface: ×64 → 0.24 mm. Values far from the surface saturate
+## at ±500, which meshing doesn't care about. The gain exists ONLY at the
+## buffer boundary — stored chunk floats and gameplay queries stay unscaled.
+const SDF_WRITE_GAIN := 64.0
+
+
 var _chunks: Dictionary = {}  # Vector3i -> PackedFloat32Array
 var _noise: FastNoiseLite
 var _height_range: float
@@ -29,26 +44,28 @@ func has_chunk(block_pos: Vector3i) -> bool:
 
 func generate_chunk(block_pos: Vector3i) -> void:
 	## Fill a chunk's SDF from the noise height field.
-	## SDF = world_y - surface_y  (negative = solid, positive = air).
-	var sdf := PackedFloat32Array()
-	sdf.resize(CHUNK_VOLUME)
-
-	var ox: int = block_pos.x * CS
-	var oy: int = block_pos.y * CS
-	var oz: int = block_pos.z * CS
-
-	var idx := 0
-	for lz in CS:
-		var wz := float(oz + lz)
-		for ly in CS:
-			var wy := float(oy + ly)
-			for lx in CS:
-				var wx := float(ox + lx)
-				var surface_y := (_noise.get_noise_2d(wx, wz) + 1.0) * 0.5 * _height_range
-				sdf[idx] = wy - surface_y
-				idx += 1
-
-	_chunks[block_pos] = sdf
+	## Uses C++ TerrainFill module for ~10x speedup over GDScript loop.
+	if ClassDB.class_exists(&"TerrainFill"):
+		var tf = ClassDB.instantiate(&"TerrainFill")
+		_chunks[block_pos] = tf.generate_chunk(block_pos, _noise, _height_range, CS)
+	else:
+		# Fallback: GDScript loop
+		var sdf := PackedFloat32Array()
+		sdf.resize(CHUNK_VOLUME)
+		var ox: int = block_pos.x * CS
+		var oy: int = block_pos.y * CS
+		var oz: int = block_pos.z * CS
+		var idx := 0
+		for lz in CS:
+			var wz := float(oz + lz)
+			for ly in CS:
+				var wy := float(oy + ly)
+				for lx in CS:
+					var wx := float(ox + lx)
+					var surface_y := (_noise.get_noise_2d(wx, wz) + 1.0) * 0.5 * _height_range
+					sdf[idx] = wy - surface_y
+					idx += 1
+		_chunks[block_pos] = sdf
 
 
 func remove_chunk(block_pos: Vector3i) -> void:
@@ -94,10 +111,10 @@ func get_height_from_noise(world_x: float, world_z: float) -> float:
 
 func fill_buffer(buffer: VoxelBuffer, region_min: Vector3i, buf_size: Vector3i) -> void:
 	## Fill a VoxelBuffer SDF channel from stored chunk data.
-	## Iterates chunk-by-chunk over the overlapping region for efficiency.
+	## Note: C++ fill_buffer via Object::call is slower than GDScript due to
+	## per-voxel Variant overhead. Keeping GDScript until we can access
+	## VoxelBuffer's raw memory directly.
 	var region_max: Vector3i = region_min + buf_size
-
-	# Determine which chunks overlap the requested region
 	var bmin := Vector3i(
 		floori(float(region_min.x) / CS),
 		floori(float(region_min.y) / CS),
@@ -106,23 +123,18 @@ func fill_buffer(buffer: VoxelBuffer, region_min: Vector3i, buf_size: Vector3i) 
 		floori(float(region_max.x - 1) / CS),
 		floori(float(region_max.y - 1) / CS),
 		floori(float(region_max.z - 1) / CS))
-
 	var sdf_ch: int = VoxelBuffer.CHANNEL_SDF
-
 	for cbz in range(bmin.z, bmax.z + 1):
 		for cby in range(bmin.y, bmax.y + 1):
 			for cbx in range(bmin.x, bmax.x + 1):
 				var bp := Vector3i(cbx, cby, cbz)
-				var co := bp * CS  # chunk origin in world
-
-				# Overlap between chunk [co, co+CS) and buffer region
+				var co := bp * CS
 				var omin_x: int = maxi(co.x, region_min.x)
 				var omin_y: int = maxi(co.y, region_min.y)
 				var omin_z: int = maxi(co.z, region_min.z)
 				var omax_x: int = mini(co.x + CS, region_max.x)
 				var omax_y: int = mini(co.y + CS, region_max.y)
 				var omax_z: int = mini(co.z + CS, region_max.z)
-
 				if _chunks.has(bp):
 					var sdf: PackedFloat32Array = _chunks[bp]
 					for wz in range(omin_z, omax_z):
@@ -135,10 +147,9 @@ func fill_buffer(buffer: VoxelBuffer, region_min: Vector3i, buf_size: Vector3i) 
 							for wx in range(omin_x, omax_x):
 								var lx_c: int = wx - co.x
 								var lx_b: int = wx - region_min.x
-								buffer.set_voxel_f(sdf[row_c + lx_c],
+								buffer.set_voxel_f(sdf[row_c + lx_c] * SDF_WRITE_GAIN,
 									lx_b, ly_b, lz_b, sdf_ch)
 				else:
-					# Chunk not loaded — generate from noise on the fly
 					for wz in range(omin_z, omax_z):
 						var fwz := float(wz)
 						var lz_b: int = wz - region_min.z
@@ -149,7 +160,7 @@ func fill_buffer(buffer: VoxelBuffer, region_min: Vector3i, buf_size: Vector3i) 
 								var fwx := float(wx)
 								var lx_b: int = wx - region_min.x
 								var sy := (_noise.get_noise_2d(fwx, fwz) + 1.0) * 0.5 * _height_range
-								buffer.set_voxel_f(fwy - sy,
+								buffer.set_voxel_f((fwy - sy) * SDF_WRITE_GAIN,
 									lx_b, ly_b, lz_b, sdf_ch)
 
 

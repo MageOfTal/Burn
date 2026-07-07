@@ -201,7 +201,13 @@ func _apply_character_push(char_body: Player, contact_normal: Vector3,
 	var char_push: Vector3 = contact_normal * (impulse_magnitude / CHAR_EFFECTIVE_MASS)
 	if char_push.length() > MAX_CHAR_PUSH_SPEED:
 		char_push = char_push.normalized() * MAX_CHAR_PUSH_SPEED
-	char_body.velocity += char_push
+	# Route through the knockback channel (frictioned independently of walk
+	# velocity; survives the grounded grip clamp) when the character has one;
+	# fall back to a raw velocity write for anything else.
+	if "movement" in char_body and char_body.movement != null and char_body.movement.has_method("add_knockback"):
+		char_body.movement.add_knockback(char_push)
+	else:
+		char_body.velocity += char_push
 
 
 # ======================================================================

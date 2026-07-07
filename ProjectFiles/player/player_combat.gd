@@ -136,7 +136,17 @@ func _process_pellet_hits(hit_info: Dictionary, current_weapon: WeaponBase, muzz
 	var hit_player_ids: Dictionary = {}  # peer_id -> true, to avoid duplicate whiz on hit targets
 	for pellet in pellets:
 		var collider = pellet.get("hit_collider")
+		# FragmentPool fragments are raw PhysicsServer3D bodies — no Node, so
+		# the raycast returns collider=null. Route them via the result's RID.
 		if collider == null:
+			var rid: RID = pellet.get("hit_rid", RID())
+			if rid.is_valid():
+				var slot := FragmentPool.slot_for_rid(rid)
+				if slot >= 0:
+					var dmg: float = rarity_struct_dmg_per_pellet * player.heat_system.get_damage_multiplier()
+					if 11 in player.active_bonuses:
+						dmg *= 1.10
+					FragmentPool.damage_fragment(slot, dmg, player.peer_id)
 			continue
 		var is_player_hit := collider is Player
 		var base_pellet_dmg := rarity_damage_per_pellet if is_player_hit else rarity_struct_dmg_per_pellet
@@ -168,7 +178,18 @@ func _process_single_hit(hit_info: Dictionary, current_weapon: WeaponBase, muzzl
 
 	var hit_player_ids: Dictionary = {}
 	var collider = hit_info.get("hit_collider")
-	if collider != null:
+	if collider == null:
+		# Maybe a FragmentPool body (raw PhysicsServer3D body, no Node).
+		var rid: RID = hit_info.get("hit_rid", RID())
+		if rid.is_valid():
+			var slot := FragmentPool.slot_for_rid(rid)
+			if slot >= 0:
+				var base_dmg: float = current_weapon.weapon_data.get_rarity_structure_damage()
+				var dmg: float = base_dmg * player.heat_system.get_damage_multiplier()
+				if 11 in player.active_bonuses:
+					dmg *= 1.10
+				FragmentPool.damage_fragment(slot, dmg, player.peer_id)
+	else:
 		var is_player_hit := collider is Player
 		var base_dmg: float
 		if is_player_hit:

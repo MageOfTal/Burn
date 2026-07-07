@@ -188,11 +188,15 @@ func host_game(port: int = NetConstants.DEFAULT_PORT) -> Error:
 	return OK
 
 
+var _host_start_time: int = 0
+
 func _start_host() -> void:
+	_host_start_time = Time.get_ticks_msec()
 	print("[Server] _start_host() — beginning host setup...")
 	_show_loading_screen("Loading game map...")
-	print("[Server] Step 1/2: Loading game map...")
+	var t := Time.get_ticks_msec()
 	await _load_game_map()
+	print("[STARTUP] Load map: %dms" % (Time.get_ticks_msec() - t))
 	print("[Server] Step 2/2: Building structures...")
 	var seed_world := get_tree().current_scene.get_node_or_null("SeedWorld")
 	if seed_world:
@@ -205,6 +209,7 @@ func _start_host() -> void:
 
 func _on_structures_complete_lobby() -> void:
 	## Callback: heavy structures finished building. Enter lobby.
+	print("[STARTUP] Host button → lobby: %dms" % (Time.get_ticks_msec() - _host_start_time))
 	_hide_loading_screen()
 	# Register host as lobby-ready
 	_lobby_ready_peers.clear()
@@ -952,6 +957,10 @@ func _start_match() -> void:
 			map.spawn_toad_bowl()
 		if map and map.has_method("spawn_test_ramps"):
 			map.spawn_test_ramps()
+		if map and map.has_method("spawn_seesaw"):
+			map.spawn_seesaw()
+		if map and map.has_method("spawn_wavy_body"):
+			map.spawn_wavy_body()
 
 		# Start burn clock
 		var burn_clock := get_node_or_null("/root/BurnClock")

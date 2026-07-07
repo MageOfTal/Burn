@@ -171,7 +171,12 @@ static void _shielding_batch_worker(void *p_userdata, uint32_t p_index) {
 	float absorbed = 0.0f;
 	const RID target_rid = ctx->target_rids[p_index];
 	const float max_abs = ctx->max_absorptions[p_index];
-	JPH::BodyID last_absorbed_body; // Tracks last body that contributed shielding.
+	// Dedup by (body_id, sub_shape_id) — not just body_id.
+	// Compound bodies (one body, N shapes) need each shape to contribute
+	// independently. Front/back face hits of the SAME shape share the same
+	// sub_shape_id, so back-face dedup still works correctly.
+	JPH::BodyID last_absorbed_body;
+	JPH::SubShapeID last_absorbed_subshape;
 
 	for (int i = 0; i < hit_count; ++i) {
 		const JPH::RayCastResult &hit = sorted_hits[i];
@@ -194,11 +199,11 @@ static void _shielding_batch_worker(void *p_userdata, uint32_t p_index) {
 			break;
 		}
 
-		// Deduplicate same-body hits (front face + back face of convex shapes).
+		// Deduplicate same-shape hits (front face + back face of convex shapes).
 		// With hit_back_faces=true, a ray through a box produces 2 hits on the
-		// same body. Without this, each block double-counts its HP as shielding.
-		// Hits are sorted by fraction, so same-body hits are adjacent.
-		if (body_id == last_absorbed_body) {
+		// same shape. Dedup by (body_id, sub_shape_id) so compound bodies with
+		// multiple shapes each contribute independently (one block = one shape).
+		if (body_id == last_absorbed_body && hit.mSubShapeID2 == last_absorbed_subshape) {
 			continue;
 		}
 
@@ -207,6 +212,7 @@ static void _shielding_batch_worker(void *p_userdata, uint32_t p_index) {
 			continue; // Skip — no absorption.
 		}
 		last_absorbed_body = body_id;
+		last_absorbed_subshape = hit.mSubShapeID2;
 		if (absorption >= 99999.0f) {
 			ctx->results[p_index] = 99999.0f;
 			return; // Terrain — fully blocked.
@@ -829,7 +835,8 @@ float JoltPhysicsDirectSpaceState3D::calc_ray_shielding(const RayParameters &p_p
 
 	// Uses the shared _classify_shielding_hit() for tag-based classification.
 	float absorbed = 0.0f;
-	JPH::BodyID last_absorbed_body; // Tracks last body that contributed shielding.
+	JPH::BodyID last_absorbed_body;
+	JPH::SubShapeID last_absorbed_subshape;
 
 	for (int i = 0; i < hit_count; ++i) {
 		const JPH::RayCastResult &hit = sorted_hits[i];
@@ -845,8 +852,9 @@ float JoltPhysicsDirectSpaceState3D::calc_ray_shielding(const RayParameters &p_p
 			break;
 		}
 
-		// Deduplicate same-body hits (front face + back face of convex shapes).
-		if (body_id == last_absorbed_body) {
+		// Deduplicate same-shape hits (front face + back face of convex shapes).
+		// Compound bodies with multiple shapes each contribute independently.
+		if (body_id == last_absorbed_body && hit.mSubShapeID2 == last_absorbed_subshape) {
 			continue;
 		}
 
@@ -855,6 +863,7 @@ float JoltPhysicsDirectSpaceState3D::calc_ray_shielding(const RayParameters &p_p
 			continue; // Skip — no absorption.
 		}
 		last_absorbed_body = body_id;
+		last_absorbed_subshape = hit.mSubShapeID2;
 		if (absorption >= 99999.0f) {
 			// DIAGNOSTIC: identify what body is being classified as terrain.
 			const JoltBody3D *diag_body = jolt_object->as_body();
@@ -973,7 +982,8 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 		int p_num_x, int p_num_y, int p_num_z,
 		float p_blast_radius,
 		float p_damage_amount,
-		float p_block_hp) {
+		float p_block_hp,
+		const RID &p_compound_body) {
 	ERR_FAIL_COND_V_MSG(space->is_stepping(), Dictionary(),
 		"calc_structure_explosion must not be called while the physics space is being stepped.");
 
@@ -1002,6 +1012,19 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 	Vector<RID> target_rids;
 	PackedFloat32Array raw_damages;
 	PackedFloat32Array block_hps;
+
+	// Compound mode: the target block's own shape self-shields (one hit at the
+	// compound body's shielding_hp). Compute the average HP to subtract it out
+	// in phase 3 so the self-shielding exactly cancels.
+	float self_shield = 0.0f;
+	if (p_compound_body.is_valid() && !p_blocks.is_empty()) {
+		float total_hp = 0.0f;
+		const Array hp_values = p_blocks.values();
+		for (int i = 0; i < hp_values.size(); i++) {
+			total_hp += float(hp_values[i]);
+		}
+		self_shield = total_hp / float(hp_values.size());
+	}
 
 	const int grid_size = p_num_x * p_num_y * p_num_z;
 	ERR_FAIL_COND_V_MSG(p_block_grid.size() != grid_size, Dictionary(),
@@ -1043,21 +1066,31 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 					continue;
 				}
 
-				Dictionary block_dict = p_blocks[key];
-				Variant v_body = block_dict[sn_body];
-				Object *body_obj = v_body.get_validated_object();
-				if (!body_obj) {
-					skip_body++;
-					continue;
-				}
+				float hp;
+				RID rid;
 
-				CollisionObject3D *col_obj = Object::cast_to<CollisionObject3D>(body_obj);
-				if (!col_obj) {
-					skip_cast++;
-					continue;
+				if (p_compound_body.is_valid()) {
+					// Compound mode: p_blocks maps Vector3i → float (HP only).
+					hp = float(p_blocks[key]);
+					rid = RID(); // All shapes share compound body's RID — can't use as target.
+				} else {
+					// Legacy mode: p_blocks maps Vector3i → Dictionary{"body", "hp"}.
+					Dictionary block_dict = p_blocks[key];
+					Variant v_body = block_dict[sn_body];
+					Object *body_obj = v_body.get_validated_object();
+					if (!body_obj) {
+						skip_body++;
+						continue;
+					}
+
+					CollisionObject3D *col_obj = Object::cast_to<CollisionObject3D>(body_obj);
+					if (!col_obj) {
+						skip_cast++;
+						continue;
+					}
+					rid = col_obj->get_rid();
+					hp = float(block_dict[sn_hp]);
 				}
-				RID rid = col_obj->get_rid();
-				float hp = float(block_dict[sn_hp]);
 
 				// Compute actual distance for falloff (only for in-range blocks).
 				float dist = Math::sqrt(dist_sq);
@@ -1102,6 +1135,24 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 	PackedFloat32Array absorptions;
 	absorptions.resize(ray_count);
 
+	// Compound mode: the worker must NOT early-out before reaching the target
+	// block's self-shielding hit, otherwise the phase-3 compensation subtracts
+	// self_shield from a value that doesn't contain it. Raise max_abs by
+	// self_shield so the worker always processes through the self-shield hit.
+	PackedFloat32Array max_abs_arr;
+	const float *max_abs_ptr;
+	if (self_shield > 0.0f) {
+		max_abs_arr.resize(ray_count);
+		float *ma = max_abs_arr.ptrw();
+		const float *rd = raw_damages.ptr();
+		for (int i = 0; i < ray_count; i++) {
+			ma[i] = rd[i] + self_shield;
+		}
+		max_abs_ptr = max_abs_arr.ptr();
+	} else {
+		max_abs_ptr = raw_damages.ptr();
+	}
+
 	ShieldingBatchContext ctx;
 	ctx.narrow_phase = &space->get_narrow_phase_query();
 	ctx.space = space;
@@ -1110,7 +1161,7 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 	ctx.jolt_from = to_jolt_r(hit_pos);
 	ctx.to_points = to_points.ptr();
 	ctx.target_rids = target_rids.ptr();
-	ctx.max_absorptions = raw_damages.ptr(); // max_absorption = raw_damage (early-out)
+	ctx.max_absorptions = max_abs_ptr;
 	ctx.results = absorptions.ptrw();
 
 	const int MIN_PARALLEL = 32;
@@ -1136,13 +1187,23 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 	Array destroyed_keys;
 	PackedVector3Array destroyed_positions;
 	PackedFloat32Array destroyed_overkill;
+	PackedFloat32Array destroyed_raw_dmg;
+	PackedFloat32Array destroyed_final_dmg;
+	PackedFloat32Array destroyed_abs;
 	Array survived_keys;
 	PackedFloat32Array survived_hps;
+	PackedFloat32Array survived_raw_dmg;
+	PackedFloat32Array survived_final_dmg;
+	PackedFloat32Array survived_abs;
 	TypedArray<RID> survived_rids;
 
 	int shielded_out = 0;
 	for (int i = 0; i < ray_count; i++) {
-		float final_dmg = MAX(dmg_ptr[i] - abs_ptr[i], 0.0f);
+		// Compound mode: subtract self_shield to cancel out the target block's
+		// own shape contributing to absorption. The target always self-shields
+		// exactly once at the compound body's average HP.
+		float effective_abs = (self_shield > 0.0f) ? MAX(abs_ptr[i] - self_shield, 0.0f) : abs_ptr[i];
+		float final_dmg = MAX(dmg_ptr[i] - effective_abs, 0.0f);
 		if (final_dmg < 0.5f) {
 			shielded_out++;
 			continue;
@@ -1153,9 +1214,15 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 			destroyed_positions.push_back(to_points[i]);
 			float overkill = CLAMP(-new_hp / p_block_hp, 0.0f, 1.0f);
 			destroyed_overkill.push_back(overkill);
+			destroyed_raw_dmg.push_back(dmg_ptr[i]);
+			destroyed_final_dmg.push_back(final_dmg);
+			destroyed_abs.push_back(abs_ptr[i]);
 		} else {
 			survived_keys.push_back(in_range_keys[i]);
 			survived_hps.push_back(new_hp);
+			survived_raw_dmg.push_back(dmg_ptr[i]);
+			survived_final_dmg.push_back(final_dmg);
+			survived_abs.push_back(abs_ptr[i]);
 			survived_rids.push_back(target_rids[i]);
 		}
 	}
@@ -1164,9 +1231,17 @@ Dictionary JoltPhysicsDirectSpaceState3D::calc_structure_explosion(
 	result["destroyed_keys"] = destroyed_keys;
 	result["destroyed_positions"] = destroyed_positions;
 	result["destroyed_overkill"] = destroyed_overkill;
+	result["destroyed_raw_dmg"] = destroyed_raw_dmg;
+	result["destroyed_final_dmg"] = destroyed_final_dmg;
+	result["destroyed_abs"] = destroyed_abs;
 	result["survived_keys"] = survived_keys;
 	result["survived_hps"] = survived_hps;
+	result["survived_raw_dmg"] = survived_raw_dmg;
+	result["survived_final_dmg"] = survived_final_dmg;
+	result["survived_abs"] = survived_abs;
 	result["survived_rids"] = survived_rids;
+	result["self_shield"] = self_shield;
+	result["shielded_out"] = shielded_out;
 
 	uint64_t t_end = OS::get_singleton()->get_ticks_usec();
 

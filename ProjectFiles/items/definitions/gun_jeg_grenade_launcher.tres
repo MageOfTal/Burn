@@ -1,13 +1,16 @@
 [gd_resource type="Resource" script_class="WeaponData" format=3 uid="uid://b1qad4ggdm4gy"]
 
 [ext_resource type="Script" uid="uid://bd5kpo5ymkl7u" path="res://items/weapon_data.gd" id="1"]
+[ext_resource type="PackedScene" path="res://weapons/grenade_projectile.tscn" id="2"]
 
 [resource]
 script = ExtResource("1")
-damage = 45.0
-structure_damage = 45.0
+damage = 55.0
+structure_damage = 200.0
 fire_rate = 1.0
 weapon_range = 200.0
+is_hitscan = false
+projectile_scene = ExtResource("2")
 spread = 1.6
 heat_per_shot = 8.9
 ads_fov = 50.0

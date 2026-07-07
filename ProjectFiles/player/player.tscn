@@ -19,6 +19,10 @@
 [ext_resource type="Shader" path="res://player/player_dissolve.gdshader" id="15_dissolve"]
 [ext_resource type="PackedScene" path="res://player/store_ui.tscn" id="16_store_ui"]
 
+[sub_resource type="PhysicsMaterial" id="PhysicsMaterial_player"]
+friction = 0.0
+bounce = 0.0
+
 [sub_resource type="ShaderMaterial" id="DissolveMaterial_001"]
 shader = ExtResource("15_dissolve")
 shader_parameter/albedo_color = Color(1.0, 1.0, 1.0, 1.0)
@@ -160,6 +164,7 @@ properties/15/spawn = true
 properties/15/replication_mode = 1
 
 [node name="Player" type="RigidBody3D"]
+physics_material_override = SubResource("PhysicsMaterial_player")
 collision_layer = 640
 collision_mask = 2271
 mass = 80.0

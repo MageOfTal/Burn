@@ -34,11 +34,18 @@ const RESPAWN_DELAY := 3.0
 ## so Jolt doesn't double-apply). Subsystems (slide_crouch, etc.) also read this.
 var gravity: float = 22.05
 
-## Velocity alias — maps to RigidBody3D.linear_velocity for convenience.
-## All subsystems read/write player.velocity; this maps to linear_velocity.
+## Movement-intent velocity. NOT aliased to RigidBody3D.linear_velocity: the
+## player body is frozen-kinematic, so the engine overwrites linear_velocity
+## every physics step with the transform-delta (so a kinematic body can impart
+## momentum to bodies it pushes). After a teleport (spawn / respawn / zone
+## warp) that delta is enormous — reading it back as "our velocity" launched
+## the player off the map at mach speed. So we keep our own intent vector;
+## apply_cv_move() hands it to the CharacterVirtual and writes the resolved
+## velocity back here. All subsystems read/write player.velocity.
+var _intent_vel: Vector3 = Vector3.ZERO
 var velocity: Vector3:
-	get: return linear_velocity
-	set(v): linear_velocity = v
+	get: return _intent_vel
+	set(v): _intent_vel = v
 
 
 ## The peer ID that owns this player. Set by NetworkManager on spawn.
@@ -81,6 +88,7 @@ var _debug_wall_key_held := false
 ## DEBUG: movement capture (toggle with F10) — gates ALL movement logging
 var capture_movement := false
 var _capture_key_held := false
+var _wedge_log_key_held := false
 
 ## Forfeit (hold P to self-kill)
 var _forfeit_hold_time := 0.0
@@ -221,11 +229,16 @@ func _ready() -> void:
 	phys_mat.friction = 0.0  # All ground movement is script-driven
 	physics_material_override = phys_mat
 
-	# Client peers: freeze the RigidBody3D to prevent physics simulation.
-	# Clients don't run game physics — position is synced from server.
-	if not multiplayer.is_server():
-		freeze = true
-		freeze_mode = RigidBody3D.FREEZE_MODE_KINEMATIC
+	# Freeze the RigidBody3D on ALL peers (frozen-kinematic).
+	#  - Server: movement is driven by JoltCharacterVirtual3D (see
+	#    PlayerMovement.apply_cv_move) which writes global_position directly.
+	#    A frozen kinematic body still pushes dynamic objects and is hit by
+	#    raycasts / sensors / weapons, but is never depenetrated by the solver,
+	#    so it's a passive physics presence — not a second collision authority
+	#    fighting the CharacterVirtual.
+	#  - Clients: don't run game physics — position is synced from the server.
+	freeze = true
+	freeze_mode = RigidBody3D.FREEZE_MODE_KINEMATIC
 
 	# Bots: flag input as bot, attach AI brain (server-side only), hide HUD/camera
 	if is_bot:
@@ -282,11 +295,12 @@ func _ready() -> void:
 			store_ui.visible = false
 
 
-func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
-	## Delegates to PlayerMovement for wall-slide and dynamic body tracking.
-	if not multiplayer.is_server():
-		return
-	movement.on_integrate_forces(state)
+func _integrate_forces(_state: PhysicsDirectBodyState3D) -> void:
+	# Player RigidBody3D is frozen-kinematic; movement is driven through
+	# JoltCharacterVirtual3D (see PlayerMovement.apply_cv_move). The engine
+	# doesn't call this on a frozen body, but keep a no-op stub in case the
+	# freeze is ever lifted.
+	pass
 
 
 func _physics_process(delta: float) -> void:
@@ -305,18 +319,27 @@ func _physics_process(delta: float) -> void:
 		print("[WALL_DEBUG] === %s ===" % ("ENABLED" if _debug_wall else "DISABLED"))
 	if not Input.is_key_pressed(KEY_F9):
 		_debug_wall_key_held = false
-	# DEBUG: F10 toggles movement data capture for the local player
+	# DEBUG: F10 toggles dynamic contact logging
 	if peer_id == multiplayer.get_unique_id() and Input.is_key_pressed(KEY_F10) and not _capture_key_held:
-		capture_movement = not capture_movement
+		GameManager.debug_dynamic_contact_log = not GameManager.debug_dynamic_contact_log
 		_capture_key_held = true
-		print("\n=== CAPTURE %s ===" % ("START" if capture_movement else "STOP"))
+		print("[F10] Dynamic contact log: %s" % ("ON" if GameManager.debug_dynamic_contact_log else "OFF"))
 	if not Input.is_key_pressed(KEY_F10):
 		_capture_key_held = false
+	# DEBUG: F12 toggles box-press diagnostic log (player + box + pressed-into + phase)
+	# (Avoiding F8 because Godot editor uses it to stop the running scene.)
+	if peer_id == multiplayer.get_unique_id() and Input.is_key_pressed(KEY_F12) and not _wedge_log_key_held:
+		GameManager.debug_wedge_log = not GameManager.debug_wedge_log
+		_wedge_log_key_held = true
+		print("[F12] Box-press diagnostic: %s" % ("ON" if GameManager.debug_wedge_log else "OFF"))
+	if not Input.is_key_pressed(KEY_F12):
+		_wedge_log_key_held = false
 
 	# Debug freecam: freeze player physics but keep rendering visuals
 	var freecam_frozen: bool = GameManager.debug_freecam_active and peer_id == multiplayer.get_unique_id()
 
 	if multiplayer.is_server() and not freecam_frozen:
+		Profiler.begin("player_physics")
 		var _t_tick_player := Time.get_ticks_usec()
 
 		# --- JUMP DEBUG: track position for 30 frames after a jump ---
@@ -324,7 +347,7 @@ func _physics_process(delta: float) -> void:
 			_jump_debug_frames = 30
 		if _jump_debug_frames > 0 and peer_id == 1 and capture_movement:
 			print("[JUMP DBG %02d] pos_y=%.4f vel_y=%.3f grounded=%s linvel_y=%.3f" % [
-				30 - _jump_debug_frames, global_position.y, velocity.y, str(movement._is_grounded), linear_velocity.y])
+				30 - _jump_debug_frames, global_position.y, velocity.y, str(movement._is_grounded), linear_velocity.y])  # linear_velocity here = engine transform-delta, kept for comparison
 			_jump_debug_frames -= 1
 
 		# Update floor detection
@@ -370,6 +393,7 @@ func _physics_process(delta: float) -> void:
 		sync_rotation_y = rotation.y
 
 		GameManager.tick_add("player", Time.get_ticks_usec() - _t_tick_player)
+		Profiler.end("player_physics")
 
 	# --- Client-side interpolation (all players on non-server peers) ---
 	# Server runs physics directly via _server_process(); clients apply the
@@ -387,13 +411,28 @@ func _physics_process(delta: float) -> void:
 
 
 func _process(delta: float) -> void:
+	Profiler.begin("player_render")
 	# All client visuals run in _process() so they update every render frame and
 	# sample the engine's physics-interpolated positions. This prevents visual
 	# artifacts (e.g. grapple rope splitting) caused by drawing at the physics
 	# tick rate while the player body is interpolated between ticks.
 	if has_node("/root/NetworkManager") and get_node("/root/NetworkManager")._loading_screen != null:
+		Profiler.end("player_render")
 		return
+	# Visual interpolation debug: compare interpolated position with physics position
+	if capture_movement and peer_id == multiplayer.get_unique_id():
+		var interp_xform := get_global_transform_interpolated()
+		var vis_pos: Vector3 = interp_xform.origin
+		var phys_pos: Vector3 = global_position
+		var diff := vis_pos - phys_pos
+		var diff_h := Vector2(diff.x, diff.z).length()
+		if diff_h > 0.0005:  # > 0.5mm horizontal
+			print("  [INTERP] vis=(%.4f,%.4f,%.4f) phys=(%.4f,%.4f,%.4f) diff_h=%.3fmm" % [
+				vis_pos.x, vis_pos.y, vis_pos.z,
+				phys_pos.x, phys_pos.y, phys_pos.z,
+				diff_h * 1000.0])
 	_client_process(delta)
+	Profiler.end("player_render")
 
 
 ## ======================================================================
@@ -472,14 +511,20 @@ func _server_process(delta: float) -> void:
 	# --- Grapple swing state machine ---
 	if grapple_system.is_active():
 		grapple_system.process(delta)
+		# Grapple sets velocity (and applies its own swing gravity); move the
+		# body through the CharacterVirtual so it still collides with geometry.
+		movement.apply_cv_move(delta, false)
 		return
 
 	# Slide cooldown
 	slide_crouch.tick_cooldown(delta)
 
-	# Grounded velocity management + gravity (delegated to PlayerMovement)
+	# Grounded velocity management (gravity is applied at the end of movement,
+	# inside apply_cv_move). Floor/contact state was already established by
+	# pre_physics_step() reading the CharacterVirtual's ground state.
 	movement.begin_movement(delta)
-	movement.apply_gravity(delta)
+	if GameManager.debug_wedge_stutter:
+		movement._dbg_cur["ws_chk_post_begin_vel"] = velocity
 
 	# Rotation from look input
 	rotation.y = player_input.look_yaw
@@ -515,6 +560,12 @@ func _server_process(delta: float) -> void:
 				slide_crouch.process_crouch(delta)
 			else:
 				movement.process_normal_movement(delta)
+
+	# Drive the move through the CharacterVirtual: swept collide-and-slide +
+	# StickToFloor ground snap + WalkStairs step-up. Folds in gravity, then
+	# writes global_position and velocity back. Runs after all movement
+	# branches so it's never skipped.
+	movement.apply_cv_move(delta)
 
 	# Track pre-land velocity for slide-on-land momentum transfer
 	slide_crouch.track_pre_land_velocity()
@@ -965,6 +1016,9 @@ func _do_respawn() -> void:
 	if demon_system.is_eliminated:
 		return
 	is_alive = true
+	# Clear any leftover velocity so the upcoming teleport to a spawn point
+	# doesn't carry a death-fall (or anything else) into the new life.
+	velocity = Vector3.ZERO
 	health = MAX_HEALTH
 	body_mesh.visible = true
 	$CollisionShape3D.set_deferred("disabled", false)

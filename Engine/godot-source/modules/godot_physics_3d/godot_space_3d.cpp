@@ -239,7 +239,7 @@ PackedFloat32Array GodotPhysicsDirectSpaceState3D::calc_ray_shielding_batch(cons
 	return PackedFloat32Array();
 }
 
-Dictionary GodotPhysicsDirectSpaceState3D::calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp) {
+Dictionary GodotPhysicsDirectSpaceState3D::calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp, const RID &p_compound_body) {
 	// GodotPhysics3D stub — project uses Jolt exclusively.
 	return Dictionary();
 }

@@ -130,7 +130,7 @@ private:
 	TypedArray<Dictionary> _intersect_ray_all(RequiredParam<PhysicsRayQueryParameters3D> rp_ray_query, int p_max_results = 32);
 	float _calc_ray_shielding(RequiredParam<PhysicsRayQueryParameters3D> rp_ray_query, RID p_target_body, float p_max_absorption);
 	PackedFloat32Array _calc_ray_shielding_batch(RequiredParam<PhysicsRayQueryParameters3D> rp_base_query, const PackedVector3Array &p_to_points, const TypedArray<RID> &p_target_bodies, const PackedFloat32Array &p_max_absorptions);
-	Dictionary _calc_structure_explosion(RequiredParam<PhysicsRayQueryParameters3D> rp_base_query, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp);
+	Dictionary _calc_structure_explosion(RequiredParam<PhysicsRayQueryParameters3D> rp_base_query, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp, const RID &p_compound_body = RID());
 	PackedInt32Array _calc_structural_integrity(const PackedByteArray &p_block_grid, int p_num_x, int p_num_y, int p_num_z, int p_total_blocks);
 	TypedArray<Dictionary> _intersect_point(RequiredParam<PhysicsPointQueryParameters3D> rp_point_query, int p_max_results = 32);
 	TypedArray<Dictionary> _intersect_shape(RequiredParam<PhysicsShapeQueryParameters3D> rp_shape_query, int p_max_results = 32);
@@ -171,7 +171,7 @@ public:
 	virtual int intersect_ray_all(const RayParameters &p_parameters, RayResult *r_results, int p_result_max) = 0;
 	virtual float calc_ray_shielding(const RayParameters &p_parameters, RID p_target_body, float p_max_absorption) = 0;
 	virtual PackedFloat32Array calc_ray_shielding_batch(const RayParameters &p_base_params, const PackedVector3Array &p_to_points, const TypedArray<RID> &p_target_bodies, const PackedFloat32Array &p_max_absorptions) = 0;
-	virtual Dictionary calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp) = 0;
+	virtual Dictionary calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp, const RID &p_compound_body = RID()) = 0;
 	virtual PackedInt32Array calc_structural_integrity(const PackedByteArray &p_block_grid, int p_num_x, int p_num_y, int p_num_z, int p_total_blocks) = 0;
 
 	struct ShapeResult {

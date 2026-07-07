@@ -17,11 +17,18 @@ ProjectFiles/export/
 ProjectFiles/*.exe
 ProjectFiles/*.pck
 
+# --- Webview addons (unused, contain large redistributables) ---
+ProjectFiles/addons/godot_cef/
+ProjectFiles/addons/godot_wry/
+
+# --- Generated terrain bake caches (regenerated at runtime if missing) ---
+ProjectFiles/terrain/*.bin
+
 # --- Engine: ignore everything, then whitelist patched files + binaries ---
 # Must un-ignore each directory level for negation to work.
 Engine/**
-!Engine/Godot_v4.6-stable_win64.exe
-!Engine/Godot_v4.6-stable_win64_console.exe
+# Engine binaries are NOT committed -- they are distributed via GitHub Releases
+# (see SETUP.md). Build them with Engine/build.bat or download a release.
 !Engine/godot-source/
 Engine/godot-source/**
 !Engine/godot-source/build.bat
@@ -33,9 +40,12 @@ Engine/godot-source/modules/jolt_physics/**
 !Engine/godot-source/modules/jolt_physics/jolt_physics_server_3d.cpp
 !Engine/godot-source/modules/jolt_physics/jolt_project_settings.h
 !Engine/godot-source/modules/jolt_physics/jolt_project_settings.cpp
+!Engine/godot-source/modules/jolt_physics/register_types.cpp
 !Engine/godot-source/modules/jolt_physics/objects/
 Engine/godot-source/modules/jolt_physics/objects/**
 !Engine/godot-source/modules/jolt_physics/objects/jolt_body_3d.h
+!Engine/godot-source/modules/jolt_physics/objects/jolt_character_virtual_3d.h
+!Engine/godot-source/modules/jolt_physics/objects/jolt_character_virtual_3d.cpp
 !Engine/godot-source/modules/jolt_physics/spaces/
 Engine/godot-source/modules/jolt_physics/spaces/**
 !Engine/godot-source/modules/jolt_physics/spaces/jolt_contact_listener_3d.h
@@ -56,6 +66,23 @@ Engine/godot-source/servers/physics_3d/**
 !Engine/godot-source/servers/physics_3d/physics_server_3d_extension.h
 !Engine/godot-source/servers/physics_3d/physics_server_3d_dummy.h
 
+# --- Patched vendored Jolt file (track only this one file in the huge tree) ---
+# Must un-ignore every parent directory level for the file negation to work.
+!Engine/godot-source/thirdparty/
+!Engine/godot-source/thirdparty/jolt_physics/
+!Engine/godot-source/thirdparty/jolt_physics/Jolt/
+!Engine/godot-source/thirdparty/jolt_physics/Jolt/Physics/
+!Engine/godot-source/thirdparty/jolt_physics/Jolt/Physics/Character/
+!Engine/godot-source/thirdparty/jolt_physics/Jolt/Physics/Character/CharacterVirtual.cpp
+
+# --- Custom engine modules (fully owned by this repo, track everything) ---
+!Engine/godot-source/modules/block_mesh/
+!Engine/godot-source/modules/block_mesh/**
+Engine/godot-source/modules/block_mesh/__pycache__/
+!Engine/godot-source/modules/terrain_fill/
+!Engine/godot-source/modules/terrain_fill/**
+Engine/godot-source/modules/terrain_fill/__pycache__/
+
 # --- OS junk ---
 .DS_Store
 Thumbs.db
@@ -65,6 +92,11 @@ desktop.ini
 .vscode/
 *.swp
 *.swo
+
+# --- Editor / build temp files ---
+~*.dll
+*.TMP
+*~RF*
 
 # --- Windows NUL device artifact ---
 nul

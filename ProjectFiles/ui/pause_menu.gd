@@ -37,6 +37,13 @@ var _momentum_damage_input: LineEdit = null
 var _explosion_radius_input: LineEdit = null
 var _explosion_damage_input: LineEdit = null
 var _resistance_scale_input: LineEdit = null
+var _surface_press_button: CheckButton = null
+var _speed_50_button: CheckButton = null
+var _explosion_diag_button: CheckButton = null
+var _structure_layers_button: CheckButton = null
+var _layer_overlay_timer: float = 0.0
+var _layer_labels: Dictionary = {}
+var _hitbox_mesh_node: MeshInstance3D = null
 
 # ── Video Settings panel UI refs ─────────────────────────────────────────
 var _video_panel: PanelContainer = null
@@ -66,6 +73,23 @@ var _glow_label: Label = null
 var _gi_option: OptionButton = null
 var _fog_button: CheckButton = null
 var _volumetric_fog_button: CheckButton = null
+var _roughness_limiter_button: CheckButton = null
+var _tonemap_option: OptionButton = null
+var _adjustment_button: CheckButton = null
+var _contrast_slider: HSlider = null
+var _contrast_label: Label = null
+var _saturation_slider: HSlider = null
+var _saturation_label: Label = null
+var _dof_button: CheckButton = null
+var _dof_distance_slider: HSlider = null
+var _dof_distance_label: Label = null
+var _dof_blur_slider: HSlider = null
+var _dof_blur_label: Label = null
+var _auto_exposure_button: CheckButton = null
+var _debanding_button: CheckButton = null
+var _scaling_mode_option: OptionButton = null
+var _sharpening_slider: HSlider = null
+var _sharpening_label: Label = null
 var _fps_hud_button: CheckButton = null
 var _debris_button: CheckButton = null
 var _detached_structures_button: CheckButton = null
@@ -91,6 +115,13 @@ func _input(event: InputEvent) -> void:
 
 
 func _process(delta: float) -> void:
+	if GameManager.debug_show_structure_layers:
+		_layer_overlay_timer += delta
+		if _layer_overlay_timer >= 0.5:
+			_layer_overlay_timer = 0.0
+			_update_structure_layer_labels()
+	elif not _layer_labels.is_empty() or _hitbox_mesh_node != null:
+		_clear_structure_layer_labels()
 	if not is_open:
 		return
 	_fps_timer += delta
@@ -201,6 +232,9 @@ func _build_main_panel() -> void:
 	_grapple_debug_visuals_button = _add_check("Debug Visuals (pill, angles, spheres)", false, vbox)
 	_grapple_debug_visuals_button.toggled.connect(_on_grapple_debug_visuals_toggled)
 
+	_add_check("Show Safe Zone (no-sever radius)", GameManager.debug_grapple_safe_zone, vbox) \
+		.toggled.connect(func(p): GameManager.debug_grapple_safe_zone = p)
+
 	_grapple_horiz_nudge_button = _add_check("Launch Nudge: Include Horizontal", true, vbox)
 	_grapple_horiz_nudge_button.toggled.connect(_on_grapple_horiz_nudge_toggled)
 
@@ -229,6 +263,9 @@ func _build_main_panel() -> void:
 	_explosion_rays_button = _add_check("Show Explosion Rays (Wall Blocks)", false, vbox)
 	_explosion_rays_button.toggled.connect(_on_explosion_rays_toggled)
 
+	_add_check("Show Block Hits", GameManager.debug_show_block_hits, vbox).toggled.connect(
+		func(pressed: bool): GameManager.debug_show_block_hits = pressed)
+
 	_lagger_delay_input = _add_scale_input("Lagger Delay (ms)",
 		GameManager.debug_lagger_delay_ms,
 		_on_lagger_delay_submitted, _on_lagger_delay_focus_lost, vbox)
@@ -238,6 +275,12 @@ func _build_main_panel() -> void:
 
 	_explosion_repeat_button = _add_check("Explosion Shielding 2000x Repeat", GameManager.debug_explosion_repeat, vbox)
 	_explosion_repeat_button.toggled.connect(_on_explosion_repeat_toggled)
+
+	_explosion_diag_button = _add_check("Explosion Diagnostics (Full Dump)", GameManager.debug_explosion_diagnostics, vbox)
+	_explosion_diag_button.toggled.connect(_on_explosion_diag_toggled)
+
+	_structure_layers_button = _add_check("Show Structure Collision Layers", GameManager.debug_show_structure_layers, vbox)
+	_structure_layers_button.toggled.connect(_on_structure_layers_toggled)
 
 	# Separator
 	vbox.add_child(HSeparator.new())
@@ -360,6 +403,113 @@ func _build_main_panel() -> void:
 		_on_resistance_scale_submitted, _on_resistance_scale_focus_lost, vbox)
 
 	# Separator
+	vbox.add_child(HSeparator.new())
+
+	# ── Player Physics ─────────────────────────────────────────────────
+	_add_section_header("Player Physics", vbox)
+
+	_speed_50_button = _add_check("Speed 50", GameManager.debug_speed_50, vbox)
+	_speed_50_button.toggled.connect(_on_speed_50_toggled)
+
+	_add_check("No Slope Projection", GameManager.debug_no_slope_projection, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_slope_projection = p)
+	_add_check("No Landing Restore", GameManager.debug_no_landing_restore, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_landing_restore = p)
+	_add_check("Always Ground Move", GameManager.debug_always_ground_move, vbox) \
+		.toggled.connect(func(p): GameManager.debug_always_ground_move = p)
+	_add_check("Show Terrain Collision", GameManager.debug_show_collision, vbox) \
+		.toggled.connect(func(p): GameManager.debug_show_collision = p)
+
+	# ── Solver Diagnostics ─────────────────────────────────────────────
+	vbox.add_child(HSeparator.new())
+	_add_section_header("Solver Diagnostics", vbox)
+
+	_add_check("Log Physics (grounding, snap, impulse)", GameManager.debug_grounding_log, vbox) \
+		.toggled.connect(func(p): GameManager.debug_grounding_log = p)
+	_add_check("Player Zero Friction", GameManager.debug_player_zero_friction, vbox) \
+		.toggled.connect(func(p): GameManager.debug_player_zero_friction = p)
+	_add_check("No Floor Speed Restore", GameManager.debug_no_floor_speed_restore, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_floor_speed_restore = p)
+	_add_check("No Dynamic Impulse Correction", GameManager.debug_no_dynamic_speed_restore, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_dynamic_speed_restore = p)
+	_add_check("No Wall Projection", GameManager.debug_no_wall_proj, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_wall_proj = p)
+	_add_check("Wall Proj on Dynamic Bodies", GameManager.debug_wall_proj_dynamic, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wall_proj_dynamic = p)
+	_add_check("No Wall Speed Scaling", GameManager.debug_no_wall_speed_scale, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_wall_speed_scale = p)
+	_add_check("Dynamic Body Speed Scaling", GameManager.debug_dynamic_speed_scale, vbox) \
+		.toggled.connect(func(p): GameManager.debug_dynamic_speed_scale = p)
+	_add_check("Restore Full Speed (ignore solver)", GameManager.debug_restore_full_speed, vbox) \
+		.toggled.connect(func(p): GameManager.debug_restore_full_speed = p)
+	_add_check("No Dime Stop", GameManager.debug_no_dime_stop, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_dime_stop = p)
+
+	# ── Wedge stability experiments ─────────────────────────────────
+	# Toggle one at a time to compare feel when pushing a box against a wall.
+	vbox.add_child(HSeparator.new())
+	_add_section_header("Wedge Stability (box vs wall)", vbox)
+
+	_add_check("Fix 1: Lerp direction by fraction (default)", GameManager.debug_wedge_lerp_direction, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_lerp_direction = p)
+	_add_check("Fix 2: Hard-kill direction above threshold", GameManager.debug_wedge_hard_kill, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_hard_kill = p)
+	_add_check("Fix 3: Skip velocity write when wedged", GameManager.debug_wedge_skip_inject, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_skip_inject = p)
+	_add_check("Fix 4: Use post-solver velocity as base", GameManager.debug_wedge_postsolver_base, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_postsolver_base = p)
+	_add_check("Box-Press Diagnostic Log (player+box+pressed-into+phase)", GameManager.debug_wedge_log, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_log = p)
+
+	# Fraction lifecycle fixes (the actual root cause: deadband oscillation)
+	_add_check("Fix 5: Decay fraction instead of reset", GameManager.debug_wedge_fraction_decay, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_fraction_decay = p)
+	_add_check("Fix 6: Hold fraction while contact exists", GameManager.debug_wedge_fraction_hold, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_fraction_hold = p)
+	_add_check("Fix 7: Stick to walls when pressing in (zero outward drift)", GameManager.debug_wedge_stick_to_walls, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_stick_to_walls = p)
+	_add_check("Fix 8: Wall-proj full 3D normal (compound contact constraint)", GameManager.debug_wall_proj_full_normal, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wall_proj_full_normal = p)
+	_add_check("Fix 9: Joint wedge-axis projection (geometric correct)", GameManager.debug_wedge_joint_proj, vbox) \
+		.toggled.connect(func(p): GameManager.debug_wedge_joint_proj = p)
+	# Wedge-cause isolation tests (turn ONE on, leave Fix 9 OFF, reproduce wedge,
+	# see if the stutter still happens — proves which subsystem is responsible).
+	_add_check("[Test] Disable Snap entirely", GameManager.debug_no_snap, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_snap = p)
+	_add_check("[Test] Disable Slope-proj", GameManager.debug_no_slope_projection, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_slope_projection = p)
+	_add_check("[Test] Disable Wall-proj", GameManager.debug_no_wall_proj, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_wall_proj = p)
+	_add_check("[Test] Disable Walk-accel", GameManager.debug_no_walk_accel, vbox) \
+		.toggled.connect(func(p): GameManager.debug_no_walk_accel = p)
+	_add_check("[Test] Apply gravity always (every frame, world-Y)", GameManager.debug_gravity_always, vbox) \
+		.toggled.connect(func(p): GameManager.debug_gravity_always = p)
+	_add_check("Restore Even With Walls", GameManager.debug_restore_with_walls, vbox) \
+		.toggled.connect(func(p): GameManager.debug_restore_with_walls = p)
+	_add_check("Instant Acceleration", GameManager.debug_instant_accel, vbox) \
+		.toggled.connect(func(p): GameManager.debug_instant_accel = p)
+
+	# ── Render profiling toggles ──
+	_add_check("No Shadows (perf test)", GameManager.debug_no_shadows, vbox) \
+		.toggled.connect(_on_no_shadows_toggled)
+	_add_check("Hide Clusters (perf test)", GameManager.debug_hide_clusters, vbox) \
+		.toggled.connect(_on_hide_clusters_toggled)
+	_add_scale_input("Shadow Distance", 800.0,
+		_on_shadow_distance_changed, func(): pass, vbox)
+	_add_check("Extend Snap Range (0.5m)", GameManager.debug_grounding_extend_snap, vbox) \
+		.toggled.connect(func(p): GameManager.debug_grounding_extend_snap = p)
+	_add_check("Dynamic Snap (vel.y × delta launch recovery)", GameManager.debug_dynamic_snap, vbox) \
+		.toggled.connect(func(p): GameManager.debug_dynamic_snap = p)
+	var _snap_budget_input := _add_labeled_input("Snap Budget (m)", str(GameManager.debug_snap_budget), vbox)
+	_snap_budget_input.text_changed.connect(func(t):
+		var v: float = clampf(float(t), 0.0, 1.0)
+		GameManager.debug_snap_budget = v
+		print("[SnapBudget] set to %.3fm" % v))
+	_add_check("Surface Press (vel.y bias)", GameManager.debug_grounding_surface_press, vbox) \
+		.toggled.connect(func(p): GameManager.debug_grounding_surface_press = p)
+	var _press_input = _add_labeled_input("Press Strength", str(GameManager.debug_grounding_press_strength), vbox)
+	_press_input.text_submitted.connect(func(t): GameManager.debug_grounding_press_strength = clampf(float(t), 0.1, 20.0))
+
 	vbox.add_child(HSeparator.new())
 
 	# --- Buttons ---
@@ -545,6 +695,82 @@ func _build_video_panel() -> void:
 
 	vbox.add_child(HSeparator.new())
 
+	# ── Reflections & Specular ──────────────────────────────────────────
+	_add_section_header("Reflections & Specular", vbox)
+
+	_roughness_limiter_button = _add_check("Roughness Limiter", VideoSettings.settings["roughness_limiter"], vbox)
+	_roughness_limiter_button.toggled.connect(_on_roughness_limiter_toggled)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Tonemap ────────────────────────────────────────────────────────
+	_add_section_header("Tonemap", vbox)
+
+	_tonemap_option = _add_option_row("Tonemap Mode", ["Linear", "Reinhardt", "Filmic", "ACES"], VideoSettings.settings["tonemap_mode"], vbox)
+	_tonemap_option.item_selected.connect(_on_tonemap_changed)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Color Adjustments ──────────────────────────────────────────────
+	_add_section_header("Color Adjustments", vbox)
+
+	_adjustment_button = _add_check("Enable Adjustments", VideoSettings.settings["adjustment_enabled"], vbox)
+	_adjustment_button.toggled.connect(_on_adjustment_toggled)
+
+	var contrast_row := _add_slider_row("Contrast", 0.5, 2.0, VideoSettings.settings["adjustment_contrast"], 0.05, vbox)
+	_contrast_slider = contrast_row[0]
+	_contrast_label = contrast_row[1]
+	_contrast_label.text = "%.2f" % VideoSettings.settings["adjustment_contrast"]
+	_contrast_slider.value_changed.connect(_on_contrast_changed)
+
+	var saturation_row := _add_slider_row("Saturation", 0.0, 2.0, VideoSettings.settings["adjustment_saturation"], 0.05, vbox)
+	_saturation_slider = saturation_row[0]
+	_saturation_label = saturation_row[1]
+	_saturation_label.text = "%.2f" % VideoSettings.settings["adjustment_saturation"]
+	_saturation_slider.value_changed.connect(_on_saturation_changed)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Camera Effects ─────────────────────────────────────────────────
+	_add_section_header("Camera Effects", vbox)
+
+	_dof_button = _add_check("Depth of Field", VideoSettings.settings["dof_enabled"], vbox)
+	_dof_button.toggled.connect(_on_dof_toggled)
+
+	var dof_dist_row := _add_slider_row("DOF Distance", 1.0, 200.0, VideoSettings.settings["dof_focus_distance"], 1.0, vbox)
+	_dof_distance_slider = dof_dist_row[0]
+	_dof_distance_label = dof_dist_row[1]
+	_dof_distance_label.text = "%.0f" % VideoSettings.settings["dof_focus_distance"]
+	_dof_distance_slider.value_changed.connect(_on_dof_distance_changed)
+
+	var dof_blur_row := _add_slider_row("DOF Blur", 0.01, 0.2, VideoSettings.settings["dof_blur_amount"], 0.01, vbox)
+	_dof_blur_slider = dof_blur_row[0]
+	_dof_blur_label = dof_blur_row[1]
+	_dof_blur_label.text = "%.2f" % VideoSettings.settings["dof_blur_amount"]
+	_dof_blur_slider.value_changed.connect(_on_dof_blur_changed)
+
+	_auto_exposure_button = _add_check("Auto Exposure", VideoSettings.settings["auto_exposure"], vbox)
+	_auto_exposure_button.toggled.connect(_on_auto_exposure_toggled)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Rendering Quality ──────────────────────────────────────────────
+	_add_section_header("Rendering Quality", vbox)
+
+	_debanding_button = _add_check("Debanding", VideoSettings.settings["debanding"], vbox)
+	_debanding_button.toggled.connect(_on_debanding_toggled)
+
+	_scaling_mode_option = _add_option_row("3D Scaling", ["Bilinear", "FSR 1.0", "FSR 2.2"], VideoSettings.settings["scaling_3d_mode"], vbox)
+	_scaling_mode_option.item_selected.connect(_on_scaling_mode_changed)
+
+	var sharp_row := _add_slider_row("Sharpening", 0.0, 2.0, VideoSettings.settings["sharpening"], 0.1, vbox)
+	_sharpening_slider = sharp_row[0]
+	_sharpening_label = sharp_row[1]
+	_sharpening_label.text = "%.1f" % VideoSettings.settings["sharpening"]
+	_sharpening_slider.value_changed.connect(_on_sharpening_changed)
+
+	vbox.add_child(HSeparator.new())
+
 	# ── Performance ──────────────────────────────────────────────────────
 	_add_section_header("Performance", vbox)
 
@@ -583,6 +809,21 @@ func _add_section_header(text: String, parent: Node) -> void:
 	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	label.add_theme_color_override("font_color", Color(0.6, 0.75, 1.0))
 	parent.add_child(label)
+
+
+func _add_labeled_input(label_text: String, default_text: String, parent: Node) -> LineEdit:
+	var hbox := HBoxContainer.new()
+	var label := Label.new()
+	label.text = label_text
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hbox.add_child(label)
+	var input := LineEdit.new()
+	input.text = default_text
+	input.custom_minimum_size = Vector2(80, 0)
+	input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hbox.add_child(input)
+	parent.add_child(hbox)
+	return input
 
 
 func _add_check(label_text: String, default: bool, parent: Node) -> CheckButton:
@@ -781,6 +1022,81 @@ func _on_volumetric_fog_toggled(pressed: bool) -> void:
 	VideoSettings.apply_fog()
 
 
+# ── Reflections & Specular ──────────────────────────────────────────────
+
+func _on_roughness_limiter_toggled(pressed: bool) -> void:
+	VideoSettings.settings["roughness_limiter"] = pressed
+	VideoSettings.apply_reflections()
+
+
+# ── Tonemap ─────────────────────────────────────────────────────────────
+
+func _on_tonemap_changed(index: int) -> void:
+	VideoSettings.settings["tonemap_mode"] = index
+	VideoSettings.apply_tonemap()
+
+
+# ── Color Adjustments ──────────────────────────────────────────────────
+
+func _on_adjustment_toggled(pressed: bool) -> void:
+	VideoSettings.settings["adjustment_enabled"] = pressed
+	VideoSettings.apply_adjustments()
+
+
+func _on_contrast_changed(value: float) -> void:
+	_contrast_label.text = "%.2f" % value
+	VideoSettings.settings["adjustment_contrast"] = value
+	VideoSettings.apply_adjustments()
+
+
+func _on_saturation_changed(value: float) -> void:
+	_saturation_label.text = "%.2f" % value
+	VideoSettings.settings["adjustment_saturation"] = value
+	VideoSettings.apply_adjustments()
+
+
+# ── Camera Effects ─────────────────────────────────────────────────────
+
+func _on_dof_toggled(pressed: bool) -> void:
+	VideoSettings.settings["dof_enabled"] = pressed
+	VideoSettings.apply_camera_effects()
+
+
+func _on_dof_distance_changed(value: float) -> void:
+	_dof_distance_label.text = "%.0f" % value
+	VideoSettings.settings["dof_focus_distance"] = value
+	VideoSettings.apply_camera_effects()
+
+
+func _on_dof_blur_changed(value: float) -> void:
+	_dof_blur_label.text = "%.2f" % value
+	VideoSettings.settings["dof_blur_amount"] = value
+	VideoSettings.apply_camera_effects()
+
+
+func _on_auto_exposure_toggled(pressed: bool) -> void:
+	VideoSettings.settings["auto_exposure"] = pressed
+	VideoSettings.apply_camera_effects()
+
+
+# ── Rendering Quality ──────────────────────────────────────────────────
+
+func _on_debanding_toggled(pressed: bool) -> void:
+	VideoSettings.settings["debanding"] = pressed
+	VideoSettings.apply_rendering_quality()
+
+
+func _on_scaling_mode_changed(index: int) -> void:
+	VideoSettings.settings["scaling_3d_mode"] = index
+	VideoSettings.apply_rendering_quality()
+
+
+func _on_sharpening_changed(value: float) -> void:
+	_sharpening_label.text = "%.1f" % value
+	VideoSettings.settings["sharpening"] = value
+	VideoSettings.apply_rendering_quality()
+
+
 # ── Performance ──────────────────────────────────────────────────────────
 
 func _on_fps_hud_toggled(pressed: bool) -> void:
@@ -794,6 +1110,18 @@ func _on_debris_toggled(pressed: bool) -> void:
 func _on_detached_structures_toggled(pressed: bool) -> void:
 	GameManager.debug_disable_detached_structures = pressed
 	print("[PauseMenu] Detached structures: %s" % ("DISABLED" if pressed else "ENABLED"))
+
+
+# ── Player Physics ──────────────────────────────────────────────────────
+
+func _on_surface_press_toggled(pressed: bool) -> void:
+	GameManager.debug_disable_surface_press = pressed
+	print("[PauseMenu] Surface press: %s" % ("DISABLED" if pressed else "ENABLED"))
+
+
+func _on_speed_50_toggled(pressed: bool) -> void:
+	GameManager.debug_speed_50 = pressed
+	print("[PauseMenu] Speed 50: %s" % ("ON" if pressed else "OFF"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -834,6 +1162,24 @@ func _refresh_all_video_controls() -> void:
 
 	_set_check_silent(_fog_button, s["fog_enabled"])
 	_set_check_silent(_volumetric_fog_button, s["volumetric_fog"])
+
+	_set_check_silent(_roughness_limiter_button, s["roughness_limiter"])
+	_set_option_silent(_tonemap_option, s["tonemap_mode"])
+	_set_check_silent(_adjustment_button, s["adjustment_enabled"])
+	_set_slider_silent(_contrast_slider, s["adjustment_contrast"])
+	_contrast_label.text = "%.2f" % s["adjustment_contrast"]
+	_set_slider_silent(_saturation_slider, s["adjustment_saturation"])
+	_saturation_label.text = "%.2f" % s["adjustment_saturation"]
+	_set_check_silent(_dof_button, s["dof_enabled"])
+	_set_slider_silent(_dof_distance_slider, s["dof_focus_distance"])
+	_dof_distance_label.text = "%.0f" % s["dof_focus_distance"]
+	_set_slider_silent(_dof_blur_slider, s["dof_blur_amount"])
+	_dof_blur_label.text = "%.2f" % s["dof_blur_amount"]
+	_set_check_silent(_auto_exposure_button, s["auto_exposure"])
+	_set_check_silent(_debanding_button, s["debanding"])
+	_set_option_silent(_scaling_mode_option, s["scaling_3d_mode"])
+	_set_slider_silent(_sharpening_slider, s["sharpening"])
+	_sharpening_label.text = "%.1f" % s["sharpening"]
 
 
 func _set_check_silent(btn: CheckButton, value: bool) -> void:
@@ -923,6 +1269,216 @@ func _on_lagger_overhead_toggled(pressed: bool) -> void:
 func _on_explosion_repeat_toggled(pressed: bool) -> void:
 	GameManager.debug_explosion_repeat = pressed
 	print("[PauseMenu] Explosion shielding 2000x repeat: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_explosion_diag_toggled(pressed: bool) -> void:
+	GameManager.debug_explosion_diagnostics = pressed
+	print("[PauseMenu] Explosion diagnostics: %s" % ("ON" if pressed else "OFF"))
+
+
+func _on_structure_layers_toggled(pressed: bool) -> void:
+	GameManager.debug_show_structure_layers = pressed
+	if not pressed:
+		_clear_structure_layer_labels()
+	print("[PauseMenu] Structure collision layers: %s" % ("ON" if pressed else "OFF"))
+
+
+func _find_structures_node() -> Node:
+	var tree := get_tree()
+	if not tree or not tree.current_scene:
+		return null
+	var seed_world = tree.current_scene.get_node_or_null("SeedWorld")
+	if seed_world == null:
+		seed_world = tree.current_scene.get_node_or_null("BlockoutMap/SeedWorld")
+	if seed_world:
+		return seed_world.get_node_or_null("Structures")
+	return null
+
+
+func _layer_bits_str(layer: int) -> String:
+	var parts: PackedStringArray = PackedStringArray()
+	if layer & CollisionLayers.WORLD: parts.append("WORLD")
+	if layer & CollisionLayers.ITEMS: parts.append("ITEMS")
+	if layer & CollisionLayers.BUBBLES: parts.append("BUBBLES")
+	if layer & CollisionLayers.RUBBER_BALLS: parts.append("RUBBER_BALLS")
+	if layer & CollisionLayers.TOAD_WALLS: parts.append("TOAD_WALLS")
+	if layer & CollisionLayers.DEBRIS: parts.append("DEBRIS")
+	if layer & CollisionLayers.TOAD_RAIN: parts.append("TOAD_RAIN")
+	if layer & CollisionLayers.PLAYERS_HIT: parts.append("PLAYERS_HIT")
+	if layer & CollisionLayers.TOAD_PLAYERS: parts.append("TOAD_PLAYERS")
+	if layer & CollisionLayers.PLAYERS_PUSH: parts.append("PLAYERS_PUSH")
+	if layer & CollisionLayers.WALL_BLOCKS: parts.append("WALL_BLOCKS")
+	if layer & CollisionLayers.WALL_SMOOTH: parts.append("WALL_SMOOTH")
+	if parts.is_empty(): return "NONE(0)"
+	return "%s(%d)" % ["|".join(parts), layer]
+
+
+func _update_structure_layer_labels() -> void:
+	var structures_node := _find_structures_node()
+	if not structures_node:
+		_clear_structure_layer_labels()
+		return
+
+	var scene_root := get_tree().current_scene
+	if not scene_root:
+		return
+
+	# Create or reuse the hitbox wireframe mesh node
+	if _hitbox_mesh_node == null or not is_instance_valid(_hitbox_mesh_node):
+		_hitbox_mesh_node = MeshInstance3D.new()
+		_hitbox_mesh_node.name = "DebugStructureHitboxes"
+		var mat := StandardMaterial3D.new()
+		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mat.no_depth_test = true
+		mat.vertex_color_use_as_albedo = true
+		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		_hitbox_mesh_node.material_override = mat
+		scene_root.add_child(_hitbox_mesh_node)
+
+	var im: ImmediateMesh
+	if _hitbox_mesh_node.mesh is ImmediateMesh:
+		im = _hitbox_mesh_node.mesh
+		im.clear_surfaces()
+	else:
+		im = ImmediateMesh.new()
+		_hitbox_mesh_node.mesh = im
+
+	const HITBOX_RANGE := 15.0
+	const HITBOX_RANGE_SQ := HITBOX_RANGE * HITBOX_RANGE
+	# Structure center can be offset from its blocks — use generous margin
+	const STRUCT_CULL_RANGE := HITBOX_RANGE + 10.0
+
+	var cam := get_viewport().get_camera_3d()
+	if not cam:
+		return
+	var cam_pos := cam.global_position
+
+	var half := 0.26  # Slightly larger than BLOCK_SIZE/2 so wireframe isn't flush with mesh
+	var seen: Dictionary = {}
+
+	im.surface_begin(Mesh.PRIMITIVE_LINES)
+
+	for child in structures_node.get_children():
+		var is_wall := child is DestructibleBlockStructure
+		var is_cluster := child is FallingBlockCluster
+		if not is_wall and not is_cluster:
+			continue
+
+		# Skip structures too far from camera
+		if cam_pos.distance_to(child.global_position) > STRUCT_CULL_RANGE:
+			continue
+
+		var id := child.get_instance_id()
+		seen[id] = true
+
+		# Determine color from compound hit body status
+		var hit_body: Node = child.get("_compound_hit_body")
+		var has_wall_blocks := false
+		var active_shapes := 0
+		var color := Color(1.0, 0.2, 0.2, 0.6)  # Red = problem
+
+		if hit_body != null and is_instance_valid(hit_body):
+			var layer: int = hit_body.collision_layer
+			has_wall_blocks = bool(layer & CollisionLayers.WALL_BLOCKS)
+			var key_map: Dictionary = child.get("_key_to_shape")
+			active_shapes = key_map.size() if key_map else 0
+			if has_wall_blocks and active_shapes > 0:
+				color = Color(0.2, 1.0, 0.2, 0.5)  # Green = correct
+			elif has_wall_blocks:
+				color = Color(1.0, 1.0, 0.2, 0.5)  # Yellow = layer ok but 0 shapes
+
+		# Draw wireframe cube only for blocks within 15m of camera
+		var xform: Transform3D = child.global_transform
+		if is_wall:
+			var hp_dict: Dictionary = child.get("_block_hp_dict")
+			if hp_dict:
+				for key: Vector3i in hp_dict:
+					var local_pos: Vector3 = child._block_local_pos(key)
+					var world_pos: Vector3 = xform * local_pos
+					if cam_pos.distance_squared_to(world_pos) <= HITBOX_RANGE_SQ:
+						_draw_wire_box_xform(im, xform, local_pos, half, color)
+		elif is_cluster:
+			var grid = child.get("grid")
+			if grid:
+				for key: Vector3i in grid.block_hp:
+					var local_pos: Vector3 = grid.block_local_pos(key)
+					var world_pos: Vector3 = xform * local_pos
+					if cam_pos.distance_squared_to(world_pos) <= HITBOX_RANGE_SQ:
+						_draw_wire_box_xform(im, xform, local_pos, half, color)
+
+		# Tiny label per structure
+		var label: Label3D
+		if _layer_labels.has(id) and is_instance_valid(_layer_labels[id]):
+			label = _layer_labels[id]
+		else:
+			label = Label3D.new()
+			label.name = "DebugLayerLbl_%d" % id
+			label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+			label.no_depth_test = true
+			label.font_size = 24
+			label.outline_size = 6
+			label.pixel_size = 0.004
+			label.outline_modulate = Color.BLACK
+			scene_root.add_child(label)
+			_layer_labels[id] = label
+
+		var type_char := "W" if is_wall else "C"
+		var hit_layer := 0
+		if hit_body and is_instance_valid(hit_body):
+			hit_layer = hit_body.collision_layer
+		var lbl := "[%s] %s  hit:%d  %dshp" % [type_char, child.name, hit_layer, active_shapes]
+		if hit_body == null or (hit_body != null and not is_instance_valid(hit_body)):
+			lbl += "  !!NO HIT BODY"
+		elif not has_wall_blocks:
+			lbl += "  !!MISSING WALL_BLOCKS"
+		if is_cluster:
+			if child.freeze:
+				lbl += "  frozen"
+		label.text = lbl
+		label.modulate = color
+		label.global_position = child.global_position + Vector3(0, 3.0, 0)
+
+	im.surface_end()
+
+	# Remove stale labels (for structures that moved out of range or were freed)
+	var to_remove: Array = []
+	for id in _layer_labels:
+		if not seen.has(id):
+			to_remove.append(id)
+	for id in to_remove:
+		if is_instance_valid(_layer_labels[id]):
+			_layer_labels[id].queue_free()
+		_layer_labels.erase(id)
+
+
+func _draw_wire_box_xform(im: ImmediateMesh, xform: Transform3D, local_center: Vector3, h: float, color: Color) -> void:
+	## Draw wireframe box transformed by xform so it rotates with the structure.
+	var c0 := xform * (local_center + Vector3(-h, -h, -h))
+	var c1 := xform * (local_center + Vector3( h, -h, -h))
+	var c2 := xform * (local_center + Vector3( h, -h,  h))
+	var c3 := xform * (local_center + Vector3(-h, -h,  h))
+	var c4 := xform * (local_center + Vector3(-h,  h, -h))
+	var c5 := xform * (local_center + Vector3( h,  h, -h))
+	var c6 := xform * (local_center + Vector3( h,  h,  h))
+	var c7 := xform * (local_center + Vector3(-h,  h,  h))
+	for edge: Array in [[c0,c1],[c1,c2],[c2,c3],[c3,c0],
+			[c4,c5],[c5,c6],[c6,c7],[c7,c4],
+			[c0,c4],[c1,c5],[c2,c6],[c3,c7]]:
+		im.surface_set_color(color)
+		im.surface_add_vertex(edge[0])
+		im.surface_set_color(color)
+		im.surface_add_vertex(edge[1])
+
+
+func _clear_structure_layer_labels() -> void:
+	for label in _layer_labels.values():
+		if is_instance_valid(label):
+			label.queue_free()
+	_layer_labels.clear()
+	if _hitbox_mesh_node and is_instance_valid(_hitbox_mesh_node):
+		_hitbox_mesh_node.queue_free()
+		_hitbox_mesh_node = null
+	_layer_overlay_timer = 0.0
 
 
 func _on_toad_density_submitted(text: String) -> void:
@@ -1136,3 +1692,35 @@ func _on_reset_pressed() -> void:
 func _on_quit_pressed() -> void:
 	_toggle_menu()
 	NetworkManager.disconnect_game()
+
+
+func _find_sun() -> DirectionalLight3D:
+	var sun := get_tree().current_scene.get_node_or_null("SeedWorld/Sun")
+	if sun == null:
+		sun = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld/Sun")
+	return sun
+
+
+func _on_no_shadows_toggled(pressed: bool) -> void:
+	GameManager.debug_no_shadows = pressed
+	var sun := _find_sun()
+	if sun:
+		sun.shadow_enabled = not pressed
+
+
+func _on_hide_clusters_toggled(pressed: bool) -> void:
+	GameManager.debug_hide_clusters = pressed
+	var structures := get_tree().current_scene.get_node_or_null("SeedWorld/Structures")
+	if structures == null:
+		structures = get_tree().current_scene.get_node_or_null("BlockoutMap/SeedWorld/Structures")
+	if structures:
+		for s in structures.get_children():
+			if s is FallingBlockCluster:
+				s.visible = not pressed
+
+
+func _on_shadow_distance_changed(text: String) -> void:
+	var sun := _find_sun()
+	if sun:
+		sun.directional_shadow_max_distance = float(text)
+		print("[RenderDebug] Shadow distance = %s" % text)

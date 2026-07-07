@@ -69,23 +69,44 @@ const CHARGE_RECHARGE_TIME := 1.0   ## Seconds to regain one charge
 const ROPE_LOS_MARGIN := 3.0
 const ROPE_LOS_INTERVAL := 1
 
-## Pill obstruction shape — one capsule centered on the rope, split into
-## two ConvexPolygonShape3D halves (left/right of the swing plane).
-## Each half is a half-capsule: flat face on the split plane, hemisphere outward.
-## If blocked, shrink radius and retry.
-const PILL_RADIUS := 0.35             ## Capsule radius for the go-around check
-const ARC_CONTACT_RADIUS := 3.0       ## Different-object contacts beyond this from center contact are ignored
-const HALF_CAPSULE_SEGS := 6          ## Circumference segments for half-capsule vertices
-const HALF_CAPSULE_HEMI_STEPS := 3    ## Latitude steps for the hemisphere cap
-## Center sweep — a flat triangle (prev_chest, current_chest, anchor) covering
-## the area the rope swept through between LOS checks.  Uses ConvexPolygonShape3D
-## with 3 coplanar vertices — the physics engine treats this as a triangle.
+## Rope thickness — shared by the sweep prism, the leaf legs, the arc-sweep
+## localizer, and the visual ribbon so they all agree on the rope's width.
+const ROPE_RADIUS := 0.04
+
+## Leaf go-around check — can the rope detour around the obstacle?
+## For each side of the swing plane we test the surface the rope would sweep
+## while wrapping around the obstacle: bent paths chest → bend → anchor,
+## pinned at both ends and widest at the obstacle, with the bend direction
+## fanned through a half-circle of LEAF_ARC_POINTS directions on that side.
+## The result is a rounded leaf-of-revolution surface (a shallow double
+## cone), tiled by fan triangles that share edges — continuous, no gaps.
+## Only the surface is tested, never the interior (the obstacle itself sits
+## there).  Tiles are extruded ±ROPE_RADIUS using the same prism trick as
+## the center sweep.  The deviation tapers linearly to zero toward both
+## ends, so the test never measures farther from the rope than the width
+## being tried at the obstacle itself.  Widths are tried widest-first; the
+## first width whose whole surface is clear proves the side is passable.
+## Both sides fully blocked at every width → CUT.
+const LEAF_MAX_WIDTH := 0.35          ## Widest detour distance at the bend point
+const LEAF_WIDTH_FRACTIONS: Array[float] = [1.0, 0.75, 0.5, 0.25]
+const LEAF_ARC_POINTS := 10           ## Bend directions per side (half-circle fan)
+
+## Center sweep — an oriented slab covering the triangle (prev_chest,
+## current_chest, anchor) the rope swept through between LOS checks,
+## rope-diameter thick.  The slab is the triangle's bounding box in its own
+## plane, so it over-covers the triangle slightly — extra candidates are
+## filtered by per-obstacle localization afterwards.
+##
+## THREADING: all slab queries (sweep, leaf tiles, arc localizer) share ONE
+## immutable BoxShape3D posed via per-query transforms.  Never mutate shape
+## data (e.g. ConvexPolygonShape3D.points) per tick — under threaded physics
+## shape data goes through a deferred command queue while queries execute
+## immediately, giving null/stale shapes and data races (crash).  Query
+## transforms are call parameters and are always same-tick correct.
 
 ## Binary search — find the interpolation t where the rope first contacts
 ## each obstacle within the swept triangle.
 const BISECT_ITERATIONS := 4          ## 4 iterations → ~6% precision (~0.01m at 240Hz)
-const ROPE_PROXIMITY_MAX := 0.05      ## Max distance from rope line for collide_shape contacts to count (rope width)
-const ARC_SWEEP_RADIUS := 0.01        ## Tiny pill radius for arc-sweep fallback (thin-object localization)
 
 
 # ======================================================================
@@ -131,59 +152,49 @@ const DEBUG_SPIKE_THRESHOLD_US := 500.0           ## Print if any section takes 
 var _rope_mesh_instance: MeshInstance3D = null
 var _anchor_light: OmniLight3D = null
 var _rope_material: StandardMaterial3D = null
-var _pill_mesh_instance: MeshInstance3D = null
+var _spark_material: StandardMaterial3D = null
+var _leaf_mesh_instance: MeshInstance3D = null
 var _contact_mesh_instance: MeshInstance3D = null
 
 ## Pre-cached debug materials (created once in setup, reused every frame)
-var _pill_clear_left_mat: StandardMaterial3D = null      # Green (left half clear)
-var _pill_clear_right_mat: StandardMaterial3D = null      # Yellow (right half clear)
-var _pill_blocked_mat: StandardMaterial3D = null           # Red (half blocked)
-var _pill_subdiv_clear_left_mat: StandardMaterial3D = null # Green 40% (subdivision clear)
-var _pill_subdiv_clear_right_mat: StandardMaterial3D = null # Yellow 40% (subdivision clear)
-var _pill_subdiv_blocked_mat: StandardMaterial3D = null    # Red 40% (subdivision blocked)
+var _leaf_clear_left_mat: StandardMaterial3D = null        # Green (left side path clear)
+var _leaf_clear_right_mat: StandardMaterial3D = null       # Yellow (right side path clear)
+var _leaf_blocked_mat: StandardMaterial3D = null           # Red (path blocked)
+var _leaf_narrow_clear_left_mat: StandardMaterial3D = null # Green 40% (narrower widths)
+var _leaf_narrow_clear_right_mat: StandardMaterial3D = null # Yellow 40% (narrower widths)
+var _leaf_narrow_blocked_mat: StandardMaterial3D = null    # Red 40% (narrower widths)
 var _sweep_wire_mat: StandardMaterial3D = null             # Blue wireframe (center sweep triangle)
 var _contact_center_mat: StandardMaterial3D = null         # Bright cyan (center contact)
-var _contact_cloud_mat: StandardMaterial3D = null          # Dim cyan (cloud points)
-var _contact_arc_mat: StandardMaterial3D = null            # Green-blue (arc contacts)
-var _contact_sphere_mat: StandardMaterial3D = null         # White semi-transparent (radius sphere)
+var _safe_zone_mat: StandardMaterial3D = null              # Green semi-transparent (no-sever radius)
+var _safe_zone_mesh_instance: MeshInstance3D = null
 
-## Pill debug state — set by server obstruction check, read by client visuals.
-## 0 = clear, 1 = blocked.  Index 0 = left half (swing direction), 1 = right half.
-var _pill_half_blocked: Array[int] = [0, 0]
-## The swing-perpendicular direction used to orient the pill halves.
-var _pill_swing_normal: Vector3 = Vector3.ZERO
-## Previous LOS chest position — stored for swept pill visualization.
+## Leaf debug state — set by server obstruction check, read by client visuals.
+## 0 = clear, 1 = blocked.  Index 0 = left side (swing direction), 1 = right side.
+var _side_blocked: Array[int] = [0, 0]
+## Width fraction that cleared per side (-1.0 = blocked or not tested).
+var _side_pass_frac: Array[float] = [-1.0, -1.0]
+## The swing-perpendicular direction used to orient the leaf sides.
+var _dbg_swing_normal: Vector3 = Vector3.ZERO
+## Previous LOS chest position — stored for sweep triangle visualization.
 var _prev_los_chest: Vector3 = Vector3.ZERO
+## Every leaf surface tested this check: {chest, arc, side, frac, blocked}.
+## arc = PackedVector3Array of bend points fanned across the side's half-circle.
+var _leaf_candidates: Array[Dictionary] = []
 
-## Half-capsule shapes — one ConvexPolygonShape3D per half (left/right).
-## Pre-created in setup() to avoid Jolt race condition.  Vertices rebuilt
-## each check to match current rope length and radius.
-var _left_half_shape: ConvexPolygonShape3D = null
-var _left_half_query: PhysicsShapeQueryParameters3D = null
-var _right_half_shape: ConvexPolygonShape3D = null
-var _right_half_query: PhysicsShapeQueryParameters3D = null
-
-## Center sweep shape — flat triangle (ConvexPolygonShape3D, 3 coplanar verts)
-## covering the area the rope swept through between LOS checks.  Rebuilt each check.
-var _center_sweep_shape: ConvexPolygonShape3D = null
+## The ONE immutable query shape: a canonical 1×1×(rope diameter) slab.
+## Every slab-shaped check (sweep triangle, leaf tiles, arc localizer) poses
+## and scales it purely via the query transform — shape data is never
+## mutated at runtime (see threading note above).
+var _slab_shape: BoxShape3D = null
+var _leaf_tile_query: PhysicsShapeQueryParameters3D = null
 var _center_sweep_query: PhysicsShapeQueryParameters3D = null
-
-## Arc-sweep pill — tiny capsule (0.01m radius) swept through the rope's arc
-## to localize thin objects that rays miss.  Same geometry as the go-around pill
-## but with a much smaller radius.  Used in _localize_obstacle() fallback.
-var _arc_sweep_shape: ConvexPolygonShape3D = null
 var _arc_sweep_query: PhysicsShapeQueryParameters3D = null
 
 ## Debug: center-ray contact point (where the rope hits geometry).
 var _center_contact_point: Vector3 = Vector3.ZERO
 var _has_center_contact: bool = false
-## Debug: contact cloud — multiple hit points on the center obstacle mapped by fan rays.
-var _center_contact_cloud: Array[Vector3] = []
-## Debug: RID of the center obstacle (used for same-object detection).
+## Debug: RID of the center obstacle.
 var _center_contact_rid: RID = RID()
-## Debug: arc contact points that caused a half to be blocked (per half).
-## Index 0 = left half contacts, 1 = right half contacts.
-var _arc_contacts: Array[Array] = [[], []]
 
 ## Debug: on-screen label showing bend angle, wrap count, rope state.
 var _debug_label: Label = null
@@ -198,13 +209,13 @@ func setup(p: Player) -> void:
 	_rope_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	_rope_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 
-	# Pre-cache pill half-capsule debug materials (avoids 8-13 allocations per frame)
-	_pill_clear_left_mat = _make_pill_mat(Color(0.1, 1.0, 0.2, 0.15))
-	_pill_clear_right_mat = _make_pill_mat(Color(1.0, 1.0, 0.1, 0.15))
-	_pill_blocked_mat = _make_pill_mat(Color(1.0, 0.15, 0.1, 0.25))
-	_pill_subdiv_clear_left_mat = _make_pill_mat(Color(0.1, 1.0, 0.2, 0.06))
-	_pill_subdiv_clear_right_mat = _make_pill_mat(Color(1.0, 1.0, 0.1, 0.06))
-	_pill_subdiv_blocked_mat = _make_pill_mat(Color(1.0, 0.15, 0.1, 0.1))
+	# Pre-cache leaf debug materials (avoids per-frame allocations)
+	_leaf_clear_left_mat = _make_leaf_mat(Color(0.1, 1.0, 0.2, 0.18))
+	_leaf_clear_right_mat = _make_leaf_mat(Color(1.0, 1.0, 0.1, 0.18))
+	_leaf_blocked_mat = _make_leaf_mat(Color(1.0, 0.15, 0.1, 0.3))
+	_leaf_narrow_clear_left_mat = _make_leaf_mat(Color(0.1, 1.0, 0.2, 0.07))
+	_leaf_narrow_clear_right_mat = _make_leaf_mat(Color(1.0, 1.0, 0.1, 0.07))
+	_leaf_narrow_blocked_mat = _make_leaf_mat(Color(1.0, 0.15, 0.1, 0.12))
 
 	# Pre-cache center sweep wireframe material
 	_sweep_wire_mat = StandardMaterial3D.new()
@@ -214,44 +225,54 @@ func setup(p: Player) -> void:
 
 	# Pre-cache contact debug materials
 	_contact_center_mat = _make_contact_mat(Color(0.2, 0.9, 1.0, 0.9))
-	_contact_cloud_mat = _make_contact_mat(Color(0.15, 0.7, 0.85, 0.7))
-	_contact_arc_mat = _make_contact_mat(Color(0.1, 0.8, 0.6, 0.9))
-	_contact_sphere_mat = StandardMaterial3D.new()
-	_contact_sphere_mat.albedo_color = Color(1.0, 1.0, 1.0, 0.3)
-	_contact_sphere_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	_contact_sphere_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	_contact_sphere_mat.no_depth_test = true
 
-	# Pre-create half-capsule shapes for pill obstruction checks
-	_left_half_shape = ConvexPolygonShape3D.new()
-	_left_half_query = PhysicsShapeQueryParameters3D.new()
-	_left_half_query.shape = _left_half_shape
-	_left_half_query.collision_mask = 1 | 1024 | 2048
-	_left_half_query.collide_with_bodies = true
-	_left_half_query.collide_with_areas = false
+	_safe_zone_mat = StandardMaterial3D.new()
+	_safe_zone_mat.albedo_color = Color(0.2, 1.0, 0.3, 0.25)
+	_safe_zone_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_safe_zone_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	_safe_zone_mat.no_depth_test = true
 
-	_right_half_shape = ConvexPolygonShape3D.new()
-	_right_half_query = PhysicsShapeQueryParameters3D.new()
-	_right_half_query.shape = _right_half_shape
-	_right_half_query.collision_mask = 1 | 1024 | 2048
-	_right_half_query.collide_with_bodies = true
-	_right_half_query.collide_with_areas = false
+	# The one immutable slab shape shared by all obstruction queries.
+	# Created once here so its data is long flushed before gameplay; from
+	# then on only query TRANSFORMS vary (threaded-physics safe — mutating
+	# shape data per tick races the server command queue).
+	_slab_shape = BoxShape3D.new()
+	_slab_shape.size = Vector3(1.0, 1.0, ROPE_RADIUS * 2.0)
+	_slab_shape.margin = 0.001
 
-	# Pre-create center sweep shape (flat triangle, verts set each check)
-	_center_sweep_shape = ConvexPolygonShape3D.new()
+	_leaf_tile_query = PhysicsShapeQueryParameters3D.new()
+	_leaf_tile_query.shape = _slab_shape
+	_leaf_tile_query.collision_mask = 1 | 1024 | 2048
+	_leaf_tile_query.collide_with_bodies = true
+	_leaf_tile_query.collide_with_areas = false
+
 	_center_sweep_query = PhysicsShapeQueryParameters3D.new()
-	_center_sweep_query.shape = _center_sweep_shape
+	_center_sweep_query.shape = _slab_shape
 	_center_sweep_query.collision_mask = 1 | 1024 | 2048
 	_center_sweep_query.collide_with_bodies = true
 	_center_sweep_query.collide_with_areas = false
 
-	# Pre-create arc-sweep pill shape (tiny capsule for thin-object localization)
-	_arc_sweep_shape = ConvexPolygonShape3D.new()
 	_arc_sweep_query = PhysicsShapeQueryParameters3D.new()
-	_arc_sweep_query.shape = _arc_sweep_shape
+	_arc_sweep_query.shape = _slab_shape
 	_arc_sweep_query.collision_mask = 1 | 1024 | 2048
 	_arc_sweep_query.collide_with_bodies = true
 	_arc_sweep_query.collide_with_areas = false
+
+	# Fire-spark material — cached here instead of created per fire: a brand
+	# new material's first draw compiles a render pipeline mid-gameplay.
+	_spark_material = StandardMaterial3D.new()
+	_spark_material.albedo_color = Color(0.5, 0.8, 1.0)
+	_spark_material.emission_enabled = true
+	_spark_material.emission = Color(0.3, 0.6, 1.0)
+	_spark_material.emission_energy_multiplier = 5.0
+	_spark_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	# Pipeline warm-up — draw every runtime-created grapple material once NOW,
+	# while the WorkerThreadPool is idle.  Async pipeline compilation runs on
+	# the pool; first-drawing these at grapple fire can deadlock against
+	# wedged terrain/mesh tasks (thread-stack capture 2026-07-07: main thread
+	# waiting on pool work at fire, pool tasks waiting on main's queue flush).
+	_warm_up_pipelines.call_deferred()
 
 	# Debug HUD label — shows bend angle, wrap count, rope state on screen
 	_debug_label = Label.new()
@@ -267,7 +288,51 @@ func setup(p: Player) -> void:
 		hud_layer.add_child(_debug_label)
 
 
-func _make_pill_mat(color: Color) -> StandardMaterial3D:
+func _warm_up_pipelines() -> void:
+	## Force one draw of every grapple material in each primitive topology we
+	## use (triangle strips for rope/leaf, line strips for wireframes), plus
+	## an omni light, so all pipelines compile at spawn instead of at fire.
+	## The geometry is millimeter-sized; extra_cull_margin defeats frustum
+	## culling so the draw actually submits.
+	if not is_inside_tree() or player == null:
+		return
+	var mats: Array[StandardMaterial3D] = [
+		_rope_material, _spark_material,
+		_leaf_clear_left_mat, _leaf_clear_right_mat, _leaf_blocked_mat,
+		_leaf_narrow_clear_left_mat, _leaf_narrow_clear_right_mat,
+		_leaf_narrow_blocked_mat, _sweep_wire_mat,
+		_contact_center_mat, _safe_zone_mat,
+	]
+	var im := ImmediateMesh.new()
+	for mat in mats:
+		if mat == null:
+			continue
+		im.surface_begin(Mesh.PRIMITIVE_TRIANGLE_STRIP, mat)
+		im.surface_add_vertex(Vector3.ZERO)
+		im.surface_add_vertex(Vector3(0.001, 0.0, 0.0))
+		im.surface_add_vertex(Vector3(0.0, 0.001, 0.0))
+		im.surface_end()
+		im.surface_begin(Mesh.PRIMITIVE_LINE_STRIP, mat)
+		im.surface_add_vertex(Vector3.ZERO)
+		im.surface_add_vertex(Vector3(0.001, 0.0, 0.0))
+		im.surface_end()
+
+	var mi := MeshInstance3D.new()
+	mi.mesh = im
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	mi.extra_cull_margin = 16384.0
+	player.add_child(mi)
+
+	# Warm the omni-light pipeline variants (fire flash + anchor light).
+	var light := OmniLight3D.new()
+	light.light_energy = 0.001
+	light.omni_range = 0.05
+	mi.add_child(light)
+
+	get_tree().create_timer(1.0).timeout.connect(mi.queue_free)
+
+
+func _make_leaf_mat(color: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
 	m.albedo_color = color
 	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
@@ -692,18 +757,19 @@ func process(delta: float) -> void:
 
 
 func _is_rope_obstructed() -> bool:
-	## Rope obstruction check — interpolated multi-obstacle, pill-based.
+	## Rope obstruction check — interpolated multi-obstacle, leaf-based.
 	##
 	## Overview:
 	## 1. Swept prism (prev_chest → current_chest → anchor) detects ALL obstacles
 	##    the rope swept through between ticks — including thin objects that rays miss.
 	## 2. For each obstacle, binary-search to find the interpolation t (0→1) where
 	##    the rope first contacts it.  Uses rays first (fast path), falls back to
-	##    collide_shape for thin objects that rays miss.
+	##    a swept capsule for thin objects that rays miss.
 	## 3. Sort obstacles by t (earliest contact first).
 	## 4. Walk through in order: at each obstacle's interpolated chest position,
-	##    run the pill go-around check.  If both halves blocked → CUT.
-	##    If at least one half clear → continue to next obstacle.
+	##    run the leaf go-around check (bent detour paths on each side of the
+	##    swing plane).  If both sides blocked at every width → CUT.
+	##    If at least one side has a clear path → continue to next obstacle.
 	## 5. If all obstacles have a clear go-around → no cut.
 	##
 	## Fallback: when the player barely moved (sweep_len < 0.05), skip the swept
@@ -713,10 +779,10 @@ func _is_rope_obstructed() -> bool:
 	var space_state := player.get_world_3d().direct_space_state
 	var player_chest: Vector3 = player.global_position + Vector3(0, 1.2, 0)
 
-	# Exclude self, anchor collider, and all other players
+	# Exclude self and all other players (NOT the anchor collider — the
+	# ROPE_LOS_MARGIN safe zone handles near-anchor hits, and excluding a
+	# large monolithic body like terrain would make the entire body invisible).
 	var excludes: Array[RID] = [player.get_rid()]
-	if _anchor_collider_rid.is_valid():
-		excludes.append(_anchor_collider_rid)
 	for peer_id in NetworkManager.players:
 		var other_player: Player = NetworkManager.players[peer_id]
 		if other_player and other_player != player:
@@ -742,13 +808,14 @@ func _is_rope_obstructed() -> bool:
 		else:
 			swing_normal = rope_dir.cross(Vector3.RIGHT).normalized()
 
-	_pill_swing_normal = swing_normal
+	_dbg_swing_normal = swing_normal
 
 	# Reset debug state
 	_has_center_contact = false
-	_center_contact_cloud = []
 	_center_contact_rid = RID()
-	_arc_contacts = [[], []]
+	_leaf_candidates = []
+	_side_blocked = [0, 0]
+	_side_pass_frac = [-1.0, -1.0]
 
 	var prev_chest: Vector3 = _last_los_chest if _last_los_chest.length() > 0.1 else player_chest
 	_prev_los_chest = prev_chest
@@ -761,32 +828,50 @@ func _is_rope_obstructed() -> bool:
 	var sweep_len: float = sweep_vec.length()
 
 	if sweep_len > 0.05:
-		var edge_a: Vector3 = player_chest - prev_chest
-		var edge_b: Vector3 = anchor_point - prev_chest
-		var tri_normal: Vector3 = edge_a.cross(edge_b)
-		var tri_n_len: float = tri_normal.length()
-		if tri_n_len > 0.001:
-			tri_normal /= tri_n_len
+		# Oriented slab covering the swept triangle: Y axis toward the anchor,
+		# X axis along the chest motion, thickness = rope diameter (canonical).
+		# Slightly over-covers the triangle; localization filters extras.
+		var mid_base: Vector3 = (prev_chest + player_chest) * 0.5
+		var y_vec: Vector3 = anchor_point - mid_base
+		var y_len: float = y_vec.length()
+		if y_len < 0.1:
+			return false
+		var y_dir: Vector3 = y_vec / y_len
+		var x_raw: Vector3 = player_chest - prev_chest
+		var x_vec: Vector3 = x_raw - y_dir * x_raw.dot(y_dir)
+		var x_dir: Vector3
+		if x_vec.length() > 0.001:
+			x_dir = x_vec.normalized()
+		elif absf(y_dir.y) < 0.9:
+			# Motion parallel to the rope — thin slab along the rope line.
+			x_dir = y_dir.cross(Vector3.UP).normalized()
 		else:
-			tri_normal = Vector3.UP
-		var offset: Vector3 = tri_normal * 0.055
-		_center_sweep_shape.points = PackedVector3Array([
-			prev_chest + offset, player_chest + offset, anchor_point + offset,
-			prev_chest - offset, player_chest - offset, anchor_point - offset])
-		_center_sweep_query.transform = Transform3D.IDENTITY
+			x_dir = y_dir.cross(Vector3.RIGHT).normalized()
+
+		var center: Vector3 = (prev_chest + player_chest + anchor_point) / 3.0
+		var half_w: float = 0.001
+		var half_l: float = 0.001
+		for pt: Vector3 in [prev_chest, player_chest, anchor_point]:
+			var d: Vector3 = pt - center
+			half_w = maxf(half_w, absf(d.dot(x_dir)))
+			half_l = maxf(half_l, absf(d.dot(y_dir)))
+		half_w = maxf(half_w, ROPE_RADIUS)
+
+		_center_sweep_query.transform = _slab_transform(center, x_dir, y_dir,
+			half_w * 2.0, half_l * 2.0)
 		_center_sweep_query.exclude = excludes
-		var sweep_overlaps := space_state.intersect_shape(_center_sweep_query, 8)
+		var sweep_overlaps := space_state.intersect_shape(_center_sweep_query, 16)
 
 		if sweep_overlaps.is_empty():
 			# Also check current-frame rope rays (catches stationary obstacles
 			# that the razor-thin prism might miss due to float precision)
 			var fallback_result := _check_rope_rays(space_state, player_chest, excludes)
 			if fallback_result.is_empty():
-				_pill_half_blocked = [0, 0]
 				return false
-			# Single obstacle from ray — run pill at current position
-			return _run_pill_check_at(space_state, player_chest, rope_dir, rope_len,
-				swing_normal, fallback_result, excludes)
+			# Single obstacle from ray — run leaf check at current position
+			return _run_leaf_check_at(space_state, player_chest, rope_dir, rope_len,
+				swing_normal, fallback_result.position,
+				fallback_result.get("rid", RID()), excludes)
 
 		# --- Collect unique obstacle RIDs from the swept prism ---
 		var obstacle_rids: Array[RID] = []
@@ -812,7 +897,6 @@ func _is_rope_obstructed() -> bool:
 				obstacle_rids.append(rid)
 
 		if obstacle_rids.is_empty():
-			_pill_half_blocked = [0, 0]
 			return false
 
 		# --- For each obstacle, find interpolation t and contact point ---
@@ -830,20 +914,18 @@ func _is_rope_obstructed() -> bool:
 			# Fall back to current-frame rope rays.
 			var fallback_result := _check_rope_rays(space_state, player_chest, excludes)
 			if fallback_result.is_empty():
-				_pill_half_blocked = [0, 0]
 				return false
-			return _run_pill_check_at(space_state, player_chest, rope_dir, rope_len,
-				swing_normal, fallback_result, excludes)
+			return _run_leaf_check_at(space_state, player_chest, rope_dir, rope_len,
+				swing_normal, fallback_result.position,
+				fallback_result.get("rid", RID()), excludes)
 
 		# --- Sort by t (earliest contact first) ---
 		obstacle_data.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
 			return a["t"] < b["t"])
 
-		# --- Walk through obstacles, pill-check each one ---
+		# --- Walk through obstacles, leaf-check each one ---
 		for obs in obstacle_data:
 			var obs_t: float = obs["t"]
-			var obs_rid: RID = obs["rid"]
-			var obs_contact: Vector3 = obs["contact"]
 
 			# Interpolated chest position at this t
 			var interp_chest: Vector3 = prev_chest.lerp(player_chest, obs_t)
@@ -858,42 +940,14 @@ func _is_rope_obstructed() -> bool:
 			# Build swing normal at this interpolated position
 			var interp_swing_normal := _compute_swing_normal(interp_rope_dir)
 
-			# Set debug state for this obstacle (last one evaluated wins for visuals)
-			_center_contact_point = obs_contact
-			_center_contact_rid = obs_rid
-			_has_center_contact = true
-			_pill_swing_normal = interp_swing_normal
+			if _run_leaf_check_at(space_state, interp_chest, interp_rope_dir,
+					interp_rope_len, interp_swing_normal, obs["contact"],
+					obs["rid"], excludes):
+				return true  # Both sides blocked — CUT
 
-			# Run pill check at the interpolated position
-			var pill_xform := _build_pill_transform(interp_chest, interp_rope_dir,
-				interp_swing_normal, interp_rope_len)
-
-			var left_pts := _build_half_capsule_points(interp_rope_len, PILL_RADIUS, 1.0)
-			_left_half_shape.points = left_pts
-			_left_half_query.transform = pill_xform
-			_left_half_query.exclude = excludes
-
-			var right_pts := _build_half_capsule_points(interp_rope_len, PILL_RADIUS, -1.0)
-			_right_half_shape.points = right_pts
-			_right_half_query.transform = pill_xform
-			_right_half_query.exclude = excludes
-
-			var left_contacts: Array[Vector3] = []
-			var left_blocked := _check_pill_half_blocked(space_state, _left_half_query, left_contacts)
-
-			var right_contacts: Array[Vector3] = []
-			var right_blocked := _check_pill_half_blocked(space_state, _right_half_query, right_contacts)
-
-			_pill_half_blocked = [1 if left_blocked else 0, 1 if right_blocked else 0]
-			_arc_contacts = [left_contacts, right_contacts]
-
-			if left_blocked and right_blocked:
-				return true  # Both halves blocked — CUT
-
-			# At least one half clear — can go around this obstacle, check next
+			# At least one side clear — can go around this obstacle, check next
 
 		# All obstacles had a way around
-		_pill_half_blocked = [0, 0]
 		return false
 
 	# =================================================================
@@ -902,12 +956,12 @@ func _is_rope_obstructed() -> bool:
 	var center_hit_result := _check_rope_rays(space_state, player_chest, excludes)
 
 	if center_hit_result.is_empty():
-		_pill_half_blocked = [0, 0]
 		return false
 
-	# Single obstacle from rays — run pill at current position
-	return _run_pill_check_at(space_state, player_chest, rope_dir, rope_len,
-		swing_normal, center_hit_result, excludes)
+	# Single obstacle from rays — run leaf check at current position
+	return _run_leaf_check_at(space_state, player_chest, rope_dir, rope_len,
+		swing_normal, center_hit_result.position,
+		center_hit_result.get("rid", RID()), excludes)
 
 
 func _check_rope_rays(space_state: PhysicsDirectSpaceState3D,
@@ -938,38 +992,158 @@ func _check_rope_rays(space_state: PhysicsDirectSpaceState3D,
 	return result
 
 
-func _run_pill_check_at(space_state: PhysicsDirectSpaceState3D,
+func _run_leaf_check_at(space_state: PhysicsDirectSpaceState3D,
 		chest: Vector3, rope_dir: Vector3, rope_len: float,
-		swing_normal: Vector3, hit_result: Dictionary,
+		swing_normal: Vector3, contact: Vector3, contact_rid: RID,
 		excludes: Array[RID]) -> bool:
-	## Run a single pill go-around check at the given chest position.
-	## Sets debug state and returns true if both halves blocked (= CUT).
-	_center_contact_point = hit_result.position
-	_center_contact_rid = hit_result.get("rid", RID())
+	## Leaf go-around check for one obstacle at the given chest position.
+	## The bend arc sits where the obstacle contacts the rope; the detour
+	## surface fans through a half-circle of directions on each side while
+	## staying pinned at chest and anchor.
+	## Sets debug state.  Returns true if BOTH sides are blocked at every
+	## width (= CUT).  The right side is skipped when the left already passed.
+	_center_contact_point = contact
+	_center_contact_rid = contact_rid
 	_has_center_contact = true
+	_dbg_swing_normal = swing_normal
 
-	var pill_xform := _build_pill_transform(chest, rope_dir, swing_normal, rope_len)
+	# Bend base: the obstacle's contact projected onto the rope line.
+	var along: float = clampf((contact - chest).dot(rope_dir),
+		rope_len * 0.05, rope_len * 0.95)
+	var bend_base: Vector3 = chest + rope_dir * along
 
-	var left_pts := _build_half_capsule_points(rope_len, PILL_RADIUS, 1.0)
-	_left_half_shape.points = left_pts
-	_left_half_query.transform = pill_xform
-	_left_half_query.exclude = excludes
+	# Second perpendicular axis — together with swing_normal it spans the
+	# plane of bend directions around the rope.
+	var z_axis: Vector3 = rope_dir.cross(swing_normal).normalized()
 
-	var right_pts := _build_half_capsule_points(rope_len, PILL_RADIUS, -1.0)
-	_right_half_shape.points = right_pts
-	_right_half_query.transform = pill_xform
-	_right_half_query.exclude = excludes
+	var left_frac := _side_pass_fraction(space_state, chest, bend_base,
+		swing_normal, z_axis, 0, excludes)
+	var right_frac := -1.0
+	if left_frac < 0.0:
+		right_frac = _side_pass_fraction(space_state, chest, bend_base,
+			-swing_normal, z_axis, 1, excludes)
 
-	var left_contacts: Array[Vector3] = []
-	var left_blocked := _check_pill_half_blocked(space_state, _left_half_query, left_contacts)
+	_side_blocked = [1 if left_frac < 0.0 else 0, 1 if right_frac < 0.0 else 0]
+	_side_pass_frac = [left_frac, right_frac]
 
-	var right_contacts: Array[Vector3] = []
-	var right_blocked := _check_pill_half_blocked(space_state, _right_half_query, right_contacts)
+	return left_frac < 0.0 and right_frac < 0.0
 
-	_pill_half_blocked = [1 if left_blocked else 0, 1 if right_blocked else 0]
-	_arc_contacts = [left_contacts, right_contacts]
 
-	return left_blocked and right_blocked
+func _side_pass_fraction(space_state: PhysicsDirectSpaceState3D,
+		chest: Vector3, bend_base: Vector3, side_dir: Vector3,
+		z_axis: Vector3, side_idx: int, excludes: Array[RID]) -> float:
+	## Try leaf detour surfaces on one side of the swing plane, widest first.
+	## Each surface fans the bend point through a half-circle of directions
+	## (side_dir at the middle, ±z_axis at the seams shared with the other
+	## side).  Returns the width fraction of the first fully clear surface,
+	## or -1.0 if every width is blocked.  Records surfaces for debug visuals.
+	for frac in LEAF_WIDTH_FRACTIONS:
+		var w: float = LEAF_MAX_WIDTH * frac
+		var arc := PackedVector3Array()
+		for k in LEAF_ARC_POINTS:
+			var theta: float = -PI * 0.5 + PI * float(k) / float(LEAF_ARC_POINTS - 1)
+			var dir: Vector3 = side_dir * cos(theta) + z_axis * sin(theta)
+			arc.append(bend_base + dir * w)
+		var blocked := _leaf_surface_blocked(space_state, chest, arc, excludes)
+		_leaf_candidates.append({
+			"chest": chest, "arc": arc, "side": side_idx,
+			"frac": frac, "blocked": blocked })
+		if not blocked:
+			return frac
+	return -1.0
+
+
+func _leaf_surface_blocked(space_state: PhysicsDirectSpaceState3D,
+		chest: Vector3, arc: PackedVector3Array,
+		excludes: Array[RID]) -> bool:
+	## Overlap-test one leaf surface: two triangle fans (apex at chest and at
+	## anchor) meeting at the shared bend arc.  Adjacent tiles share edges,
+	## so the coverage is continuous — nothing can slip between tiles.
+	## Early-exits on the first blocked tile.
+	for k in arc.size() - 1:
+		if _fan_tile_blocked(space_state, chest, arc[k], arc[k + 1], excludes):
+			return true
+		if _fan_tile_blocked(space_state, anchor_point, arc[k], arc[k + 1], excludes):
+			return true
+	return false
+
+
+func _fan_tile_blocked(space_state: PhysicsDirectSpaceState3D,
+		apex: Vector3, p0: Vector3, p1: Vector3,
+		excludes: Array[RID]) -> bool:
+	## Overlap-test one fan tile: the triangle (apex, p0, p1) truncated near
+	## the apex by the LOS safe margin (so the player's surroundings and the
+	## anchor surface don't count as obstructions), rope-diameter thick.
+	## Posed as an oriented slab in the tile's plane via the query transform
+	## (never mutates shape data — threaded-physics safe).  The slab is the
+	## quad's in-plane bounding box; the slight lateral over-cover lands on
+	## the neighboring tile's part of the surface, so coverage stays exact.
+	var corners := _fan_tile_corners(apex, p0, p1)
+	if corners.is_empty():
+		return false
+
+	var mid_q: Vector3 = (corners[0] + corners[1]) * 0.5
+	var mid_p: Vector3 = (corners[2] + corners[3]) * 0.5
+	var y_vec: Vector3 = mid_p - mid_q
+	var y_len: float = y_vec.length()
+	if y_len < 0.01:
+		return false
+	var y_dir: Vector3 = y_vec / y_len
+	var x_raw: Vector3 = corners[2] - corners[3]  # p1 - p0 (arc chord)
+	var x_vec: Vector3 = x_raw - y_dir * x_raw.dot(y_dir)
+	var x_len: float = x_vec.length()
+	if x_len < 0.001:
+		return false  # Degenerate sliver — apex colinear with the arc chord
+	var x_dir: Vector3 = x_vec / x_len
+
+	var center: Vector3 = (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25
+	var half_w: float = 0.001
+	var half_l: float = 0.001
+	for i in 4:
+		var d: Vector3 = corners[i] - center
+		half_w = maxf(half_w, absf(d.dot(x_dir)))
+		half_l = maxf(half_l, absf(d.dot(y_dir)))
+
+	_leaf_tile_query.transform = _slab_transform(center, x_dir, y_dir,
+		half_w * 2.0, half_l * 2.0)
+	_leaf_tile_query.exclude = excludes
+	return not space_state.intersect_shape(_leaf_tile_query, 1).is_empty()
+
+
+func _fan_tile_corners(apex: Vector3, p0: Vector3, p1: Vector3) -> PackedVector3Array:
+	## Corners of a fan tile truncated near its apex: [q0, q1, p1, p0] where
+	## q0/q1 sit the safe-margin distance from the apex along each edge.
+	## Returns empty if the tile is degenerate.
+	var len0: float = apex.distance_to(p0)
+	var len1: float = apex.distance_to(p1)
+	if len0 < 0.05 or len1 < 0.05:
+		return PackedVector3Array()
+	var trim: float = minf(ROPE_LOS_MARGIN, minf(len0, len1) * 0.45)
+	var q0: Vector3 = apex.lerp(p0, trim / len0)
+	var q1: Vector3 = apex.lerp(p1, trim / len1)
+	return PackedVector3Array([q0, q1, p1, p0])
+
+
+func _slab_transform(center: Vector3, x_dir: Vector3, y_dir: Vector3,
+		w: float, l: float) -> Transform3D:
+	## Pose the canonical slab shape: X scaled to width w, Y scaled to
+	## length l, Z (thickness = rope diameter) unscaled.  x_dir/y_dir must
+	## be orthonormal.
+	var z_dir: Vector3 = x_dir.cross(y_dir)
+	return Transform3D(Basis(x_dir * w, y_dir * l, z_dir), center)
+
+
+func _segment_slab_transform(a: Vector3, b: Vector3, width: float) -> Transform3D:
+	## Pose the canonical slab along segment a → b (local Y axis) with the
+	## given cross-section width, centered at the midpoint.  Caller
+	## guarantees a ≠ b.
+	var y_dir: Vector3 = (b - a).normalized()
+	var x_dir: Vector3
+	if absf(y_dir.y) < 0.9:
+		x_dir = y_dir.cross(Vector3.UP).normalized()
+	else:
+		x_dir = y_dir.cross(Vector3.RIGHT).normalized()
+	return _slab_transform((a + b) * 0.5, x_dir, y_dir, width, a.distance_to(b))
 
 
 func _localize_obstacle(space_state: PhysicsDirectSpaceState3D,
@@ -982,10 +1156,10 @@ func _localize_obstacle(space_state: PhysicsDirectSpaceState3D,
 	##
 	## Strategy:
 	## 1. Binary search using raycasts (fast, works for most objects).
-	## 2. If all rays miss (thin object), fall back to sweeping a tiny pill
-	##    (0.01m radius) through the rope's arc using cast_motion, with the
-	##    exclude list set to block everything except target_rid so only that
-	##    object can be hit.  get_rest_info then gives the contact point.
+	## 2. If all rays miss (thin object), fall back to sweeping a thin
+	##    rope-radius capsule through the rope's arc using cast_motion, with
+	##    the exclude list set to block everything except target_rid so only
+	##    that object can be hit.  get_rest_info then gives the contact point.
 
 	# --- Fast path: binary search with rays ---
 	var best_t: float = -1.0
@@ -1027,7 +1201,7 @@ func _localize_obstacle(space_state: PhysicsDirectSpaceState3D,
 
 		return { "t": best_t, "rid": target_rid, "contact": best_contact }
 
-	# --- Fallback: rays missed — arc-sweep a tiny pill to localize thin objects ---
+	# --- Fallback: rays missed — arc-sweep a thin capsule to localize thin objects ---
 	# Build an exclude list that blocks everything EXCEPT target_rid.
 	# This turns the physics query into an "include-only" filter for the target.
 	var arc_excludes: Array[RID] = excludes.duplicate()
@@ -1042,29 +1216,26 @@ func _localize_obstacle(space_state: PhysicsDirectSpaceState3D,
 			if not already:
 				arc_excludes.append(other_rid)
 
-	# Build the tiny pill (same geometry as go-around pill, but 0.01m radius)
-	# aligned along the rope at t=0 (prev_chest → anchor).
+	# Thin rope-width slab along the rope at t=0 (prev_chest → anchor),
+	# trimmed by the LOS safe margins at both ends so the anchor surface and
+	# the player's surroundings can't produce an immediate hit.  Posed via
+	# transform only (threaded-physics safe).
+	# NOTE: pure translation over-sweeps toward the anchor end (the real rope
+	# pivots at the anchor), but hits near the anchor land in the safe zone
+	# and are discarded below anyway.
 	var prev_rope_vec: Vector3 = anchor_point - prev_chest
 	var prev_rope_len: float = prev_rope_vec.length()
 	if prev_rope_len < 0.1:
 		return {}
 	var prev_rope_dir: Vector3 = prev_rope_vec / prev_rope_len
-
-	# Build a full capsule (both halves combined) at ARC_SWEEP_RADIUS
-	# We use side_sign=+1 and side_sign=-1 points merged into one shape so the
-	# pill covers the full rope circumference (thin 0.01m tube around the rope).
-	var left_pts := _build_half_capsule_points(prev_rope_len, ARC_SWEEP_RADIUS, 1.0)
-	var right_pts := _build_half_capsule_points(prev_rope_len, ARC_SWEEP_RADIUS, -1.0)
-	var full_pts := PackedVector3Array()
-	full_pts.append_array(left_pts)
-	full_pts.append_array(right_pts)
-	_arc_sweep_shape.points = full_pts
-
-	# Build the pill transform at t=0 position
-	var prev_swing_normal := _compute_swing_normal(prev_rope_dir)
-	var pill_xform := _build_pill_transform(prev_chest, prev_rope_dir,
-		prev_swing_normal, prev_rope_len)
-	_arc_sweep_query.transform = pill_xform
+	var trim: float = minf(ROPE_LOS_MARGIN, prev_rope_len * 0.45)
+	var cap_a: Vector3 = prev_chest + prev_rope_dir * trim
+	var cap_b: Vector3 = anchor_point - prev_rope_dir * trim
+	var cap_len: float = cap_a.distance_to(cap_b)
+	if cap_len < 0.05:
+		return {}
+	var sweep_xform := _segment_slab_transform(cap_a, cap_b, ROPE_RADIUS * 2.0)
+	_arc_sweep_query.transform = sweep_xform
 	_arc_sweep_query.exclude = arc_excludes
 
 	# Sweep motion = how the player chest moved this frame (the arc).
@@ -1082,28 +1253,12 @@ func _localize_obstacle(space_state: PhysicsDirectSpaceState3D,
 	# The unsafe fraction IS our t value (0→1 along prev_chest → cur_chest)
 	var hit_t: float = motion_result[1]
 
-	# Move the pill to the unsafe position and use get_rest_info to get contact point + RID.
-	# Since our exclude list blocks everything except target_rid, this is guaranteed
-	# to return the target's contact info (if anything).
+	# Translate the slab to the unsafe position and use get_rest_info to
+	# get the contact point.  Since our exclude list blocks everything except
+	# target_rid, this is guaranteed to return the target's contact info.
 	var hit_chest: Vector3 = prev_chest + sweep_motion * hit_t
-	var hit_rope_vec: Vector3 = anchor_point - hit_chest
-	var hit_rope_len: float = hit_rope_vec.length()
-	if hit_rope_len < 0.1:
-		return {}
-	var hit_rope_dir: Vector3 = hit_rope_vec / hit_rope_len
-	var hit_swing_normal := _compute_swing_normal(hit_rope_dir)
-
-	# Rebuild pill geometry at the hit position for get_rest_info
-	var hit_left := _build_half_capsule_points(hit_rope_len, ARC_SWEEP_RADIUS, 1.0)
-	var hit_right := _build_half_capsule_points(hit_rope_len, ARC_SWEEP_RADIUS, -1.0)
-	var hit_full := PackedVector3Array()
-	hit_full.append_array(hit_left)
-	hit_full.append_array(hit_right)
-	_arc_sweep_shape.points = hit_full
-
-	var hit_pill_xform := _build_pill_transform(hit_chest, hit_rope_dir,
-		hit_swing_normal, hit_rope_len)
-	_arc_sweep_query.transform = hit_pill_xform
+	sweep_xform.origin += sweep_motion * hit_t
+	_arc_sweep_query.transform = sweep_xform
 	_arc_sweep_query.motion = Vector3.ZERO  # No motion for rest info query
 
 	var rest_info := space_state.get_rest_info(_arc_sweep_query)
@@ -1159,7 +1314,7 @@ func _ray_hits_rid(space_state: PhysicsDirectSpaceState3D,
 
 
 func _compute_swing_normal(rope_dir: Vector3) -> Vector3:
-	## Compute a swing-perpendicular normal for the pill orientation.
+	## Compute a swing-perpendicular normal for the leaf side orientation.
 	## Uses current velocity if available, otherwise falls back to world up.
 	var rad_spd: float = player.velocity.dot(rope_dir)
 	var tang_v: Vector3 = player.velocity - rope_dir * rad_spd
@@ -1168,159 +1323,6 @@ func _compute_swing_normal(rope_dir: Vector3) -> Vector3:
 	if absf(rope_dir.y) < 0.9:
 		return rope_dir.cross(Vector3.UP).normalized()
 	return rope_dir.cross(Vector3.RIGHT).normalized()
-
-
-func _log_los_timing(t0: int, t_center: int, t_fan: int, t_pill: int, outcome: String) -> void:
-	## Print LOS check timing breakdown if it exceeds the spike threshold.
-	var t_end := Time.get_ticks_usec()
-	var total_us: float = t_end - t0
-	var now_sec: float = Time.get_ticks_msec() / 1000.0
-	if total_us > DEBUG_SPIKE_THRESHOLD_US and (now_sec - _debug_last_print_time) > 0.5:
-		_debug_last_print_time = now_sec
-		var center_us: float = (t_fan - t_center) if t_fan > 0 else (t_end - t_center)
-		var fan_us: float = float(t_pill - t_fan) if (t_fan > 0 and t_pill > 0) else 0.0
-		var pill_us: float = float(t_end - t_pill) if t_pill > 0 else 0.0
-		var setup_us: float = t_center - t0
-		print("[LOS SPIKE] total=%.0fµs  setup=%.0fµs  center=%.0fµs  fan=%.0fµs  pill=%.0fµs  outcome=%s" % [
-			total_us, setup_us, center_us, fan_us, pill_us, outcome])
-
-
-func _build_half_capsule_points(rope_len: float, radius: float,
-		side_sign: float) -> PackedVector3Array:
-	## Generate vertices for a thin SHELL on one side of the capsule.
-	## This is NOT a solid half — it's a thin curved wall representing the
-	## outside path the rope would take when going around an obstacle.
-	##
-	## Local space: Y-axis = rope direction (0 = player, rope_len = anchor).
-	##              X-axis = swing_normal (split direction).
-	## side_sign: +1.0 = left shell (+X side), -1.0 = right shell (-X side).
-	##
-	## The shell is built from two concentric layers of vertices:
-	##   Outer layer: at full radius
-	##   Inner layer: at radius - SHELL_THICKNESS
-	## The convex hull of these two layers forms a thin curved wall.
-	var points := PackedVector3Array()
-	const SHELL_THICKNESS := 0.06  ## Thin wall thickness
-
-	var inner_radius: float = maxf(radius - SHELL_THICKNESS, 0.01)
-	# Capsule centered at Y = rope_len/2.  Cylinder extends from
-	# cyl_bottom to cyl_top; hemispheres cap each end.
-	var half_cyl: float = maxf((rope_len - 2.0 * radius) * 0.5, 0.0)
-	var mid_y: float = rope_len * 0.5
-	var cyl_bottom: float = mid_y - half_cyl
-	var cyl_top: float = mid_y + half_cyl
-
-	# Generate two layers (outer and inner) of the half-shell surface.
-	# The shell covers a half-circle arc from -90° to +90° around the capsule
-	# axis on the side_sign side (+X or -X).
-	for layer in 2:
-		var r: float = radius if layer == 0 else inner_radius
-
-		# Cylinder body rings
-		for yi in HALF_CAPSULE_SEGS + 1:
-			var t: float = float(yi) / float(HALF_CAPSULE_SEGS)
-			var y_local: float = cyl_bottom + t * (cyl_top - cyl_bottom)
-
-			for ai in HALF_CAPSULE_SEGS + 1:
-				# Half-circle arc from -90° to +90° (outward side)
-				var angle: float = -PI * 0.5 + PI * float(ai) / float(HALF_CAPSULE_SEGS)
-				var lx: float = cos(angle) * r * side_sign
-				var lz: float = sin(angle) * r
-				points.append(Vector3(lx, y_local, lz))
-
-		# Bottom hemisphere cap (player end)
-		for hi in range(1, HALF_CAPSULE_HEMI_STEPS + 1):
-			var phi: float = (PI * 0.5) * float(hi) / float(HALF_CAPSULE_HEMI_STEPS)
-			var y_local: float = cyl_bottom - sin(phi) * r
-			var ring_r: float = cos(phi) * r
-			if ring_r < 0.005:
-				points.append(Vector3(0.0, y_local, 0.0))
-				continue
-			for ai in HALF_CAPSULE_SEGS + 1:
-				var angle: float = -PI * 0.5 + PI * float(ai) / float(HALF_CAPSULE_SEGS)
-				var lx: float = cos(angle) * ring_r * side_sign
-				var lz: float = sin(angle) * ring_r
-				points.append(Vector3(lx, y_local, lz))
-
-		# Top hemisphere cap (anchor end)
-		for hi in range(1, HALF_CAPSULE_HEMI_STEPS + 1):
-			var phi: float = (PI * 0.5) * float(hi) / float(HALF_CAPSULE_HEMI_STEPS)
-			var y_local: float = cyl_top + sin(phi) * r
-			var ring_r: float = cos(phi) * r
-			if ring_r < 0.005:
-				points.append(Vector3(0.0, y_local, 0.0))
-				continue
-			for ai in HALF_CAPSULE_SEGS + 1:
-				var angle: float = -PI * 0.5 + PI * float(ai) / float(HALF_CAPSULE_SEGS)
-				var lx: float = cos(angle) * ring_r * side_sign
-				var lz: float = sin(angle) * ring_r
-				points.append(Vector3(lx, y_local, lz))
-
-	return points
-
-
-func _build_pill_transform(player_chest: Vector3, rope_dir: Vector3,
-		swing_normal: Vector3, _rope_len: float) -> Transform3D:
-	## Build a Transform3D that places the pill centered on the rope.
-	## Local Y = rope direction, local X = swing_normal (split direction).
-	## Origin = player_chest (the Y=0 of local space is at the player end).
-	## The capsule extends from Y=(-radius) to Y=(rope_len + radius).
-	var basis_y: Vector3 = rope_dir
-	var basis_x: Vector3 = swing_normal
-	var basis_z: Vector3 = basis_y.cross(basis_x)
-	if basis_z.length() < 0.001:
-		# Fallback if swing_normal is parallel to rope
-		if absf(rope_dir.y) < 0.9:
-			basis_x = rope_dir.cross(Vector3.UP).normalized()
-		else:
-			basis_x = rope_dir.cross(Vector3.RIGHT).normalized()
-		basis_z = basis_y.cross(basis_x)
-	basis_z = basis_z.normalized()
-	basis_x = basis_y.cross(basis_z).normalized()
-
-	# Origin at player chest — local space Y=0 corresponds to player chest,
-	# Y=rope_len is at the anchor.  Vertices are generated in this local space.
-	return Transform3D(Basis(basis_x, basis_y, basis_z), player_chest)
-
-
-func _check_pill_half_blocked(space_state: PhysicsDirectSpaceState3D,
-		query: PhysicsShapeQueryParameters3D,
-		out_contacts: Array[Vector3]) -> bool:
-	## Check if a single half-capsule is blocked.
-	## Returns true if blocked, false if clear path exists.
-
-	# Step A: Check if the center obstruction obstacle overlaps this half
-	var overlaps := space_state.intersect_shape(query, 32)
-	var found_obstruction := false
-	for overlap in overlaps:
-		var rid: RID = overlap.get("rid", RID())
-		if rid == _center_contact_rid:
-			out_contacts.append(_center_contact_point)
-			found_obstruction = true
-	if found_obstruction:
-		return true
-
-	# Step B: Different objects — only contacts within ARC_CONTACT_RADIUS (3m)
-	# of the center contact count.  Prevents distant unrelated objects from
-	# accidentally blocking the pill half.
-	var contacts: Array[Vector3] = []
-	contacts.assign(space_state.collide_shape(query, 32))
-
-	var found_nearby := false
-	for ci in range(1, contacts.size(), 2):
-		var contact_pos: Vector3 = contacts[ci]
-		# Skip contacts near the anchor or player (safe zones)
-		if contact_pos.distance_to(anchor_point) < ROPE_LOS_MARGIN:
-			continue
-		if contact_pos.distance_to(player.global_position) < ROPE_LOS_MARGIN:
-			continue
-		# Only count if within range of the center contact point
-		if contact_pos.distance_to(_center_contact_point) > ARC_CONTACT_RADIUS:
-			continue
-		out_contacts.append(contact_pos)
-		found_nearby = true
-
-	return found_nearby
 
 
 # ======================================================================
@@ -1345,7 +1347,7 @@ func _do_release(with_boost: bool) -> void:
 	# When boosted on the ground, force airborne so the upward velocity
 	# component actually launches the player instead of being pinned to the floor.
 	if boosted and player.is_on_floor():
-		player.movement._is_grounded = false
+		player.movement.force_airborne()
 
 	_show_grapple_release.rpc(release_pos)
 	if boosted:
@@ -1411,14 +1413,14 @@ func reset_state() -> void:
 	_charges = MAX_CHARGES
 	_recharge_timer = 0.0
 	_grapple_time = 0.0
-	_pill_half_blocked = [0, 0]
-	_pill_swing_normal = Vector3.ZERO
+	_side_blocked = [0, 0]
+	_side_pass_frac = [-1.0, -1.0]
+	_dbg_swing_normal = Vector3.ZERO
 	_prev_los_chest = Vector3.ZERO
 	_center_contact_point = Vector3.ZERO
 	_has_center_contact = false
-	_center_contact_cloud = []
 	_center_contact_rid = RID()
-	_arc_contacts = [[], []]
+	_leaf_candidates = []
 	cleanup()
 
 
@@ -1470,28 +1472,48 @@ func client_process_visuals(_delta: float) -> void:
 
 	var show_debug: bool = GameManager.debug_grapple_visuals
 
-	# --- Debug HUD label — rope state, pill status ---
+	# --- Debug HUD label — rope state, leaf status ---
 	if _debug_label and show_debug:
 		_debug_label.visible = true
 		var lines: PackedStringArray = PackedStringArray()
 		lines.append("Rope Length: %.1fm" % _rope_length)
 		if _has_center_contact:
 			lines.append("Contact: (%.1f, %.1f, %.1f)" % [_center_contact_point.x, _center_contact_point.y, _center_contact_point.z])
-		lines.append("Pills: L=%s  R=%s" % [
-			"BLOCKED" if _pill_half_blocked[0] == 1 else "clear",
-			"BLOCKED" if _pill_half_blocked[1] == 1 else "clear"])
+			var side_txt: PackedStringArray = PackedStringArray()
+			for i in 2:
+				if _side_blocked[i] == 1:
+					side_txt.append("BLOCKED")
+				elif _side_pass_frac[i] >= 0.0:
+					side_txt.append("clear @ %.2fm" % (_side_pass_frac[i] * LEAF_MAX_WIDTH))
+				else:
+					side_txt.append("skipped")
+			lines.append("Leaf: L=%s  R=%s" % [side_txt[0], side_txt[1]])
 		_debug_label.text = "\n".join(lines)
 	elif _debug_label:
 		_debug_label.visible = false
 
 	# --- Debug visuals (these are rebuilt each frame, acceptable for debug) ---
-	_free_visual(_pill_mesh_instance)
-	_pill_mesh_instance = null
+	_free_visual(_leaf_mesh_instance)
+	_leaf_mesh_instance = null
 	_free_visual(_contact_mesh_instance)
 	_contact_mesh_instance = null
 	if show_debug:
-		_build_pill_visual(player_hand)
+		_build_leaf_visual(player_hand)
 		_build_contact_debug_visual()
+
+	# --- Safe zone sphere (independent toggle) ---
+	_free_visual(_safe_zone_mesh_instance)
+	_safe_zone_mesh_instance = null
+	if GameManager.debug_grapple_safe_zone:
+		var sz_im := ImmediateMesh.new()
+		_safe_zone_mesh_instance = MeshInstance3D.new()
+		_safe_zone_mesh_instance.mesh = sz_im
+		_safe_zone_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_safe_zone_mesh_instance.top_level = true
+		_safe_zone_mesh_instance.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+		_draw_debug_sphere_wireframe(sz_im, _safe_zone_mat, anchor_point, ROPE_LOS_MARGIN, 24, 12)
+		if scene_root:
+			scene_root.add_child(_safe_zone_mesh_instance)
 
 
 func _build_rope_ribbon(im: ImmediateMesh, from: Vector3, to: Vector3, cam_pos: Vector3) -> void:
@@ -1500,7 +1522,7 @@ func _build_rope_ribbon(im: ImmediateMesh, from: Vector3, to: Vector3, cam_pos: 
 	if rope_length < 0.01:
 		return
 
-	const HALF_WIDTH := 0.04  ## Thin rope
+	const HALF_WIDTH := ROPE_RADIUS  ## Thin rope — matches the physics width
 	const SEGMENTS := 12
 
 	im.surface_begin(Mesh.PRIMITIVE_TRIANGLE_STRIP)
@@ -1531,70 +1553,60 @@ func cleanup() -> void:
 	_rope_mesh_instance = null
 	_free_visual(_anchor_light)
 	_anchor_light = null
-	_free_visual(_pill_mesh_instance)
-	_pill_mesh_instance = null
+	_free_visual(_leaf_mesh_instance)
+	_leaf_mesh_instance = null
 	_free_visual(_contact_mesh_instance)
 	_contact_mesh_instance = null
+	_free_visual(_safe_zone_mesh_instance)
+	_safe_zone_mesh_instance = null
 
 
 # ======================================================================
-#  Pill debug visualization
+#  Leaf debug visualization
 # ======================================================================
 
-func _build_pill_visual(player_chest: Vector3) -> void:
-	## Draw solid half-capsule shells (left/right of the rope).
+func _build_leaf_visual(player_chest: Vector3) -> void:
+	## Draw every leaf detour surface tested by the last obstruction check —
+	## the same truncated fan tiles the physics queries used.
 	## Color coding:
-	##   Left half:  green (clear) / red (blocked)
-	##   Right half: yellow (clear) / red (blocked)
-	## Inner subdivisions (shrunk radius) drawn at 40% opacity.
-	var pill_anchor: Vector3 = anchor_point
-	var rope_vec: Vector3 = pill_anchor - player_chest
-	var rope_len: float = rope_vec.length()
-	if rope_len < 0.5:
-		return
-	var rope_dir: Vector3 = rope_vec / rope_len
-
-	var swing_n: Vector3 = _pill_swing_normal
-	if swing_n.length() < 0.5:
-		if absf(rope_dir.y) < 0.9:
-			swing_n = rope_dir.cross(Vector3.UP).normalized()
-		else:
-			swing_n = rope_dir.cross(Vector3.RIGHT).normalized()
-
-	# Build the same transform used for physics
-	var pill_xform := _build_pill_transform(player_chest, rope_dir, swing_n, rope_len)
-
+	##   Left side:  green (clear) / red (blocked)
+	##   Right side: yellow (clear) / red (blocked)
+	## Narrower widths drawn with the dimmer materials.
+	## Also draws the center sweep triangle wireframe.
 	var im := ImmediateMesh.new()
-	_pill_mesh_instance = MeshInstance3D.new()
-	_pill_mesh_instance.mesh = im
-	_pill_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	_pill_mesh_instance.top_level = true
-	_pill_mesh_instance.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
+	_leaf_mesh_instance = MeshInstance3D.new()
+	_leaf_mesh_instance.mesh = im
+	_leaf_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_leaf_mesh_instance.top_level = true
+	_leaf_mesh_instance.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
-	# Pick cached materials per half (full opacity for first subdivision, dim for rest)
-	var all_fracs: Array[float] = [1.0, 0.5, 0.25, 0.75]
+	for cand in _leaf_candidates:
+		var narrow: bool = cand["frac"] < 1.0
+		var mat: StandardMaterial3D
+		if cand["blocked"]:
+			mat = _leaf_narrow_blocked_mat if narrow else _leaf_blocked_mat
+		elif cand["side"] == 0:
+			mat = _leaf_narrow_clear_left_mat if narrow else _leaf_clear_left_mat
+		else:
+			mat = _leaf_narrow_clear_right_mat if narrow else _leaf_clear_right_mat
 
-	for half_idx in 2:
-		var sign_dir: float = 1.0 if half_idx == 0 else -1.0
-		var blocked: bool = _pill_half_blocked[half_idx] == 1
+		var arc: PackedVector3Array = cand["arc"]
+		var cand_chest: Vector3 = cand["chest"]
+		for apex_idx in 2:
+			var apex: Vector3 = cand_chest if apex_idx == 0 else anchor_point
+			for k in arc.size() - 1:
+				var corners := _fan_tile_corners(apex, arc[k], arc[k + 1])
+				if corners.is_empty():
+					continue
+				# corners = [q0, q1, p1, p0] → strip order q0, q1, p0, p1
+				im.surface_begin(Mesh.PRIMITIVE_TRIANGLE_STRIP, mat)
+				im.surface_add_vertex(corners[0])
+				im.surface_add_vertex(corners[1])
+				im.surface_add_vertex(corners[3])
+				im.surface_add_vertex(corners[2])
+				im.surface_end()
 
-		for fi in all_fracs.size():
-			var frac: float = all_fracs[fi]
-			var draw_radius: float = PILL_RADIUS * frac
-			var is_subdiv: bool = fi > 0
-
-			var mat: StandardMaterial3D
-			if blocked:
-				mat = _pill_subdiv_blocked_mat if is_subdiv else _pill_blocked_mat
-			elif half_idx == 0:
-				mat = _pill_subdiv_clear_left_mat if is_subdiv else _pill_clear_left_mat
-			else:
-				mat = _pill_subdiv_clear_right_mat if is_subdiv else _pill_clear_right_mat
-
-			_draw_half_capsule_solid(im, pill_xform, draw_radius,
-				rope_len, sign_dir, mat)
-
-	# Also draw the center sweep triangle (using cached material)
+	# Center sweep triangle wireframe (using cached material)
 	var prev_chest: Vector3 = _prev_los_chest if _prev_los_chest.length() > 0.1 else player_chest
 	var sweep_vec: Vector3 = player_chest - prev_chest
 	if sweep_vec.length() > 0.05:
@@ -1607,99 +1619,16 @@ func _build_pill_visual(player_chest: Vector3) -> void:
 
 	var scene_root := get_tree().current_scene
 	if scene_root:
-		scene_root.add_child(_pill_mesh_instance)
-
-
-func _draw_half_capsule_solid(im: ImmediateMesh, xform: Transform3D,
-		radius: float, rope_len: float, side_sign: float, mat: StandardMaterial3D) -> void:
-	## Draw a solid (filled) half-capsule shell (one side of the pill).
-	## xform: origin = player chest, Y = rope dir, X = swing_normal.
-	## side_sign: +1.0 = left half (+X), -1.0 = right half (-X).
-	## Renders as triangle strips between adjacent latitude rows.
-	const ARC_SEGS := 8   # circumference segments for the half-circle
-	const CYL_RINGS := 3  # number of rings along the cylinder body
-	const HEMI_RINGS := 3 # latitude rings per hemisphere cap
-
-	var half_cyl: float = maxf((rope_len - 2.0 * radius) * 0.5, 0.0)
-	var mid_y: float = rope_len * 0.5
-	var cyl_bottom: float = mid_y - half_cyl
-	var cyl_top: float = mid_y + half_cyl
-
-	# Build a list of "rows" — each row is an array of world-space vertices
-	# forming a half-circle arc at a specific latitude.  Then we stitch
-	# adjacent rows with triangle strips.
-	var rows: Array[PackedVector3Array] = []
-
-	# --- Bottom pole (single point) ---
-	var pole_bottom := PackedVector3Array()
-	var pole_pt: Vector3 = xform * Vector3(0.0, cyl_bottom - radius, 0.0)
-	for _i in ARC_SEGS + 1:
-		pole_bottom.append(pole_pt)
-	rows.append(pole_bottom)
-
-	# --- Bottom hemisphere rings (from pole upward to cyl_bottom) ---
-	for lat_i in range(HEMI_RINGS, 0, -1):
-		var phi: float = (PI * 0.5) * float(lat_i) / float(HEMI_RINGS)
-		var y_local: float = cyl_bottom - sin(phi) * radius
-		var ring_r: float = cos(phi) * radius
-		var row := PackedVector3Array()
-		for seg_i in ARC_SEGS + 1:
-			var angle: float = -PI * 0.5 + PI * float(seg_i) / float(ARC_SEGS)
-			var lx: float = cos(angle) * ring_r * side_sign
-			var lz: float = sin(angle) * ring_r
-			row.append(xform * Vector3(lx, y_local, lz))
-		rows.append(row)
-
-	# --- Cylinder body rings ---
-	for ring_i in CYL_RINGS + 1:
-		var t: float = float(ring_i) / float(CYL_RINGS)
-		var y_local: float = cyl_bottom + t * (cyl_top - cyl_bottom)
-		var row := PackedVector3Array()
-		for seg_i in ARC_SEGS + 1:
-			var angle: float = -PI * 0.5 + PI * float(seg_i) / float(ARC_SEGS)
-			var lx: float = cos(angle) * radius * side_sign
-			var lz: float = sin(angle) * radius
-			row.append(xform * Vector3(lx, y_local, lz))
-		rows.append(row)
-
-	# --- Top hemisphere rings (from cyl_top upward to pole) ---
-	for lat_i in range(1, HEMI_RINGS + 1):
-		var phi: float = (PI * 0.5) * float(lat_i) / float(HEMI_RINGS)
-		var y_local: float = cyl_top + sin(phi) * radius
-		var ring_r: float = cos(phi) * radius
-		var row := PackedVector3Array()
-		if ring_r < 0.005:
-			# Top pole — degenerate ring
-			var pp: Vector3 = xform * Vector3(0.0, cyl_top + radius, 0.0)
-			for _i in ARC_SEGS + 1:
-				row.append(pp)
-		else:
-			for seg_i in ARC_SEGS + 1:
-				var angle: float = -PI * 0.5 + PI * float(seg_i) / float(ARC_SEGS)
-				var lx: float = cos(angle) * ring_r * side_sign
-				var lz: float = sin(angle) * ring_r
-				row.append(xform * Vector3(lx, y_local, lz))
-		rows.append(row)
-
-	# --- Stitch adjacent rows with triangle strips ---
-	for ri in range(rows.size() - 1):
-		var row_a: PackedVector3Array = rows[ri]
-		var row_b: PackedVector3Array = rows[ri + 1]
-		im.surface_begin(Mesh.PRIMITIVE_TRIANGLE_STRIP, mat)
-		for si in row_a.size():
-			im.surface_add_vertex(row_a[si])
-			im.surface_add_vertex(row_b[si])
-		im.surface_end()
+		scene_root.add_child(_leaf_mesh_instance)
 
 
 # ======================================================================
-#  Contact debug visualization — circles at contact points + 2.0m sphere
+#  Contact debug visualization — circle at the center contact point
 # ======================================================================
 
 func _build_contact_debug_visual() -> void:
-	## Draw small green-blue circles at each contact point from the obstruction
-	## check, and a wireframe sphere around the center contact showing the
-	## ARC_CONTACT_RADIUS (2.0m) disregard boundary.
+	## Draw a small circle at the center contact point (where the rope hits
+	## the obstacle) from the obstruction check.
 	if not _has_center_contact:
 		return
 
@@ -1711,22 +1640,7 @@ func _build_contact_debug_visual() -> void:
 	_contact_mesh_instance.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 
 	# All materials are pre-cached in setup() — no per-frame allocation.
-
-	# --- Player-side contact (center hit, bright cyan) ---
 	_draw_debug_circle(im, _contact_center_mat, _center_contact_point, 0.15, 12)
-
-	# --- Anchor-side contact (dimmer cyan, from anchor→player ray) ---
-	for pt in _center_contact_cloud:
-		if pt.distance_to(_center_contact_point) > 0.01:
-			_draw_debug_circle(im, _contact_cloud_mat, pt, 0.12, 10)
-
-	# --- Arc contact circles (pill half contacts) ---
-	for half_idx in 2:
-		for contact_pos in _arc_contacts[half_idx]:
-			_draw_debug_circle(im, _contact_arc_mat, contact_pos, 0.1, 10)
-
-	# --- 3m range sphere around center contact (ARC_CONTACT_RADIUS filter boundary) ---
-	_draw_debug_sphere_wireframe(im, _contact_sphere_mat, _center_contact_point, ARC_CONTACT_RADIUS, 16, 8)
 
 	var scene_root := get_tree().current_scene
 	if scene_root:
@@ -1804,13 +1718,7 @@ func _show_grapple_fire(from: Vector3, to: Vector3) -> void:
 	sphere.radius = 0.15
 	sphere.height = 0.3
 	spark.mesh = sphere
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.5, 0.8, 1.0)
-	mat.emission_enabled = true
-	mat.emission = Color(0.3, 0.6, 1.0)
-	mat.emission_energy_multiplier = 5.0
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	spark.material_override = mat
+	spark.material_override = _spark_material
 	spark.top_level = true
 	spark.physics_interpolation_mode = Node.PHYSICS_INTERPOLATION_MODE_OFF
 	scene_root.add_child(spark)

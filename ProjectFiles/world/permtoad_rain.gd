@@ -59,27 +59,34 @@ func _find_host_and_start() -> void:
 
 
 func _physics_process(delta: float) -> void:
+	Profiler.begin("toad_rain")
 	if not multiplayer.is_server():
+		Profiler.end("toad_rain")
 		return
 	if _container == null:
+		Profiler.end("toad_rain")
 		return
 
 	if not _started:
 		_find_host_and_start()
+		Profiler.end("toad_rain")
 		return
 
 	_timer -= delta
 	if _timer > 0.0:
+		Profiler.end("toad_rain")
 		return
 	_timer = spawn_interval
 
 	if _container.get_child_count() >= max_toads:
+		Profiler.end("toad_rain")
 		return
 
 	for _i in range(toads_per_tick):
 		if _container.get_child_count() >= max_toads:
 			break
 		_spawn_permtoad()
+	Profiler.end("toad_rain")
 
 
 func _spawn_permtoad() -> void:
@@ -109,7 +116,7 @@ func _spawn_permtoad() -> void:
 
 	# Higher bounce to stay lively (matches toad bowl)
 	var phys_mat := PhysicsMaterial.new()
-	phys_mat.bounce = 0.7
+	phys_mat.bounce = 0.3
 	phys_mat.friction = 0.3
 	toad.physics_material_override = phys_mat
 
@@ -191,7 +198,7 @@ func _spawn_test_discs(host_pos: Vector3) -> void:
 		toad.collision_mask = CollisionLayers.WORLD | CollisionLayers.PLAYERS_PUSH | CollisionLayers.TOAD_RAIN  # world + player push + toad bodies
 
 		var phys_mat := PhysicsMaterial.new()
-		phys_mat.bounce = 0.7
+		phys_mat.bounce = 0.3
 		phys_mat.friction = 0.3
 		toad.physics_material_override = phys_mat
 

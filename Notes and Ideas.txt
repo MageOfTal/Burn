@@ -71,6 +71,8 @@ Players (health system)
 A Damageable base (or even just a documented interface contract) would let ExplosionHelper and weapon code treat all damageable things uniformly without type-checking.
 
 
+all sleeping obects should wake up when any force is applied to them, like block clusters.
+
 
 
 

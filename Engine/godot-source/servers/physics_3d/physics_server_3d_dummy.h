@@ -120,7 +120,7 @@ public:
 	virtual int intersect_ray_all(const RayParameters &p_parameters, RayResult *r_results, int p_result_max) override { return 0; }
 	virtual float calc_ray_shielding(const RayParameters &p_parameters, RID p_target_body, float p_max_absorption) override { return 0.0f; }
 	virtual PackedFloat32Array calc_ray_shielding_batch(const RayParameters &p_base_params, const PackedVector3Array &p_to_points, const TypedArray<RID> &p_target_bodies, const PackedFloat32Array &p_max_absorptions) override { return PackedFloat32Array(); }
-	virtual Dictionary calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp) override { return Dictionary(); }
+	virtual Dictionary calc_structure_explosion(const RayParameters &p_base_params, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp, const RID &p_compound_body = RID()) override { return Dictionary(); }
 	virtual PackedInt32Array calc_structural_integrity(const PackedByteArray &p_block_grid, int p_num_x, int p_num_y, int p_num_z, int p_total_blocks) override { return PackedInt32Array(); }
 
 	virtual int intersect_point(const PointParameters &p_parameters, ShapeResult *r_results, int p_result_max) override { return 0; }

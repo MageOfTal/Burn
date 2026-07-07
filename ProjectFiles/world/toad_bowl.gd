@@ -1,21 +1,33 @@
 extends Node3D
 
-## Debug toad bowl — a concave hemisphere near the host player filled with 60
-## persistent toads that bounce around forever, never despawning.
-## Used to test player push physics without needing the toad dimension.
+## Debug toad bowl — a circular arena near the host spawn filled with
+## persistent toads, for physics playtesting ("swimming in toads").
 ##
-## The bowl is an actual semi-sphere built from rings of angled collision panels
-## that approximate a smooth concave interior. Toads bounce off the curved walls
-## and stay contained. A ramp leads up to the rim so the player can walk in.
+## v2 (2026-07-02): the old bowl was a zero-thickness inward-facing trimesh
+## hemisphere with backface_collision, floating 8 m in the air — thin-shell
+## geometry that tunnels and has no exterior. This version is built ONLY from
+## solid convex pieces (cylinder floor + box wall panels), so collision is
+## bulletproof and exactly matches the visuals. It sits ON the terrain
+## (sampled at build time, never buried), and a walkable ramp leads from the
+## ground through a doorway in the wall ring: walk up, step over a low
+## threshold, drop into the toads. Jump back out the same way.
+##
+## Local frame: node origin at the base center (terrain height). Floor slab
+## occupies local Y 0..1; the arena floor you stand on is local Y = 1.
 
-const BOWL_RADIUS: float = 8.0      ## Radius of the hemisphere
-const RING_COUNT: int = 6           ## Latitude rings from bottom pole to equator (rim)
-const SEGMENTS_PER_RING: int = 24   ## Panels around each ring
-const PANEL_THICKNESS: float = 0.4  ## Collision panel thickness
-const TOAD_COUNT: int = 60          ## Number of persistent toads
-const TOAD_SCALE: float = 0.35      ## Collision radius
+const BOWL_RADIUS: float = 8.0      ## Wall ring radius
+const WALL_PANELS: int = 20         ## Panels in the ring (one skipped = doorway)
+const WALL_HEIGHT: float = 3.5      ## Panel height above the arena floor
+const WALL_THICKNESS: float = 0.6
+const FLOOR_THICKNESS: float = 1.0
+const THRESHOLD_HEIGHT: float = 1.2 ## Doorway lip above the arena floor (jumpable)
+const RAMP_ANGLE_DEG: float = 24.0  ## Walkable (< 50° max slope, gentle)
+const RAMP_WIDTH: float = 3.2
+
+const TOAD_COUNT: int = 60
+const TOAD_SCALE: float = 0.35
+const SPAWN_HEIGHT: float = 3.0     ## Local Y for toad spawn (above floor at Y=1)
 const _ToadBody := preload("res://world/toad_body.gd")
-const SPAWN_HEIGHT: float = 4.0     ## How high above the bowl bottom to spawn toads
 
 var _toad_body_scene: PackedScene = null
 var _toads_container: Node3D = null
@@ -25,152 +37,144 @@ func _ready() -> void:
 	_toad_body_scene = load("res://world/toad_body.tscn")
 
 
-func build(center: Vector3) -> void:
-	## Build the bowl geometry and spawn toads. Call after adding to the tree.
-	## The bowl center is at the bottom of the hemisphere (the pole).
-	## The rim (equator) is at local Y = BOWL_RADIUS.
-	global_position = center
+func build(base_center: Vector3, height_sampler: Node = null) -> void:
+	## Build the arena and spawn toads. base_center.y should be the terrain
+	## height at the center; if height_sampler (SeedWorld) is provided, the
+	## base is raised to the highest terrain point under the footprint so no
+	## piece is buried, and the ramp foot is seated on the actual ground.
+	var base_y: float = base_center.y
+	var ramp_foot_ground_y: float = base_center.y
+	if height_sampler != null and height_sampler.has_method("get_height_from_noise"):
+		# Highest terrain under the bowl footprint → nothing sinks into a bump.
+		for i in 8:
+			var a: float = TAU * i / 8.0
+			var h: float = height_sampler.get_height_from_noise(
+				base_center.x + cos(a) * BOWL_RADIUS, base_center.z + sin(a) * BOWL_RADIUS)
+			base_y = maxf(base_y, h)
+		base_y = maxf(base_y, height_sampler.get_height_from_noise(base_center.x, base_center.z))
+		base_y += 0.05
 
-	_build_hemisphere()
-	_build_ramp()
+	global_position = Vector3(base_center.x, base_y, base_center.z)
 
-	# Container for the toads
-	_toads_container = Node3D.new()
-	_toads_container.name = "BowlToads"
-	add_child(_toads_container)
+	var floor_top: float = FLOOR_THICKNESS  # local Y of the arena floor
 
-	# Label above the rim
+	# ── Floor: one solid cylinder slab ──────────────────────────────────
+	var bowl_mat := StandardMaterial3D.new()
+	bowl_mat.albedo_color = Color(0.2, 0.5, 0.15)
+	var wall_mat := StandardMaterial3D.new()
+	wall_mat.albedo_color = Color(0.25, 0.42, 0.2)
+	var ramp_mat := StandardMaterial3D.new()
+	ramp_mat.albedo_color = Color(0.4, 0.3, 0.2)
+
+	var floor_shape := CylinderShape3D.new()
+	floor_shape.radius = BOWL_RADIUS + WALL_THICKNESS
+	floor_shape.height = FLOOR_THICKNESS
+	var floor_mesh := CylinderMesh.new()
+	floor_mesh.top_radius = floor_shape.radius
+	floor_mesh.bottom_radius = floor_shape.radius
+	floor_mesh.height = FLOOR_THICKNESS
+	_add_static_piece("Floor", floor_shape, floor_mesh, Vector3(0, FLOOR_THICKNESS * 0.5, 0), Vector3.ZERO, bowl_mat)
+
+	# ── Wall ring: solid box panels, one gap as the doorway (+Z side) ───
+	# Panel width slightly over the arc length so neighbors overlap (no slits).
+	var arc: float = TAU / WALL_PANELS
+	var panel_w: float = BOWL_RADIUS * arc * 1.18
+	var doorway_index: int = WALL_PANELS / 4  # angle ≈ +90° → +Z direction
+	for i in WALL_PANELS:
+		if i == doorway_index:
+			continue
+		var a: float = arc * i  # panel WALL_PANELS/4 centers exactly at +Z
+		var pos := Vector3(cos(a) * BOWL_RADIUS, floor_top + WALL_HEIGHT * 0.5, sin(a) * BOWL_RADIUS)
+		var shape := BoxShape3D.new()
+		shape.size = Vector3(panel_w, WALL_HEIGHT, WALL_THICKNESS)
+		var mesh := BoxMesh.new()
+		mesh.size = shape.size
+		# Rotate so the panel's thickness axis (Z) points at the ring center.
+		var yaw: float = -a + PI * 0.5
+		_add_static_piece("Wall%d" % i, shape, mesh, pos, Vector3(0, yaw, 0), wall_mat)
+
+	# ── Doorway threshold: low lip the player steps over, toads mostly not ─
+	var door_a: float = arc * doorway_index
+	var door_dir := Vector3(cos(door_a), 0, sin(door_a))  # ≈ +Z
+	var thr_shape := BoxShape3D.new()
+	thr_shape.size = Vector3(panel_w, THRESHOLD_HEIGHT, WALL_THICKNESS)
+	var thr_mesh := BoxMesh.new()
+	thr_mesh.size = thr_shape.size
+	_add_static_piece("Threshold", thr_shape, thr_mesh,
+			door_dir * BOWL_RADIUS + Vector3(0, floor_top + THRESHOLD_HEIGHT * 0.5, 0),
+			Vector3(0, -door_a + PI * 0.5, 0), wall_mat)
+
+	# ── Landing: flat platform at threshold-top height, straddling the wall ─
+	var lip_y: float = floor_top + THRESHOLD_HEIGHT  # local Y of the walk-over surface
+	var landing_shape := BoxShape3D.new()
+	landing_shape.size = Vector3(RAMP_WIDTH, 0.4, 2.6)
+	var landing_mesh := BoxMesh.new()
+	landing_mesh.size = landing_shape.size
+	var landing_center := door_dir * (BOWL_RADIUS + 0.7) + Vector3(0, lip_y - 0.2, 0)
+	_add_static_piece("Landing", landing_shape, landing_mesh, landing_center,
+			Vector3(0, -door_a + PI * 0.5, 0), ramp_mat)
+
+	# ── Ramp: ground → landing outer edge, at a gentle walkable angle ───
+	var ramp_angle: float = deg_to_rad(RAMP_ANGLE_DEG)
+	var landing_outer := door_dir * (BOWL_RADIUS + 2.0) + Vector3(0, lip_y, 0)
+	# Seat the ramp foot on the real terrain out along the door direction.
+	var ground_foot_y: float = global_position.y
+	if height_sampler != null and height_sampler.has_method("get_height_from_noise"):
+		var est_run: float = (lip_y + 2.0) / tan(ramp_angle)
+		var foot_probe: Vector3 = global_position + door_dir * (BOWL_RADIUS + 2.0 + est_run)
+		ground_foot_y = height_sampler.get_height_from_noise(foot_probe.x, foot_probe.z)
+	var rise: float = (global_position.y + lip_y) - ground_foot_y
+	rise = maxf(rise, 1.0)
+	var ramp_len: float = rise / sin(ramp_angle) + 1.0
+	var ramp_thickness: float = 0.6
+	var half := ramp_len * 0.5
+	var ramp_center := landing_outer + door_dir * (cos(ramp_angle) * half) \
+			+ Vector3(0, -sin(ramp_angle) * half - ramp_thickness * 0.4, 0)
+	var ramp_shape := BoxShape3D.new()
+	ramp_shape.size = Vector3(RAMP_WIDTH, ramp_thickness, ramp_len)
+	var ramp_mesh := BoxMesh.new()
+	ramp_mesh.size = ramp_shape.size
+	# Tilt about the axis perpendicular to door_dir: local +Z (pointing away
+	# from the bowl, along door_dir after yaw) drops toward the ground.
+	_add_static_piece("Ramp", ramp_shape, ramp_mesh, ramp_center,
+			Vector3(ramp_angle, -door_a + PI * 0.5, 0), ramp_mat)
+
+	# ── Label ────────────────────────────────────────────────────────────
 	var label := Label3D.new()
 	label.text = "TOAD BOWL"
 	label.font_size = 48
 	label.modulate = Color(0.2, 0.8, 0.2)
 	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	label.position = Vector3(0, BOWL_RADIUS + 2.0, 0)
+	label.position = Vector3(0, floor_top + WALL_HEIGHT + 2.0, 0)
 	add_child(label)
 
-	# Spawn toads (server only)
+	# ── Toads ────────────────────────────────────────────────────────────
+	_toads_container = Node3D.new()
+	_toads_container.name = "BowlToads"
+	add_child(_toads_container)
 	if multiplayer.is_server():
 		_spawn_toads()
 
-	print("[ToadBowl] Built hemisphere at %s with %d toads (radius=%.0f)" % [
-		center, TOAD_COUNT, BOWL_RADIUS])
+	print("[ToadBowl] Built solid arena at %s (base_y=%.2f, %d toads, doorway toward %s)" % [
+		global_position, base_y, TOAD_COUNT, door_dir])
 
 
-func _build_hemisphere() -> void:
-	## Build a concave hemisphere from rings of box collision panels (invisible)
-	## with a single smooth SphereMesh visual on top.
-	##
-	## Each ring is at a latitude angle from 0 (bottom pole) to PI/2 (equator/rim).
-	## Panels are positioned on the sphere surface and angled to face inward.
-	## The collision panels approximate the smooth concave interior.
-	##
-	## Coordinate system: bowl center (bottom pole) is at local origin (0,0,0).
-	## The hemisphere opens upward. A point on the sphere at latitude phi and
-	## longitude theta is:
-	##   x = R * sin(phi) * cos(theta)
-	##   z = R * sin(phi) * sin(theta)
-	##   y = R * (1 - cos(phi))     [shifted so bottom pole is at Y=0]
-
-	# --- Smooth visual mesh: procedural hemisphere (inside faces only) ---
-	var bowl_mat := StandardMaterial3D.new()
-	bowl_mat.albedo_color = Color(0.2, 0.5, 0.15)  # Earthy green
-
-	var visual := MeshInstance3D.new()
-	visual.name = "BowlVisual"
-	visual.mesh = _create_hemisphere_mesh(BOWL_RADIUS, 48, 16)
-	visual.material_override = bowl_mat
-	visual.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	add_child(visual)
-
-	# --- Invisible collision panels (same as before, but no visual meshes) ---
-	for ring_i in RING_COUNT:
-		var phi: float = (float(ring_i) + 1.0) / float(RING_COUNT) * (PI / 2.0)
-		var phi_next: float = (float(ring_i) + 2.0) / float(RING_COUNT) * (PI / 2.0)
-		if ring_i == RING_COUNT - 1:
-			phi_next = PI / 2.0  # Stop exactly at the equator — no overshoot, open top
-
-		var ring_r: float = BOWL_RADIUS * sin(phi)
-		var ring_y: float = BOWL_RADIUS * (1.0 - cos(phi))
-		var arc_len: float = BOWL_RADIUS * (phi_next - phi)
-		var tilt_angle: float = phi
-
-		var segs: int = maxi(8, SEGMENTS_PER_RING)
-		var panel_width: float = 2.0 * ring_r * sin(PI / segs)
-
-		for seg_i in segs:
-			var mid_theta: float = TAU * (seg_i + 0.5) / segs
-
-			var px: float = cos(mid_theta) * ring_r
-			var pz: float = sin(mid_theta) * ring_r
-			var py: float = ring_y
-
-			var body := StaticBody3D.new()
-			body.collision_layer = CollisionLayers.WORLD
-			body.collision_mask = 0
-
-			var col := CollisionShape3D.new()
-			var shape := BoxShape3D.new()
-			shape.size = Vector3(panel_width, arc_len, PANEL_THICKNESS)
-			col.shape = shape
-			body.add_child(col)
-
-			body.position = Vector3(px, py, pz)
-			body.rotation.y = -mid_theta
-			body.rotation.x = -(PI / 2.0 - tilt_angle)
-
-			add_child(body)
-
-
-func _build_ramp() -> void:
-	## Ramp from the ground up to the bowl rim so the player can walk in.
-	## The bowl bottom pole is at local (0,0,0). The rim is at Y = BOWL_RADIUS.
-	## The bowl is placed 8m above terrain, so ground is at local Y = -8.
-	## The ramp approaches from outside in the +Z direction, sloping up to the rim.
-	var ramp_mat := StandardMaterial3D.new()
-	ramp_mat.albedo_color = Color(0.4, 0.3, 0.2)
-
-	var rim_y: float = BOWL_RADIUS
-	var ground_y: float = -8.0  # Bowl is placed 8m above terrain
-	var rise: float = rim_y - ground_y  # 16m total rise
-	var run: float = 24.0  # Gentle slope
-	var ramp_len: float = sqrt(rise * rise + run * run)
-	var ramp_angle: float = atan2(rise, run)
-	var ramp_width: float = 3.5
-	var ramp_thickness: float = 0.3
-
+func _add_static_piece(piece_name: String, shape: Shape3D, mesh: Mesh, pos: Vector3, rot: Vector3, mat: Material) -> void:
+	## One solid StaticBody3D whose collision and visual are the same primitive.
 	var body := StaticBody3D.new()
+	body.name = piece_name
 	body.collision_layer = CollisionLayers.WORLD
 	body.collision_mask = 0
-	body.name = "Ramp"
-
 	var col := CollisionShape3D.new()
-	var shape := BoxShape3D.new()
-	shape.size = Vector3(ramp_width, ramp_thickness, ramp_len + 2.0)
 	col.shape = shape
 	body.add_child(col)
-
-	var mesh := MeshInstance3D.new()
-	var box := BoxMesh.new()
-	box.size = shape.size
-	mesh.mesh = box
-	mesh.material_override = ramp_mat
-	mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	body.add_child(mesh)
-
-	# rotation.x = +ramp_angle tilts local +Z toward -Y (downhill away from bowl).
-	# Local -Z end = top (rim), local +Z end = bottom (ground).
-	# Top end (-Z side) = center + half_len * (0, +sin(angle), -cos(angle)).
-	# We want the top end at (0, rim_y, BOWL_RADIUS) — outer edge of the rim.
-	var half_len: float = ramp_len / 2.0
-	var dy: float = sin(ramp_angle) * half_len
-	var dz: float = cos(ramp_angle) * half_len
-
-	var center_y: float = rim_y - dy   # top at rim_y, bottom at ground_y
-	var center_z: float = BOWL_RADIUS + dz  # top at +BOWL_RADIUS, bottom extends outward to +Z
-
-	body.position = Vector3(0, center_y, center_z)
-	body.rotation.x = ramp_angle  # +Z end tilts down (away from bowl), -Z end is the top
-
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	mi.material_override = mat
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	body.add_child(mi)
+	body.position = pos
+	body.rotation = rot
 	add_child(body)
 
 
@@ -207,16 +211,16 @@ func _spawn_toads() -> void:
 
 		# Higher bounce so they stay lively in the bowl
 		var phys_mat := PhysicsMaterial.new()
-		phys_mat.bounce = 0.7
+		phys_mat.bounce = 0.3
 		phys_mat.friction = 0.3
 		toad.physics_material_override = phys_mat
 
-		# Spread toads inside the bowl above the bottom
+		# Spread toads inside the bowl above the floor
 		var angle: float = TAU * i / TOAD_COUNT
-		var dist: float = rng.randf_range(0.5, BOWL_RADIUS * 0.5)
+		var dist: float = rng.randf_range(0.5, BOWL_RADIUS * 0.6)
 		var spawn_pos := Vector3(
 			cos(angle) * dist,
-			SPAWN_HEIGHT,
+			SPAWN_HEIGHT + rng.randf_range(0.0, 1.5),
 			sin(angle) * dist
 		)
 
@@ -235,78 +239,6 @@ func _spawn_toads() -> void:
 			rng.randf_range(-4, 4),
 			rng.randf_range(-4, 4)
 		)
-
-
-func _create_hemisphere_mesh(radius: float, lon_segments: int, lat_segments: int) -> ArrayMesh:
-	## Build an ArrayMesh for the bottom hemisphere of a sphere (phi from 0 at the
-	## bottom pole up to PI/2 at the equator/rim). Normals point INWARD so only the
-	## concave interior renders (like looking into a bowl).
-	##
-	## Bowl coordinate system: bottom pole at local Y=0, rim at Y=radius.
-	## Sphere center at Y=radius (standard sphere shifted up by radius).
-	var arrays := []
-	arrays.resize(Mesh.ARRAY_MAX)
-
-	var verts := PackedVector3Array()
-	var normals := PackedVector3Array()
-	var uvs := PackedVector2Array()
-	var indices := PackedInt32Array()
-
-	# Generate vertices ring by ring from bottom pole (phi=PI, sphere bottom)
-	# up to equator (phi=PI/2). In standard spherical coords where phi=0 is the
-	# top pole, the bottom hemisphere is phi in [PI/2, PI].
-	# But our bowl Y = radius * (1 - cos(bowl_phi)) where bowl_phi goes 0..PI/2.
-	# Converting: sphere_phi = PI - bowl_phi, so bowl_phi=0 → sphere_phi=PI (bottom),
-	# bowl_phi=PI/2 → sphere_phi=PI/2 (equator).
-	for lat_i in range(lat_segments + 1):
-		var bowl_phi: float = (float(lat_i) / float(lat_segments)) * (PI / 2.0)
-		var ring_r: float = radius * sin(bowl_phi)
-		var ring_y: float = radius * (1.0 - cos(bowl_phi))
-		var v: float = float(lat_i) / float(lat_segments)
-
-		for lon_i in range(lon_segments + 1):
-			var theta: float = TAU * float(lon_i) / float(lon_segments)
-			var u: float = float(lon_i) / float(lon_segments)
-
-			var pos := Vector3(
-				cos(theta) * ring_r,
-				ring_y,
-				sin(theta) * ring_r
-			)
-			# Normal pointing toward sphere center (inward) for concave rendering.
-			# Sphere center is at (0, radius, 0). Inward normal = center - pos.
-			var normal: Vector3 = (Vector3(0, radius, 0) - pos).normalized()
-
-			verts.append(pos)
-			normals.append(normal)
-			uvs.append(Vector2(u, v))
-
-	# Generate triangle indices — winding order reversed for inward-facing normals.
-	# Standard winding is (a, b, c) for outward; we use (a, c, b) for inward.
-	for lat_i in range(lat_segments):
-		for lon_i in range(lon_segments):
-			var a: int = lat_i * (lon_segments + 1) + lon_i
-			var b: int = a + lon_segments + 1
-			var c: int = a + 1
-			var d: int = b + 1
-
-			# Two triangles per quad, reversed winding
-			indices.append(a)
-			indices.append(d)
-			indices.append(b)
-
-			indices.append(a)
-			indices.append(c)
-			indices.append(d)
-
-	arrays[Mesh.ARRAY_VERTEX] = verts
-	arrays[Mesh.ARRAY_NORMAL] = normals
-	arrays[Mesh.ARRAY_TEX_UV] = uvs
-	arrays[Mesh.ARRAY_INDEX] = indices
-
-	var mesh := ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-	return mesh
 
 
 func _setup_toad_eyes(toad: RigidBody3D, radius: float) -> void:

@@ -34,13 +34,12 @@ const RARITY_COLORS := {
 const PICKUP_POPUP_RANGE := 4.0
 
 ## Rarity label stacking constants
-const STACK_SPACING := 0.35         ## World units between stacked labels
-const MAX_STACK := 5                ## Labels per column before wrapping
-const WRAP_X_OFFSET := 1.5          ## World units horizontal offset for wrapped column
-const SCREEN_OVERLAP_X := 80.0      ## Pixels — labels within this X range are "same column"
-const SCREEN_OVERLAP_Y := 40.0      ## Pixels — labels within this Y range overlap
 const STACK_VISIBLE_RANGE := 30.0   ## Max distance to include in stacking computation
 const BASE_LABEL_Y := 1.0           ## Default rarity label Y offset
+const LABEL_RELAX_ITERS := 4        ## Constraint passes per frame
+const LABEL_ANCHOR_PULL := 0.3      ## Fraction of offset pulled back toward anchor per iter
+const LABEL_LERP_SPEED := 15.0      ## Lerp speed toward target offset
+const MAX_DISPLACEMENT_PX := 200.0  ## Max screen-pixel drift before clamping
 
 @onready var mesh: MeshInstance3D = $MeshInstance3D
 @onready var label: Label3D = $Label3D
@@ -51,6 +50,10 @@ var _pickup_proximity: ProximityLabel = null
 
 ## Rarity label stacking — static frame cache (computed once per frame)
 static var _stack_frame: int = -1
+
+## Per-instance label offset state for smooth movement
+var _label_offset_px := Vector2.ZERO  ## Current screen-space offset in pixels (lerped)
+
 
 
 func _ready() -> void:
@@ -122,8 +125,8 @@ func _process(delta: float) -> void:
 		if not should_show and _pickup_proximity.label:
 			_pickup_proximity._hide_label()
 
-	# Rarity label stacking (runs once per frame via static cache)
-	if not multiplayer.is_server() and label:
+	# Rarity label stacking (runs once per frame via static cache, any rendering peer)
+	if label:
 		_try_compute_rarity_stacking()
 
 
@@ -220,6 +223,7 @@ func _on_pickup_label_update(lbl: Label3D, _player: Node, _dist: float) -> void:
 func _try_compute_rarity_stacking() -> void:
 	## Called from each WorldItem's _process(). Static frame cache ensures
 	## the expensive computation only runs once per engine frame.
+	## Uses force-directed placement: spring toward anchor + repulsion from neighbors.
 	var frame := Engine.get_process_frames()
 	if frame == _stack_frame:
 		return
@@ -242,7 +246,14 @@ func _try_compute_rarity_stacking() -> void:
 	if world_items == null:
 		return
 
-	# Collect all visible rarity labels with their screen positions
+	var vp_size: Vector2 = camera.get_viewport().get_visible_rect().size
+	var vp_height: float = vp_size.y
+	var half_tan_fov: float = tan(deg_to_rad(camera.fov) * 0.5)
+	var cam_right: Vector3 = camera.global_transform.basis.x
+	var cam_up: Vector3 = camera.global_transform.basis.y
+	var dt: float = get_process_delta_time()
+
+	# Collect visible labels with screen-space info
 	var entries: Array[Dictionary] = []
 	for child in world_items.get_children():
 		if not child is WorldItem:
@@ -252,72 +263,102 @@ func _try_compute_rarity_stacking() -> void:
 			continue
 		var dist: float = player_pos.distance_to(wi.global_position)
 		if dist > STACK_VISIBLE_RANGE:
-			# Reset far-away labels to default position
 			wi.label.position = Vector3(0, BASE_LABEL_Y, 0)
+			wi._label_offset_px = Vector2.ZERO
 			continue
 		var world_label_pos: Vector3 = wi.global_position + Vector3(0, BASE_LABEL_Y, 0)
 		if camera.is_position_behind(world_label_pos):
 			wi.label.position = Vector3(0, BASE_LABEL_Y, 0)
+			wi._label_offset_px = Vector2.ZERO
 			continue
-		var screen_pos: Vector2 = camera.unproject_position(world_label_pos)
+		var screen_anchor: Vector2 = camera.unproject_position(world_label_pos)
+
+		# Measure screen-space label size
+		var depth: float = maxf(camera.global_position.distance_to(world_label_pos), 0.1)
+		var world_per_px: float = 2.0 * depth * half_tan_fov / vp_height
+		var f: Font = wi.label.font if wi.label.font else ThemeDB.fallback_font
+		var text_size: Vector2 = f.get_string_size(
+			wi.label.text, HORIZONTAL_ALIGNMENT_CENTER, -1, wi.label.font_size
+		)
+		var outline_extra: float = wi.label.outline_size * 2.0
+		var screen_w: float = (text_size.x + outline_extra) * wi.label.pixel_size / world_per_px
+		var screen_h: float = (text_size.y + outline_extra) * wi.label.pixel_size / world_per_px
+
 		entries.append({
 			"item": wi,
-			"screen": screen_pos,
-			"dist": dist,
+			"anchor": screen_anchor,
+			"half_w": screen_w * 0.5,
+			"half_h": screen_h * 0.5,
+			"depth": depth,
+			"world_per_px": world_per_px,
 		})
 
 	if entries.is_empty():
 		return
 
-	# Cluster labels by screen proximity using greedy grouping
-	var clusters: Array[Array] = []
-	var assigned: Array[bool] = []
-	assigned.resize(entries.size())
-	assigned.fill(false)
-
+	# Iterative constraint relaxation: resolve overlaps then pull toward anchor
+	# Work with target offsets, then lerp current offset toward them
+	var target_offsets: Array[Vector2] = []
+	target_offsets.resize(entries.size())
 	for i in entries.size():
-		if assigned[i]:
-			continue
-		var cluster: Array[Dictionary] = [entries[i]]
-		assigned[i] = true
-		# Find all unassigned entries that overlap with any member of this cluster
-		var search_idx := 0
-		while search_idx < cluster.size():
-			var anchor: Vector2 = cluster[search_idx]["screen"]
-			for j in entries.size():
-				if assigned[j]:
+		target_offsets[i] = (entries[i]["item"] as WorldItem)._label_offset_px
+
+	for _iter in LABEL_RELAX_ITERS:
+		# Pull each label back toward its anchor (offset=0)
+		for i in entries.size():
+			target_offsets[i] *= (1.0 - LABEL_ANCHOR_PULL)
+
+		# Push overlapping pairs apart along minimum separation axis
+		for i in entries.size():
+			var ei: Dictionary = entries[i]
+			var ci: Vector2 = ei["anchor"] as Vector2 + target_offsets[i]
+			var hw_i: float = ei["half_w"]
+			var hh_i: float = ei["half_h"]
+			for j in range(i + 1, entries.size()):
+				var ej: Dictionary = entries[j]
+				var cj: Vector2 = ej["anchor"] as Vector2 + target_offsets[j]
+				var hw_j: float = ej["half_w"]
+				var hh_j: float = ej["half_h"]
+				# Overlap on each axis (with padding)
+				var dx: float = absf(ci.x - cj.x)
+				var dy: float = absf(ci.y - cj.y)
+				var overlap_x: float = (hw_i + hw_j + 4.0) - dx
+				var overlap_y: float = (hh_i + hh_j + 4.0) - dy
+				if overlap_x <= 0 or overlap_y <= 0:
 					continue
-				var other: Vector2 = entries[j]["screen"]
-				if absf(anchor.x - other.x) < SCREEN_OVERLAP_X and absf(anchor.y - other.y) < SCREEN_OVERLAP_Y:
-					cluster.append(entries[j])
-					assigned[j] = true
-			search_idx += 1
-		clusters.append(cluster)
+				# Push along axis with LEAST overlap (cheapest to resolve)
+				var push: Vector2
+				if overlap_y <= overlap_x:
+					# Vertical push — most common for wide text labels
+					var sign_y: float = 1.0 if ci.y >= cj.y else -1.0
+					push = Vector2(0, sign_y * overlap_y * 0.5)
+				else:
+					var sign_x: float = 1.0 if ci.x >= cj.x else -1.0
+					push = Vector2(sign_x * overlap_x * 0.5, 0)
+				target_offsets[i] += push
+				target_offsets[j] -= push
+				# Update centers for subsequent pair checks this iteration
+				ci += push
+				# cj updated implicitly via target_offsets[j]
 
-	# For each cluster, sort by distance (closest at bottom) and assign stack offsets
-	for cluster in clusters:
-		if cluster.size() <= 1:
-			# Single item — reset to default
-			var wi: WorldItem = cluster[0]["item"]
+	# Clamp and lerp current offsets toward targets
+	for i in entries.size():
+		var wi: WorldItem = entries[i]["item"]
+		var target: Vector2 = target_offsets[i]
+		if target.length() > MAX_DISPLACEMENT_PX:
+			target = target.normalized() * MAX_DISPLACEMENT_PX
+		wi._label_offset_px = wi._label_offset_px.lerp(target, clampf(LABEL_LERP_SPEED * dt, 0.0, 1.0))
+
+	# Apply offsets to label world positions
+	for entry in entries:
+		var wi: WorldItem = entry["item"]
+		var offset_px: Vector2 = wi._label_offset_px
+		if offset_px.length_squared() < 0.5:
 			wi.label.position = Vector3(0, BASE_LABEL_Y, 0)
-			continue
-
-		# Sort: closest items first (bottom of stack)
-		cluster.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
-			return a["dist"] < b["dist"]
-		)
-
-		var col := 0  # Current column (0 = first, 1 = wrapped)
-		var row := 0  # Row within current column
-		for entry in cluster:
-			var wi: WorldItem = entry["item"]
-			var x_offset: float = col * WRAP_X_OFFSET
-			var y_offset: float = BASE_LABEL_Y + row * STACK_SPACING
-			wi.label.position = Vector3(x_offset, y_offset, 0)
-			row += 1
-			if row >= MAX_STACK:
-				row = 0
-				col += 1
+		else:
+			var wpp: float = entry["world_per_px"]
+			var world_offset: Vector3 = (cam_right * offset_px.x - cam_up * offset_px.y) * wpp
+			wi.label.position = Vector3(0, BASE_LABEL_Y, 0) + world_offset
 
 
 func _ensure_above_ground() -> void:

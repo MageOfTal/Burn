@@ -420,9 +420,9 @@ PackedFloat32Array PhysicsDirectSpaceState3D::_calc_ray_shielding_batch(Required
 	return calc_ray_shielding_batch(p_base_query->get_parameters(), p_to_points, p_target_bodies, p_max_absorptions);
 }
 
-Dictionary PhysicsDirectSpaceState3D::_calc_structure_explosion(RequiredParam<PhysicsRayQueryParameters3D> rp_base_query, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp) {
+Dictionary PhysicsDirectSpaceState3D::_calc_structure_explosion(RequiredParam<PhysicsRayQueryParameters3D> rp_base_query, const Dictionary &p_blocks, const PackedByteArray &p_block_grid, const Transform3D &p_structure_transform, float p_block_size, int p_num_x, int p_num_y, int p_num_z, float p_blast_radius, float p_damage_amount, float p_block_hp, const RID &p_compound_body) {
 	EXTRACT_PARAM_OR_FAIL_V(p_base_query, rp_base_query, Dictionary());
-	return calc_structure_explosion(p_base_query->get_parameters(), p_blocks, p_block_grid, p_structure_transform, p_block_size, p_num_x, p_num_y, p_num_z, p_blast_radius, p_damage_amount, p_block_hp);
+	return calc_structure_explosion(p_base_query->get_parameters(), p_blocks, p_block_grid, p_structure_transform, p_block_size, p_num_x, p_num_y, p_num_z, p_blast_radius, p_damage_amount, p_block_hp, p_compound_body);
 }
 
 PackedInt32Array PhysicsDirectSpaceState3D::_calc_structural_integrity(const PackedByteArray &p_block_grid, int p_num_x, int p_num_y, int p_num_z, int p_total_blocks) {
@@ -537,7 +537,7 @@ void PhysicsDirectSpaceState3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("intersect_ray_all", "parameters", "max_results"), &PhysicsDirectSpaceState3D::_intersect_ray_all, DEFVAL(32));
 	ClassDB::bind_method(D_METHOD("calc_ray_shielding", "parameters", "target_body", "max_absorption"), &PhysicsDirectSpaceState3D::_calc_ray_shielding, DEFVAL(RID()), DEFVAL(99999.0f));
 	ClassDB::bind_method(D_METHOD("calc_ray_shielding_batch", "base_parameters", "to_points", "target_bodies", "max_absorptions"), &PhysicsDirectSpaceState3D::_calc_ray_shielding_batch);
-	ClassDB::bind_method(D_METHOD("calc_structure_explosion", "base_parameters", "blocks", "block_grid", "structure_transform", "block_size", "num_x", "num_y", "num_z", "blast_radius", "damage_amount", "block_hp"), &PhysicsDirectSpaceState3D::_calc_structure_explosion);
+	ClassDB::bind_method(D_METHOD("calc_structure_explosion", "base_parameters", "blocks", "block_grid", "structure_transform", "block_size", "num_x", "num_y", "num_z", "blast_radius", "damage_amount", "block_hp", "compound_body"), &PhysicsDirectSpaceState3D::_calc_structure_explosion, DEFVAL(RID()));
 	ClassDB::bind_method(D_METHOD("calc_structural_integrity", "block_grid", "num_x", "num_y", "num_z", "total_blocks"), &PhysicsDirectSpaceState3D::_calc_structural_integrity);
 	ClassDB::bind_method(D_METHOD("intersect_shape", "parameters", "max_results"), &PhysicsDirectSpaceState3D::_intersect_shape, DEFVAL(32));
 	ClassDB::bind_method(D_METHOD("cast_motion", "parameters"), &PhysicsDirectSpaceState3D::_cast_motion);

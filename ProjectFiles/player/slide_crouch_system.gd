@@ -6,7 +6,6 @@ class_name SlideCrouchSystem
 ## Attached as a child of Player in player.tscn.
 
 ## --- Slide constants ---
-const SLIDE_INITIAL_SPEED := 12.0    ## Only used as fallback if somehow speed is 0
 const SLIDE_FRICTION_COEFF := 0.30   ## Ground friction
 const SLIDE_MIN_SPEED := 0.5        ## Low threshold — let slides die naturally via physics
 const SLIDE_MIN_ENTRY_SPEED := 3.5
@@ -14,7 +13,6 @@ const SLIDE_COOLDOWN := 0.4
 const SLIDE_CAPSULE_HEIGHT := 1.0
 const SLIDE_CAMERA_OFFSET := -0.5
 const SLIDE_AIRBORNE_GRACE := 0.2
-const SLIDE_SNAP_DOWN := 4.0
 const SLIDE_TO_CROUCH_DELAY := 0.3   ## Seconds coasting at low speed before crouch transition
 const SLIDE_MAX_SPEED := 32.0        ## Soft cap — extra drag kicks in above this speed
 const SLIDE_OVERCAP_DRAG := 8.0      ## Extra deceleration per m/s over the soft cap
@@ -42,7 +40,7 @@ var _slide_forward_dir: Vector3 = Vector3.ZERO    ## Original slide direction fo
 var _wants_slide_on_land: bool = false             ## Queue slide when landing from a jump
 var _slide_on_land_grace: float = 0.0              ## Grace window after landing to trigger slide
 var _was_on_floor: bool = true                     ## Track floor state for landing detection
-var _pre_land_velocity_y: float = 0.0              ## Vertical speed right before landing
+var _pre_land_velocity: Vector3 = Vector3.ZERO      ## Full velocity right before landing
 var _crouch_airborne_timer: float = 0.0            ## Crouch airborne grace (like slide)
 var _slide_was_on_floor: bool = true                ## Track floor→air transition for ramp launch
 
@@ -104,8 +102,12 @@ func start_slide() -> void:
 	_slide_low_speed_timer = 0.0
 	_slide_was_on_floor = player.is_on_floor()
 	_slide_smoothed_normal = player.get_floor_normal() if player.is_on_floor() else Vector3.UP
-	# Lock slide direction to current movement direction — NO speed boost.
-	var horiz := Vector2(player.velocity.x, player.velocity.z)
+	# Lock slide direction to actual momentum, not input direction.
+	# If coming from a landing, _pre_land_velocity has the real momentum
+	# from before the walking code redirected velocity to match input.
+	var momentum := _pre_land_velocity if _pre_land_velocity != Vector3.ZERO \
+		else player.velocity
+	var horiz := Vector2(momentum.x, momentum.z)
 	var horiz_speed := horiz.length()
 	if horiz_speed > 0.01:
 		var dir_2d := horiz.normalized()
@@ -117,25 +119,27 @@ func start_slide() -> void:
 		_slide_velocity = forward * SLIDE_MIN_ENTRY_SPEED
 		_slide_forward_dir = Vector3(forward.x, 0.0, forward.z).normalized()
 
+	_pre_land_velocity = Vector3.ZERO  # Consumed — ground slides use current velocity
 	apply_lowered_pose(SLIDE_CAPSULE_HEIGHT, SLIDE_CAMERA_OFFSET)
 
 
 func process_slide(delta: float) -> void:
+	Profiler.begin("slide_system")
 	## Server-only: physics-based slide.
 	## Uses real inclined-plane physics: a = g * (sin(angle)*alignment - friction*cos(angle))
 	## Sliding posture is retained when going airborne passively (ramps, ledges).
 	## Jumping out of a slide ends it — the player stands up in the air.
 
-	var on_floor := player.is_on_floor()
+	var on_floor := player.movement._is_grounded
 	var gravity: float = player.gravity
 
 	# --- Jump out of slide: keep all horizontal momentum, end slide, stand up ---
-	if player._frame_jump and on_floor:
+	if player._frame_jump and on_floor and has_headroom():
 		player.velocity.x = _slide_velocity.x
 		player.velocity.z = _slide_velocity.z
 		player.velocity.y = player.movement.slope_compensated_jump_y()
-		player.movement._is_grounded = false  # Override hysteresis — airborne now
-		player.movement._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
+
+		player.movement.force_airborne()
 		# End slide directly — bypass end_slide() which would transition to crouch
 		# since we're still on_floor and holding shift
 		is_sliding = false
@@ -147,58 +151,38 @@ func process_slide(delta: float) -> void:
 		# Queue slide-on-land so holding shift will re-enter slide/crouch on landing
 		if player.player_input.action_slide:
 			queue_slide_on_land()
+		Profiler.end("slide_system")
 		return
 
 	# --- Airborne: retain slide posture, apply gravity, skip ground physics ---
+	# vel.y carries through from the last grounded frame's slope projection —
+	# the capsule follows its natural trajectory off the surface.
 	if not on_floor:
-		_slide_airborne_timer += delta
-		# Ramp launch: first frame leaving ground during slide
-		if _slide_was_on_floor:
-			var launch_steepness := sqrt(1.0 - _slide_smoothed_normal.y * _slide_smoothed_normal.y)
-			var slide_speed := _slide_velocity.length()
-			var launch_vy := slide_speed * launch_steepness * 0.7
-			if launch_vy > 0.5:
-				player.velocity.y = launch_vy
-			else:
-				player.velocity.y = 0.0
-		else:
-			player.velocity.y -= gravity * delta
-
-		# Keep horizontal slide velocity (no friction in air)
-		player.velocity.x = _slide_velocity.x
-		player.velocity.z = _slide_velocity.z
+		# Only count actual air time (not grounded-on-steep-slope) for landing projection
+		if not player.movement._is_grounded:
+			_slide_airborne_timer += delta
+		# Track slide velocity from solver output (respects wall collisions)
+		_slide_velocity = Vector3(player.velocity.x, 0.0, player.velocity.z)
 		_slide_was_on_floor = false
 
 		# Only end slide in air if the player released shift
 		if not player.player_input.action_slide:
 			end_slide()
+		Profiler.end("slide_system")
 		return
 
 	# --- Just landed: reset airborne state, refresh floor normal ---
-	# Project full 3D velocity onto the ground plane to get the real along-surface
-	# speed. Someone falling straight into a slope has most velocity absorbed by
-	# the ground — only the tangential component carries into the slide.
+	# _slide_velocity was tracked during airtime (horizontal components of
+	# player.velocity). On landing, just continue the slide — grounded slope
+	# physics (slope_force + friction) handles acceleration/deceleration.
+	# No tangent projection: sliding over a hill and briefly leaving the
+	# surface shouldn't convert freefall velocity into forward speed.
 	if _slide_airborne_timer > 0.0:
 		_slide_airborne_timer = 0.0
-		var floor_n := player.get_floor_normal()
-		_slide_smoothed_normal = floor_n
-		# Project full velocity onto ground plane: v_tangent = v - (v·n)*n
-		var full_vel := player.velocity
-		var into_surface := full_vel.dot(floor_n)
-		var tangent_vel := full_vel - floor_n * into_surface
-		# Extract horizontal component of the tangent velocity
-		var tangent_horiz := Vector3(tangent_vel.x, 0.0, tangent_vel.z)
-		var tangent_speed := tangent_horiz.length()
-		if tangent_speed > SLIDE_MIN_ENTRY_SPEED:
-			_slide_velocity = tangent_horiz
-			_slide_forward_dir = tangent_horiz.normalized()
-		elif tangent_speed > 0.5:
-			# Some speed but below entry threshold — let ground physics bleed it out
-			_slide_velocity = tangent_horiz
-			_slide_forward_dir = tangent_horiz.normalized()
-		else:
-			# Almost no along-surface speed — end the slide
+		_slide_smoothed_normal = player.get_floor_normal()
+		if _slide_velocity.length() < 0.5:
 			end_slide()
+			Profiler.end("slide_system")
 			return
 
 	# --- Smooth the floor normal to prevent jitter on procedural terrain ---
@@ -298,9 +282,10 @@ func process_slide(delta: float) -> void:
 	player.velocity.x = _slide_velocity.x
 	player.velocity.z = _slide_velocity.z
 
-	var speed_factor := _slide_velocity.length() / SLIDE_INITIAL_SPEED
-	var snap_force := SLIDE_SNAP_DOWN + gravity * slope_steepness * speed_factor
-	player.velocity.y = -snap_force * maxf(slope_steepness, 0.08)
+	# Slope projection: set vel.y tangent to surface using the smoothed normal
+	var sn: Vector3 = _slide_smoothed_normal
+	player.velocity.y = -(sn.x * player.velocity.x + sn.z * player.velocity.z) / sn.y
+
 	_slide_was_on_floor = true
 
 	# --- End conditions (ground only) ---
@@ -317,6 +302,7 @@ func process_slide(delta: float) -> void:
 
 	if should_end:
 		end_slide()
+	Profiler.end("slide_system")
 
 
 func end_slide() -> void:
@@ -369,8 +355,8 @@ func process_post_slide_window(delta: float) -> bool:
 		player.velocity.x = _post_slide_dir.x * _post_slide_speed
 		player.velocity.z = _post_slide_dir.z * _post_slide_speed
 		player.velocity.y = player.movement.slope_compensated_jump_y()
-		player.movement._is_grounded = false  # Override hysteresis — airborne now
-		player.movement._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
+
+		player.movement.force_airborne()
 		_post_slide_timer = 0.0
 		_post_slide_speed = 0.0
 		_post_slide_dir = Vector3.ZERO
@@ -405,33 +391,30 @@ func start_crouch() -> void:
 
 
 func process_crouch(delta: float) -> void:
+	Profiler.begin("crouch_system")
 	## Server-only: crouched movement with reduced speed.
 
-	# Airborne grace — stay crouched when briefly leaving the ground (bumpy hills).
-	# Only end crouch after the grace expires.
 	var on_floor := player.is_on_floor()
-	if on_floor:
-		_crouch_airborne_timer = 0.0
-	else:
-		_crouch_airborne_timer += delta
-		if _crouch_airborne_timer > CROUCH_AIRBORNE_GRACE:
+
+	# Stay crouched while airborne as long as ctrl is held
+	if not on_floor:
+		if not player.player_input.action_slide:
 			end_crouch()
-			return
+		Profiler.end("crouch_system")
+		return
 
 	if not player.player_input.action_slide and has_headroom():
 		end_crouch()
+		Profiler.end("crouch_system")
 		return
 
-	# Allow jumping out of crouch (must actually be on floor, not just in grace)
+	# Allow jumping out of crouch
 	if player._frame_jump and on_floor and has_headroom():
 		end_crouch()
 		player.velocity.y = player.movement.slope_compensated_jump_y()
-		player.movement._is_grounded = false  # Override hysteresis — airborne now
-		player.movement._post_jump_rising = true  # Suppress grounding while rising (uphill fix)
-		return
 
-	# Crouched movement — slower, same acceleration feel (only when grounded)
-	if not on_floor:
+		player.movement.force_airborne()
+		Profiler.end("crouch_system")
 		return
 
 	var shoe_bonus: float = player.inventory.get_shoe_speed_bonus() if player.inventory else 0.0
@@ -442,12 +425,19 @@ func process_crouch(delta: float) -> void:
 	var horizontal := Vector2(player.velocity.x, player.velocity.z)
 	if direction:
 		var target: Vector2 = Vector2(direction.x, direction.z) * current_speed
-		horizontal = horizontal.move_toward(target, player.movement.ACCELERATION * delta)
+		var new_speed := move_toward(horizontal.length(), target.length(), player.movement.WALK_ACCEL * delta)
+		horizontal = target.normalized() * new_speed
 	else:
-		horizontal = horizontal.move_toward(Vector2.ZERO, player.movement.DECELERATION * delta)
+		horizontal = Vector2.ZERO
 
 	player.velocity.x = horizontal.x
 	player.velocity.z = horizontal.y
+
+	# Slope projection: set vel.y tangent to surface (same as normal movement)
+	if on_floor and player.movement._has_floor_contact:
+		var n: Vector3 = player.movement._floor_normal
+		player.velocity.y = -(n.x * player.velocity.x + n.z * player.velocity.z) / n.y
+	Profiler.end("crouch_system")
 
 
 func end_crouch() -> void:
@@ -469,9 +459,10 @@ func queue_slide_on_land() -> void:
 
 
 func track_pre_land_velocity() -> void:
-	## Call each frame while airborne to capture vertical speed before landing.
+	## Call each frame while airborne to capture velocity before landing.
+	## Called before movement code runs, so this is the solver's raw output.
 	if not _was_on_floor:
-		_pre_land_velocity_y = player.velocity.y
+		_pre_land_velocity = player.velocity
 
 
 func process_landing(delta: float) -> void:
@@ -479,12 +470,18 @@ func process_landing(delta: float) -> void:
 	var was_airborne := not _was_on_floor
 	_was_on_floor = player.is_on_floor()
 
+	# Clear stale pre-land velocity on landing so ground slides use current velocity
+	if was_airborne and player.is_on_floor():
+		if not _wants_slide_on_land:
+			_pre_land_velocity = Vector3.ZERO
+
 	if was_airborne and player.is_on_floor() and _wants_slide_on_land:
 		# Project the pre-landing velocity onto the ground plane to get the real
 		# along-surface speed. Only the tangential component becomes slide momentum.
 		var floor_n := player.get_floor_normal()
-		# Reconstruct the pre-land velocity (horizontal from current + vertical from tracked)
-		var pre_land_vel := Vector3(player.velocity.x, _pre_land_velocity_y, player.velocity.z)
+		# Use the full pre-land velocity captured before movement code ran,
+		# so the slide direction follows actual momentum, not input direction.
+		var pre_land_vel := _pre_land_velocity
 		var into_surface := pre_land_vel.dot(floor_n)
 		var tangent_vel := pre_land_vel - floor_n * into_surface
 		var tangent_horiz := Vector3(tangent_vel.x, 0.0, tangent_vel.z)
@@ -527,6 +524,9 @@ func apply_lowered_pose(capsule_height: float, camera_offset: float) -> void:
 	if col_shape.shape is CapsuleShape3D:
 		col_shape.shape.height = capsule_height
 		col_shape.position.y = capsule_height * 0.5
+	# Keep the movement CharacterVirtual's capsule in sync with the body.
+	if player.movement != null and player.movement.has_method("set_capsule_height"):
+		player.movement.set_capsule_height(capsule_height)
 
 	var height_ratio := capsule_height / _original_capsule_height
 	player.body_mesh.scale.y = _original_mesh_scale_y * height_ratio
@@ -541,6 +541,8 @@ func apply_standing_pose() -> void:
 	if col_shape.shape is CapsuleShape3D:
 		col_shape.shape.height = _original_capsule_height
 		col_shape.position.y = _original_capsule_height * 0.5
+	if player.movement != null and player.movement.has_method("set_capsule_height"):
+		player.movement.set_capsule_height(_original_capsule_height)
 
 	player.body_mesh.scale.y = _original_mesh_scale_y
 	player.body_mesh.position.y = _original_mesh_y

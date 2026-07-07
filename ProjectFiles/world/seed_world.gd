@@ -61,7 +61,7 @@ func _ready() -> void:
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = Color(0.25, 0.65, 0.35)
 
-	# --- Custom terrain system (replaces VoxelTerrain) ---
+	# --- Custom terrain system (shared StaticBody3D, full collision everywhere) ---
 	_terrain_system = TerrainSystem.new()
 	_terrain_system.name = "TerrainSystem"
 	add_child(_terrain_system)
@@ -132,35 +132,48 @@ func _ready() -> void:
 func _spawn_heavy_structures() -> void:
 	## Spread heavy wall/ramp spawning across frames.
 	## Called from network_manager after all synchronous setup is done.
+	var t_total := Time.get_ticks_msec()
 	var rng := _structure_rng
 	var structures_node := Node3D.new()
 	structures_node.name = "Structures"
 	add_child(structures_node)
 
-	# Build terrain chunks before spawning structures (need collision for raycasts)
+	var t_terrain := Time.get_ticks_msec()
 	await _terrain_system.build_initial()
+	print("[STARTUP] Terrain build: %dms" % (Time.get_ticks_msec() - t_terrain))
 
 	# Pre-compute tower position so walls/ramps can respect the exclusion zone.
-	# The tower itself is spawned last (it awaits voxel generation).
 	_precompute_tower_position(rng)
 
 	if not GameManager.debug_skip_structures:
+		var t := Time.get_ticks_msec()
 		await _spawn_walls_batched(rng, structures_node)
+		print("[STARTUP] Walls: %dms" % (Time.get_ticks_msec() - t))
+		t = Time.get_ticks_msec()
 		await _spawn_ramps_batched(rng, structures_node)
+		print("[STARTUP] Ramps: %dms" % (Time.get_ticks_msec() - t))
+		t = Time.get_ticks_msec()
 		await _spawn_smooth_ramps_batched(rng, structures_node)
+		print("[STARTUP] Smooth ramps: %dms" % (Time.get_ticks_msec() - t))
+		t = Time.get_ticks_msec()
 		await _spawn_obj_structures_batched(rng, structures_node)
+		print("[STARTUP] Obj structures: %dms" % (Time.get_ticks_msec() - t))
+		t = Time.get_ticks_msec()
 		await _spawn_tower(rng, structures_node)
+		print("[STARTUP] Tower: %dms" % (Time.get_ticks_msec() - t))
 	else:
 		print("[SeedWorld] Skipping structures (debug toggle)")
-		await get_tree().process_frame  # Yield once so signal timing stays consistent
+		await get_tree().process_frame
 	_spawn_dummies(rng)
 
 	_spawn_test_platforms()
 	_spawn_sine_ramps()
+	_spawn_test_cube()
+	_spawn_push_blocks()
 
 	structures_complete = true
 	world_generation_complete.emit()
-	print("[SeedWorld] World generation complete — all structures placed")
+	print("[STARTUP] Total: %dms" % (Time.get_ticks_msec() - t_total))
 
 
 func reset_world() -> void:
@@ -173,6 +186,11 @@ func reset_world() -> void:
 	if _terrain_system:
 		_terrain_system.reset()
 		print("[SeedWorld] Terrain system reset (craters cleared)")
+
+	# Clear structure bakes (positions change on reset due to RNG)
+	for path in [WALL_BAKE_PATH, RAMP_BAKE_PATH]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
 
 	# --- 2. Destroy all structures (walls, ramps, tower) ---
 	var structures := get_node_or_null("Structures")
@@ -329,24 +347,55 @@ func _apply_crater(world_pos: Vector3, radius: float) -> void:
 #  Structure spawning (walls, ramps, spawns, loot, dummies)
 # ======================================================================
 
+const WALL_BAKE_PATH := "res://terrain/wall_bake.bin"
+
 func _spawn_walls_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn destructible walls, yielding every few walls to keep the
-	## loading screen responsive and let the engine process frames.
 	var wall_scene := preload("res://world/destructible_wall.tscn")
+
+	# Try loading baked wall parameters
+	var wall_params: Array = _load_wall_bake()
+	if wall_params.is_empty():
+		wall_params = _generate_wall_params(rng)
+		_save_wall_bake(wall_params)
+
+	var t_total := Time.get_ticks_usec()
+	var t_inst := 0
+	var t_add := 0
+	var spawned := 0
+
+	for p in wall_params:
+		var t0 := Time.get_ticks_usec()
+		var wall: Node3D = wall_scene.instantiate()
+		wall.name = "Wall_%d" % spawned
+		wall.wall_size = p["size"]
+		wall.wall_tier = p["tier"]
+		wall.position = p["pos"]
+		wall.rotation.y = p["rot"]
+		var t1 := Time.get_ticks_usec()
+		parent.add_child(wall)
+		var t2 := Time.get_ticks_usec()
+		t_inst += t1 - t0
+		t_add += t2 - t1
+		spawned += 1
+
+		if spawned % 50 == 0:
+			await get_tree().process_frame
+
+	print("[SeedWorld] Spawned %d walls (inst=%dms add=%dms total=%dms)" % [
+		spawned, t_inst / 1000, t_add / 1000, (Time.get_ticks_usec() - t_total) / 1000])
+
+
+func _generate_wall_params(rng: RandomNumberGenerator) -> Array:
 	var wall_sizes := [
-		Vector3(10, 4, 1),
-		Vector3(8, 3, 1),
-		Vector3(12, 5, 1),
-		Vector3(6, 3, 2),
-		Vector3(14, 4, 1),
+		Vector3(10, 4, 1), Vector3(8, 3, 1), Vector3(12, 5, 1),
+		Vector3(6, 3, 2), Vector3(14, 4, 1),
 	]
 	var tier_weights := [0.30, 0.35, 0.25, 0.10]
-	var spawned := 0
+	var params: Array = []
 
 	for i in num_walls:
 		var wall_size: Vector3 = wall_sizes[rng.randi() % wall_sizes.size()]
 		var y_rot := rng.randf_range(0, TAU)
-
 		var roll := rng.randf()
 		var tier: int = 0
 		var cumulative := 0.0
@@ -355,51 +404,77 @@ func _spawn_walls_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 			if roll <= cumulative:
 				tier = t
 				break
-
 		var pos := _get_random_ground_pos(rng, wall_size.y * 0.5, 30.0)
 		if pos == Vector3.INF:
 			continue
-
-		# Skip if inside tower exclusion zone
 		if _tower_position != Vector3.INF:
 			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
 			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
 				continue
+		params.append({"size": wall_size, "tier": tier, "pos": pos, "rot": y_rot})
 
-		var wall: Node3D = wall_scene.instantiate()
-		wall.name = "Wall_%d" % spawned
-		wall.wall_size = wall_size
-		wall.wall_tier = tier
-		wall.position = pos
-		wall.rotation.y = y_rot
-		parent.add_child(wall)
-		spawned += 1
+	return params
 
-		# Yield every 5 walls so the loading screen stays responsive
-		if spawned % 5 == 0:
-			await get_tree().process_frame
 
-	print("[SeedWorld] Spawned %d walls" % spawned)
+func _save_wall_bake(params: Array) -> void:
+	var f := FileAccess.open(WALL_BAKE_PATH, FileAccess.WRITE)
+	if f:
+		f.store_var(params, true)
+		f.close()
 
+
+func _load_wall_bake() -> Array:
+	if not FileAccess.file_exists(WALL_BAKE_PATH):
+		return []
+	var f := FileAccess.open(WALL_BAKE_PATH, FileAccess.READ)
+	if not f:
+		return []
+	var data = f.get_var(true)
+	f.close()
+	if data is Array:
+		return data
+	return []
+
+
+const RAMP_BAKE_PATH := "res://terrain/ramp_bake.bin"
 
 func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
-	## Spawn destructible ramps, yielding every batch to spread load.
 	var ramp_scene := preload("res://world/destructible_ramp.tscn")
+
+	var ramp_params: Array = _load_ramp_bake()
+	if ramp_params.is_empty():
+		ramp_params = _generate_ramp_params(rng)
+		_save_ramp_bake(ramp_params)
+
+	var spawned := 0
+	for p in ramp_params:
+		var ramp: Node3D = ramp_scene.instantiate()
+		ramp.name = "Ramp_%d" % spawned
+		ramp.ramp_size = p["size"]
+		ramp.ramp_tier = p["tier"]
+		ramp.position = p["pos"]
+		ramp.rotation.y = p["rot_y"]
+		ramp.rotation.x = p["rot_x"]
+		parent.add_child(ramp)
+		spawned += 1
+		if spawned % 50 == 0:
+			await get_tree().process_frame
+
+	print("[SeedWorld] Spawned %d destructible ramps" % spawned)
+
+
+func _generate_ramp_params(rng: RandomNumberGenerator) -> Array:
 	var ramp_sizes := [
-		Vector3(4, 0.5, 8),
-		Vector3(3, 0.5, 6),
-		Vector3(5, 0.5, 10),
-		Vector3(3, 0.5, 5),
+		Vector3(4, 0.5, 8), Vector3(3, 0.5, 6),
+		Vector3(5, 0.5, 10), Vector3(3, 0.5, 5),
 	]
 	var angles_deg := [15.0, 20.0, 25.0, 30.0]
 	var tier_weights := [0.35, 0.35, 0.20, 0.10]
-	var spawned := 0
-
+	var params: Array = []
 	for i in num_ramps:
 		var ramp_size: Vector3 = ramp_sizes[rng.randi() % ramp_sizes.size()]
 		var ramp_angle: float = angles_deg[rng.randi() % angles_deg.size()]
 		var y_rot := rng.randf_range(0, TAU)
-
 		var roll := rng.randf()
 		var tier: int = 0
 		var cumulative := 0.0
@@ -408,32 +483,33 @@ func _spawn_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
 			if roll <= cumulative:
 				tier = t
 				break
-
 		var pos := _get_random_ground_pos(rng, 0.3, 25.0)
 		if pos == Vector3.INF:
 			continue
-
-		# Skip if inside tower exclusion zone
 		if _tower_position != Vector3.INF:
 			var dist_to_tower := Vector2(pos.x - _tower_position.x, pos.z - _tower_position.z).length()
 			if dist_to_tower < TOWER_EXCLUSION_RADIUS:
 				continue
+		params.append({"size": ramp_size, "tier": tier, "pos": pos, "rot_y": y_rot, "rot_x": deg_to_rad(ramp_angle)})
+	return params
 
-		var ramp: Node3D = ramp_scene.instantiate()
-		ramp.name = "Ramp_%d" % spawned
-		ramp.ramp_size = ramp_size
-		ramp.ramp_tier = tier
-		ramp.position = pos
-		ramp.rotation.y = y_rot
-		ramp.rotation.x = deg_to_rad(ramp_angle)
-		parent.add_child(ramp)
-		spawned += 1
 
-		# Yield every 5 ramps (each builds a block grid like walls)
-		if spawned % 5 == 0:
-			await get_tree().process_frame
+func _save_ramp_bake(params: Array) -> void:
+	var f := FileAccess.open(RAMP_BAKE_PATH, FileAccess.WRITE)
+	if f:
+		f.store_var(params, true)
+		f.close()
 
-	print("[SeedWorld] Spawned %d destructible ramps" % spawned)
+
+func _load_ramp_bake() -> Array:
+	if not FileAccess.file_exists(RAMP_BAKE_PATH):
+		return []
+	var f := FileAccess.open(RAMP_BAKE_PATH, FileAccess.READ)
+	if not f:
+		return []
+	var data = f.get_var(true)
+	f.close()
+	return data if data is Array else []
 
 
 func _spawn_smooth_ramps_batched(rng: RandomNumberGenerator, parent: Node3D) -> void:
@@ -714,6 +790,91 @@ func _spawn_test_platforms() -> void:
 	var top_y := ground_y + wall_height
 	print("[TestPlatforms] Upright wall + 40° ramp at x=%.0f z=%.0f — top at y=%.1f" % [
 		pos_x, pos_z, top_y])
+
+
+func _spawn_test_cube() -> void:
+	## DEBUG: Giant heavy RigidBody3D cube for wall-slide testing.
+	var pos := Vector3(30, 0, 0)
+	var ground_y := get_height_from_noise(pos.x, pos.z)
+
+	var cube := RigidBody3D.new()
+	cube.name = "TestCube"
+	cube.mass = 50000.0
+	cube.can_sleep = false
+	cube.lock_rotation = true
+	cube.collision_layer = CollisionLayers.WORLD
+	cube.collision_mask = CollisionLayers.WORLD
+	cube.position = Vector3(pos.x, ground_y + 15.0, pos.z)
+
+	var shape := BoxShape3D.new()
+	shape.size = Vector3(20, 20, 20)
+	var col := CollisionShape3D.new()
+	col.shape = shape
+	cube.add_child(col)
+
+	var mesh := MeshInstance3D.new()
+	var box := BoxMesh.new()
+	box.size = shape.size
+	mesh.mesh = box
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.9, 0.3, 0.1)
+	mesh.material_override = mat
+	cube.add_child(mesh)
+
+	add_child(cube)
+	print("[TestCube] 50000kg cube at (%.0f, %.1f, %.0f) — 20m, no gravity" % [pos.x, ground_y + 15.0, pos.z])
+
+
+func _spawn_push_blocks() -> void:
+	## DEBUG: Row of pushable RigidBody3D blocks past the toad bowl area.
+	## Twice player height (3.6m), half player mass (40kg).
+	var count := 8
+	var block_size := Vector3(1.5, 3.6, 1.5)
+	var block_mass := 40.0
+	var start_z := 40.0
+	var spacing := 3.0
+
+	var container := Node3D.new()
+	container.name = "PushBlocks"
+	add_child(container)
+
+	for i in count:
+		var x := float(i - count / 2) * spacing
+		var z := start_z
+		var ground_y := get_height_from_noise(x, z)
+
+		var body := RigidBody3D.new()
+		body.name = "PushBlock_%d" % i
+		body.mass = block_mass
+		body.collision_layer = CollisionLayers.ITEMS | CollisionLayers.WALL_SMOOTH
+		body.collision_mask = CollisionLayers.DEFAULT_PHYSICS
+		body.contact_monitor = false
+		body.lock_rotation = false
+		# Continuous CD so high-speed player↔box contacts don't tunnel through.
+		# The phasing-into-box bug we diagnosed via [BOXLOG] traced to the
+		# constraint solver missing fast motion in a single tick.
+		body.continuous_cd = true
+
+		var shape := BoxShape3D.new()
+		shape.size = block_size
+		var col := CollisionShape3D.new()
+		col.shape = shape
+		body.add_child(col)
+
+		var mesh := MeshInstance3D.new()
+		var box := BoxMesh.new()
+		box.size = block_size
+		mesh.mesh = box
+		var mat := StandardMaterial3D.new()
+		mat.albedo_color = Color(0.2, 0.6, 0.9)
+		mesh.material_override = mat
+		body.add_child(mesh)
+
+		body.position = Vector3(x, ground_y + block_size.y * 0.5, z)
+		container.add_child(body)
+
+	print("[PushBlocks] Spawned %d blocks (%.0fkg, %.1fm tall) at z=%.0f" % [
+		count, block_mass, block_size.y, start_z])
 
 
 func _spawn_sine_ramps() -> void:

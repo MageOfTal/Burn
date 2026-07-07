@@ -44,6 +44,28 @@ var settings := {
 
 	# GI
 	"gi_mode": 0,        # 0=None, 1=SDFGI
+
+	# Reflections & Specular
+	"roughness_limiter": false,  # Specular AA for metallic surfaces
+
+	# Tonemap
+	"tonemap_mode": 2,   # 0=Linear, 1=Reinhardt, 2=Filmic, 3=ACES
+
+	# Color Adjustments
+	"adjustment_enabled": false,
+	"adjustment_contrast": 1.0,   # 0.5–2.0
+	"adjustment_saturation": 1.0, # 0.0–2.0
+
+	# Camera Effects
+	"dof_enabled": false,
+	"dof_focus_distance": 20.0,   # 1–200
+	"dof_blur_amount": 0.05,      # 0.01–0.2
+	"auto_exposure": false,
+
+	# Rendering Quality
+	"debanding": false,
+	"scaling_3d_mode": 0, # 0=Bilinear, 1=FSR 1.0, 2=FSR 2.2
+	"sharpening": 0.5,    # 0.0–2.0 (higher = sharper)
 }
 
 # ── Presets ───────────────────────────────────────────────────────────────
@@ -58,6 +80,11 @@ const PRESET_LOW := {
 	"glow_enabled": false, "glow_intensity": 0.5,
 	"fog_enabled": true, "volumetric_fog": false,
 	"gi_mode": 0,
+	"roughness_limiter": false, "tonemap_mode": 2,
+	"adjustment_enabled": false, "adjustment_contrast": 1.0, "adjustment_saturation": 1.0,
+	"dof_enabled": false, "dof_focus_distance": 20.0, "dof_blur_amount": 0.05,
+	"auto_exposure": false,
+	"debanding": false, "scaling_3d_mode": 0, "sharpening": 0.5,
 }
 
 const PRESET_MEDIUM := {
@@ -71,6 +98,11 @@ const PRESET_MEDIUM := {
 	"glow_enabled": true, "glow_intensity": 0.5,
 	"fog_enabled": true, "volumetric_fog": false,
 	"gi_mode": 0,
+	"roughness_limiter": true, "tonemap_mode": 2,
+	"adjustment_enabled": false, "adjustment_contrast": 1.0, "adjustment_saturation": 1.0,
+	"dof_enabled": false, "dof_focus_distance": 20.0, "dof_blur_amount": 0.05,
+	"auto_exposure": false,
+	"debanding": true, "scaling_3d_mode": 0, "sharpening": 0.5,
 }
 
 const PRESET_HIGH := {
@@ -84,6 +116,11 @@ const PRESET_HIGH := {
 	"glow_enabled": true, "glow_intensity": 0.8,
 	"fog_enabled": true, "volumetric_fog": true,
 	"gi_mode": 0,
+	"roughness_limiter": true, "tonemap_mode": 2,
+	"adjustment_enabled": false, "adjustment_contrast": 1.0, "adjustment_saturation": 1.0,
+	"dof_enabled": false, "dof_focus_distance": 20.0, "dof_blur_amount": 0.05,
+	"auto_exposure": false,
+	"debanding": true, "scaling_3d_mode": 0, "sharpening": 0.5,
 }
 
 const PRESET_ULTRA := {
@@ -97,6 +134,11 @@ const PRESET_ULTRA := {
 	"glow_enabled": true, "glow_intensity": 1.0,
 	"fog_enabled": true, "volumetric_fog": true,
 	"gi_mode": 1,
+	"roughness_limiter": true, "tonemap_mode": 3,
+	"adjustment_enabled": false, "adjustment_contrast": 1.0, "adjustment_saturation": 1.0,
+	"dof_enabled": false, "dof_focus_distance": 20.0, "dof_blur_amount": 0.05,
+	"auto_exposure": false,
+	"debanding": true, "scaling_3d_mode": 0, "sharpening": 0.3,
 }
 
 const PRESETS := {
@@ -145,6 +187,11 @@ func apply_all() -> void:
 	apply_fog()
 	apply_gi()
 	apply_fov()
+	apply_reflections()
+	apply_tonemap()
+	apply_adjustments()
+	apply_camera_effects()
+	apply_rendering_quality()
 
 
 # ── Display ──────────────────────────────────────────────────────────────
@@ -345,6 +392,78 @@ func apply_fov() -> void:
 		camera.fov = settings["fov"]
 
 
+# ── Reflections & Specular ──────────────────────────────────────────────
+
+func apply_reflections() -> void:
+	RenderingServer.screen_space_roughness_limiter_set_active(
+		settings["roughness_limiter"], 0.25, 0.18)
+
+
+# ── Tonemap ─────────────────────────────────────────────────────────────
+
+func apply_tonemap() -> void:
+	var env := _find_environment()
+	if env == null:
+		return
+	match settings["tonemap_mode"]:
+		0: env.tonemap_mode = Environment.TONE_MAPPER_LINEAR
+		1: env.tonemap_mode = Environment.TONE_MAPPER_REINHARDT
+		2: env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+		3: env.tonemap_mode = Environment.TONE_MAPPER_ACES
+
+
+# ── Color Adjustments ──────────────────────────────────────────────────
+
+func apply_adjustments() -> void:
+	var env := _find_environment()
+	if env == null:
+		return
+	env.adjustment_enabled = settings["adjustment_enabled"]
+	if settings["adjustment_enabled"]:
+		env.adjustment_contrast = settings["adjustment_contrast"]
+		env.adjustment_saturation = settings["adjustment_saturation"]
+
+
+# ── Camera Effects (DOF, Auto Exposure) ────────────────────────────────
+
+func apply_camera_effects() -> void:
+	var world_env := _find_world_environment()
+	if world_env == null:
+		return
+
+	var attrs: CameraAttributesPractical
+	if world_env.camera_attributes is CameraAttributesPractical:
+		attrs = world_env.camera_attributes
+	else:
+		attrs = CameraAttributesPractical.new()
+		world_env.camera_attributes = attrs
+
+	# DOF (far blur — cinematic distance blur)
+	attrs.dof_blur_far_enabled = settings["dof_enabled"]
+	if settings["dof_enabled"]:
+		attrs.dof_blur_far_distance = settings["dof_focus_distance"]
+		attrs.dof_blur_far_transition = settings["dof_focus_distance"] * 0.5
+		attrs.dof_blur_amount = settings["dof_blur_amount"]
+
+	# Auto Exposure
+	attrs.auto_exposure_enabled = settings["auto_exposure"]
+
+
+# ── Rendering Quality ──────────────────────────────────────────────────
+
+func apply_rendering_quality() -> void:
+	var vp := get_viewport()
+	vp.use_debanding = settings["debanding"]
+
+	match settings["scaling_3d_mode"]:
+		0: vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+		1: vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR
+		2: vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR2
+
+	# FSR sharpness is inverted: 0.0 = sharpest, 2.0 = no sharpening
+	vp.fsr_sharpness = 2.0 - settings["sharpening"]
+
+
 # ── Presets ──────────────────────────────────────────────────────────────
 
 func apply_preset(preset_name: String) -> void:
@@ -384,5 +503,18 @@ func _find_sun() -> DirectionalLight3D:
 				return child
 	for child in scene.get_children():
 		if child is DirectionalLight3D:
+			return child
+	return null
+
+
+func _find_world_environment() -> WorldEnvironment:
+	var scene := get_tree().current_scene
+	if scene == null:
+		return null
+	var world_env := scene.get_node_or_null("WorldEnvironment")
+	if world_env and world_env is WorldEnvironment:
+		return world_env
+	for child in scene.get_children():
+		if child is WorldEnvironment:
 			return child
 	return null

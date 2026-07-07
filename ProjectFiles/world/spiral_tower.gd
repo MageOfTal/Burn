@@ -16,13 +16,13 @@ const TowerChunkScript := preload("res://world/tower_chunk.gd")
 #  Tower geometry constants
 # ======================================================================
 
-const CORE_RADIUS := 3.0           ## Solid cylindrical core radius (meters)
-const RAMP_WIDTH := 2.5            ## Ramp extends this far beyond core
-const OUTER_RADIUS := 5.5          ## CORE_RADIUS + RAMP_WIDTH
-const TOWER_HEIGHT := 40.0         ## Total tower height (meters)
+const CORE_RADIUS := 9.0           ## Solid cylindrical core radius (meters)
+const RAMP_WIDTH := 7.5            ## Ramp extends this far beyond core
+const OUTER_RADIUS := 16.5         ## CORE_RADIUS + RAMP_WIDTH
+const TOWER_HEIGHT := 120.0        ## Total tower height (meters)
 const SPIRAL_ROTATIONS := 4.5     ## Full rotations over the height
 const RAMP_ARC := PI * 0.5        ## Ramp spans 90 degrees of arc
-const RAMP_THICKNESS := 1.5       ## Vertical thickness of ramp surface
+const RAMP_THICKNESS := 4.5       ## Vertical thickness of ramp surface
 
 ## SDF writing resolution — smaller = more detail but slower generation
 const SDF_STEP := 0.8              ## Step size for voxel writing (meters)
@@ -30,8 +30,8 @@ const SDF_FILL_VALUE := -1.0       ## Negative SDF = solid
 const SDF_EMPTY_VALUE := 1.0       ## Positive SDF = air
 
 ## Sphere-painting radius for do_sphere approach (blobby but fast)
-const CORE_PAINT_RADIUS := 2.0    ## Sphere radius for painting the core column
-const RAMP_PAINT_RADIUS := 1.2    ## Sphere radius for painting the ramp path
+const CORE_PAINT_RADIUS := 6.0    ## Sphere radius for painting the core column
+const RAMP_PAINT_RADIUS := 3.6    ## Sphere radius for painting the ramp path
 
 # ======================================================================
 #  Structural integrity constants (Local Boundary BFS)
@@ -223,11 +223,11 @@ func _build_tower() -> void:
 	# Paint the spiral shape using spheres along the core and ramp paths
 	await _paint_tower_shape()
 
-	# Remove the temporary viewer — once painted, the tower data is stored
-	# by VoxelStreamMemory and no longer needs active streaming.
+	# Keep the viewer — VoxelTerrain needs it to render blocks, not just stream them.
+	# The viewer stays at the tower center so all tower blocks remain visible.
 	if _temp_viewer and is_instance_valid(_temp_viewer):
-		_temp_viewer.queue_free()
-		print("[SpiralTower] Removed temporary VoxelViewer")
+		_temp_viewer.name = "TowerViewer"
+		print("[SpiralTower] Keeping VoxelViewer for rendering")
 
 	_is_built = true
 	generation_complete.emit()
@@ -1029,12 +1029,18 @@ func _bake_slab_meshes(sever_y: float) -> void:
 				shifted_pts[pt_i] = raw_pts[pt_i] - mesh_aabb.get_center()
 			var centered_convex := ConvexPolygonShape3D.new()
 			centered_convex.points = shifted_pts
+			# margin=0 eliminates the rounded-edge zone where two slabs in a
+			# pile would overlap and bump the player capsule upward at
+			# boundaries. Trade-off: sharp edges may stick to each other on
+			# settling, but slabs are heavy debris so it's negligible.
+			centered_convex.margin = 0.0
 			slab_shape = centered_convex
 		else:
 			# Fallback: cylinder matching the tower's known radius
 			var cyl := CylinderShape3D.new()
 			cyl.radius = OUTER_RADIUS
 			cyl.height = slab_height
+			cyl.margin = 0.0
 			slab_shape = cyl
 			print("[SpiralTower] Convex hull failed for slab %d, using cylinder fallback" % _cached_slab_meshes.size())
 		_cached_slab_shapes.append(slab_shape)
@@ -1543,11 +1549,13 @@ func _spawn_rock_chunks_legacy(impact_pos: Vector3, chunk_count: int,
 		var rock_mesh: ArrayMesh = _generate_rock_mesh(chunk_size, i)
 		var convex := rock_mesh.create_convex_shape(true, false)
 		if convex and convex is ConvexPolygonShape3D and convex.points.size() >= 4:
+			convex.margin = 0.0
 			col.shape = convex
 		else:
 			var box_shape := BoxShape3D.new()
 			var half := chunk_size * 0.45
 			box_shape.size = Vector3(half, half * 0.7, half)
+			box_shape.margin = 0.0
 			col.shape = box_shape
 		chunk.add_child(col)
 
